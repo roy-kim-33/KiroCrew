@@ -22,11 +22,17 @@ from kiro_crew.acp.types import (
     AcpEvent,
     TurnUsage,
 )
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    STEER_NOTICE_BOUND_SECS,
+    split_trailing_protocol_suffix,
+)
 from kiro_crew.messaging import (
     APPROVAL_AUTO,
     APPROVAL_INTERACTIVE,
     TransportCapabilities,
     TurnDriver,
+    driver,
 )
 from kiro_crew.messaging.renderer import Renderer
 from kiro_crew.monitoring.completion import MonitorCompletionHook
@@ -487,6 +493,196 @@ class TestApprovalLadder:
         assert p.approved == ["rq1"]
 
 
+class _SteerRecordingProvider(_ScriptedProvider):
+    """A provider that can be steered; records every wire call in order."""
+
+    def __init__(self, events, *, supports_steer=True, steer_exc=None):
+        super().__init__(events)
+        self.supports_steer = supports_steer
+        # The deny paths read the refusal answer; a steer-capable double has both.
+        self.supports_refusal_steer = supports_steer
+        self.calls: list[tuple[str, str]] = []
+        self._steer_exc = steer_exc
+
+    async def steer(self, message):
+        self.calls.append(("steer", message))
+        if self._steer_exc is not None:
+            raise self._steer_exc
+        return True
+
+    async def approve_tool(self, request_id, *, always=False):
+        self.calls.append(("approve_tool", request_id))
+        await super().approve_tool(request_id, always=always)
+
+    async def reject_tool(self, request_id):
+        self.calls.append(("reject_tool", request_id))
+        await super().reject_tool(request_id)
+
+
+class _ExpiringDecider:
+    """A decider whose prompt expired: denies and records the cause, as every
+    shipped channel decider does (see ``ApprovalDecider``)."""
+
+    def __init__(self, cause=DENY_CAUSE_APPROVAL_TIMEOUT):
+        self._cause = cause
+        self.last_deny_cause = ""
+
+    async def __call__(self, event):
+        self.last_deny_cause = self._cause
+        return False
+
+
+class TestApprovalTimeoutInbandNotice:
+    """The transport path's mirror of the native Slack handler's timeout arm.
+
+    ``messaging.use_transport`` defaults true, so this TurnDriver is what a
+    default install runs: when a channel decider lets its prompt expire, the
+    driver must steer the approval-timeout cause into the running turn BEFORE
+    it rejects, or the model is handed kiro-cli's "User denied tool execution"
+    for a call nobody answered. Ordering, capability gating, best-effort and
+    bound are pinned; cancellation mid-steer must still answer the wire.
+    """
+
+    def _perm_script(self):
+        return [
+            AcpEvent(
+                kind=EVENT_PERMISSION_REQUEST,
+                request_id="rq1",
+                title="bash: rm -rf build",
+                options=[{"id": "approve"}],
+            ),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_expired_prompt_steers_the_cause_before_the_reject(self):
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+        await TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
+            "hi"
+        )
+        assert [c[0] for c in p.calls] == ["steer", "reject_tool"]
+        notice = p.calls[0][1]
+        # The approval-timeout wording, not the generic policy one.
+        assert "expired unanswered" in notice
+        assert "went unanswered until its window closed" in notice
+        assert "bash: rm -rf build" in notice
+        assert p.rejected == ["rq1"]
+        # The prompt itself was still rendered first (steer follows the ask).
+        assert r.events[0][0] == "prompt_choice"
+
+    @pytest.mark.asyncio
+    async def test_a_human_denial_is_not_explained_away(self):
+        """A person's Deny is a real decision the generic result describes
+        correctly; steering "expired" over it would be a lie."""
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+        await TurnDriver(
+            p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider(cause="")
+        ).run("hi")
+        assert [c[0] for c in p.calls] == ["reject_tool"]
+
+    @pytest.mark.asyncio
+    async def test_a_plain_callable_decider_denies_without_a_cause(self):
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+
+        async def decider(event):
+            return False
+
+        await TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=decider).run("hi")
+        assert [c[0] for c in p.calls] == ["reject_tool"]
+
+    @pytest.mark.asyncio
+    async def test_no_steer_when_the_provider_cannot_be_steered(self):
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script(), supports_steer=False)
+        await TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
+            "hi"
+        )
+        assert [c[0] for c in p.calls] == ["reject_tool"]
+
+    @pytest.mark.asyncio
+    async def test_reject_still_sent_when_the_steer_raises(self):
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script(), steer_exc=RuntimeError("wire down"))
+        await TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
+            "hi"
+        )
+        assert ("reject_tool", "rq1") in p.calls
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_steer_is_cut_by_the_bound(self, monkeypatch):
+        """Only the bound can get past a steer that never returns, so this pins
+        the bound itself, not merely the swallow."""
+        monkeypatch.setattr(driver, "STEER_NOTICE_BOUND_SECS", 0.05)
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+
+        async def _hanging_steer(message):
+            p.calls.append(("steer", message))
+            await asyncio.Event().wait()
+
+        p.steer = _hanging_steer  # type: ignore[method-assign]
+        await asyncio.wait_for(
+            TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
+                "hi"
+            ),
+            timeout=2.0,
+        )
+        assert [c[0] for c in p.calls] == ["steer", "reject_tool"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_the_steer_still_answers_the_wire(self, monkeypatch):
+        """A REAL task cancel while parked in the steer: the shielded reject must
+        still reach the wire before the cancellation re-raises, or the
+        subprocess blocks on the unanswered permission forever -- and the denial
+        must still be audited, because the re-raise skips the normal path's
+        SEL row and a rejection that reached the wire but not the audit trail is
+        a gap in a security control."""
+        audited: list[dict] = []
+
+        class _Sel:
+            def log_api_access(self, **kw):
+                audited.append(kw)
+
+        monkeypatch.setattr(driver, "sel", lambda: _Sel())
+        r = _RecordingRenderer()
+        p = _SteerRecordingProvider(self._perm_script())
+        parked = asyncio.Event()
+
+        async def _hanging_steer(message):
+            p.calls.append(("steer", message))
+            parked.set()
+            await asyncio.Event().wait()
+
+        p.steer = _hanging_steer  # type: ignore[method-assign]
+        task = asyncio.create_task(
+            TurnDriver(p, r, approval_mode=APPROVAL_INTERACTIVE, decider=_ExpiringDecider()).run(
+                "hi"
+            )
+        )
+        await asyncio.wait_for(parked.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert ("reject_tool", "rq1") in p.calls
+        denied = [a for a in audited if a.get("operation") == "tool_permission"]
+        assert len(denied) == 1
+        assert denied[0]["outcome"] == "denied"
+        assert "request_id=rq1" in denied[0]["resources"]
+
+    def test_the_bound_is_the_shared_constant(self):
+        """One number for the dashboard runner, the native Slack arm and this
+        driver, so the three surfaces cannot drift."""
+        from kiro_crew.dashboard import chat_runner
+        from kiro_crew.slack import handler as slack_handler
+
+        assert driver.STEER_NOTICE_BOUND_SECS == STEER_NOTICE_BOUND_SECS
+        assert chat_runner._STEER_NOTICE_BOUND_SECS == STEER_NOTICE_BOUND_SECS
+        assert slack_handler._STEER_NOTICE_BOUND_SECS == STEER_NOTICE_BOUND_SECS
+
+
 class TestAutoApproveTool:
     """The injected auto_approve_tool predicate (e.g. auto_approve_subagent_spawn
     for spawn_run) takes precedence over the interactive ladder.
@@ -893,10 +1089,10 @@ class TestDenyAllTools:
 class TestPromptChoiceNamesItsOwnTool:
     """A security prompt must name the tool IT asks about.
 
-    Renderers used to reconstruct the name from the last ``tool_call`` they saw and
-    never cleared it, so a permission arriving without its own titled tool call
-    named the PREVIOUS tool. That is informed consent, so the name (and the purpose
-    of the matching tool call) travel on the prompt event itself.
+    A renderer that reconstructs the name from the last ``tool_call`` it saw and
+    never clears it names the PREVIOUS tool when a permission arrives without its
+    own titled tool call. That breaks informed consent, so the name (and the
+    purpose of the matching tool call) travel on the prompt event itself.
     """
 
     async def _decider(self, event):
@@ -1019,3 +1215,189 @@ class TestPromptChoiceNamesItsOwnTool:
             ]
         )
         assert "AKIAIOSFODNN7EXAMPLE" not in prompts[0][3]
+
+
+def _drain_text(*chunks: str) -> tuple[str, list[str]]:
+    """Feed *chunks* through the marker filter and split what came out.
+
+    Returns the visible text and the steer payloads, so a test can assert on
+    both halves: nothing that keeps prose is worth anything if it also stops
+    consuming real markers.
+    """
+    parser = driver._SteeringMarkerFilter()
+    frames: list[tuple[str, str]] = []
+    for chunk in chunks:
+        frames.extend(parser.feed(chunk))
+    frames.extend(parser.flush())
+    return (
+        "".join(payload for kind, payload in frames if kind == "text"),
+        [payload for kind, payload in frames if kind == "steer"],
+    )
+
+
+class TestProseMentioningSteeringSurvives:
+    """Starting with the sentinel is not the same as being a marker.
+
+    `_SteeringMarkerFilter` held any tail that began `[STEERING` until it found
+    a `]`, and deleted it at flush if none arrived. That is a locate-by-substring
+    decision: the same sentence survived if the writer happened to type a `]`
+    later and vanished if they did not, so an agent explaining the steering
+    protocol lost the rest of its message on every channel the driver feeds
+    (Discord, Telegram, WhatsApp).
+
+    The tail is now judged by the GRAMMAR the marker actually has. A tail that can
+    still extend into `[STEERING steer-<id>]` is held, exactly as before; one that
+    has already diverged is prose and is handed on. This is the same rule
+    `constants.split_trailing_protocol_suffix` applies downstream — and it was
+    only reachable there because the driver upstream had already deleted the text.
+    """
+
+    PROSE = [
+        "Use the [STEERING protocol to redirect",
+        "see [STEERING acknowledgment format",
+        # The exact string `test_unfinished_marker_prefix_grammar.py` pins as
+        # visible at the renderer. The driver runs first, so that contract was
+        # being negated before the renderer ever saw the text.
+        "The [STEERING acknowledgment renders as a chip",
+    ]
+
+    @pytest.mark.parametrize("text", PROSE)
+    def test_an_unclosed_steering_tail_that_is_prose_is_left_visible(self, text):
+        visible, steer = _drain_text(text)
+        assert visible == text
+        assert steer == []
+
+    @pytest.mark.parametrize("text", PROSE)
+    def test_the_same_prose_already_survived_when_a_bracket_closed_it(self, text):
+        """The contrast that makes the defect a defect rather than a policy.
+
+        A closed frame that fails `_STEER_MARKER_RE` was already handed on as
+        prose. So the only thing separating "your sentence is delivered" from
+        "your sentence is deleted" was a `]` somewhere later in the stream —
+        which is not a property of the text's meaning.
+        """
+        closed = text + " ] and the rest"
+        visible, steer = _drain_text(closed)
+        assert visible == closed
+        assert steer == []
+
+    def test_prose_split_across_provider_chunks_still_survives(self):
+        """The hold happens mid-stream, so the split is where the bug lived."""
+        visible, steer = _drain_text("see [STEER", "ING acknowledgment format")
+        assert visible == "see [STEERING acknowledgment format"
+        assert steer == []
+
+
+class TestRealMarkersAreStillConsumed:
+    """Negative controls. A filter that kept prose by keeping everything would
+    leak control frames to the channel, which is the failure this class exists
+    to prevent — so each case below has to keep working unchanged."""
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ("before [STEERING steer-4a2f: pause] after",),
+            # The recognizer is IGNORECASE, so the prefix probe beside it must be
+            # too: a probe that judged these prose would EMIT half a control frame.
+            ("before [STEERING STEER-4A2F: pause] after",),
+            ("before [steering steer-4a2f: pause] after",),
+            # Split inside the id: the classic reason the filter buffers at all.
+            ("before [STEERING steer-4a", "2f: pause] after"),
+        ],
+    )
+    def test_a_marker_is_consumed_and_never_reaches_the_text(self, chunks):
+        visible, steer = _drain_text(*chunks)
+        assert visible == "before  after"
+        assert steer == ["pause"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "before [STEERING steer-4a2f",
+            "before [STEERING steer-",
+            "tail [STEE",
+            # Prose by intent, but every byte of it could still extend into a
+            # marker, so it is held and dropped -- correctly. The rule is about
+            # what the grammar admits, not about what the writer meant.
+            "id prefix, as in [STEERING steer",
+        ],
+    )
+    def test_a_marker_the_stream_was_cut_inside_is_still_dropped(self, text):
+        """Fail-closed is preserved: a tail that could still have become a marker
+        is dropped at flush rather than emitted. Half a control frame on a channel
+        is worse than a lost fragment, and unlike the prose above this text really
+        was on its way to being a marker."""
+        visible, steer = _drain_text(text)
+        assert visible == text.split("[")[0]
+        assert steer == []
+
+    def test_an_oversized_unterminated_marker_still_enters_drop_mode(self):
+        """The 16 KiB ceiling is checked before the grammar probe, so an
+        adversarial buffer cannot make the export re-scan a growing string."""
+        visible, steer = _drain_text("[STEERING steer-" + "a" * 20_000)
+        assert visible == ""
+        assert steer == []
+
+
+class TestTheTwoSpellingsOfTheGrammarAgree:
+    """The recognizer and the prefix probe are one grammar written once.
+
+    `_STEER_TAIL_PREFIX_RE` is compiled from `constants._STEERING_TAIL_PREFIX_RE`'s
+    pattern precisely so the marker grammar has a single source. This pins the
+    relationship that makes that safe, which a shared string alone does not: every
+    cut point of anything the recognizer accepts must be admitted by the probe.
+    Miss one and the filter emits half a real marker; admit too much and prose is
+    held. `IGNORECASE` is one axis on which the two spellings can silently
+    diverge, so this pins them together.
+    """
+
+    ACCEPTED = [
+        "[STEERING steer-4a2f]",
+        "[STEERING steer-4a2f: pause]",
+        "[STEERING steer-4a2f-9b1c: stop and re-plan]",
+        "[STEERING STEER-4A2F: pause]",
+        "[steering steer-4a2f]",
+        "[STEERING  steer-4a2f  :  spaced  ]",
+    ]
+
+    @pytest.mark.parametrize("marker", ACCEPTED)
+    def test_no_chunk_split_of_an_accepted_marker_leaks(self, marker):
+        """The property in the form that actually matters: split an accepted
+        marker at every byte and no part of it may reach the text."""
+        assert (
+            driver._STEER_MARKER_RE.match(marker) is not None
+        ), "the corpus entry is not actually accepted, so it pins nothing"
+        for cut in range(len(marker) + 1):
+            visible, steer = _drain_text(marker[:cut], marker[cut:])
+            assert visible == "", f"a split at byte {cut} leaked {visible!r}"
+            assert len(steer) == 1, f"a split at byte {cut} lost the marker"
+
+    @pytest.mark.parametrize("marker", ACCEPTED)
+    def test_every_prefix_past_the_sentinel_is_admitted_by_the_probe(self, marker):
+        """The regex half of the same property, stated where the probe applies.
+
+        Cuts shorter than `[STEERING` never reach it -- the drain answers those
+        from its own partial-sentinel branch -- so asserting on them would pin a
+        contract this regex does not have. From the sentinel onward the probe is
+        the only thing standing between a buffered fragment and the channel.
+        """
+        for cut in range(len(driver._STEER_PREFIX), len(marker)):
+            prefix = marker[:cut]
+            assert (
+                driver._STEER_TAIL_PREFIX_RE.match(prefix) is not None
+            ), f"the probe would call {prefix!r} prose and emit part of a marker"
+
+    def test_the_probe_can_actually_refuse(self):
+        """Guard the guard: a probe that admitted everything would satisfy the
+        test above and restore the deletion this change removes."""
+        assert driver._STEER_TAIL_PREFIX_RE.match("[STEERING acknowledgment") is None
+
+    def test_the_driver_and_the_renderer_read_the_same_prose_the_same_way(self):
+        """Cross-layer pin. `split_trailing_protocol_suffix` decides the same
+        question downstream; a tail either layer calls prose must survive both,
+        or the visible contract depends on which one ran first — which is exactly
+        how this defect stayed hidden behind a passing renderer test."""
+        for text in TestProseMentioningSteeringSurvives.PROSE:
+            visible, suffix = split_trailing_protocol_suffix(text)
+            assert (visible, suffix) == (text, ""), "the renderer's own view changed"
+            assert _drain_text(text)[0] == text

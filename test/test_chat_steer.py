@@ -64,6 +64,47 @@ class TestApiChatSteer:
         assert "queue_push" not in events  # steered, not queued
 
     @pytest.mark.asyncio
+    async def test_composer_steer_records_its_admission_for_the_requeue(
+        self, tmp_path, monkeypatch, _patch_sel
+    ):
+        """The composer stamps the containment its own request was admitted under.
+
+        Its requeue runs in the turn's teardown, past the RPC's suspension, so
+        without the stamp a mirror linked during that suspension would be folded
+        into the entry's baseline and survive the drain. The LINKED exemption does
+        not save it: a new outbound mirror is never exempt, because the author does
+        not control mirror links.
+
+        Read from INSIDE the RPC, the only vantage point where "before the
+        suspension" is observable.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _running_slot(state)
+
+        seen: dict = {}
+
+        async def _inspect(msg):
+            seen["stamp"] = slot._steer_admissions.get(msg)
+            seen["origin"] = slot._steer_user_origin.get(msg)
+            return True
+
+        client_mock = MagicMock()
+        client_mock.supports_steer = True
+        client_mock.steer = AsyncMock(side_effect=_inspect)
+        slot._acp_client = client_mock
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat", json={"slot": "test", "message": "go left", "steer": True}
+            )
+            assert resp.status == 200
+
+        assert seen["stamp"] is not None, "the composer must record its admission too"
+        assert seen["origin"] is True, "and mark the text as its own human's"
+
+    @pytest.mark.asyncio
     async def test_app_authenticated_steer_falls_back_to_fail_closed_queue(
         self, tmp_path, monkeypatch, _patch_sel
     ):
@@ -141,6 +182,54 @@ class TestApiChatSteer:
             assert data.get("steered") is not True
 
         client_mock.steer.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_steer_failure_requeues_it_as_possibly_delivered(
+        self, tmp_path, monkeypatch, _patch_sel
+    ):
+        """A steer whose RPC died on a stdin stall may already be in the turn.
+        It is not re-sent as a fresh queued message: it stays pending, and the
+        dying turn's teardown requeues it with a note that it may already have
+        been delivered."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.dashboard import chat_runner
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _running_slot(state)
+        client_mock = MagicMock()
+        client_mock.supports_steer = True
+        client_mock.steer = AsyncMock(
+            side_effect=AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+        )
+        slot._acp_client = client_mock
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat", json={"slot": "test", "message": "also tag it", "steer": True}
+            )
+            assert resp.status == 200
+
+        assert slot._pending_steers == ["also tag it"]
+        assert all(entry["content"] != "also tag it" for entry in slot._queue)
+
+        chat_runner._requeue_unconsumed_steers(state, slot)
+        assert slot._queue[0]["content"] == "also tag it"
+        assert slot._steer_possibly_delivered == set()
+
+        state.subagents = None
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()) as run_chat,
+        ):
+            assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+        assert run_chat.call_args.args[2] == "also tag it"
+        assert run_chat.call_args.kwargs.get("_steer_possibly_delivered") is True
+        rows = [m for m in slot.messages if m.get("role") == "user"]
+        assert rows[-1]["content"] == "also tag it", "the user's row keeps the text as typed"
+        assert "steer_possibly_delivered" not in (rows[-1].get("meta") or {})
 
     @pytest.mark.asyncio
     async def test_steer_cuts_segment_before_user_append(self, tmp_path, monkeypatch, _patch_sel):
@@ -228,7 +317,7 @@ class TestApiChatSteer:
     async def test_steer_send_id_persists_and_broadcasts(self, tmp_path, monkeypatch, _patch_sel):
         """A client-minted meta.sendId rides the steer: the persisted steer row
         and the steer_push broadcast both carry it, so the client can reconcile
-        its optimistic bubble by id instead of by text (#6075)."""
+        its optimistic bubble by id instead of by text."""
         state, slot = self._steer_capable_state(tmp_path, monkeypatch)
 
         async with TestClient(TestServer(_make_app(state))) as client:
@@ -274,7 +363,7 @@ class TestApiChatSteer:
         falls onto the new-turn path, whose generic client-meta persistence must
         carry the sendId onto the plain user row — with NO steer flag. That
         non-steer row is exactly what the client reads as proof of the new-turn
-        path (#6075), so this pins the pass-through property the frontend half
+        path, so this pins the pass-through property the frontend half
         of the fix rests on: an allowlist that later drops sendId from persisted
         user meta would reopen the issue with every other test green.
 

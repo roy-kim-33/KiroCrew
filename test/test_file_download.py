@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_download
 
@@ -22,7 +23,7 @@ from kiro_crew.dashboard.handlers import api_file_download
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-download", api_file_download)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -135,6 +136,11 @@ async def test_text_file_redacted_blocks_download(tmp_path, mock_sel):
             assert resp.status == 400
             payload = await resp.json()
             assert "redacted" in payload["error"]
+            # The scan refusal carries a machine-readable discriminator (the
+            # same one file-stream/upload emit) so the client can name it a
+            # CREDENTIAL refusal rather than confusing it with the endpoint's
+            # other 400s (invalid input, out-of-project path).
+            assert payload["code"] == "content_redacted"
 
 
 # --- Security envelope ---
@@ -146,6 +152,9 @@ async def test_invalid_path_rejected(mock_sel):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/file-download?path=/etc/passwd")
             assert resp.status == 400
+            # A non-scan 400 must NOT carry the content_redacted code, or the
+            # client would mislabel a rejected path as a credential refusal.
+            assert (await resp.json()).get("code") != "content_redacted"
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""Which stream events count as a subagent's OWN activity (``#4841``).
+"""Which stream events count as a subagent's OWN activity.
 
 ``SubagentInfo.last_activity`` is what idle-stall detection measures
 (``_maybe_flag_stall``: ``idle = now - info.last_activity``), and ``_run_inner``
@@ -164,6 +164,69 @@ async def test_dispatch_carries_provenance_onto_the_roster_event():
     assert roster[0].runtime_global is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["compaction", "clear", "agent_switched", "steer"])
+@pytest.mark.parametrize("co_tenants", [True, False])
+async def test_dispatch_carries_provenance_onto_every_fanned_out_notice(kind, co_tenants):
+    """The same provenance rides every other notice kind a sessionless frame can
+    carry -- compaction, clear, agent switch, steer echo: one fanned out to
+    co-tenants is ``runtime_global``, and the same frame to a lone session (its
+    sole owner) is not. The handle already gates its own compaction state on
+    this; the event carries it so a consumer measuring this session's activity
+    or startup sees the same answer."""
+    from kiro_crew.acp.types import (
+        EVENT_AGENT_SWITCHED,
+        EVENT_CLEAR_STATUS,
+        EVENT_COMPACTION_STATUS,
+        EVENT_STEER_QUEUED,
+        METHOD_AGENT_SWITCHED,
+        METHOD_CLEAR_STATUS,
+        METHOD_COMPACTION_STATUS,
+        METHOD_SESSION_UPDATE,
+    )
+
+    frame, want_kind = {
+        "compaction": (
+            {"method": METHOD_COMPACTION_STATUS, "params": {"status": {"type": "completed"}}},
+            EVENT_COMPACTION_STATUS,
+        ),
+        "clear": ({"method": METHOD_CLEAR_STATUS, "params": {}}, EVENT_CLEAR_STATUS),
+        "agent_switched": (
+            {"method": METHOD_AGENT_SWITCHED, "params": {"agentName": "other"}},
+            EVENT_AGENT_SWITCHED,
+        ),
+        "steer": (
+            {
+                "method": METHOD_SESSION_UPDATE,
+                "params": {"update": {"sessionUpdate": "steering_queued", "content": "x"}},
+            },
+            EVENT_STEER_QUEUED,
+        ),
+    }[kind]
+    rt, reader = _runtime()
+    sids = ("sub-a", "sub-b") if co_tenants else ("sub-a",)
+    queues = {sid: asyncio.Queue() for sid in sids}
+    rt._session_queues.update(queues)
+    handle = AcpSessionHandle("sub-a", queues["sub-a"], rt)
+    task = asyncio.ensure_future(rt._reader_loop())
+    await asyncio.sleep(0)
+    try:
+        reader.feed_data((json.dumps(frame) + "\n").encode())
+        reader.feed_data(
+            (json.dumps({"id": 1, "result": {"stopReason": "end_turn"}}) + "\n").encode()
+        )
+        events = [ev async for ev in handle._dispatch_events(req_id=1, timeout=3.0)]
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    notices = [ev for ev in events if ev.kind == want_kind]
+    assert len(notices) == 1
+    assert notices[0].runtime_global is co_tenants
+
+
 # ── what the stream loop counts as this subagent's activity ──────────
 
 
@@ -174,12 +237,17 @@ def _mock_sessions(stream_factory: object) -> MagicMock:
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
     provider.context_usage_pct = lambda: 0.0
+    # Read synchronously after every turn; as AsyncMock children they
+    # would hand back coroutines nobody awaits.
+    provider.context_window_tokens = lambda: 0
+    provider.context_used_tokens = lambda: 0
     provider.stream = MagicMock(side_effect=stream_factory)
     sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
     sessions.release = MagicMock()
     sessions.reset = AsyncMock()
     sessions.record_success = MagicMock()
     sessions.get_agent = MagicMock(return_value="")
+    sessions.get_agent_selection = MagicMock(return_value=("template", ""))
     sessions.get_approval_policy = MagicMock(return_value="auto")
     sessions.has_session = MagicMock(return_value=True)
     return sessions

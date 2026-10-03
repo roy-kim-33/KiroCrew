@@ -43,6 +43,8 @@ def _make_state(tmp_path, session_map):
     sessions.set_slack_link = session_map.set_slack_link
     sessions.clear_slack_link = session_map.clear_slack_link
     sessions.get_session_for_thread = session_map.get_session_for_thread
+    # The unlink route lands the cleared link on disk before it answers.
+    sessions.aflush = session_map.aflush
     sessions.set_approval_policy = MagicMock()
     state = DashboardState(
         sessions=sessions,
@@ -78,7 +80,17 @@ def _fake_provider():
 
     fake_client.stream = _stream
     fake_client.stream_command = _stream
+    # These provider-client accessors are sync on the real client; leaving
+    # them as AsyncMock attrs creates coroutines _run_chat calls but never
+    # awaits (it reads them synchronously by design).
     fake_client.context_usage_pct = MagicMock(return_value=0.0)
+    fake_client.context_window_tokens = MagicMock(return_value=0)
+    fake_client.context_used_tokens = MagicMock(return_value=0)
+    fake_client.mcp_session_report = MagicMock(return_value=None)
+    # getattr(client, "client", None) reaches a nested ACP client for
+    # pop_pending_oauth_requests(); a bare AsyncMock().client would make that
+    # lookup return another AsyncMock whose call also goes unawaited.
+    fake_client.client = None
     return fake_client
 
 

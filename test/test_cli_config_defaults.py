@@ -3,7 +3,7 @@
 The load path can only REPORT drift: a stored old default and a deliberate opt-out
 are the same bytes, so it must not rewrite either. This command is the surface
 where the operator resolves that ambiguity themselves, which is what lets the
-report be one answerable line instead of a permanent per-key notice (#7559).
+report be one answerable line instead of a permanent per-key notice.
 """
 
 from __future__ import annotations
@@ -131,8 +131,82 @@ def test_keep_records_the_stored_values_and_silences_the_report(home, capsys):
     assert "recorded as intentional" in capsys.readouterr().out
 
 
+def test_the_restart_hint_names_only_restart_bound_keys(home, capsys):
+    """The schema's ``restart=True`` mark decides the hint, so a key the mark leaves
+    hot is not sent through a restart. ``forward_declared_env`` is marked;
+    ``autocompact_pct`` is not."""
+    from kiro_crew.config.schema import requires_restart
+
+    assert requires_restart("mcp_gateway.forward_declared_env")
+    assert not requires_restart("session.autocompact_pct")
+    _run(_args(adopt=True), home)
+    out = capsys.readouterr().out
+    assert "session.autocompact_pct removed" in out
+    assert "mcp_gateway.forward_declared_env removed" in out
+    restart = [line for line in out.splitlines() if "Restart the gateway" in line]
+    assert restart == [
+        "Restart the gateway for a running instance to pick up: mcp_gateway.forward_declared_env"
+    ]
+
+
+def test_adopting_only_live_keys_asks_for_no_restart(home, capsys):
+    _run(_args(keys=["session.autocompact_pct"], adopt=True), home)
+    out = capsys.readouterr().out
+    assert "session.autocompact_pct removed" in out
+    assert "Restart the gateway" not in out
+
+
+def test_adopting_a_boot_only_key_asks_for_a_restart(tmp_path, capsys):
+    """The gateway sizes its loop-stall watchdog from this key once, at start, so a
+    running one keeps the stored budget until it restarts; the hint has to say so."""
+    d = tmp_path / "crew"
+    d.mkdir()
+    stored = {"dashboard": {"loop_stall_exit_after_secs": 25}}
+    (d / "config.json").write_text(json.dumps(stored), encoding="utf-8")
+    _run(_args(keys=["dashboard.loop_stall_exit_after_secs"], adopt=True), d)
+    out = capsys.readouterr().out
+    assert "dashboard.loop_stall_exit_after_secs removed" in out
+    assert (
+        "Restart the gateway for a running instance to pick up: "
+        "dashboard.loop_stall_exit_after_secs"
+    ) in out
+    assert "loop_stall_exit_after_secs" not in _stored(d).get("dashboard", {})
+
+
+def test_keeping_a_row_whose_meaning_moved_repeats_the_note(tmp_path, capsys):
+    d = tmp_path / "crew"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"skills": {"lazy_load": False}}), encoding="utf-8")
+    lazy = next(e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "skills.lazy_load")
+    _run(_args(keep=True), d)
+    out = capsys.readouterr().out
+    assert "skills.lazy_load recorded as intentional" in out
+    assert f"Note: {lazy.note}." in out
+
+
+def test_keeping_one_of_the_tool_stall_pair_says_the_other_still_bounds_it(tmp_path, capsys):
+    """Keeping the hard cap at 3600 while adopting the suspect window leaves the
+    window at an hour, and the confirmation is the moment to say so."""
+    d = tmp_path / "crew"
+    d.mkdir()
+    stored = {"watchdog": {"tool_stall_suspect_secs": 3600.0, "tool_stall_hard_cap_secs": 3600.0}}
+    (d / "config.json").write_text(json.dumps(stored), encoding="utf-8")
+    cap = next(
+        e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "watchdog.tool_stall_hard_cap_secs"
+    )
+    _run(_args(keys=["watchdog.tool_stall_hard_cap_secs"], keep=True), d)
+    assert f"Note: {cap.note}." in capsys.readouterr().out
+    _run(_args(), d)
+    assert cap.note in capsys.readouterr().out
+
+
+def test_keeping_a_row_without_a_note_prints_no_note(home, capsys):
+    _run(_args(keep=True), home)
+    assert "Note:" not in capsys.readouterr().out
+
+
 def test_adopting_an_acked_key_drops_its_ack(home):
-    """The ack recorded a value that is no longer stored, so keeping it would
+    """The ack recorded a value that is not the stored one, so keeping it would
     silence a genuinely deliberate choice made later."""
     _run(_args(keys=["session.autocompact_pct"], keep=True), home)
     _run(_args(keys=["session.autocompact_pct"], adopt=True), home)
@@ -175,6 +249,21 @@ def test_adopt_says_the_overlay_still_wins_when_it_carries_the_key(home, capsys)
     assert "the current default now applies" not in out
 
 
+def test_an_overlay_shadowed_restart_bound_key_asks_for_no_restart(home, capsys):
+    """The overlay still decides that key, so the running value does not move and a
+    restart would change nothing."""
+    from kiro_crew.config.schema import requires_restart
+
+    assert requires_restart("mcp_gateway.forward_declared_env")
+    (home / "config.local.json").write_text(
+        json.dumps({"mcp_gateway": {"forward_declared_env": False}}), encoding="utf-8"
+    )
+    _run(_args(keys=["mcp_gateway.forward_declared_env"], adopt=True), home)
+    out = capsys.readouterr().out
+    assert "mcp_gateway.forward_declared_env removed from config.json" in out
+    assert "Restart the gateway" not in out
+
+
 def test_an_unknown_key_is_refused_rather_than_silently_ignored(home, capsys):
     with pytest.raises(SystemExit) as e:
         _run(_args(keys=["session.timeout_secs"], adopt=True), home)
@@ -189,6 +278,72 @@ def test_a_clean_install_says_so(tmp_path, capsys):
     (d / "config.json").write_text(json.dumps({"session": {"autocompact_pct": 70.0}}), "utf-8")
     _run(_args(), d)
     assert "No stored value holds a superseded default" in capsys.readouterr().out
+
+
+def test_listing_shows_what_auto_adoption_already_removed(tmp_path, capsys):
+    """An adopted key holds no stored value, so it is listed from the ledger instead.
+
+    The load path announced the removal once, at WARNING, in a gateway log; this
+    command is where an operator asks the question again later. Listed even when
+    nothing is currently drifted -- that is the common state right after an upgrade.
+    """
+    d = tmp_path / "crew"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"agent": {}}), "utf-8")
+    with patch("kiro_crew.config.loader.config_dir", return_value=d):
+        SD.record_adoptions({"agent.subagent_timeout_secs": 1800})
+
+    _run(_args(), d)
+    out = capsys.readouterr().out
+    assert "agent.subagent_timeout_secs" in out
+    assert "1800" in out
+    assert "kirocrew config set agent.subagent_timeout_secs 1800" in out
+    assert "No stored value holds a superseded default" in out
+    # Listing changes nothing, in either file.
+    assert _stored(d) == {"agent": {}}
+    with patch("kiro_crew.config.loader.config_dir", return_value=d):
+        assert SD.adopted_superseded() == {"agent.subagent_timeout_secs": 1800}
+
+
+def test_listing_renders_the_ledger_even_without_a_config_file(tmp_path, capsys):
+    d = tmp_path / "crew"
+    d.mkdir()
+    with patch("kiro_crew.config.loader.config_dir", return_value=d):
+        SD.record_adoptions({"agent.subagent_timeout_secs": 1800})
+
+    _run(_args(), d)
+    out = capsys.readouterr().out
+    assert "agent.subagent_timeout_secs" in out and "1800" in out
+    assert "No config.json yet" in out
+
+
+def test_listing_renders_the_ledger_before_a_corrupt_config_is_refused(tmp_path, capsys):
+    """The ledger is printed before config.json is opened, so a corrupt file cannot
+    hide what an earlier load removed from it."""
+    d = tmp_path / "crew"
+    d.mkdir()
+    (d / "config.json").write_text("{ not json", encoding="utf-8")
+    with patch("kiro_crew.config.loader.config_dir", return_value=d):
+        SD.record_adoptions({"agent.subagent_timeout_secs": 1800})
+
+    with pytest.raises(SystemExit):
+        _run(_args(), d)
+    captured = capsys.readouterr()
+    assert "kirocrew config set agent.subagent_timeout_secs 1800" in captured.out
+    assert "Could not read" in captured.err
+
+
+def test_an_adopted_key_is_not_an_adopt_or_keep_target(tmp_path, capsys):
+    """Nothing is stored for it, so naming it is refused like any other non-drift."""
+    d = tmp_path / "crew"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"agent": {}}), "utf-8")
+    with patch("kiro_crew.config.loader.config_dir", return_value=d):
+        SD.record_adoptions({"agent.subagent_timeout_secs": 1800})
+
+    with pytest.raises(SystemExit):
+        _run(_args(keys=["agent.subagent_timeout_secs"], keep=True), d)
+    assert "Not holding a superseded default" in capsys.readouterr().err
 
 
 def test_a_missing_config_needs_no_action(tmp_path, capsys):
@@ -280,7 +435,8 @@ def test_an_appended_coerced_entry_is_detected_without_editing_the_detector(monk
     """
     appended = SD.CoercedValue(
         dotted_key="agent.provider",
-        resolves_to="acp",
+        resolves_to=lambda _v: "acp",
+        default="acp",
         reason="names a withdrawn provider",
         is_coerced=lambda v: v == "gone",
     )

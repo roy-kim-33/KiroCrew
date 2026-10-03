@@ -3,8 +3,10 @@ import type { MutableRefObject } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { Plus } from 'lucide-react'
 import type { ChatSlot } from '../../types'
-import { comparePinnedThenSort } from './sessionOrder'
+import { compareBySort, comparePinnedThenSort } from './sessionOrder'
 import { i18nT } from '../../i18n/t'
+import { PINNED_SESSION_ORDER_CHANGED_EVENT, PINNED_SESSION_ORDER_KEY, readPinnedSessionOrder, reconcilePinnedSessionOrder } from '../../utils/pinnedSessionOrder'
+import { LIST_TITLE_CLS } from '../../components/listShell'
 
 /** Rows shown before the list defers to "show all". Sized so the flyout stays
  *  a glance rather than a panel: past ~8 rows the eye has to scan, at which
@@ -124,14 +126,36 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
 
   const unread = useMemo(() => new Set(unreadSlots), [unreadSlots])
   const pinned = useMemo(() => new Set(slots.filter(s => s.pinned).map(s => s.key)), [slots])
+  const [storedPinnedOrder, setStoredPinnedOrder] = useState(readPinnedSessionOrder)
+  const naturalPinnedOrder = useMemo(
+    () => slots.filter(s => s.pinned).sort((a, b) => compareBySort(a, b, 'date-desc')).map(s => s.key),
+    [slots],
+  )
+  const pinnedOrder = useMemo(
+    () => reconcilePinnedSessionOrder(storedPinnedOrder, naturalPinnedOrder),
+    [storedPinnedOrder, naturalPinnedOrder],
+  )
+  const pinnedRank = useMemo(() => new Map(pinnedOrder.map((key, index) => [key, index])), [pinnedOrder])
+  useEffect(() => {
+    const refresh = () => setStoredPinnedOrder(readPinnedSessionOrder())
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === PINNED_SESSION_ORDER_KEY) refresh()
+    }
+    window.addEventListener(PINNED_SESSION_ORDER_CHANGED_EVENT, refresh)
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener(PINNED_SESSION_ORDER_CHANGED_EVENT, refresh)
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [])
 
   // Always date-desc, regardless of the sidebar's saved sort. This surface is
   // "what was I just doing" — a name-sorted flyout would answer a different
   // question than the one hovering it asks. Pin-first still applies so a row
   // does not change position between the two surfaces.
   const ordered = useMemo(
-    () => [...slots].sort((a, b) => comparePinnedThenSort(a, b, 'date-desc', pinned)),
-    [slots, pinned],
+    () => [...slots].sort((a, b) => comparePinnedThenSort(a, b, 'date-desc', pinned, pinnedRank)),
+    [slots, pinned, pinnedRank],
   )
   const rows = ordered.slice(0, FLYOUT_MAX_ROWS)
   const hidden = ordered.length - rows.length
@@ -183,6 +207,19 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
     ? { from: toggleClip(panelWidth, surfaceH), to: FULL_CLIP }
     : null
 
+  // The open morph is a clip-path window growing out of the toggle, and its
+  // final keyframe (`FULL_CLIP`) stays applied after it lands. That resting
+  // clip is the bug: `inset(0px round 12px)` re-rounds the panel's border box,
+  // whose CSS border is `rounded-xl` (16px), at a DIFFERENT radius. The border
+  // arc and the clip arc do not coincide, so the top-left corner paints two
+  // concentric 1px strokes. The clip is only needed WHILE growing — at rest the
+  // CSS border is the single source of the corner. So once the morph settles we
+  // hand Framer `clipPath: 'none'` as the resting target, releasing the inset.
+  const [clipSettled, setClipSettled] = useState(false)
+  // Re-arm on every fresh open (a new measured height restarts the morph), so a
+  // reopen animates from the toggle again rather than snapping in clip-free.
+  useLayoutEffect(() => { setClipSettled(false) }, [surfaceH])
+
   return (
     <motion.div
       ref={setSurface}
@@ -208,9 +245,17 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
       // once at mount. Frame one is opacity 0, so the pre-measure frame is not
       // visible. Reduced motion keeps the fade and drops the growth.
       initial={{ opacity: 0 }}
+      // While morphing: grow the clip window from the toggle to full. Once
+      // settled: `clipPath: 'none'` so Framer releases the resting inset and the
+      // CSS border alone rounds the corner (single clean stroke, see above). The
+      // non-clip paths (reduced motion, pre-measure) never set a clip to release.
       animate={openClip
-        ? { opacity: [0, 1], clipPath: [openClip.from, openClip.to] }
+        ? (clipSettled
+            ? { opacity: 1, clipPath: 'none' }
+            : { opacity: [0, 1], clipPath: [openClip.from, openClip.to] })
         : { opacity: 1 }}
+      // The clip has finished growing; flip to the clip-free resting state.
+      onAnimationComplete={() => { if (openClip && !clipSettled) setClipSettled(true) }}
       exit={{ opacity: 0, transition: { duration: 0.1 } }}
       transition={reduce
         ? { duration: 0.15 }
@@ -229,7 +274,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
               than a flyout-local copy means the two can never disagree, in any
               locale. A distinct "Recent" caption would put a text swap in the
               middle of a morph whose whole point is that nothing moves. */}
-          <span className="sessions-panel-title truncate text-sm font-semibold tracking-[.04em] text-text-strong">
+          <span className={LIST_TITLE_CLS}>
             {i18nT('pages.chatSidebar.sessions')}
           </span>
         </div>
@@ -271,7 +316,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
               aria-disabled={!connected}
               title={label}
               onClick={() => { if (connected) onSwitch(slot.key) }}
-              className={`flex w-full items-center gap-2 rounded-md border-none bg-transparent px-2 py-1.5 text-left text-[13px] outline-none transition-colors ${
+              className={`flex w-full items-center gap-2 rounded-md border-none bg-transparent px-2 py-1.5 text-left text-[13px] outline-hidden transition-colors ${
                 isActive
                   ? '!bg-accent-subtle text-text-strong'
                   : connected
@@ -287,7 +332,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
                   status === 'approval' ? 'bg-warn'
                     : status === 'question' ? 'bg-info'
                       : status === 'running' ? 'bg-accent animate-pulse'
-                        : isUnread ? 'bg-accent'
+                        : isUnread ? 'bg-ok'
                           : 'bg-transparent'
                 }`}
               />

@@ -218,8 +218,9 @@ async def evaluate_new_servers(
     Nothing is deleted here. One server owns one row, so a row is replaced by its
     own server's next measurement and by nothing else — there is no inventory to
     compare against and no size to bound. That matters because the only caller's
-    list comes from ``probe_all``, which excludes consent-disabled rows by design:
-    any rule that deleted "servers not in this list" would discard the valid
+    list comes from ``probe_all``, which carries consent-disabled rows only as
+    unprobed placeholders that :func:`_measurable` drops at the door: any rule
+    that deleted "servers not measured this pass" would discard the valid
     measurement of every disabled server.
 
     Every filesystem touch here is offloaded: this runs inside a request handler
@@ -238,9 +239,26 @@ async def evaluate_new_servers(
     """
     if budget is not None and _PASS_LOCK.locked():
         logger.debug("shareability: a pass is already running; serving stored rows")
-        return await asyncio.to_thread(_stored_verdicts, servers, runtime_dir)
+        return await asyncio.to_thread(_stored_verdicts, _measurable(servers), runtime_dir)
     async with _PASS_LOCK:
-        return await _evaluate_pass(servers, runtime_dir, budget, on_progress)
+        return await _evaluate_pass(_measurable(servers), runtime_dir, budget, on_progress)
+
+
+def _measurable(servers: list[Any]) -> list[Any]:
+    """*servers* without the disabled rows -- dropped before anything reads them.
+
+    ``probe_all`` carries a disabled server as an unprobed placeholder so the
+    dashboard can list it; this pass has nothing to say about it (probing is the
+    act consent gates). It is dropped HERE, ahead of the identity derivation, and
+    not at the candidate filter downstream: an identity hashes the command, and a
+    disabled row's config is the one nobody has exercised, so a malformed value
+    there (a non-string ``command``) would otherwise raise before the per-server
+    boundary and abort the pass for every healthy server -- the placeholder that
+    keeps a row visible must not take Measure All down. The row itself is still
+    in the probe response; the dashboard reads a disabled server's stored verdict
+    by name, so nothing is lost by measuring nothing for it.
+    """
+    return [s for s in servers if not getattr(s, "disabled", False)]
 
 
 def _stored_verdicts(servers: list[Any], runtime_dir: Path) -> dict[str, CachedPreflight]:
@@ -281,14 +299,15 @@ async def _evaluate_pass(
             # and nothing else, so a result that is not stored is not merely
             # forgotten, it is reported as "never measured" about a server we
             # just spawned twice -- but it must not suppress a re-measure, being
-            # the one verdict two spawns cannot justify freezing (#4339). So it
+            # the one verdict two spawns cannot justify freezing. So it
             # stays a candidate and the next pass re-derives it, which is what
             # lets a press clear a row that was wrong.
             if not hit.caller_sensitive:
                 continue
-        if getattr(server, "disabled", False) or not getattr(server, "command", ""):
-            # A disabled server must not be spawned (probing is the act consent
-            # gates), and a server with no command has no stdio pipe to stub.
+        if not getattr(server, "command", ""):
+            # A server with no command has no stdio pipe to stub. (Disabled rows
+            # never reach this loop: ``_measurable`` drops them before an identity
+            # is derived, because probing is the act consent gates.)
             continue
         candidates.append((server.name in known, server))
 
@@ -307,7 +326,7 @@ async def _evaluate_pass(
     # Bounded fan-out, not a sequential walk. This is awaited by a request the
     # operator is waiting on, and each pre-flight is two spawns that can each hit
     # the probe timeout — serially that is the budget times two timeouts of dead
-    # wait, so one hung server used to make the whole pass feel hung. The cap is
+    # wait, so one hung server would make the whole pass feel hung. The cap is
     # the prober's own, because the same executor and the same DNS resolution sit
     # underneath: raising it here would flood the pool this bound exists to
     # protect. Each pre-flight already spawns twice, so the real process ceiling
@@ -369,9 +388,9 @@ async def _evaluate_pass(
             # makes a result VISIBLE (the dashboard reads this cache and only this
             # cache); what makes a divergence non-durable is that the loop above
             # refuses to let such a row skip the next measurement. Separating
-            # those two meanings is the whole of the #4339 fix -- the earlier
-            # attempt withheld the row instead, which made the measurement
-            # invisible and had the page call the server unmeasured.
+            # those two meanings is what keeps both properties: withholding the
+            # row instead would make the measurement invisible and have the page
+            # call the server unmeasured.
             cache.put(server.name, identities[server.name], verdict)
             measured += 1
         else:

@@ -27,8 +27,13 @@ class TestSessionStartSemaphore:
         cfg.session.pool_ttl_secs = 0
         sm = SessionManager(cfg)
         assert hasattr(sm, "_start_sem")
-        # Semaphore(4) limits concurrent cold-starts for memory safety
-        assert sm._start_sem._value == 4
+        # The background width plus the person reserve (kiro_crew.start_priority).
+        from kiro_crew.session_allocation import (
+            FOREGROUND_COLD_START_RESERVE,
+            MAX_CONCURRENT_COLD_STARTS,
+        )
+
+        assert sm._start_sem._value == MAX_CONCURRENT_COLD_STARTS + FOREGROUND_COLD_START_RESERVE
 
     @pytest.mark.asyncio
     async def test_semaphore_limits_concurrent_starts(self):
@@ -85,7 +90,7 @@ class TestParallelBatching:
         assert _MAX_PARALLEL_TASKS == 3
 
     @pytest.mark.asyncio
-    async def test_large_group_batched(self):
+    async def test_large_group_batched(self, tmp_path):
         """A group of 6 tasks should be split into batches of 4 + 2."""
         from kiro_crew.task_models import Project, Task, TaskStatus
 
@@ -95,7 +100,7 @@ class TestParallelBatching:
         sessions.release = MagicMock()
         sessions.reset = AsyncMock()
 
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         # Track execution order
         executed: list[int] = []
@@ -122,7 +127,7 @@ class TestParallelBatching:
         assert set(executed) == {1, 2, 3, 4, 5, 6}
 
     @pytest.mark.asyncio
-    async def test_small_group_not_batched(self):
+    async def test_small_group_not_batched(self, tmp_path):
         """A group of 3 tasks should run in a single gather (no batching needed)."""
         from kiro_crew.task_models import Project, Task, TaskStatus
 
@@ -132,7 +137,7 @@ class TestParallelBatching:
         sessions.release = MagicMock()
         sessions.reset = AsyncMock()
 
-        runner = TaskRunner(sessions=sessions, auto_test=False)
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
 
         executed: list[int] = []
 

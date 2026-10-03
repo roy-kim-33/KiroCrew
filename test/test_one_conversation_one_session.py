@@ -2,8 +2,8 @@
 
 Each test here maps to an acceptance criterion for making a channel-born
 conversation's dashboard tab BE that conversation rather than a copy of it.
-Every one fails before the change: the tab used to run a separate session and
-write a separate transcript.
+The tab runs the same session and transcript as the conversation, never a
+separate copy.
 """
 
 from __future__ import annotations
@@ -446,7 +446,7 @@ class TestA6NoLostOrOutOfOrderTurn:
             assert mgr.is_busy(SLACK_KEY) is True
             assert mgr.is_busy("1785370133.085469") is True
 
-        asyncio.new_event_loop().run_until_complete(_check())
+        asyncio.run(_check())
 
     def test_no_steer_primitive_is_exposed(self):
         """Withdrawn deliberately: an unaccounted steer can drop a message."""
@@ -480,8 +480,8 @@ class TestForeignAppendsInterleaveChronologically:
     """A channel turn that lands mid-window is filed where it happened.
 
     The save rewrites ``meta + frozen prefix + window``. Foreign lines (another
-    writer's acknowledged appends) used to be concatenated after the window,
-    which parked a channel reply that arrived BEFORE the user's next dashboard
+    writer's acknowledged appends) must not be concatenated after the window,
+    which would park a channel reply that arrived BEFORE the user's next dashboard
     message after it. Once the tab and the thread share one transcript that
     reordering is the conversation the next turn reads back.
     """

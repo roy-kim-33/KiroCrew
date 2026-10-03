@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -46,7 +46,13 @@ def _request(body: object) -> web.Request:
     state = MagicMock()
     state._gateway_restart_task = None
     state._gateway_restart_in_progress = False
+    state.owner_id = ""  # no owner configured: the local bootstrap subject is the owner
     req.app = {"state": state}
+    # Both routes are owner-gated: model the dashboard owner's claims.
+    claims = {"app": "", "user": "local-app"}
+    req.__contains__.side_effect = lambda key: key in claims
+    req.__getitem__.side_effect = lambda key: claims[key] if key in claims else DEFAULT
+    req.get.side_effect = lambda key, *default: claims[key] if key in claims else DEFAULT
     return req
 
 
@@ -249,7 +255,7 @@ class TestChannelEndpoint:
         def _slow_read() -> str:
             # Sampled from the worker thread while the coroutine is parked on it:
             # this is exactly the window a second check could squeeze into.
-            seen.append(updates._check_in_flight)
+            seen.append(updates._check_task is not None)
             return "nightly"
 
         started = asyncio.Event()
@@ -278,14 +284,10 @@ class TestChannelEndpoint:
             f"cleanup, so a concurrent check could interleave: {seen}"
         )
         # And it must not stay held afterwards — that leak stops every future check.
-        assert updates._check_in_flight is False
+        assert updates._check_task is None
 
-    def test_a_failure_in_the_cleanup_still_releases_the_guard(self, _isolated_channel_home):
-        """The inverse hazard, and the worse one.
-
-        A raise inside the cleanup must not leave `_check_in_flight` stuck True:
-        that silently stops the updater checking for the life of the process.
-        """
+    def test_a_failure_in_cleanup_still_releases_task_ownership(self, _isolated_channel_home):
+        """A cleanup exception must not leave a finished task as the owner."""
         update_layout.set_release_channel("stable")
 
         def _explode() -> str:
@@ -313,40 +315,61 @@ class TestChannelEndpoint:
                     await slow
 
         asyncio.run(_scenario())
-        assert updates._check_in_flight is False, (
-            "the guard leaked on the error path — every future update check is now "
-            "a no-op and the updater has silently stopped"
+        assert updates._check_task is None, (
+            "finished task ownership leaked on the error path, so later checks "
+            "would keep joining a dead worker"
         )
 
-    def test_stale_verdict_is_dropped_even_if_the_recheck_no_ops(self, _isolated_channel_home):
-        """A check already in flight makes ``_do_update_check`` return early.
-
-        The response must then say "not checked" rather than echo the old
-        channel's verdict and ``latest_version`` as though they applied here.
-        """
+    def test_channel_switch_reruns_after_waiting_for_the_previous_generation(
+        self, _isolated_channel_home
+    ):
+        """A channel switch waits for the old task, then checks the new channel."""
         update_layout.set_release_channel("stable")
         updates._set_update_info(
             update_available=True, latest_version="9.9.9", check_status="succeeded"
         )
+        old_generation = updates._check_generation
+        checked_channels: list[str] = []
 
-        with (
-            patch.object(updates, "detect_install_layout", return_value=self._feed_layout()),
-            patch.object(updates, "_check_in_flight", True),
-        ):
-            resp = asyncio.run(updates.api_update_channel(_request({"channel": "nightly"})))
+        async def _scenario():
+            release = asyncio.Event()
+
+            async def _existing_check() -> None:
+                await release.wait()
+
+            async def _fresh_check() -> None:
+                checked_channels.append(update_layout.release_channel())
+                updates._set_update_info(
+                    channel="nightly",
+                    update_available=False,
+                    latest_version="",
+                    check_status="succeeded",
+                )
+
+            shared = asyncio.create_task(_existing_check())
+            with (
+                patch.object(updates, "detect_install_layout", return_value=self._feed_layout()),
+                patch.object(updates, "_check_task", shared),
+                patch.object(updates, "_check_task_generation", old_generation),
+                patch.object(updates, "_run_update_check", _fresh_check),
+            ):
+                pending = asyncio.create_task(
+                    updates.api_update_channel(_request({"channel": "nightly"}))
+                )
+                await asyncio.sleep(0)
+                assert not pending.done()
+                release.set()
+                return await pending
+
+        resp = asyncio.run(_scenario())
 
         assert resp.status == 200
-        assert updates._update_info["check_status"] == "unchecked"
-        assert updates._update_info["update_available"] is None
+        assert checked_channels == ["nightly"]
+        assert updates._update_info["check_status"] == "succeeded"
+        assert updates._update_info["update_available"] is False
         assert updates._update_info["latest_version"] == ""
-        # The switcher reads `channel` off this response. The invalidated cache
-        # holds "" for it, so the stored value must win or a successful switch
-        # blanks the control that just performed it.
         payload = json.loads(resp.body.decode())
         assert payload["channel"] == "nightly"
-        # And the command must name the NEW lane. Left empty, the client falls back
-        # to the command shipped in status -- the PREVIOUS channel's -- so copying
-        # it would move the install straight back.
         assert "--channel nightly" in payload["update_command"]
 
     @pytest.mark.parametrize("junk", ["beta", "../../etc/passwd", ""])
@@ -377,29 +400,26 @@ class TestChannelEndpoint:
         assert resp.status == 400
         assert not (_isolated_channel_home / "channel").exists()
 
-    def test_a_check_superseded_by_a_switch_cannot_write_its_verdict(self, _isolated_channel_home):
-        """An in-flight check against the OLD feed must not land after the switch.
-
-        The in-flight guard cannot cancel a running check, so a check that started
-        on the previous channel would otherwise finish afterwards, write that
-        lane's verdict into the cache and stamp the 12-hourly clock -- pinning a
-        stale answer for half a day to a channel this install no longer follows.
-        """
+    def test_a_check_superseded_by_a_switch_reruns_the_new_channel(self, _isolated_channel_home):
+        """A superseded shared check is followed by one for the new channel."""
         update_layout.set_release_channel("stable")
+        checked_channels: list[str] = []
 
         async def _scenario() -> None:
             started = asyncio.Event()
             release = asyncio.Event()
 
             async def _slow_feed_check(capability: object) -> None:
-                started.set()
-                await release.wait()
-                # The verdict the OLD channel's feed would have produced.
+                channel = update_layout.release_channel()
+                checked_channels.append(channel)
+                if len(checked_channels) == 1:
+                    started.set()
+                    await release.wait()
                 updates._set_update_info(
                     managed_by="kirocrew",
-                    channel="stable",
-                    update_available=True,
-                    latest_version="1.2.3",
+                    channel=channel,
+                    update_available=channel == "stable",
+                    latest_version="1.2.3" if channel == "stable" else "",
                     check_status="succeeded",
                 )
 
@@ -409,7 +429,6 @@ class TestChannelEndpoint:
             ):
                 slow = asyncio.create_task(updates._do_update_check())
                 await started.wait()
-                # Switch channels while that check is still talking to the old feed.
                 updates._invalidate_update_check("nightly")
                 update_layout.set_release_channel("nightly")
                 release.set()
@@ -417,13 +436,12 @@ class TestChannelEndpoint:
 
         asyncio.run(_scenario())
 
-        # The superseded verdict was discarded, not published.
-        assert updates._update_info["check_status"] == "unchecked"
-        assert updates._update_info["update_available"] is None
+        assert checked_channels == ["stable", "nightly"]
+        assert updates._update_info["check_status"] == "succeeded"
+        assert updates._update_info["channel"] == "nightly"
+        assert updates._update_info["update_available"] is False
         assert updates._update_info["latest_version"] == ""
-        # And the clock stays unstamped so the next poll re-checks the NEW lane
-        # immediately instead of waiting out the 12-hour interval.
-        assert updates._last_update_check == 0.0
+        assert updates._last_update_check > 0.0
 
     def test_refuses_a_git_checkout(self, _isolated_channel_home):
         # A git checkout follows its remote; writing a channel file would be a
@@ -436,7 +454,7 @@ class TestChannelEndpoint:
         assert resp.status == 409
         assert not (_isolated_channel_home / "channel").exists()
 
-    @pytest.mark.parametrize("kind", ["dmg", "appimage", "docker"])
+    @pytest.mark.parametrize("kind", ["dmg", "appimage", "nsis", "docker"])
     def test_refuses_an_externally_managed_install(self, kind, _isolated_channel_home):
         layout = InstallLayout(
             kind=kind,
@@ -480,6 +498,142 @@ class TestChannelEndpoint:
         ):
             resp = asyncio.run(updates.api_update_channel(_request({"channel": "insider"})))
         assert resp.status == 500
+
+
+class TestUpdateRevalidate:
+    """``POST /api/update/revalidate`` — the CLI's post-update badge reconcile.
+
+    Authenticated over loopback + the local secret (the CLI path), NOT the
+    browser owner gate — a raw ``X-Local-Secret`` request carries no owner
+    identity, so an owner-gated endpoint would 403 the CLI and the fix would be
+    inert. These rows pin that the auth the CLI actually sends is accepted and
+    that a wrong/absent secret or a non-loopback origin is refused.
+    """
+
+    @staticmethod
+    def _cli_request(secret: str, *, remote: str = "127.0.0.1", header: str | None = None):
+        """A request stub carrying the CLI's loopback origin + local-secret header."""
+        req = MagicMock()
+        req.remote = remote
+        req.headers = {"X-Local-Secret": header if header is not None else secret}
+        state = MagicMock()
+        req.app = {"state": state, "local_secret": secret}
+        return req
+
+    def test_invalidates_then_rechecks_in_order(self, _isolated_channel_home):
+        """On valid CLI auth the endpoint drops the cache, THEN re-runs the check.
+
+        Order matters: a re-check that ran before the invalidation would just
+        re-pin the stale verdict. The check re-derives against the channel this
+        install follows, so the invalidation is passed that same channel.
+        """
+        update_layout.set_release_channel("stable")
+        calls: list[str] = []
+
+        def _fake_invalidate(channel: str) -> None:
+            calls.append(f"invalidate:{channel}")
+
+        async def _fake_check() -> None:
+            calls.append("recheck")
+            updates._set_update_info(
+                channel="stable",
+                update_available=False,
+                latest_version="",
+                check_status="succeeded",
+            )
+
+        with (
+            patch.object(updates, "_invalidate_update_check", _fake_invalidate),
+            patch.object(updates, "_do_update_check", _fake_check),
+        ):
+            resp = asyncio.run(updates.api_update_revalidate(self._cli_request("s3cret")))
+
+        assert resp.status == 200
+        assert calls == ["invalidate:stable", "recheck"]
+        payload = json.loads(resp.body.decode())
+        assert payload == {"ok": True}
+
+    def test_wrong_secret_is_refused_without_rechecking(self, _isolated_channel_home):
+        called: list[str] = []
+
+        async def _fake_check() -> None:
+            called.append("recheck")
+
+        with (
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+            patch.object(updates, "_do_update_check", _fake_check),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header="wrong"))
+            )
+        assert resp.status == 403
+        assert called == [], "a refused caller still reached the cache"
+
+    def test_non_loopback_is_refused(self, _isolated_channel_home):
+        called: list[str] = []
+        with patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", remote="10.0.0.5"))
+            )
+        assert resp.status == 403
+        assert called == []
+
+    def test_non_ascii_secret_is_refused_not_crashed(self, _isolated_channel_home):
+        """A non-ASCII X-Local-Secret must be an audited 403, never a TypeError/500.
+
+        hmac.compare_digest raises TypeError on a str carrying a non-ASCII char,
+        and this header is attacker-controllable on the tokenless bypass path, so
+        a str compare would turn the auditable denial into an unaudited 500.
+        """
+        called: list[str] = []
+        with patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header="wröng"))
+            )
+        assert resp.status == 403
+        assert called == [], "a refused non-ASCII secret still reached the cache"
+
+    @pytest.mark.parametrize(
+        "header",
+        ["s3cret\udcff", "\udcff", "wröng\udc80"],
+        ids=["trailing-surrogate", "only-surrogate", "non-ascii-and-surrogate"],
+    )
+    def test_a_lone_surrogate_secret_is_refused_and_audited(self, _isolated_channel_home, header):
+        """aiohttp decodes a header value with ``surrogateescape``, so a non-UTF-8
+        byte in ``X-Local-Secret`` arrives as a lone surrogate. A strict encode
+        raises on it; the endpoint must answer its own audited 403 instead."""
+        called: list[str] = []
+        audited: list[dict[str, object]] = []
+
+        async def fake_audit(request: object, **kwargs: object) -> None:
+            audited.append(kwargs)
+
+        with (
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+            patch.object(updates, "_audit_update_event", fake_audit),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header=header))
+            )
+        assert resp.status == 403
+        assert json.loads(resp.body.decode())["code"] == "invalid_secret"
+        assert audited == [
+            {"operation": "update.revalidate", "outcome": "denied", "resources": "invalid-secret"}
+        ]
+        assert called == [], "a refused surrogate secret still reached the cache"
+
+    def test_an_empty_secret_is_refused_and_audited(self, _isolated_channel_home):
+        audited: list[dict[str, object]] = []
+
+        async def fake_audit(request: object, **kwargs: object) -> None:
+            audited.append(kwargs)
+
+        with patch.object(updates, "_audit_update_event", fake_audit):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header=""))
+            )
+        assert resp.status == 403
+        assert [a["resources"] for a in audited] == ["invalid-secret"]
 
 
 class TestRestartEndpoint:

@@ -411,6 +411,7 @@ class TestAliasUnderExtraPath:
         )
 
         class FakeLoader:
+
             _usage = ledger
             _dir = main_dir
             _extra_paths: list = [app_dir]
@@ -513,6 +514,7 @@ class TestServedAliasIsFolded:
         ):
 
             class FakeLoader:
+
                 _usage = ledger
                 _dir = tmp_path
                 _extra_paths: list = []
@@ -546,6 +548,11 @@ class TestFrontmatterFailurePolicy:
         bad.write_bytes(b"---\nname: B\xff\xfead\n---\nbody")  # invalid UTF-8
 
         class FakeLoader:
+            # The real `_read_enumerated_skill_bytes` below asks this before an
+            # unconfined read; these fixtures' files stand for walked ones.
+            def _vet_unconfined_path(self, path):
+                return True
+
             _fm_cache: dict = {}
             # No recorded root: the unconfined case, so these tests keep
             # exercising real read/decode failure rather than a refusal.
@@ -557,6 +564,31 @@ class TestFrontmatterFailurePolicy:
         with pytest.raises(UnicodeDecodeError):
             SkillsLoader._cached_frontmatter(FakeLoader(), bad, within=None)
 
+    def test_a_writer_raises_on_a_refused_read(self, tmp_path, monkeypatch):
+        """The REAL loader, so the read-time check the fakes here stub out refuses.
+
+        A rewrite that read "no metadata" would drop ``version`` and ``pinned``,
+        so a writer must hear the refusal; a reader keeps the empty answer.
+        """
+        from kiro_crew import skills as skills_module
+        from kiro_crew.skills import SkillsLoader
+
+        root = tmp_path / "skills"
+        skill = _make_skill(
+            root, "auto/kept", "---\nname: kept\nversion: 3\npinned: true\n---\nbody"
+        )
+        loader = SkillsLoader(skills_path=root, install_builtins=False)
+        try:
+            # Nothing walked yet, so the path is unvetted and gets checked.
+            monkeypatch.setattr(skills_module, "validate_file_path", lambda _candidate: None)
+            with pytest.raises(PermissionError):
+                loader._cached_frontmatter(skill, within=None, for_write=True)
+            with pytest.raises(PermissionError):
+                loader.get_auto_skill_version("auto/kept")
+            assert loader._cached_frontmatter(skill, within=None) == {}
+        finally:
+            loader.close()
+
     def test_nothing_is_cached_for_a_failed_read(self, tmp_path):
         """A propagated failure must not leave a poisoned mtime-keyed entry."""
         from kiro_crew.skills import SkillsLoader
@@ -567,6 +599,11 @@ class TestFrontmatterFailurePolicy:
         bad.write_bytes(b"---\nname: B\xff\xfead\n---\nbody")
 
         class FakeLoader:
+            # The real `_read_enumerated_skill_bytes` below asks this before an
+            # unconfined read; these fixtures' files stand for walked ones.
+            def _vet_unconfined_path(self, path):
+                return True
+
             _fm_cache: dict = {}
             # No recorded root: the unconfined case, so these tests keep
             # exercising real read/decode failure rather than a refusal.
@@ -587,6 +624,11 @@ class TestFrontmatterFailurePolicy:
         calls: list[int] = []
 
         class FakeLoader:
+            # The real `_read_enumerated_skill_bytes` below asks this before an
+            # unconfined read; these fixtures' files stand for walked ones.
+            def _vet_unconfined_path(self, path):
+                return True
+
             _fm_cache: dict = {}
             # No recorded root: the unconfined case, so these tests keep
             # exercising real read/decode failure rather than a refusal.
@@ -631,6 +673,11 @@ class TestUnreadableSkillPropagates:
         os.chmod(skill, 0o000)
 
         class FakeLoader:
+            # The real `_read_enumerated_skill_bytes` below asks this before an
+            # unconfined read; these fixtures' files stand for walked ones.
+            def _vet_unconfined_path(self, path):
+                return True
+
             _fm_cache: dict = {}
             _confine: dict = {}
             _read_enumerated_skill_bytes = SkillsLoader._read_enumerated_skill_bytes
@@ -669,6 +716,12 @@ class TestUndecodableSkillDoesNotCrash:
             _dir = tmp_path
             _extra_paths: list = []
             _alias_cache = None
+
+            # The real `_read_enumerated_skill_bytes` below asks this before an
+            # unconfined read; these fixtures' files stand for walked ones.
+            def _vet_unconfined_path(self, path):
+                return True
+
             _fm_cache: dict = {}
             # No recorded root: the unconfined case, so these tests keep
             # exercising real read/decode failure rather than a refusal.
@@ -733,7 +786,7 @@ class TestCacheCoversTheFilesystem:
     """The alias map depends on the ledger AND on which files are served, so a
     cache keyed on the ledger alone goes stale in a reachable way: deleting an
     alias leaves the ledger untouched, and the stale map keeps folding hits from
-    a file that no longer exists.
+    a deleted file.
     """
 
     def test_removing_a_served_alias_invalidates_the_cache(self, tmp_path):
@@ -797,6 +850,7 @@ class TestNameIsRedacted:
         ledger = _make_ledger(tmp_path, {"leaky": (3, now)})
 
         class FakeLoader:
+
             _usage = ledger
             _dir = tmp_path
             _extra_paths: list = []
@@ -827,6 +881,7 @@ class TestNameIsRedacted:
         ledger = _make_ledger(tmp_path, {"normal": (3, now)})
 
         class FakeLoader:
+
             _usage = ledger
             _dir = tmp_path
             _extra_paths: list = []
@@ -870,6 +925,7 @@ class TestCostIsCharactersNotBytes:
         ledger = _make_ledger(tmp_path, {"dashes": (10, now)})
 
         class FakeLoader:
+
             _usage = ledger
             _dir = tmp_path
             _extra_paths: list = []
@@ -930,6 +986,7 @@ class TestAliasCacheInvalidation:
         pairs = [("first", first), ("second", second)]
 
         class FakeLoader:
+
             _usage = ledger
             _dir = tmp_path
             _extra_paths: list = []

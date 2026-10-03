@@ -15,6 +15,7 @@ import platform
 import re
 import tempfile
 import threading
+import types
 import unittest.mock
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from kiro_crew.config.loader import (
     SessionConfig,
     SlackConfig,
     SttConfig,
+    WatchdogConfig,
     WorkspaceConfig,
     _migrate_workspaces,
     _validated_stt_model,
@@ -47,11 +49,64 @@ from kiro_crew.config.loader import (
     validate_kiro_agent_references,
     workspace_dir_for,
 )
+from kiro_crew.memory_stores import (
+    UnknownMemoryStore,
+    memory_store_name_defect,
+    provision_member_memory,
+)
 from kiro_crew.stt import limits as stt_limits
 from kiro_crew.stt import models as stt_models
 
+
+@pytest.mark.parametrize("enabled,keep", [(False, 30), (True, 2)])
+def test_memory_backup_controls_survive_load_and_save(tmp_path, monkeypatch, enabled, keep):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"memory": {"backup_enabled": enabled, "backup_keep": keep}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(loader_module, "config_path", lambda: path)
+    config = KiroCrewConfig.load()
+    assert config.memory.backup_enabled is enabled
+    assert config.memory.backup_keep == keep
+    config.save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["memory"]["backup_enabled"] is enabled
+    assert saved["memory"]["backup_keep"] == keep
+
+
+@pytest.mark.parametrize(
+    ("memory_data", "expected"),
+    [
+        pytest.param({}, True, id="missing-defaults-on"),
+        pytest.param({"backup_enabled": False}, False, id="boolean-false"),
+        pytest.param({"backup_enabled": True}, True, id="boolean-true"),
+        pytest.param({"backup_enabled": 0}, True, id="integer-zero-is-invalid"),
+        pytest.param({"backup_enabled": ""}, True, id="empty-string-is-invalid"),
+        pytest.param({"backup_enabled": "false"}, True, id="string-false-is-invalid"),
+        pytest.param({"backup_enabled": [False]}, True, id="list-is-invalid"),
+    ],
+)
+def test_memory_backup_enabled_requires_json_boolean_without_jsonschema(
+    tmp_path, monkeypatch, memory_data, expected
+):
+    """The shipped runtime still enforces the config field's bool contract."""
+    from kiro_crew.config import validation
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"memory": memory_data}), encoding="utf-8")
+    monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+    monkeypatch.setattr(loader_module, "config_path", lambda: path)
+    monkeypatch.setattr(loader_module, "config_local_path", lambda: tmp_path / "missing.local.json")
+
+    config = KiroCrewConfig.load()
+
+    assert config.memory.backup_enabled is expected
+
+
 # Logger used by the loader module — needed for capturing warnings in tests
 logger = logging.getLogger("kiro_crew.config.loader")
+
 
 # ---------------------------------------------------------------------------
 # Helpers / Strategies
@@ -61,7 +116,7 @@ logger = logging.getLogger("kiro_crew.config.loader")
 _ENUM_FIELDS: list[tuple[str, str, list[str]]] = [
     ("agent", "approval_mode", ["auto", "interactive"]),
     ("agent", "provider", ["acp"]),
-    ("agent", "sandbox", ["auto", "off"]),
+    ("agent", "sandbox", ["auto", "strict", "off"]),
     ("agent", "log_level", ["DEBUG", "INFO", "WARNING", "ERROR"]),
     ("memory", "embedding_provider", ["llama_cpp"]),
 ]
@@ -206,10 +261,50 @@ def test_max_subagents_defaults_to_auto_sentinel() -> None:
 
 
 def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
-    assert KiroCrewConfig().agent.sandbox_allow_unsandboxed_exec is False
-    assert _load_from_dict({}).agent.sandbox_allow_unsandboxed_exec is False
+    # Direct construction resolves per platform too, so pin one. Both paths must
+    # agree — see test_fresh_gateway_boot_does_not_write_itself_a_lockdown.
+    with unittest.mock.patch("sys.platform", "linux"):
+        assert KiroCrewConfig().agent.sandbox_allow_unsandboxed_exec is False
+    # The undeclared case resolves per platform, so pin one: unpinned, this line
+    # would assert the fail-closed default on Linux CI and the permitting one on a
+    # Windows dev box. The platform matrix itself lives in
+    # test_sandbox_allow_unsandboxed_exec_default_resolves_per_platform.
+    with unittest.mock.patch("sys.platform", "linux"):
+        assert _load_from_dict({}).agent.sandbox_allow_unsandboxed_exec is False
     enabled = _load_from_dict({"agent": {"sandbox_allow_unsandboxed_exec": True}})
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
+
+
+def test_ssh_auth_sock_forward_is_not_an_agent_config_field() -> None:
+    """The SSH_AUTH_SOCK forward enable is NOT read from config.json.
+
+    Keeping the socket grants USE of the operator's ssh-agent keys for the
+    session -- an authorization, not a preference -- so its consent lives on the
+    keystone (``ssh_auth_sock_consent.json``, agent-nonwritable, sealed read-only
+    in the sandbox), the same placement as ``computer_use.json``. An
+    agent-writable enable in config.json would let a prompt-injected shell flip
+    its own forwarding on. This asserts the field is absent so it cannot silently
+    return: an agent-readable enable is the exact hole this design closes.
+    """
+    import dataclasses
+
+    from kiro_crew.config.sections import AgentConfig
+
+    field_names = {f.name for f in dataclasses.fields(AgentConfig)}
+    assert "sandbox_forward_ssh_auth_sock" not in field_names
+    # A config.json that names the old key is ignored, not honoured: the loader
+    # builds AgentConfig field-by-field and never reads it.
+    cfg = _load_from_dict({"agent": {"sandbox_forward_ssh_auth_sock": True}})
+    assert not hasattr(cfg.agent, "sandbox_forward_ssh_auth_sock")
+
+
+def test_episodic_max_count_is_floored_at_one() -> None:
+    """A zero or negative V1 episodic cap would refuse every merge-only write, even
+    on an empty store, so the loader clamps it to 1. A positive value is kept as
+    written."""
+    assert _load_from_dict({"memory": {"episodic_max_count": 0}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": -5}}).memory.episodic_max_count == 1
+    assert _load_from_dict({"memory": {"episodic_max_count": 7}}).memory.episodic_max_count == 7
 
 
 def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
@@ -262,21 +357,114 @@ def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
     )
 
 
-def test_sandbox_allow_unsandboxed_exec_default_is_platform_independent(monkeypatch) -> None:
-    """No platform may flip this default on its own.
+def test_sandbox_allow_unsandboxed_exec_default_resolves_per_platform(monkeypatch) -> None:
+    """An UNDECLARED key resolves per platform, INTO the dataclass value.
 
-    Deriving the fallback from ``sys.platform`` turns a documented fail-closed
-    refusal into an unconfined spawn wherever no backend exists — which is every
-    Windows host — so an agent-selected repo's ``include.path`` could reach
-    ``~/.aws/credentials`` with no operator having declared anything. The
-    discoverable path to the opt-in is the ``kirocrew setup`` consent step
-    (``test_sandbox_unsandboxed_exec_consent.py``), not a platform default.
+    The resolution lives here, at the one place that sees the raw document, and the
+    result is carried by the VALUE rather than by whether the key was present. That
+    is a safety property, not a style choice: :meth:`KiroCrewConfig.save` publishes
+    the whole in-memory snapshot through ``to_dict()`` -> ``asdict(self.agent)``, so
+    every full-document write (the boot default-config write, CLI one-shots)
+    materializes this key. Were the effective policy keyed on presence, such a write
+    would silently convert "never decided" into a declared lockdown and refuse every
+    agent subprocess on a host that has no backend to fall back on — see
+    ``test_windows_default_survives_a_full_document_round_trip``.
+
+    A declared value still wins in both directions, on every platform.
+    ``config.loader.unsandboxed_exec_declared`` remains for diagnostics only (audit
+    labelling and message wording); the effective verdict is
+    ``sandbox.unsandboxed_exec_permitted_by()``. The direction ``kirocrew setup``
+    asks in is covered by ``test_sandbox_unsandboxed_exec_consent.py``.
     """
-    for plat in ("win32", "linux", "darwin"):
+    monkeypatch.setattr("sys.platform", "win32")
+    assert _load_from_dict({}).agent.sandbox_allow_unsandboxed_exec is True
+    assert _load_from_dict(
+        {"agent": {"approval_mode": "auto"}}
+    ).agent.sandbox_allow_unsandboxed_exec
+    for plat in ("linux", "darwin"):
         monkeypatch.setattr("sys.platform", plat)
         assert _load_from_dict({}).agent.sandbox_allow_unsandboxed_exec is False, plat
         with_section = _load_from_dict({"agent": {"approval_mode": "auto"}})
         assert with_section.agent.sandbox_allow_unsandboxed_exec is False, plat
+    # A declaration outranks the platform in both directions.
+    for plat in ("win32", "linux", "darwin"):
+        monkeypatch.setattr("sys.platform", plat)
+        declared_false = _load_from_dict({"agent": {"sandbox_allow_unsandboxed_exec": False}})
+        assert declared_false.agent.sandbox_allow_unsandboxed_exec is False, plat
+        declared_true = _load_from_dict({"agent": {"sandbox_allow_unsandboxed_exec": True}})
+        assert declared_true.agent.sandbox_allow_unsandboxed_exec is True, plat
+
+
+def _saved_agent_section(tmp_path, monkeypatch, cfg) -> dict:
+    """Run ``cfg.save()`` against a tmp config dir and return the agent section written."""
+    main = tmp_path / "config.json"
+    local = tmp_path / "config.local.json"
+    monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: main)
+    monkeypatch.setattr("kiro_crew.config.loader.config_local_path", lambda: local)
+    cfg.save()
+    return json.loads(main.read_text(encoding="utf-8")).get("agent", {})
+
+
+def test_save_omits_the_exec_permission_when_it_was_never_declared(tmp_path, monkeypatch) -> None:
+    """Absence is load-bearing, so a whole-document write must not materialize it.
+
+    ``sandbox_allow_unsandboxed_exec`` is resolved from its ABSENCE: an absent key
+    means "no decision recorded", which is what selects the platform default, what
+    tells ``kirocrew setup`` a decision is still worth surfacing, and what makes the
+    audit event say the PLATFORM permitted a spawn rather than an operator.
+
+    ``save()`` publishes every field, so without the strip it would freeze the
+    resolved value in as a declaration - writing ``false`` refuses every agent
+    subprocess nobody asked to refuse, and writing ``true`` fakes a consent that was
+    never given and skips the prompt that makes the posture explicit. Both directions are pinned
+    here.
+    """
+    monkeypatch.setattr("sys.platform", "win32")
+    written = _saved_agent_section(tmp_path, monkeypatch, KiroCrewConfig())
+    assert "sandbox_allow_unsandboxed_exec" not in written
+    # The rest of the section still lands - the strip is one key, not the section.
+    assert "approval_mode" in written
+
+
+def test_save_preserves_the_exec_permission_once_declared(tmp_path, monkeypatch) -> None:
+    """An operator's recorded decision must survive a whole-document write.
+
+    Both directions: a declared ``false`` is the lockdown that outranks a permitting
+    platform, and a declared ``true`` is the opt-in on a platform that refuses by
+    default. Dropping either would silently hand the host back to the platform.
+    """
+    monkeypatch.setattr("sys.platform", "win32")
+    for declared in (True, False):
+        main = tmp_path / f"config-{declared}.json"
+        local = tmp_path / f"config-local-{declared}.json"
+        main.write_text(
+            json.dumps({"agent": {"sandbox_allow_unsandboxed_exec": declared}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda m=main: m)
+        monkeypatch.setattr("kiro_crew.config.loader.config_local_path", lambda ll=local: ll)
+        cfg = KiroCrewConfig()
+        cfg.agent.sandbox_allow_unsandboxed_exec = declared
+        cfg.save()
+        written = json.loads(main.read_text(encoding="utf-8"))["agent"]
+        assert written["sandbox_allow_unsandboxed_exec"] is declared, declared
+
+
+def test_fresh_boot_write_then_load_keeps_the_platform_default(tmp_path, monkeypatch) -> None:
+    """The first-run path is construct -> save -> load, and it must not flip anything.
+
+    ``cli_server._gateway`` creates the default config by constructing
+    ``KiroCrewConfig()`` directly, ``save()``-ing it, and reloading. With the key
+    stripped the fresh file carries no decision, so the reload resolves the platform
+    default and the host stays both usable and undeclared.
+    """
+    monkeypatch.setattr("sys.platform", "win32")
+    written = _saved_agent_section(tmp_path, monkeypatch, KiroCrewConfig())
+    assert "sandbox_allow_unsandboxed_exec" not in written
+    assert _load_from_dict({"agent": written}).agent.sandbox_allow_unsandboxed_exec is True
+
+    monkeypatch.setattr("sys.platform", "linux")
+    assert _load_from_dict({"agent": written}).agent.sandbox_allow_unsandboxed_exec is False
 
 
 def test_registry_branchless_legacy_entry_preserves_mainline():
@@ -346,6 +534,163 @@ def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
     assert reloaded.slack.home_tab_sessions_per_kind == 42
 
 
+class TestSessionControlLoad:
+    """agent.session_control load-time coercion.
+
+    The operator's single withdrawal of cross-session control. A MISSING key
+    defaults to true (today's behaviour), but a PRESENT-but-malformed value --
+    the routine quoted `"false"` config mistake -- must coerce to FALSE, so a
+    botched opt-out withdraws the capability rather than silently leaving every
+    agent able to drive peer sessions.
+    """
+
+    def test_missing_key_defaults_true(self) -> None:
+        assert _load_from_dict({}).agent.session_control is True
+
+    def test_explicit_true_and_false(self) -> None:
+        assert _load_from_dict({"agent": {"session_control": True}}).agent.session_control is True
+        assert _load_from_dict({"agent": {"session_control": False}}).agent.session_control is False
+
+    def test_quoted_false_coerces_to_false_not_true(self) -> None:
+        # The fail-open this locks shut: `"false"` is not a bool, and defaulting
+        # it to true keeps the capability on against the operator's intent.
+        assert (
+            _load_from_dict({"agent": {"session_control": "false"}}).agent.session_control is False
+        )
+
+    def test_quoted_true_also_coerces_to_false(self) -> None:
+        # A non-bool is an explicit opt-out, the same rule `member_dispatch`
+        # follows: a value the operator quoted is not a value to trust.
+        assert (
+            _load_from_dict({"agent": {"session_control": "true"}}).agent.session_control is False
+        )
+
+    def test_any_present_non_bool_coerces_to_false(self) -> None:
+        for bad in ("false", "true", "yes", 1, 0, {}, [], None):
+            assert (
+                _load_from_dict({"agent": {"session_control": bad}}).agent.session_control is False
+            ), bad
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"session_control": "false"}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.agent.session_control is False
+
+    def test_coercion_says_so_in_the_log(self) -> None:
+        """Silence is half the defect: an operator who meant ON gets told."""
+        cfg, logs = _load_from_dict_with_logs({"agent": {"session_control": "true"}})
+        assert cfg.agent.session_control is False
+        said = [m for m in logs if "agent.session_control" in m and "not a boolean" in m]
+        assert said, logs
+        line = said[0]
+        # Names the type it found and the JSON that chooses, so the operator can act.
+        assert "str" in line
+        assert "false" in line
+
+    def test_a_real_bool_draws_no_coercion_line(self) -> None:
+        # The superseded-default notice for a stored ``false`` is a different
+        # line and belongs to a different mechanism; only the coercion line is
+        # this loop's to emit.
+        for good in (True, False):
+            _, logs = _load_from_dict_with_logs({"agent": {"session_control": good}})
+            assert not [m for m in logs if "not a boolean" in m], (good, logs)
+
+
+class TestMemberDispatchLoad:
+    """agent.member_dispatch load-time coercion.
+
+    The operator ceiling on the member session-control bypass. A MISSING key
+    defaults to true (today's behaviour), but a PRESENT-but-malformed value —
+    the routine quoted `"false"` config mistake — must coerce to FALSE, so a
+    botched opt-out withdraws the bypass rather than silently leaving it on
+    (a governance ceiling that fails open otherwise).
+    """
+
+    def test_missing_key_defaults_true(self) -> None:
+        assert _load_from_dict({}).agent.member_dispatch is True
+
+    def test_explicit_true_and_false(self) -> None:
+        assert _load_from_dict({"agent": {"member_dispatch": True}}).agent.member_dispatch is True
+        assert _load_from_dict({"agent": {"member_dispatch": False}}).agent.member_dispatch is False
+
+    def test_quoted_false_coerces_to_false_not_true(self) -> None:
+        # The GPT-flagged fail-open: `"false"` is not a bool, and defaulting it
+        # to true would keep the bypass authorized against the operator's intent.
+        assert (
+            _load_from_dict({"agent": {"member_dispatch": "false"}}).agent.member_dispatch is False
+        )
+
+    def test_any_present_non_bool_coerces_to_false(self) -> None:
+        # A present but malformed value fails to the SAFE direction (bypass off),
+        # including a truthy-looking string that must not be trusted.
+        for bad in ("true", "yes", 1, 0, {}, [], None):
+            assert (
+                _load_from_dict({"agent": {"member_dispatch": bad}}).agent.member_dispatch is False
+            ), bad
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"member_dispatch": False}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.agent.member_dispatch is False
+
+    def test_coercion_says_so_in_the_log(self) -> None:
+        """The shared loop covers this key too, so the signal does as well."""
+        cfg, logs = _load_from_dict_with_logs({"agent": {"member_dispatch": "true"}})
+        assert cfg.agent.member_dispatch is False
+        assert [m for m in logs if "agent.member_dispatch" in m and "not a boolean" in m], logs
+
+
+class TestCrewPanelLoad:
+    """agent.crew_panel load-time coercion.
+
+    The operator ceiling on the crew member's own webview, and the third key on
+    the shared fail-closed loop. A MISSING key defaults to true (the capability's
+    zero-configuration contract), but a PRESENT-but-malformed value -- the routine
+    quoted `"false"` config mistake -- must coerce to FALSE, so a botched opt-out
+    withdraws the grant rather than silently leaving every member able to publish.
+    """
+
+    def test_missing_key_defaults_true(self) -> None:
+        assert _load_from_dict({}).agent.crew_panel is True
+
+    def test_explicit_true_and_false(self) -> None:
+        assert _load_from_dict({"agent": {"crew_panel": True}}).agent.crew_panel is True
+        assert _load_from_dict({"agent": {"crew_panel": False}}).agent.crew_panel is False
+
+    def test_quoted_false_coerces_to_false_not_true(self) -> None:
+        assert _load_from_dict({"agent": {"crew_panel": "false"}}).agent.crew_panel is False
+
+    def test_any_present_non_bool_coerces_to_false(self) -> None:
+        for bad in ("false", "true", "yes", 1, 0, {}, [], None):
+            assert _load_from_dict({"agent": {"crew_panel": bad}}).agent.crew_panel is False, bad
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"crew_panel": False}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.agent.crew_panel is False
+
+    def test_coercion_says_so_in_the_log(self) -> None:
+        """The shared loop covers this key too, so the signal does as well."""
+        cfg, logs = _load_from_dict_with_logs({"agent": {"crew_panel": "true"}})
+        assert cfg.agent.crew_panel is False
+        assert [m for m in logs if "agent.crew_panel" in m and "not a boolean" in m], logs
+
+    def test_the_three_switches_share_one_loop(self) -> None:
+        """One loop, so no switch can keep the guard while another loses it."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "session_control": "false",
+                    "member_dispatch": "false",
+                    "crew_panel": "false",
+                }
+            }
+        )
+        assert cfg.agent.session_control is False
+        assert cfg.agent.member_dispatch is False
+        assert cfg.agent.crew_panel is False
+
+
 class TestFallbackModelLoad:
     """agent.fallback_model flows through the explicit load() kwargs."""
 
@@ -369,6 +714,31 @@ class TestFallbackModelLoad:
     def test_round_trips_through_to_dict(self) -> None:
         loaded = _load_from_dict({"agent": {"fallback_model": "claude-opus-5"}})
         assert loaded.to_dict()["agent"]["fallback_model"] == "claude-opus-5"
+
+
+class TestRefusalFallbackModelLoad:
+    """agent.refusal_fallback_model flows through the explicit load() kwargs."""
+
+    def test_load_coerces_registry_alias(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "opus-4.8-1m"}})
+        assert loaded.agent.refusal_fallback_model == "claude-opus-4.8"
+
+    def test_load_default_is_disabled(self) -> None:
+        # DEFAULT PIN: a config without the key loads "" — the refusal retry
+        # is OFF and a refusal surfaces exactly as before the feature.
+        assert _load_from_dict({}).agent.refusal_fallback_model == ""
+
+    def test_load_auto_defers_to_recommendation(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "auto"}})
+        assert loaded.agent.refusal_fallback_model == "auto"
+
+    def test_load_malformed_value_never_crashes(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": {"not": "a string"}}})
+        assert loaded.agent.refusal_fallback_model == ""
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"refusal_fallback_model": "claude-opus-5"}})
+        assert loaded.to_dict()["agent"]["refusal_fallback_model"] == "claude-opus-5"
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -454,6 +824,19 @@ _safe_name_st = st.text(
     min_size=1,
     max_size=15,
 )
+
+# Memory-store names are stricter than the generic identifier alphabet above: a
+# store name becomes a single path segment, so ``memory_store_name_defect``
+# refuses an underscore, an outer hyphen and a Windows device basename. Such a
+# name is UNDECLARED for resolution however the config spells it, which is what
+# stops ``resolve_agent_bindings`` from handing a crew a store no resolver will
+# compose a path for. A property about a store a crew is genuinely BOUND to
+# therefore has to generate a name the shape rule accepts.
+_store_name_st = st.text(
+    alphabet=st.sampled_from("abcdefghijklmnopqrstuvwxyz0123456789-"),
+    min_size=1,
+    max_size=15,
+).filter(lambda n: memory_store_name_defect(n) is None)
 
 # Strategy for KiroCrewAgentConfig instances
 _kirocrew_agent_config_st = st.builds(
@@ -1112,7 +1495,7 @@ class TestAgentWorkspaceBindingsProperties:
     @given(
         agent_name=_safe_name_st,
         ws_name=_safe_name_st,
-        store_name=_safe_name_st,
+        store_name=_store_name_st,
         kiro_agent_name=st.text(min_size=1, max_size=20),
         ws_dir=st.text(min_size=1, max_size=30),
         store_desc=st.text(min_size=0, max_size=20),
@@ -1155,17 +1538,21 @@ class TestAgentWorkspaceBindingsProperties:
             default_memory_store=store_name,
         )
 
+        expected_store = (
+            "default" if agent_name == "default" else provision_member_memory(config, agent_name)
+        )
+
         # Resolve via explicit agent_name
         result = resolve_agent_bindings(config, agent_name=agent_name)
         assert isinstance(result, ResolvedBindings)
         assert result.workspace_dir == Path(ws_dir)
-        assert result.memory_store_name == store_name
+        assert result.memory_store_name == expected_store
         assert result.kiro_agent == kiro_agent_name
 
         # Resolve via default_agent (no explicit agent_name)
         result2 = resolve_agent_bindings(config)
         assert result2.workspace_dir == Path(ws_dir)
-        assert result2.memory_store_name == store_name
+        assert result2.memory_store_name == expected_store
         assert result2.kiro_agent == kiro_agent_name
 
     # Feature: agent-workspace-bindings, Property 4: Resolver fallback on missing references
@@ -1174,7 +1561,7 @@ class TestAgentWorkspaceBindingsProperties:
         missing_ws=_safe_name_st,
         missing_store=_safe_name_st,
         fallback_ws_name=_safe_name_st,
-        fallback_store_name=_safe_name_st,
+        fallback_store_name=_store_name_st,
         fallback_ws_dir=st.text(min_size=1, max_size=30),
     )
     @settings(deadline=None)
@@ -1187,11 +1574,7 @@ class TestAgentWorkspaceBindingsProperties:
         fallback_store_name: str,
         fallback_ws_dir: str,
     ) -> None:
-        """When an agent references a non-existent workspace or store,
-        the resolver falls back to default_workspace / default_memory_store.
-
-        **Validates: Requirements 7.3, 7.4, 2.3**
-        """
+        """Workspace fallback never repairs an invalid member memory binding."""
         # Ensure the agent references names that do NOT exist in the maps
         assume(missing_ws != fallback_ws_name)
         assume(missing_store != fallback_store_name)
@@ -1211,12 +1594,17 @@ class TestAgentWorkspaceBindingsProperties:
             default_memory_store=fallback_store_name,
         )
 
+        if agent_name != "default":
+            with pytest.raises(UnknownMemoryStore):
+                resolve_agent_bindings(config, agent_name=agent_name)
+        expected_store = (
+            "default" if agent_name == "default" else provision_member_memory(config, agent_name)
+        )
         result = resolve_agent_bindings(config, agent_name=agent_name)
 
         # Should fall back to default_workspace dir
         assert result.workspace_dir == Path(fallback_ws_dir)
-        # Should fall back to default_memory_store name
-        assert result.memory_store_name == fallback_store_name
+        assert result.memory_store_name == expected_store
 
     # Feature: agent-workspace-bindings, Property 8: Kiro agent validation warnings
     @given(
@@ -1287,6 +1675,19 @@ class TestAgentWorkspaceBindingsProperties:
                 )
 
     # Feature: agent-workspace-bindings, Property 7: Workspace path resolution
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason=(
+            "known Windows gap that additionally cannot be EXECUTED there: this is a "
+            "hypothesis property test with deadline=None, so its example budget "
+            "outruns the shards' per-test --timeout, and on Windows pytest-timeout "
+            "has no SIGALRM to interrupt with -- it kills the process, taking the "
+            "whole session with it (measured: the run died at 22% with no summary). "
+            "It is skipped HERE rather than tracked in windows-expected-failures.txt, "
+            "because that list is now executed as a strict xfail and a hanging entry "
+            "in it is a shard-killer."
+        ),
+    )
     @given(
         ws_name=_safe_name_st,
         path_kind=st.sampled_from(["absolute_slash", "absolute_tilde", "relative"]),
@@ -1463,6 +1864,59 @@ class TestAgentWorkspaceBindingsProperties:
         assert result.kiro_agent == expected_kiro
 
 
+class TestMemoryStoreBindingFloor:
+    """Legacy bindings stay exact, and explicit V2 selection creates a new store."""
+
+    @pytest.mark.parametrize(
+        "bound",
+        ["default", "", None],
+        ids=["explicit-default", "empty-string", "key-absent"],
+    )
+    def test_default_assistant_retains_v1_without_repairing_member_bindings(self, bound) -> None:
+        # ``None`` stands for the key being absent from the crew's config entry: the
+        # field's own default is the floor, and this pins that the two agree.
+        assert KiroCrewAgentConfig().memory_store == "default"
+        agent_kwargs: dict = {"kiro_agent": "kirocrew", "workspace": "default"}
+        if bound is not None:
+            agent_kwargs["memory_store"] = bound
+
+        config = KiroCrewConfig(
+            agents={
+                "default": KiroCrewAgentConfig(**agent_kwargs),
+                "floor": KiroCrewAgentConfig(**agent_kwargs),
+                "chose": KiroCrewAgentConfig(kiro_agent="kirocrew", memory_store="work"),
+                "broken": KiroCrewAgentConfig(kiro_agent="kirocrew", memory_store="gone"),
+            },
+            default_agent="floor",
+            workspaces={"default": WorkspaceConfig(dir="workspace")},
+            default_workspace="default",
+            # The operator's table names ONLY other stores, and ``default_memory_store``
+            # is one of them. This is the exact config shape that relocated every crew.
+            memory_stores={"work": MemoryStoreConfig(), "email": MemoryStoreConfig()},
+            default_memory_store="work",
+        )
+        assert "default" not in config.memory_stores, "the floor must not be declared here"
+
+        assert resolve_agent_bindings(config, agent_name="default").memory_store_name == "default"
+        with pytest.raises(UnknownMemoryStore, match="is unavailable; Global was not used"):
+            resolve_agent_bindings(config, agent_name="broken")
+        if bound == "":
+            with pytest.raises(UnknownMemoryStore, match="invalid memory store name"):
+                resolve_agent_bindings(config)
+        else:
+            assert resolve_agent_bindings(config, agent_name="floor").memory_store_name == "default"
+            assert resolve_agent_bindings(config).memory_store_name == "default"
+        assert (
+            resolve_agent_bindings(
+                config, agent_name="chose", validate_memory_files=False
+            ).memory_store_name
+            == "work"
+        )
+
+        private_store = provision_member_memory(config, "chose")
+        assert resolve_agent_bindings(config, agent_name="chose").memory_store_name == private_store
+
+
 class TestResourceIndependence:
     """Property-based test for resource independence between config types."""
 
@@ -1580,7 +2034,7 @@ class TestEdgeCases:
     )
     def test_history_max_days_sanitized_at_load(self, raw: int, expected: int) -> None:
         """A hand-edited negative history_max_days falls back to the default
-        at load instead of reaching prune_history raw (#8245)."""
+        at load instead of reaching prune_history raw."""
         cfg = _load_from_dict({"memory": {"history_max_days": raw}})
         assert cfg.memory.history_max_days == expected
 
@@ -1593,6 +2047,24 @@ class TestEdgeCases:
         """recent_tint_count defaults to 0 (off) when not in config."""
         cfg = _load_from_dict({})
         assert cfg.dashboard.recent_tint_count == 0
+
+    def test_folder_sort_loaded_from_config(self) -> None:
+        for mode in ("custom", "name", "created"):
+            cfg = _load_from_dict({"dashboard": {"folder_sort": mode}})
+            assert cfg.dashboard.folder_sort == mode
+
+    def test_folder_sort_defaults_to_custom(self) -> None:
+        """Absent = the stored-order sidebar every earlier build drew, so an
+        upgrade changes nothing the person sees."""
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.folder_sort == "custom"
+
+    def test_folder_sort_unknown_value_reads_as_custom(self) -> None:
+        """A hand-edited or downgraded value must not fail open into a mode the
+        sidebar's reader would not recognise either; both fall back the same way."""
+        for junk in ("alphabetical", "", None, 3, ["name"], "Name"):
+            cfg = _load_from_dict({"dashboard": {"folder_sort": junk}})
+            assert cfg.dashboard.folder_sort == "custom", junk
 
     def test_update_nudge_loaded_from_config(self) -> None:
         """The popup's snooze/skip record round-trips through load, so a GET
@@ -1625,7 +2097,7 @@ class TestEdgeCases:
         assert cfg.memory.embedding_provider == "llama_cpp"
 
     def test_none_provider_coerces_to_llama_cpp(self) -> None:
-        """Embeddings are always-on: a legacy 'none' (previously-disabled) coerces too."""
+        """Embeddings are always-on: a legacy 'none' (the disabled spelling) coerces too."""
         raw_config: dict = {
             "memory": {"embedding_provider": "none"},
         }
@@ -1926,7 +2398,7 @@ class TestMultiAgentOrchestrationProperties:
     @given(
         agent_name=_safe_name_st,
         ws_name=_safe_name_st,
-        store_name=_safe_name_st,
+        store_name=_store_name_st,
         kiro_agent_name=st.text(min_size=1, max_size=15),
         ws_dir=st.text(min_size=1, max_size=20),
     )
@@ -1960,10 +2432,13 @@ class TestMultiAgentOrchestrationProperties:
             default_memory_store=store_name,
         )
 
+        expected_store = (
+            "default" if agent_name == "default" else provision_member_memory(config, agent_name)
+        )
         result = resolve_agent_bindings(config, agent_name=agent_name)
 
         assert result.workspace_dir == Path(ws_dir)
-        assert result.memory_store_name == store_name
+        assert result.memory_store_name == expected_store
         assert result.kiro_agent == kiro_agent_name
 
     # Feature: multi-agent-orchestration, Property 6: Non-KiroCrew agent names resolve via default agent
@@ -2005,6 +2480,9 @@ class TestMultiAgentOrchestrationProperties:
             memory_stores={store_name: MemoryStoreConfig()},
             default_memory_store=store_name,
         )
+
+        if default_name != "default":
+            provision_member_memory(config, default_name)
 
         # Isolate from host ~/.kiro/agents/: pin the materialized-agent snapshot
         # as empty and ready so _materialized_kiro_agent never scans the host
@@ -2163,10 +2641,12 @@ class TestMultiAgentMigrationEdgeCases:
             default_memory_store="default",
         )
 
+        private_store = provision_member_memory(config, "test")
         result = resolve_agent_bindings(config, agent_name="test")
 
         # Falls back to default_workspace dir
         assert result.workspace_dir == Path("my-fallback-dir")
+        assert result.memory_store_name == private_store
 
     def test_resolver_with_empty_agent_name_uses_default(self) -> None:
         """Resolver with empty agent name uses default_agent.
@@ -2188,15 +2668,19 @@ class TestMultiAgentMigrationEdgeCases:
             default_memory_store="default",
         )
 
+        private_store = provision_member_memory(config, "mydefault")
+
         # Empty string agent_name → uses default_agent
         result = resolve_agent_bindings(config, agent_name="")
         assert result.kiro_agent == "kirocrew"
         assert result.workspace_dir == Path("ws-dir")
+        assert result.memory_store_name == private_store
 
         # None agent_name → uses default_agent
         result2 = resolve_agent_bindings(config, agent_name=None)
         assert result2.kiro_agent == "kirocrew"
         assert result2.workspace_dir == Path("ws-dir")
+        assert result2.memory_store_name == private_store
 
 
 class TestReactionsEmptyStringFiltering:
@@ -2388,7 +2872,7 @@ class TestSttRetiredProviders:
         A retired name is deliberately absent from the schema's enum, so the plain
         validation path would report "enum violation" and drop the key, leaving the
         operator told that a value was rejected and not that the recogniser they
-        chose no longer exists. The absence of that generic line is the assertion:
+        chose does not exist. The absence of that generic line is the assertion:
         it is what shows the degrade ran first.
         """
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
@@ -2408,10 +2892,11 @@ class TestSttRetiredProviders:
 
     def test_an_unknown_provider_is_told_what_it_could_have_been(self, caplog) -> None:
         """A typo gets the selectable list; a retired name gets the reason instead,
-        because "mlx is not one of local/apple/transcribe" answers the wrong
-        question for someone who had it working yesterday."""
+        because "mlx is not one of local/apple/transcribe/off" answers the wrong
+        question for someone who had it working yesterday. A typo also lands on
+        ``off`` rather than ``local``: ``test_stt_provider_off`` carries why."""
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whispr" in caplog.text
         for selectable in loader_module._VALID_STT_PROVIDERS:
             assert selectable in caplog.text
@@ -2436,16 +2921,18 @@ class TestSttRetiredProviders:
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
             assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
             assert _validated_stt_provider("parakeet") == STT_PROVIDER_LOCAL
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whisper" in caplog.text
         assert "parakeet" in caplog.text
         assert "whispr" in caplog.text
 
     def test_a_non_string_provider_degrades_rather_than_raising(self, tmp_path: Path) -> None:
         """The membership tests take an ``object``, so a hand-edited number or a
-        JSON ``null`` has to fall through to the default instead of a TypeError."""
+        JSON ``null`` has to fall through instead of a TypeError. ``null`` names
+        nothing and is read as the absent key (the default); a number is a value
+        that cannot be honoured and fails closed like any other unknown one."""
         assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
-        assert _loaded_stt(tmp_path, {"provider": 7}).provider == STT_PROVIDER_LOCAL
+        assert _loaded_stt(tmp_path, {"provider": 7}).provider == "off"
 
 
 class TestSttRemovedFieldsAreInert:
@@ -2854,6 +3341,182 @@ class TestWidgetDensityRoundTrip:
         assert loaded.dashboard.widget_density == "less"
 
 
+class TestDefaultMemoryModeRoundTrip:
+    """Tests for dashboard.default_memory_mode persistence."""
+
+    def test_defaults_to_persistent(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.default_memory_mode == "persistent"
+
+    def test_loads_from_config(self) -> None:
+        cfg = _load_from_dict({"dashboard": {"default_memory_mode": "incognito"}})
+        assert cfg.dashboard.default_memory_mode == "incognito"
+
+    def test_invalid_value_falls_back_to_temporary(self) -> None:
+        cfg = _load_from_dict({"dashboard": {"default_memory_mode": "surprise"}})
+        assert cfg.dashboard.default_memory_mode == "temporary"
+
+    def test_malformed_dashboard_section_falls_back_to_temporary(self) -> None:
+        cfg = _load_from_dict({"dashboard": "not-an-object"})
+        assert cfg.dashboard.default_memory_mode == "temporary"
+
+    def test_unreadable_config_falls_back_to_temporary(self) -> None:
+        cfg = _load_from_dict("not valid json {{{")
+        assert cfg.dashboard.default_memory_mode == "temporary"
+
+    def test_invalid_value_fails_closed_before_schema_validation(self) -> None:
+        """Schema cleanup must not erase corruption into the Persistent default."""
+
+        def assert_normalized(data: dict) -> dict:
+            assert data["dashboard"]["default_memory_mode"] == "temporary"
+            return data
+
+        with unittest.mock.patch(
+            "kiro_crew.config.loader._validate_config_data",
+            side_effect=assert_normalized,
+        ):
+            cfg = _load_from_dict({"dashboard": {"default_memory_mode": "surprise"}})
+
+        assert cfg.dashboard.default_memory_mode == "temporary"
+
+    def test_locked_write_invalidates_unchanged_fingerprint_cache(self, tmp_path: Path) -> None:
+        """A successful PUT-equivalent write must be visible with a coarse fingerprint."""
+        from kiro_crew.config.loader import (
+            _invalidate_config_cache,
+            update_config_locked,
+            write_config_atomically,
+        )
+
+        cfg_file = tmp_path / "config.json"
+        local_file = tmp_path / "config.local.json"
+        write_config_atomically(
+            cfg_file,
+            {
+                "agents": {"default": {"kiro_agent": "kirocrew"}},
+                "default_agent": "default",
+                "workspaces": {"default": {"dir": "~/workspace"}},
+                "dashboard": {"default_memory_mode": "incognito"},
+            },
+        )
+        _invalidate_config_cache()
+        try:
+            with (
+                unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
+                unittest.mock.patch(
+                    "kiro_crew.config.loader.config_local_path", return_value=local_file
+                ),
+                unittest.mock.patch(
+                    "kiro_crew.config.loader._config_fingerprint",
+                    return_value=(("coarse-filesystem", 1, 1, 0o600),),
+                ),
+            ):
+                assert KiroCrewConfig.load().dashboard.default_memory_mode == "incognito"
+
+                def select_temporary(data: dict) -> dict:
+                    data.setdefault("dashboard", {})["default_memory_mode"] = "temporary"
+                    return data
+
+                update_config_locked(
+                    cfg_file,
+                    mutate=select_temporary,
+                    stamp_meta=False,
+                )
+                assert KiroCrewConfig.load().dashboard.default_memory_mode == "temporary"
+        finally:
+            _invalidate_config_cache()
+
+    def test_inflight_reader_cannot_restore_stale_cache_after_write(self, tmp_path: Path) -> None:
+        """A pre-write read cannot publish after a same-fingerprint write completes."""
+        from kiro_crew.config.loader import (
+            _invalidate_config_cache,
+            update_config_locked,
+            write_config_atomically,
+        )
+
+        cfg_file = tmp_path / "config.json"
+        local_file = tmp_path / "config.local.json"
+        write_config_atomically(
+            cfg_file,
+            {
+                "agents": {"default": {"kiro_agent": "kirocrew"}},
+                "default_agent": "default",
+                "workspaces": {"default": {"dir": "~/workspace"}},
+                "dashboard": {"default_memory_mode": "incognito"},
+            },
+        )
+        _invalidate_config_cache()
+
+        real_read_text = Path.read_text
+        old_read = threading.Event()
+        release_read = threading.Event()
+        blocked = {"done": False}
+        observed: list[str] = []
+        errors: list[BaseException] = []
+        reader: threading.Thread | None = None
+
+        def read_then_wait(self_path: Path, *args, **kwargs) -> str:
+            content = real_read_text(self_path, *args, **kwargs)
+            if self_path == cfg_file and not blocked["done"]:
+                blocked["done"] = True
+                old_read.set()
+                if not release_read.wait(timeout=5):
+                    raise TimeoutError("config write did not release the blocked reader")
+            return content
+
+        def load_during_write() -> None:
+            try:
+                observed.append(KiroCrewConfig.load().dashboard.default_memory_mode)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        try:
+            with (
+                unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
+                unittest.mock.patch(
+                    "kiro_crew.config.loader.config_local_path", return_value=local_file
+                ),
+                unittest.mock.patch(
+                    "kiro_crew.config.loader._config_fingerprint",
+                    return_value=(("coarse-filesystem", 1, 1, 0o600),),
+                ),
+                unittest.mock.patch.object(Path, "read_text", read_then_wait),
+            ):
+                reader = threading.Thread(target=load_during_write)
+                reader.start()
+                assert old_read.wait(timeout=5), "reader did not capture the pre-write config"
+
+                def select_temporary(data: dict) -> dict:
+                    data.setdefault("dashboard", {})["default_memory_mode"] = "temporary"
+                    return data
+
+                update_config_locked(
+                    cfg_file,
+                    mutate=select_temporary,
+                    stamp_meta=False,
+                )
+                release_read.set()
+                reader.join(timeout=5)
+                assert not reader.is_alive(), "blocked config reader did not finish"
+                assert not errors
+                assert observed == ["incognito"]
+                assert KiroCrewConfig.load().dashboard.default_memory_mode == "temporary"
+        finally:
+            release_read.set()
+            if reader is not None:
+                reader.join(timeout=5)
+            _invalidate_config_cache()
+
+    def test_survives_save_load(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        cfg = _load_from_dict({"dashboard": {"default_memory_mode": "temporary"}})
+        cfg_file = tmp_path / "config.json"
+        with patch("kiro_crew.config.loader.config_path", return_value=cfg_file):
+            cfg.save()
+            loaded = KiroCrewConfig.load()
+        assert loaded.dashboard.default_memory_mode == "temporary"
+
+
 class TestArchiveRetentionDays:
     """session.archive_retention_days parsing and disable sentinel."""
 
@@ -2992,6 +3655,56 @@ class TestConfigCache:
             second = KiroCrewConfig.load()
         assert second.agent.model == "model-bbbb"
 
+    def test_atomic_replacement_identity_busts_same_size_fingerprint(self, tmp_path: Path) -> None:
+        """Atomic mode writes differ even when legacy fingerprint fields match."""
+        import os as _os
+        from unittest.mock import patch
+
+        from kiro_crew.config.loader import (
+            _config_fingerprint,
+            update_config_locked,
+            write_config_atomically,
+        )
+
+        cfg_file = tmp_path / "config.json"
+        local = tmp_path / "config.local.json"
+        document = {
+            **self._CANON,
+            "dashboard": {"default_memory_mode": "incognito"},
+        }
+        with (
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
+            patch("kiro_crew.config.loader.config_local_path", return_value=local),
+        ):
+            write_config_atomically(cfg_file, document)
+            before_stat = cfg_file.stat()
+            before = _config_fingerprint()
+
+            def select_temporary(data: dict) -> dict:
+                data["dashboard"]["default_memory_mode"] = "temporary"
+                return data
+
+            update_config_locked(
+                cfg_file,
+                mutate=select_temporary,
+                stamp_meta=False,
+            )
+            after_write = cfg_file.stat()
+            assert after_write.st_size == before_stat.st_size
+            assert after_write.st_mode == before_stat.st_mode
+            _os.utime(
+                cfg_file,
+                ns=(after_write.st_atime_ns, before_stat.st_mtime_ns),
+            )
+            after = _config_fingerprint()
+
+        # mtime, size, and mode are deliberately identical: the old fingerprint
+        # would have reused another process's stale cache. Device/inode/ctime
+        # replacement identity must still distinguish the atomic write.
+        assert before[0][4:] == after[0][4:]
+        assert before[0][1:4] != after[0][1:4]
+        assert before != after
+
     def test_save_invalidates_cache(self, tmp_path: Path) -> None:
         """save() must drop the cache so the next load sees the written value."""
         from unittest.mock import patch
@@ -3092,7 +3805,7 @@ class TestDynamicSubagentSizingFields:
         assert a.subagent_cost_gb == 0.5
         assert a.subagent_cpu_cost_cores == 1.0
         assert a.subagent_auto_max == 32
-        assert a.subagent_spawn_stagger_secs == 2.0
+        assert a.subagent_spawn_stagger_secs == 0.25
 
     def test_explicit_values_load(self) -> None:
         cfg = _load_from_dict(
@@ -3201,7 +3914,47 @@ class TestSecurityBoundClamping:
 
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
             cfg = _load_from_dict({"agent": {"subagent_max_turns": 99999}})
-        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 1000
+
+    def test_subagent_timeout_zero_sentinel_survives_the_clamp(self) -> None:
+        """``0`` means "use the default", so a MIN floor must not rewrite it.
+
+        Clamping it to the 60s floor hands a healthy subagent a one-minute
+        deadline -- the opposite of what the field's own help text promises.
+        Asserted for the int form (the raw-dict clamp) and the numeric-string
+        form (which that clamp skips and only the coercion site bounds).
+        """
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            assert (
+                _load_from_dict({"agent": {"subagent_timeout_secs": 0}}).agent.subagent_timeout_secs
+                == 0
+            )
+            assert (
+                _load_from_dict(
+                    {"agent": {"subagent_timeout_secs": "0"}}
+                ).agent.subagent_timeout_secs
+                == 0
+            )
+            # A non-zero value below the floor is still raised to it.
+            assert (
+                _load_from_dict({"agent": {"subagent_timeout_secs": 5}}).agent.subagent_timeout_secs
+                == 60
+            )
+            assert (
+                _load_from_dict(
+                    {"agent": {"subagent_timeout_secs": "5"}}
+                ).agent.subagent_timeout_secs
+                == 60
+            )
+
+    def test_subagent_timeout_clamped_to_bounds(self) -> None:
+        from kiro_crew.config.loader import SUBAGENT_TIMEOUT_MAX, SUBAGENT_TIMEOUT_MIN
+
+        with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
+            hi = _load_from_dict({"agent": {"subagent_timeout_secs": 999999}})
+            lo = _load_from_dict({"agent": {"subagent_timeout_secs": 1}})
+        assert hi.agent.subagent_timeout_secs == SUBAGENT_TIMEOUT_MAX == 86400
+        assert lo.agent.subagent_timeout_secs == SUBAGENT_TIMEOUT_MIN == 60
 
     def test_pool_size_clamped_to_max(self) -> None:
         from kiro_crew.config.loader import POOL_SIZE_MAX
@@ -3270,7 +4023,7 @@ class TestSecurityBoundClamping:
     def test_session_start_timeout_floored_to_min(self) -> None:
         """A value below the floor is clamped UP: a session-start budget under
         the backend's 30s OAuth authorization wait recreates the race the
-        dedicated budget exists to prevent (issue #2946)."""
+        dedicated budget exists to prevent."""
         from kiro_crew.config.loader import SESSION_START_TIMEOUT_MIN
 
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event"):
@@ -3300,13 +4053,13 @@ class TestSecurityBoundClamping:
             )
         assert cfg.agent.subagent_auto_max == 64
         assert cfg.agent.max_subagents == 64
-        assert cfg.agent.subagent_max_turns == 200
+        assert cfg.agent.subagent_max_turns == 1000
         assert cfg.session.pool_size == 10
 
         d = cfg.to_dict()
         assert d["agent"]["subagent_auto_max"] == 64
         assert d["agent"]["max_subagents"] == 64
-        assert d["agent"]["subagent_max_turns"] == 200
+        assert d["agent"]["subagent_max_turns"] == 1000
         assert d["session"]["pool_size"] == 10
 
     def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
@@ -3314,9 +4067,9 @@ class TestSecurityBoundClamping:
         skips non-int values (see ``test_non_int_value_not_clamped``) --
         ``_safe_int``'s own docstring says clamping at the coercion site is
         what actually enforces the range for a numeric STRING that slips past
-        it. ``max_subagents``/``subagent_max_turns`` previously reached the
+        it. ``max_subagents``/``subagent_max_turns`` reach the
         dataclass with NO coercion at all, and ``subagent_auto_max``/
-        ``pool_size`` were ``_safe_int``-coerced but without bounds -- all
+        ``pool_size`` are ``_safe_int``-coerced but without bounds -- all
         four let a numeric-string value bypass the declared ceiling entirely."""
         from kiro_crew.config.loader import (
             POOL_SIZE_MAX,
@@ -3335,7 +4088,7 @@ class TestSecurityBoundClamping:
             }
         )
         assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
-        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 1000
         assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
         assert cfg.session.pool_size == POOL_SIZE_MAX == 10
         for v in (
@@ -3348,7 +4101,7 @@ class TestSecurityBoundClamping:
 
     def test_numeric_string_in_range_still_parses(self) -> None:
         """A well-formed numeric string within bounds must keep working --
-        the fix must not turn a previously-accepted legacy string value into
+        the fix must not turn an already-valid legacy string value into
         the default."""
         cfg = _load_from_dict(
             {
@@ -3398,12 +4151,12 @@ class TestSecurityBoundClamping:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:
             cfg = _load_from_dict(
                 {
-                    "agent": {"subagent_auto_max": 64, "subagent_max_turns": 200},
+                    "agent": {"subagent_auto_max": 64, "subagent_max_turns": 1000},
                     "session": {"pool_size": 10},
                 }
             )
         assert cfg.agent.subagent_auto_max == 64
-        assert cfg.agent.subagent_max_turns == 200
+        assert cfg.agent.subagent_max_turns == 1000
         assert cfg.session.pool_size == 10
         mock_event.assert_not_called()
 
@@ -3455,7 +4208,7 @@ class TestSecurityBoundClamping:
 
 class TestAutocompactPctLoadClamp:
     """session.autocompact_pct clamps into the documented 5-90 range at load
-    time (issue #4734).
+    time.
 
     The dashboard config API rejected out-of-range writes but a hand-edited
     config.json loaded verbatim: at 500 the autocompactor trigger
@@ -3835,6 +4588,45 @@ class TestTrustedLocalApps:
         assert cfg.to_dict()["agent"]["apps_trusted_local"] == ["local-app"]
 
 
+class TestAppsUiStreamTimeout:
+    """``agent.apps_ui_stream_timeout_secs`` is the body-transfer deadline on the
+    unauthenticated ``/apps/{name}/ui/`` route, so an unusable value must resolve
+    to a usable deadline rather than to none."""
+
+    def test_defaults_to_thirty_seconds(self) -> None:
+        assert AgentConfig().apps_ui_stream_timeout_secs == 30
+        assert _load_from_dict({}).agent.apps_ui_stream_timeout_secs == 30
+
+    def test_an_in_range_value_round_trips(self) -> None:
+        cfg = _load_from_dict({"agent": {"apps_ui_stream_timeout_secs": 45}})
+        assert cfg.agent.apps_ui_stream_timeout_secs == 45
+        assert cfg.to_dict()["agent"]["apps_ui_stream_timeout_secs"] == 45
+
+    @pytest.mark.parametrize(
+        "written,loaded",
+        [(4, 5), (0, 5), (-30, 5), (601, 600), (86400, 600)],
+    )
+    def test_a_value_outside_the_range_is_clamped_to_the_bound(
+        self, written: int, loaded: int
+    ) -> None:
+        """The declared range is [5, 600]: below 5 a client cannot finish a real
+        transfer, and above 600 the permit is held long enough that eight such
+        clients are the head-of-line wedge the deadline exists to stop."""
+        cfg = _load_from_dict({"agent": {"apps_ui_stream_timeout_secs": written}})
+        assert cfg.agent.apps_ui_stream_timeout_secs == loaded
+
+    def test_a_numeric_string_from_an_older_writer_still_loads(self) -> None:
+        """``_safe_int`` accepts the numeric-string form every other bounded
+        agent key accepts, so a hand-edited ``"60"`` is 60 seconds, not 30."""
+        cfg = _load_from_dict({"agent": {"apps_ui_stream_timeout_secs": "60"}})
+        assert cfg.agent.apps_ui_stream_timeout_secs == 60
+
+    @pytest.mark.parametrize("value", ["soon", "", None, True, False, 4.5, [], {}])
+    def test_a_value_that_is_not_a_whole_number_loads_the_default(self, value) -> None:
+        cfg = _load_from_dict({"agent": {"apps_ui_stream_timeout_secs": value}})
+        assert cfg.agent.apps_ui_stream_timeout_secs == 30
+
+
 def test_heartbeat_default_deliver_default_is_slack():
     """Absent config -> backward-compatible 'slack' default."""
     cfg = _load_from_dict({})
@@ -3932,6 +4724,39 @@ class TestKnowledgeAutoIngest:
             assert key in _EDITABLE_CONFIG, key
 
 
+class TestMemoryPersistenceAndInjectionToggles:
+    """``memory.persistence_enabled`` / ``inject_memory`` / ``inject_lessons``:
+    default on, override reads, junk falls back to the default (``_safe_bool``
+    accepts only real booleans)."""
+
+    def test_defaults_are_on(self) -> None:
+        mc = _load_from_dict({}).memory
+        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
+            True,
+            True,
+            True,
+        )
+
+    def test_an_empty_memory_section_leaves_every_toggle_on(self) -> None:
+        mc = _load_from_dict({"memory": {}}).memory
+        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
+            True,
+            True,
+            True,
+        )
+
+    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
+    def test_false_reads_false(self, key: str) -> None:
+        mc = _load_from_dict({"memory": {key: False}}).memory
+        assert getattr(mc, key) is False
+
+    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
+    @pytest.mark.parametrize("bad", ["false", 0, 1, None, [], {}])
+    def test_junk_falls_back_to_on(self, key: str, bad: object) -> None:
+        mc = _load_from_dict({"memory": {key: bad}}).memory
+        assert getattr(mc, key) is True
+
+
 class TestKnowledgePoolIdleTtl:
     """``knowledge.pool_idle_ttl_secs`` parsing: default, override, explicit 0,
     and rejection of negative / bool / typed-wrong values back to the default."""
@@ -3984,9 +4809,9 @@ class TestKnowledgePoolIdleTtl:
 
 
 class TestSaveRoundTripPreservesAllSections:
-    """to_dict() (which save() writes as the ENTIRE config.json) previously
-    omitted knowledge/heartbeat/snapshot_dir/watchdog, so any save silently
-    deleted those sections from disk. save() fires from many routine paths —
+    """to_dict() (which save() writes as the ENTIRE config.json) must not omit
+    knowledge/heartbeat/snapshot_dir/watchdog, or any save silently
+    deletes those sections from disk. save() fires from many routine paths —
     the theme PUT handler, the AIM auto-update toggle, and (worst) the one-shot
     write-back migration inside load() itself when a config lacks an "agents"
     map. So a user who hand-wrote e.g. {"knowledge": {"pool_idle_ttl_secs": 0}}
@@ -4027,19 +4852,23 @@ class TestSaveRoundTripPreservesAllSections:
 
 
 class TestOrchestratorWatchdogThemeAreParsed:
-    """load() must actually parse the orchestrator, watchdog, and dashboard-theme
-    fields from config.json. They were advertised in config-baseline.json and
-    served by /api/config/schema, and real consumers read them
-    (acp/session_handle.py .watchdog, dashboard/chat_orchestrator.py
-    .orchestrator.stage_timeout_seconds), but the cls(...) construction passed no
-    orchestrator=/watchdog= kwargs and DashboardConfig omitted theme_mode/
+    """load() must actually parse the watchdog and dashboard-theme fields from
+    config.json. They are advertised in config-baseline.json and served by
+    /api/config/schema, and real consumers read them (acp/session_handle.py
+    .watchdog), but the cls(...) construction passed no watchdog= kwarg and
+    DashboardConfig omitted theme_mode/
     theme_color/onboarded — so config values were silently ignored (defaults
     always won) and the server-authoritative theme never round-tripped (the
     onboarding modal re-armed on every gateway restart)."""
 
-    def test_orchestrator_stage_timeout_is_parsed(self) -> None:
-        cfg = _load_from_dict({"orchestrator": {"stage_timeout_seconds": 60}})
-        assert cfg.orchestrator.stage_timeout_seconds == 60
+    def test_retired_orchestrator_section_loads_and_is_ignored(self) -> None:
+        cfg, warnings = _load_from_dict_with_logs(
+            {"orchestrator": {"stage_timeout_seconds": 60}, "watchdog": {"check_after_secs": 5}}
+        )
+        assert not hasattr(cfg, "orchestrator")
+        assert cfg.watchdog.check_after_secs == 5.0
+        assert "orchestrator" not in cfg.to_dict()
+        assert not [w for w in warnings if "orchestrator" in w]
 
     def test_watchdog_fields_are_parsed(self) -> None:
         cfg = _load_from_dict(
@@ -4170,6 +4999,16 @@ class TestOrchestratorWatchdogThemeAreParsed:
         assert cfg.dashboard.import_onboarded is True
         assert cfg.to_dict()["dashboard"]["import_onboarded"] is True
 
+    def test_crewmates_onboarded_defaults_false_for_new_config(self) -> None:
+        assert DashboardConfig().crewmates_onboarded is False
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.crewmates_onboarded is False
+
+    def test_crewmates_onboarded_round_trips(self) -> None:
+        cfg = _load_from_dict({"dashboard": {"crewmates_onboarded": True}})
+        assert cfg.dashboard.crewmates_onboarded is True
+        assert cfg.to_dict()["dashboard"]["crewmates_onboarded"] is True
+
     def test_import_onboarded_string_false_falls_back_without_jsonschema(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4194,8 +5033,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
 
     def test_absent_sections_use_defaults(self) -> None:
         cfg = _load_from_dict({})
-        assert cfg.orchestrator.stage_timeout_seconds == 1800
-        assert cfg.watchdog.tool_stall_hard_cap_secs == 3600.0
+        assert cfg.watchdog.tool_stall_hard_cap_secs == WatchdogConfig().tool_stall_hard_cap_secs
         assert cfg.dashboard.theme_mode == ""
         assert cfg.dashboard.onboarded is False
         assert cfg.dashboard.import_onboarded is False
@@ -4204,11 +5042,9 @@ class TestOrchestratorWatchdogThemeAreParsed:
         cfg = _load_from_dict(
             {
                 "watchdog": {"check_after_secs": "junk"},
-                "orchestrator": {"stage_timeout_seconds": "x"},
             }
         )
         assert cfg.watchdog.check_after_secs == 60.0
-        assert cfg.orchestrator.stage_timeout_seconds == 1800
 
 
 class TestMalformedConfigNeverBricksLoad:
@@ -4315,6 +5151,28 @@ class TestEmptyResponseAutoContinueWiring:
     def test_default_is_true(self) -> None:
         cfg = _load_from_dict({})
         assert cfg.session.empty_response_auto_continue is True
+
+
+class TestEmptyResponseMaxContinuesWiring:
+    """session.empty_response_max_continues: wired, defaulted, and RANGE-clamped
+    — a hand-edited 0 must not disable recovery and a 999 must not arm an
+    unbounded ladder (the ladder's give-up arithmetic trusts this clamp)."""
+
+    def test_persisted_value_survives_load(self) -> None:
+        cfg = _load_from_dict({"session": {"empty_response_max_continues": 3}})
+        assert cfg.session.empty_response_max_continues == 3
+
+    def test_default_is_one(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.session.empty_response_max_continues == 1
+
+    def test_below_range_clamps_to_min(self) -> None:
+        cfg = _load_from_dict({"session": {"empty_response_max_continues": 0}})
+        assert cfg.session.empty_response_max_continues == 1
+
+    def test_above_range_clamps_to_max(self) -> None:
+        cfg = _load_from_dict({"session": {"empty_response_max_continues": 999}})
+        assert cfg.session.empty_response_max_continues == 10
 
 
 class TestGitLabHostAllowlist:
@@ -4432,7 +5290,7 @@ class TestGitLabHostAllowlist:
 def test_legacy_wechat_config_key_still_populates_wecom():
     """A config written before the wechat->wecom rename keeps its WeCom settings.
 
-    Regression for the rename (#542): load() falls back to the legacy
+    load() falls back to the legacy
     "wechat" key so existing installs don't silently lose their allow-list /
     thresholds / enabled flag on upgrade.
     """
@@ -4497,12 +5355,186 @@ class TestAppAgentDispatch(unittest.TestCase):
         import kiro_crew.config.loader as loader
 
         loader._MATERIALIZED_AGENTS = frozenset()
+        loader._MATERIALIZED_STEMS = {}
+        loader._MATERIALIZED_SEEN.clear()
         loader._MATERIALIZED_AGENTS_READY = False
         loader._MATERIALIZED_AGENTS_GENERATION = 0
         loader._MATERIALIZED_REFRESH_ISSUED = 0
         loader._MATERIALIZED_REFRESH_APPLIED = 0
 
     tearDown = setUp
+
+    def test_crewmate_bound_to_a_file_name_dispatches_the_declared_agent(self):
+        # A package installs `KiroPkg-captain.json` declaring "captain", and kiro-cli
+        # lists only "captain". A crewmate that recorded the FILE name dispatches
+        # the declared agent, and its row is not edited.
+        import kiro_crew.config.loader as loader
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(Path(td), {"KiroPkg-captain.json": {"name": "captain"}})
+            cfg = self._config()
+            cfg.agents["KiroPkg-captain"] = KiroCrewAgentConfig(kiro_agent="KiroPkg-captain")
+            cfg.default_agent = "KiroPkg-captain"
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
+                assert loader.resolve_agent_bindings(cfg, "KiroPkg-captain").kiro_agent == "captain"
+                # The default path (no name) resolves the same crewmate the same way.
+                assert loader.resolve_agent_bindings(cfg).kiro_agent == "captain"
+                assert loader.resolve_agent_identity(cfg, "KiroPkg-captain")[1] == "captain"
+        assert cfg.agents["KiroPkg-captain"].kiro_agent == "KiroPkg-captain"
+
+    def test_subagent_paths_of_a_file_name_bound_crewmate_dispatch_the_declared_agent(self):
+        # The subagent run hands ``execution.template_id`` to kiro-cli without
+        # the resolver, so every builder of that field from a crewmate row must
+        # map the file name: the member record itself, a resumed member
+        # conversation, and a spawn inheriting the parent's member selection.
+        from types import SimpleNamespace
+
+        import kiro_crew.config.loader as loader
+        from kiro_crew import execution_context as ec
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+        from kiro_crew.subagent_manager.admission.gate import _GateMixin
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(Path(td), {"KiroPkg-captain.json": {"name": "captain"}})
+            cfg = self._config()
+            cfg.agents["pkg"] = KiroCrewAgentConfig(kiro_agent="KiroPkg-captain")
+            with (
+                unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d),
+                unittest.mock.patch.object(
+                    loader.KiroCrewConfig, "load", classmethod(lambda cls, *a, **k: cfg)
+                ),
+            ):
+                member = ec.resolve_member_execution(cfg, "pkg")
+                assert member.template_id == "captain"
+                # A record written before the mapping existed still names the file.
+                stale = ec.ExecutionContext(
+                    None,
+                    ec.MemoryStoreRef("default"),
+                    "member",
+                    "KiroPkg-captain",
+                    selection_name="pkg",
+                )
+                resumed = _GateMixin.resolve_spawn_execution(
+                    SimpleNamespace(), conversation_key="subagent:run-1", _record=stale
+                )
+                assert resumed.template_id == "captain"
+                inherited = _GateMixin.resolve_spawn_execution(
+                    SimpleNamespace(),
+                    parent_session_key="dashboard:chat",
+                    _record=None,
+                    _inherited_selection=("member", "pkg"),
+                )
+                assert (inherited.selection_name, inherited.template_id) == ("pkg", "captain")
+                # The chat read of such a record dispatches the declared agent too.
+                assert (
+                    loader.resolve_agent_bindings(
+                        cfg, "pkg", selection_kind="member", execution_context=stale
+                    ).kiro_agent
+                    == "captain"
+                )
+                from kiro_crew import session_agent_selection as sas
+
+                with unittest.mock.patch.object(sas, "read_session_execution", lambda _k: stale):
+                    session = sas.resolve_session_agent_bindings(
+                        loader.resolve_agent_bindings, cfg, "dashboard:chat", None
+                    )
+                assert session.kiro_agent == "captain"
+
+                # A TEMPLATE selection already names the exact provider agent.
+                # Even when that id equals a global file stem, only a member
+                # record is eligible for stem-to-declared-name repair.
+                template = ec.ExecutionContext(
+                    None,
+                    ec.MemoryStoreRef("default"),
+                    "template",
+                    "KiroPkg-captain",
+                    selection_name="KiroPkg-captain",
+                )
+                assert (
+                    loader.resolve_agent_bindings(
+                        cfg,
+                        "KiroPkg-captain",
+                        selection_kind="template",
+                        execution_context=template,
+                    ).kiro_agent
+                    == "KiroPkg-captain"
+                )
+                with unittest.mock.patch.object(sas, "read_session_execution", lambda _k: template):
+                    session = sas.resolve_session_agent_bindings(
+                        loader.resolve_agent_bindings, cfg, "dashboard:chat", None
+                    )
+                assert session.kiro_agent == "KiroPkg-captain"
+        assert cfg.agents["pkg"].kiro_agent == "KiroPkg-captain"
+
+    def test_stem_mapping_never_overrides_a_declared_name(self):
+        # Only a name kiro-cli does not know is mapped: a declared name, a stem two
+        # configs share, and an unknown name all pass through unchanged.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(
+                Path(td),
+                {
+                    "worker.json": {"name": "worker"},
+                    "Pkg-worker.json": {"name": "other"},
+                    "worker2.json": {"name": "Pkg-worker"},
+                },
+            )
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
+                assert loader.dispatch_kiro_agent("worker") == "worker"
+                assert loader.dispatch_kiro_agent("Pkg-worker") == "Pkg-worker"
+                assert loader.dispatch_kiro_agent("nope") == "nope"
+                assert loader.dispatch_kiro_agent("") == ""
+
+    def test_file_name_bound_crewmate_takes_the_background_role_effort(self):
+        # The role set holds declared names; a crew that recorded a background
+        # worker's FILE name runs that worker, so it takes the role effort too.
+        import kiro_crew.config.loader as loader
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(Path(td), {"Pkg-kirocrew-lite.json": {"name": "kirocrew-lite"}})
+            cfg = self._config()
+            cfg.agent.reasoning_effort = "high"
+            cfg.agent.role_efforts = {"background": "low"}
+            cfg.agents["bg"] = KiroCrewAgentConfig(kiro_agent="Pkg-kirocrew-lite")
+            with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
+                assert cfg.resolve_session_effort(None, "bg") == "low"
+                # A pin on the crew still outranks the role effort.
+                cfg.agents["bg"].reasoning_effort = "medium"
+                assert cfg.resolve_session_effort(None, "bg") == "medium"
+
+    def test_file_name_bound_crewmate_resolves_its_template_model_pin(self):
+        # The model readers (_session_model, the spawn readout) need no mapping:
+        # _resolve_named_agent_model already matches the file stem, so the file
+        # name finds the pin the declared name finds, and the factory selection
+        # both feed answers the same for either spelling.
+        import kiro_crew.config.loader as loader
+        from kiro_crew import subagent
+        from kiro_crew.config.loader import KiroCrewAgentConfig
+        from kiro_crew.session import _session_model
+
+        with tempfile.TemporaryDirectory() as td:
+            d = self._agents_dir(
+                Path(td), {"KiroPkg-captain.json": {"name": "captain", "model": "claude-opus-4.8"}}
+            )
+            cfg = self._config()
+            cfg.agents["pkg"] = KiroCrewAgentConfig(kiro_agent="KiroPkg-captain")
+            with (
+                unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d),
+                unittest.mock.patch.object(
+                    loader.KiroCrewConfig, "load", classmethod(lambda cls, *a, **k: cfg)
+                ),
+            ):
+                by_stem = cfg._resolve_named_agent_model("KiroPkg-captain", agents_dir=d)
+                assert by_stem == cfg._resolve_named_agent_model("captain", agents_dir=d)
+                assert by_stem == "claude-opus-4.8"
+                # A pinned template defers to the factory, as the declared name does.
+                assert _session_model(cfg, None, crew_agent="pkg") is None
+                selected = cfg.acp_effective_model("captain", None)
+                assert selected and cfg.acp_effective_model("KiroPkg-captain", None) == selected
+                assert subagent._spawn_effective_model(None, "pkg") == selected
 
     def _config(self):
         from kiro_crew.config.loader import (
@@ -4584,11 +5616,13 @@ class TestAppAgentDispatch(unittest.TestCase):
 
         cfg = self._config()
         cfg.agents["mochi"] = KiroCrewAgentConfig(kiro_agent="explicitly-bound")
+        private_store = provision_member_memory(cfg, "mochi")
         with tempfile.TemporaryDirectory() as td:
             d = self._agents_dir(Path(td), {"mochi--mochi.json": {"name": "mochi"}})
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 r = loader.resolve_agent_bindings(cfg, agent_name="mochi")
         assert r.kiro_agent == "explicitly-bound"
+        assert r.memory_store_name == private_store
 
     def test_non_object_json_in_agents_dir_is_skipped(self):
         import kiro_crew.config.loader as loader
@@ -4621,7 +5655,7 @@ class TestAppAgentDispatch(unittest.TestCase):
             d = self._agents_dir(Path(td), {"mochi--mochi.json": {"name": "mochi"}})
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 loader.refresh_materialized_agents()
-            # The directory is gone AND kiro_agents_dir is no longer patched, so
+            # The directory is gone AND kiro_agents_dir is not patched, so
             # any filesystem access would change the answer. It must not.
             for _ in range(5):
                 assert (
@@ -4697,14 +5731,16 @@ class TestAppAgentDispatch(unittest.TestCase):
 
         def _older_scan_that_is_overtaken(_p):
             with unittest.mock.patch.object(
-                loader, "_scan_materialized_agents", lambda _p2: frozenset({"kept"})
+                loader,
+                "_scan_materialized_index",
+                lambda _p2: (frozenset({"kept"}), {}),
             ):
                 loader.refresh_materialized_agents()  # newer refresh lands first
             # This older view still contains the agent that was deleted meanwhile.
-            return frozenset({"kept", "deleted"})
+            return frozenset({"kept", "deleted"}), {}
 
         with unittest.mock.patch.object(
-            loader, "_scan_materialized_agents", _older_scan_that_is_overtaken
+            loader, "_scan_materialized_index", _older_scan_that_is_overtaken
         ):
             loader.refresh_materialized_agents()
 
@@ -4724,6 +5760,7 @@ class TestAppAgentDispatch(unittest.TestCase):
         cfg = self._config()
         cfg.agents["default"] = KiroCrewAgentConfig(kiro_agent="worker")
         cfg.agents["worker"] = KiroCrewAgentConfig(kiro_agent="other")
+        private_store = provision_member_memory(cfg, "worker")
 
         with tempfile.TemporaryDirectory() as td:
             d = self._agents_dir(Path(td), {"unrelated.json": {"name": "unrelated"}})
@@ -4739,6 +5776,7 @@ class TestAppAgentDispatch(unittest.TestCase):
                 # Whereas the physical name resolves elsewhere — the bug avoided.
                 trap = loader.resolve_agent_bindings(cfg, agent_name=first.kiro_agent)
                 assert trap.kiro_agent == "other"
+                assert trap.memory_store_name == private_store
 
     def test_stale_refresh_cannot_erase_a_published_agent(self):
         # The race: a refresh globs the directory BEFORE a registration writes into
@@ -4750,9 +5788,9 @@ class TestAppAgentDispatch(unittest.TestCase):
         def _scan_that_races(_p):
             # Stands in for "the directory as it looked before the write".
             loader.publish_materialized_agents({"mochi", "mochi--mochi"})
-            return frozenset({"other", "other--other"})
+            return frozenset({"other", "other--other"}), {}
 
-        with unittest.mock.patch.object(loader, "_scan_materialized_agents", _scan_that_races):
+        with unittest.mock.patch.object(loader, "_scan_materialized_index", _scan_that_races):
             loader.refresh_materialized_agents()
 
         cfg = self._config()
@@ -4770,7 +5808,7 @@ class TestAppAgentDispatch(unittest.TestCase):
         assert loader.resolve_agent_bindings(self._config(), agent_name="gone").kiro_agent == "gone"
 
         with unittest.mock.patch.object(
-            loader, "_scan_materialized_agents", lambda _p: frozenset({"kept"})
+            loader, "_scan_materialized_index", lambda _p: (frozenset({"kept"}), {})
         ):
             loader.refresh_materialized_agents()
 
@@ -4820,7 +5858,7 @@ class TestAppAgentDispatch(unittest.TestCase):
         import kiro_crew.config.loader as loader
 
         scan_threads: list[int] = []
-        real_scan = loader._scan_materialized_agents
+        real_scan = loader._scan_materialized_index
 
         def _recording_scan(p):
             scan_threads.append(threading.get_ident())
@@ -4841,7 +5879,7 @@ class TestAppAgentDispatch(unittest.TestCase):
 
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 with unittest.mock.patch.object(
-                    loader, "_scan_materialized_agents", _recording_scan
+                    loader, "_scan_materialized_index", _recording_scan
                 ):
                     loop_thread = asyncio.run(_on_loop())
 
@@ -5047,6 +6085,319 @@ class TestAppAgentDispatch(unittest.TestCase):
                 )
         assert r.kiro_agent == "kirocrew"
         assert r.requested_resolved is False
+
+
+class TestDanglingDefaultAgentReset(unittest.TestCase):
+    """A default agent whose template file is gone is pointed back at ``default``
+    by the next landed snapshot refresh, and only then: a healthy, managed,
+    cold, unreadable or concurrently changed state leaves ``config.json`` as it
+    is, and the alias row is never edited.
+
+    "Gone" means an agent an earlier landed snapshot declared that the latest
+    landed snapshot does not. A template the directory never declared -- one a
+    project checkout or the edition supplies -- may still dispatch, so it is
+    not evidence of a removal."""
+
+    def setUp(self):
+        import kiro_crew.config.loader as loader
+
+        loader._MATERIALIZED_AGENTS = frozenset()
+        loader._MATERIALIZED_STEMS = {}
+        loader._MATERIALIZED_SEEN.clear()
+        loader._MATERIALIZED_AGENTS_READY = False
+        loader._MATERIALIZED_AGENTS_GENERATION = 0
+        loader._MATERIALIZED_REFRESH_ISSUED = 0
+        loader._MATERIALIZED_REFRESH_APPLIED = 0
+        loader._invalidate_config_cache()
+
+    tearDown = setUp
+
+    def _home(self, tmp: Path, agents: dict[str, dict], default: str, files: dict[str, dict]):
+        """A ``config.json`` naming *default* over *agents*, and an agents dir of *files*."""
+        config = tmp / "config.json"
+        config.write_text(
+            json.dumps({"default_agent": default, "agents": agents}), encoding="utf-8"
+        )
+        agents_dir = tmp / "agents"
+        agents_dir.mkdir()
+        for filename, body in files.items():
+            (agents_dir / filename).write_text(json.dumps(body), encoding="utf-8")
+        return config, agents_dir
+
+    def _patched(self, config: Path, agents_dir: Path):
+        import kiro_crew.config.loader as loader
+
+        return (
+            unittest.mock.patch.object(loader, "config_path", lambda: config),
+            unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: agents_dir),
+        )
+
+    @staticmethod
+    def _on_disk(config: Path) -> dict:
+        return json.loads(config.read_text(encoding="utf-8"))
+
+    def test_dangling_default_is_reset_to_default_and_the_row_kept(self):
+        # The owner made the ``pkg`` crew (running ``captain``) the default, then
+        # the package was uninstalled. The landed refresh points the default back
+        # at ``default``; the row stays, since the template may come back.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2, unittest.mock.patch("kiro_crew.sel.sel") as sel:
+                loader.refresh_materialized_agents()
+                assert self._on_disk(config)["default_agent"] == "pkg"
+                (d / "captain.json").unlink()
+                with self.assertLogs("kiro_crew.config.loader", level="WARNING") as logs:
+                    loader.refresh_materialized_agents()
+            on_disk = self._on_disk(config)
+        assert on_disk["default_agent"] == "default"
+        assert on_disk["agents"]["pkg"]["kiro_agent"] == "captain"
+        assert any("'pkg'" in line and "'captain'" in line for line in logs.output)
+        event = sel.return_value.log.call_args.args[0]
+        assert event.event_type == "default_agent_reset"
+        assert event.resources == "agent:pkg"
+        assert event.metadata == {"template": "captain", "reset_to": "default"}
+
+    def test_file_name_binding_counts_as_the_declared_agent(self):
+        # A row that recorded the FILE name is healthy while that file declares
+        # its agent, and dangling once the file is gone.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "KiroPkg-captain"}},
+                "pkg",
+                {
+                    "kirocrew.json": {"name": "kirocrew"},
+                    "KiroPkg-captain.json": {"name": "captain"},
+                },
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                assert self._on_disk(config)["default_agent"] == "pkg"
+                (d / "KiroPkg-captain.json").unlink()
+                loader.refresh_materialized_agents()
+                assert self._on_disk(config)["default_agent"] == "default"
+
+    def test_healthy_default_is_untouched(self):
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                assert loader.reset_dangling_default_agent() is False
+            assert self._on_disk(config)["default_agent"] == "pkg"
+
+    def test_cold_empty_or_failed_snapshot_acts_on_nothing(self):
+        # No scan has landed, the scan found no agent at all, or the scan failed:
+        # none of these says anything about one template, so nothing is written.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                assert loader.reset_dangling_default_agent() is False
+                loader.refresh_materialized_agents()  # lands an EMPTY snapshot
+                assert loader._MATERIALIZED_AGENTS_READY is True
+                assert self._on_disk(config)["default_agent"] == "pkg"
+                (d / "kirocrew.json").write_text(json.dumps({"name": "kirocrew"}), encoding="utf-8")
+                with unittest.mock.patch.object(
+                    loader, "_scan_materialized_index", side_effect=OSError("boom")
+                ):
+                    loader.refresh_materialized_agents()
+                assert self._on_disk(config)["default_agent"] == "pkg"
+                # The lazy build a lookup performs answers that lookup only.
+                loader._MATERIALIZED_AGENTS_READY = False
+                assert loader.dispatch_kiro_agent("captain") == "captain"
+                assert loader._MATERIALIZED_AGENTS_READY is True
+            assert self._on_disk(config)["default_agent"] == "pkg"
+
+    def test_managed_template_is_left_to_its_own_self_heal(self):
+        # A missing ``kirocrew.json`` is regenerated before spawn, so a default
+        # bound to it -- explicitly or by an empty binding -- is not dangling.
+        import kiro_crew.config.loader as loader
+
+        for bound in ("kirocrew", ""):
+            with tempfile.TemporaryDirectory() as td:
+                config, d = self._home(
+                    Path(td),
+                    {"default": {"kiro_agent": "kirocrew"}, "mine": {"kiro_agent": bound}},
+                    "mine",
+                    {"other.json": {"name": "other"}},
+                )
+                p1, p2 = self._patched(config, d)
+                with p1, p2:
+                    loader.refresh_materialized_agents()
+                assert self._on_disk(config)["default_agent"] == "mine"
+
+    def test_missing_default_alias_invents_no_target(self):
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"pkg": {"kiro_agent": "captain"}, "other": {"kiro_agent": "kirocrew"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                (d / "captain.json").unlink()
+                loader.refresh_materialized_agents()
+            assert self._on_disk(config)["default_agent"] == "pkg"
+
+    def test_default_changed_inside_the_lock_wins(self):
+        # A PUT that repointed the default between the check and the locked
+        # read-modify-write is not overwritten: the mutate re-derives both
+        # conditions on the document it actually holds.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {
+                    "default": {"kiro_agent": "kirocrew"},
+                    "pkg": {"kiro_agent": "captain"},
+                    "other": {"kiro_agent": "kirocrew"},
+                },
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            real_read = loader.read_config_for_update
+
+            repointed: list[bool] = []
+
+            def _repointed(path=None):
+                repointed.append(True)
+                data = real_read(path)
+                data["default_agent"] = "other"
+                config.write_text(json.dumps(data), encoding="utf-8")
+                return data
+
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                (d / "captain.json").unlink()
+                with unittest.mock.patch.object(loader, "read_config_for_update", _repointed):
+                    loader.refresh_materialized_agents()
+            # The refresh reached the locked write, and lost it to the PUT.
+            assert repointed
+            assert self._on_disk(config)["default_agent"] == "other"
+
+    def test_unreadable_config_is_untouched(self):
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents(heal_default=False)
+                with unittest.mock.patch.object(
+                    loader.KiroCrewConfig, "load", classmethod(lambda cls: 1 / 0)
+                ):
+                    assert loader.reset_dangling_default_agent() is False
+                with unittest.mock.patch.object(
+                    loader, "read_config_for_update", side_effect=loader.ConfigReadError("torn")
+                ):
+                    assert loader.reset_dangling_default_agent() is False
+            assert self._on_disk(config)["default_agent"] == "pkg"
+
+    def test_a_refresh_that_does_not_heal_leaves_the_evidence_for_one_that_does(self):
+        # A non-owner catalog fetch or a lazy lookup refreshes without healing.
+        # When one of those is the first to see the file gone, the owner's next
+        # refresh must still reset the default it left dangling.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                (d / "captain.json").unlink()
+                loader.refresh_materialized_agents(heal_default=False)
+                assert self._on_disk(config)["default_agent"] == "pkg"
+                loader.refresh_materialized_agents()
+            assert self._on_disk(config)["default_agent"] == "default"
+
+    def test_a_template_the_directory_never_declared_is_not_reset(self):
+        # ``scout`` runs ``reviewer``, which only a project checkout (or an
+        # edition) declares: it dispatches, though no file in this directory
+        # names it. Neither the boot refresh nor a later one may repoint the
+        # owner's default on that absence.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "scout": {"kiro_agent": "reviewer"}},
+                "scout",
+                {"kirocrew.json": {"name": "kirocrew"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                loader.refresh_materialized_agents()
+            assert self._on_disk(config)["default_agent"] == "scout"
+
+    def test_a_removed_file_whose_agent_the_edition_supplies_is_not_reset(self):
+        # The file went, but the edition contributes an agent of the same name,
+        # so the default still dispatches.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with p1, p2:
+                loader.refresh_materialized_agents()
+                (d / "captain.json").unlink()
+                with unittest.mock.patch(
+                    "kiro_crew.platform.context.current_context",
+                    lambda: types.SimpleNamespace(
+                        agent_catalog=types.SimpleNamespace(
+                            builtin_agents=lambda: [{"name": "captain"}]
+                        )
+                    ),
+                ):
+                    loader.refresh_materialized_agents()
+            assert self._on_disk(config)["default_agent"] == "pkg"
 
 
 class TestWeixinConfig(unittest.TestCase):
@@ -5858,8 +7209,14 @@ _DISPATCH_EXEMPT = {
     "resolved_alias",
     # Request metadata the caller checks separately, not dispatch identity.
     "requested_resolved",
+    # Namespace provenance controls later resolution, not identical current targets.
+    "selection_kind",
+    # Protects automatic publication after resolution, not dispatch identity.
+    "selection_revision",
     # Derived from memory_store_name plus global config shared by both sides.
     "effective_memory_config",
+    # Session selection validates admitted member/mode before this target comparison.
+    "execution_context",
 }
 
 
@@ -5878,7 +7235,10 @@ def _dispatch_field_mutations() -> dict[str, object]:
         "model": "drift-pin-other-model",
         "resolved_alias": "drift-pin-other-alias",
         "requested_resolved": False,
+        "selection_kind": "template",
+        "selection_revision": "observed-selection-revision",
         "effective_memory_config": {"embedding_provider": "drift-pin-other"},
+        "execution_context": object(),
     }
 
 
@@ -5989,11 +7349,11 @@ class TestSameDispatchBindingDriftPin:
 
 
 class TestMigrationWriteBackOrdering:
-    """The write-back migration must not lose a concurrent config write (#7793).
+    """The write-back migration must not lose a concurrent config write.
 
-    ``load()``'s migration used to call ``cfg.save()``, which re-serializes the
+    A migration that calls ``cfg.save()`` re-serializes the
     whole snapshot this load parsed. A config write landing after that read and
-    before the save was silently replaced by the older snapshot. ``load()`` runs
+    before the save is silently replaced by the older snapshot. ``load()`` runs
     off the event loop in places (``chat_runner``'s stop-hook nudge-cap site
     awaits ``asyncio.to_thread(KiroCrewConfig.load)``), so the interleave is
     reachable rather than theoretical.

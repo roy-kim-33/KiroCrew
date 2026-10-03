@@ -4,27 +4,24 @@ Applying the owner-only lockdown after the payload is already at its final path
 leaves a window in which the file exists under whatever permissions it
 inherited. On Windows that is the parent directory's DACL, and POSIX mode bits
 are not enforced there at all, so ``atomic_write(mode=0o600)`` does not close
-it. Issue #5307 converted the last seven such writers to
-``atomic_write(..., restrict_to_owner=True)``, which locks the temp file down
-before the first content byte and before the rename.
+it. Such writers use ``atomic_write(..., restrict_to_owner=True)``, which locks
+the temp file down before the first content byte and before the rename.
 
-Nothing prevented a NEW writer from reintroducing the shape. Two layers here:
+Two layers guard against a new writer reintroducing the exposed shape:
 
 * ``scripts/check_lockdown_before_publish.py`` is an AST rule over
   ``src/kiro_crew``, exercised below against fixtures for every shape it must
-  catch and every correct shape it must not. Validated against real history:
-  run against the tree before #5329 it flags 6/6 of #5307's sites; against
-  ``main`` after it, 0/6.
+  catch and every correct shape it must not.
 * behavioural probes assert the ORDER at the live writers, rather than the
   final mode -- a final-mode assertion passes just as happily when the payload
   was exposed for the whole write window, and on NTFS reports ``0o666``
-  regardless of the DACL. The technique (record whether the FINAL path exists
-  at the moment lockdown runs) is from PR #5314 by @leonlaiyc, whose
-  production change landed via #5329.
+  regardless of the DACL. The technique records whether the FINAL path exists
+  at the moment lockdown runs.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import sys
 from pathlib import Path
@@ -33,6 +30,11 @@ from unittest.mock import patch
 import pytest
 from test_live_target import _make_valid_checkout
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_lockdown_before_publish")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_lockdown_before_publish.py"
 
@@ -558,11 +560,75 @@ def reasserter(path):
         assert not checker.scan_source(source)
 
 
+def _waiver_key(fixture: Path, function: str) -> str:
+    """The ``KNOWN_UNCONVERTED`` key ``main()`` will look up for *fixture*.
+
+    ``scan_path`` keys a file by its path RELATIVE to the checkout when it lies
+    inside one and by its absolute posix path otherwise, and ``main()`` derives
+    the checkout root from the checker's own location. A fixture under
+    ``tmp_path`` may be either -- pytest's temp root is not guaranteed to sit
+    outside the repository (a developer's ``TMPDIR=./tmp`` puts it inside) -- so
+    the key is derived through the checker's own keying rather than assumed to be
+    the absolute form.
+    """
+    root = Path(checker.__file__).resolve().parent.parent
+    rel = checker.scan_path(fixture, root)[0][0]
+    return f"{rel}::{function}"
+
+
 class TestTheRealTree:
     """The gate the CI job runs."""
 
+    @staticmethod
+    @functools.lru_cache(maxsize=1)
+    def _scan_src() -> tuple[tuple[str, int, str, str], ...]:
+        """One whole-tree AST scan, shared by every test in this class.
+
+        Both tests below independently re-derive `checker.main`'s per-file
+        `scan_path` results over the same `src/kiro_crew` tree; walking and
+        re-parsing every file twice per test is what made this class slow.
+
+        Narrowed through ``source_corpus.iter_candidate_sources`` rather than a bare
+        `rglob` + re-read + re-parse of every module: `_lockdown_target` can only
+        report a violation from a call to one of the lockdown primitives
+        (`restrict_to_owner` / `chmod_safe` / `chmod` / `fchmod_safe` / `fchmod`),
+        so a file whose text contains none of those names cannot possibly match
+        and is never a false negative to skip. Streamed, because the ~145
+        candidates are the largest files in the tree (~13 M characters, stored at
+        four bytes each once a file holds an emoji) and a tuple of their texts
+        was ~50 MiB live for nothing.
+        """
+        from source_corpus import iter_candidate_sources  # noqa: PLC0415
+
+        found: list[tuple[str, int, str, str]] = []
+        for path, text in iter_candidate_sources(
+            require_any=("restrict_to_owner", "chmod_safe", "chmod", "fchmod_safe", "fchmod")
+        ):
+            # Same relative-to convention as `scan_path` (relative to REPO_ROOT,
+            # e.g. `src/kiro_crew/...`), so a KNOWN_UNCONVERTED key built from
+            # this scan matches one built from `checker.main`.
+            rel = (
+                path.relative_to(REPO_ROOT).as_posix()
+                if path.is_relative_to(REPO_ROOT)
+                else path.as_posix()
+            )
+            for line, fn, expr in checker.scan_source(text):
+                found.append((rel, line, fn, expr))
+        return tuple(sorted(found))
+
     def test_src_has_no_unclassified_violation(self) -> None:
-        exit_code = checker.main(["check", str(REPO_ROOT / "src" / "kiro_crew")])
+        """Same pass/fail as `checker.main(["check", <src dir>])`, off the cached scan."""
+        new: list[tuple[str, int, str, str]] = []
+        seen_known: set[str] = set()
+        for rel, line, fn, expr in self._scan_src():
+            key = "%s::%s" % (rel, fn)
+            entry = checker.KNOWN_UNCONVERTED.get(key)
+            if entry is not None and entry[1] == expr:
+                seen_known.add(key)
+            else:
+                new.append((rel, line, fn, expr))
+        stale = set(checker.KNOWN_UNCONVERTED) - seen_known
+        exit_code = 1 if (new or stale) else 0
         assert exit_code == 0, (
             "a lockdown-before-publish violation is unclassified. Convert it to "
             "atomic_write(..., restrict_to_owner=True), or annotate a genuine "
@@ -576,11 +642,7 @@ class TestTheRealTree:
         future regression at one of those very sites would land unnoticed
         because its entry was already there.
         """
-        src = REPO_ROOT / "src" / "kiro_crew"
-        live: set[str] = set()
-        for py in sorted(src.rglob("*.py")):
-            for rel, _line, fn, _expr in checker.scan_path(py, REPO_ROOT):
-                live.add(f"{rel}::{fn}")
+        live = {f"{rel}::{fn}" for rel, _line, fn, _expr in self._scan_src()}
 
         stale = sorted(set(checker.KNOWN_UNCONVERTED) - live)
         assert not stale, (
@@ -668,9 +730,9 @@ class TestTheRealTree:
 
         `scan_path` normalises with `.as_posix()` for the same reason. On Linux
         `str()` and `as_posix()` agree, so no assertion here can distinguish
-        them -- the Windows shard is the real verification, and it caught this
-        exact bug: every allowlist entry reported "no longer violates" while
-        every real site reported as new.
+        them -- the Windows shard is the real verification: a backslash key
+        matches no real site, so the entry reads as already-clean while every
+        real site reports as new.
         """
         bad = [key for key in checker.KNOWN_UNCONVERTED if "\\" in key]
         assert not bad, f"KNOWN_UNCONVERTED keys must use forward slashes: {bad}"
@@ -703,9 +765,8 @@ class TestTheRealTree:
 
         The enforcement lives in ``main()`` (``entry[1] == expr``), so this runs a
         real file through it: one function, the tracked violation plus a second
-        unrelated one. An earlier version of this test only compared two dict
-        entries and never invoked the scanner at all, so it asserted nothing
-        about the property it claimed to pin (First Principles review, #5348).
+        unrelated one. Comparing two dict entries without invoking the scanner
+        would assert nothing about the property this pins.
         """
         fixture = tmp_path / "writer.py"
         fixture.write_text(
@@ -716,11 +777,10 @@ class TestTheRealTree:
             "    other.chmod(0o600)\n",
             encoding="utf-8",
         )
-        # `scan_path` keys a file outside the repo by its absolute posix path.
         monkeypatch.setattr(
             checker,
             "KNOWN_UNCONVERTED",
-            {f"{fixture.as_posix()}::save": ("#9999", "tracked")},
+            {_waiver_key(fixture, "save"): ("#9999", "tracked")},
         )
 
         exit_code = checker.main(["check", str(fixture)])
@@ -748,7 +808,7 @@ class TestTheRealTree:
         monkeypatch.setattr(
             checker,
             "KNOWN_UNCONVERTED",
-            {f"{fixture.as_posix()}::save": ("#9999", "tracked")},
+            {_waiver_key(fixture, "save"): ("#9999", "tracked")},
         )
 
         assert checker.main(["check", str(fixture)]) == 0
@@ -756,7 +816,7 @@ class TestTheRealTree:
 
 # ─── behavioural probes: ORDER at the live writers ──────────────────────────
 #
-# Technique from PR #5314 (@leonlaiyc): patch the lockdown helper and record
+# Technique: patch the lockdown helper and record
 # whether the FINAL path already exists when it runs. That is a property both
 # platforms must satisfy, unlike a final-mode assertion.
 

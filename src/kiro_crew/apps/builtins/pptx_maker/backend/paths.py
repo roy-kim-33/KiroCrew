@@ -29,6 +29,7 @@ import os
 import re
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.security import is_sensitive_path, redact
 
@@ -71,9 +72,29 @@ def engine_root() -> Path:
     return app_root() / "vendor" / _ENGINE_DIRNAME
 
 
+def venv_python(root: Path) -> Path:
+    """The engine venv's interpreter inside *root*, in this platform's venv layout.
+
+    The single authority for this path. ``uv`` puts the interpreter under ``bin/``
+    on POSIX and under ``Scripts/`` (as ``python.exe``) on Windows, and three
+    callers need the answer: the readiness probe, the editable-skill install and
+    the preview-tool launcher. Root-parameterized because provisioning asks it of
+    a STAGED tree as well as the live one.
+
+    Not a cosmetic branch: with the POSIX literal hardcoded, every Windows
+    readiness probe reported "no venv" and the editable install was handed an
+    interpreter path that does not exist, so provisioning could never succeed —
+    and one caller had already grown a private Windows workaround instead.
+    """
+    venv = root / "mcp-local" / ".venv"
+    if platform_compat.IS_WINDOWS:
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
+
 def engine_python() -> Path:
-    """The engine venv's interpreter (created by the provision script)."""
-    return engine_root() / "mcp-local" / ".venv" / "bin" / "python"
+    """The live engine venv's interpreter (created by the provision script)."""
+    return venv_python(engine_root())
 
 
 def preview_tools_root() -> Path:
@@ -132,11 +153,21 @@ def deck_root() -> Path:
     """
     override = os.environ.get(DECK_ROOT_ENV)
     if override:
-        return Path(override).expanduser().resolve()
+        resolved = Path(override).expanduser().resolve()
+        logger.debug("deck root: from %s override -> %r", DECK_ROOT_ENV, resolved)
+        return resolved
     configured = read_engine_config().get("output_dir")
     if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser().resolve()
-    return (Path.home() / ENGINE_DEFAULT_DECK_ROOT).resolve()
+        resolved = Path(configured.strip()).expanduser().resolve()
+        logger.debug("deck root: from engine config output_dir -> %r", resolved)
+        return resolved
+    # POSIX-oriented default: expands the user home and a relative sub-path. On
+    # Windows Path.home() and the separator differ, so logging which branch
+    # produced the root tells a reader whether this fallback ran or a configured
+    # value won — the resolution left no such signal before.
+    resolved = (Path.home() / ENGINE_DEFAULT_DECK_ROOT).resolve()
+    logger.debug("deck root: from home default -> %r", resolved)
+    return resolved
 
 
 def _contained(candidate: Path, root: Path) -> Path | None:

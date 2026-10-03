@@ -1,5 +1,6 @@
 import React from 'react'
 import { useLocation, useNavigate, useNavigationType } from 'react-router-dom'
+import { arrivedByFreshNavigation, isTrapEntry, routerEntry, type TrapEntryState } from '../lib/routeHistoryPosition'
 
 /** The mounted page's answer to "may I navigate away from you?". `true` allows
  *  the navigation, `false` keeps the user exactly where they are. */
@@ -13,7 +14,7 @@ type Channel = {
    *  Back guard needs to know there is something at stake before the user
    *  presses anything, and asking to find out would pop a confirm over a
    *  keystroke. */
-  publishStake: (atStake: boolean) => void
+  publishStake: (atStake: boolean, publisher: object) => void
   subscribeStake: (listener: (atStake: boolean) => void) => () => void
 }
 
@@ -54,32 +55,55 @@ const NavigationLeaveGuardContext = React.createContext<Channel | null>(null)
  * the draft so no exit destroys it — is tracked in #8010.
  */
 export function NavigationLeaveGuardProvider({ children }: { children: React.ReactNode }) {
-  // One slot, not a registry: exactly one page is on screen at a time, so two
-  // simultaneous registrants cannot exist. Cleanup is identity-checked, which
-  // is what stops an outgoing page's unmount from clearing the incoming page's
-  // guard if the two ever interleave.
-  const guard = React.useRef<NavigationLeaveGuard | null>(null)
+  // A SET, not one slot. One page is on screen at a time, but a page can hold two
+  // surfaces that each own a draft -- the Crewmates page holds the New crewmate dialog
+  // and the side panel's Schedules create form -- and a single slot made the second
+  // registrant silently clobber the first, so whichever mounted last was the only draft
+  // still protected. Each registration removes only its own entry on cleanup, so an
+  // outgoing surface cannot clear an incoming one's guard.
+  const guards = React.useRef(new Set<NavigationLeaveGuard>())
   // Kept in refs and pushed to listeners rather than held in state: the answer
   // flips on the keystroke that first dirties a draft, and state here would
   // re-render the whole app under this provider to tell one listener.
   const stake = React.useRef(false)
+  // Who is currently holding work. A set rather than one boolean for the reason spelled
+  // out on `publishStake` below.
+  const stakeHolders = React.useRef(new Set<object>())
   const stakeListeners = React.useRef(new Set<(atStake: boolean) => void>())
   const channel = React.useMemo<Channel>(() => ({
     register: g => {
-      guard.current = g
-      return () => { if (guard.current === g) guard.current = null }
+      guards.current.add(g)
+      return () => { guards.current.delete(g) }
     },
     // A page with nothing at stake registers no guard and this is a bare
     // `true`. The guard may show a confirm, so callers must only ever ask from
     // an event handler — never during render.
-    ask: () => guard.current?.() !== false,
-    publishStake: atStake => {
-      if (stake.current === atStake) return
-      stake.current = atStake
+    //
+    // Every registered guard is asked and one `false` vetoes, but asking STOPS at
+    // that first refusal: each guard may raise its own confirm, and a user who
+    // has already said "stay" must not then be asked about a second draft for a
+    // navigation that is no longer going to happen. Iterated over a copy, since a
+    // guard's own confirm can unmount a surface and mutate the set.
+    ask: () => {
+      for (const g of [...guards.current]) {
+        if (g() === false) return false
+      }
+      return true
+    },
+    // Per PUBLISHER, for the same reason `register` keeps a set: one page can hold two
+    // drafts, and with a single shared boolean whichever surface published `false` last
+    // disarmed the Back guard for the other one's still-typed draft. The channel's answer
+    // is whether ANY publisher is holding work.
+    publishStake: (atStake, publisher) => {
+      if (atStake) stakeHolders.current.add(publisher)
+      else stakeHolders.current.delete(publisher)
+      const next = stakeHolders.current.size > 0
+      if (stake.current === next) return
+      stake.current = next
       // Iterated over a copy: a listener may unsubscribe from inside its own
       // callback, and mutating the live set mid-iteration would skip the next
       // listener.
-      for (const listener of [...stakeListeners.current]) listener(atStake)
+      for (const listener of [...stakeListeners.current]) listener(next)
     },
     subscribeStake: listener => {
       stakeListeners.current.add(listener)
@@ -121,16 +145,23 @@ export function useRegisterNavigationLeaveGuard(guard: NavigationLeaveGuard) {
  * earlier — before any gesture — so it can arm itself while there is something
  * to lose and stay completely out of the history stack while there is not. A
  * page that registers a guard but publishes no stake keeps its old behaviour:
- * every wired in-app exit asks, and Back does not.
+ * every wired in-app exit asks, and Back does not — which is why a surface
+ * holding a draft should publish, not merely register. Each caller is its own
+ * publisher, so two surfaces on one page cannot disarm each other.
  */
 export function usePublishNavigationStake(atStake: boolean) {
   const channel = React.useContext(NavigationLeaveGuardContext)
-  React.useEffect(() => { channel?.publishStake(atStake) }, [channel, atStake])
+  // Identity for this caller, stable across renders — the channel keys the set on it.
+  const self = React.useRef({})
+  React.useEffect(() => { channel?.publishStake(atStake, self.current) }, [channel, atStake])
   // Unmount-only, and deliberately NOT folded into the effect above, whose
   // cleanup also runs on every flip of `atStake`: a page that is gone holds
   // nothing, and leaving its last `true` published would keep the Back guard
   // armed for a draft that no longer exists.
-  React.useEffect(() => () => { channel?.publishStake(false) }, [channel])
+  React.useEffect(() => {
+    const id = self.current
+    return () => { channel?.publishStake(false, id) }
+  }, [channel])
 }
 
 const ALWAYS_MAY_LEAVE = () => true
@@ -191,45 +222,55 @@ export function useGuardedLeave(): (perform: () => void | Promise<void>, to?: st
   }, [mayLeave, isCurrentUrl])
 }
 
-/**
- * The router state a history entry this guard minted carries.
- *
- * The marker is what makes such an entry recognisable when its location is read
- * back — including across a reload, where it is the only thing that survives to
- * identify one. Declared as a TYPE with an identifier key rather than a string
- * constant: the key is a router contract no user ever reads, and spelling it as a
- * quoted literal would make the i18n gate charge it as untranslated copy.
- */
-type TrapEntryState = { __navigationLeaveTrap?: true }
+/* `TrapEntryState` / `isTrapEntry` live in `lib/routeHistoryPosition.ts`: the
+ * arrows' position store must recognise a trap duplicate too (a trap is never a
+ * Forward destination), and the lib is the leaf of this import edge. */
 
-const isTrapEntry = (state: unknown): boolean =>
-  !!(state && typeof state === 'object' && (state as TrapEntryState).__navigationLeaveTrap === true)
-
-/**
- * The router's own per-entry bookkeeping, read straight from the platform.
- *
- * Not from a render: `popstate` fires BEFORE React commits the new location, so
- * a rendered value still describes the entry the user just left. `idx` is
- * react-router's stack position and `usr` the state a navigation carried.
- */
-const routerEntry = (): { idx: number | null; state: unknown } => {
-  const raw = window.history.state as { idx?: unknown; usr?: unknown } | null
-  return { idx: typeof raw?.idx === 'number' ? raw.idx : null, state: raw?.usr }
-}
+/* The per-entry `history.state` reader is shared with the arrows' position
+ * store — `routerEntry` in `lib/routeHistoryPosition.ts` is the one spelling of
+ * that react-router-internal shape. Reads here still happen at event time, not
+ * from a render: `popstate` fires BEFORE React commits the new location, so a
+ * rendered value would describe the entry the user just left. */
 
 /** The whole address, the way this guard compares two entries. */
 const addressOf = (l: { pathname: string; search: string; hash: string }): string =>
   l.pathname + l.search + l.hash
 
-/** Did this document arrive by a plain navigation, rather than a reload or a
- *  Back/Forward into it? Only then is the entry it landed on known to be the TOP
- *  of the stack — a navigation truncates, a reload preserves whatever was above.
- *  Absent timing data answers "unknown", never "yes". */
-const arrivedByFreshNavigation = (): boolean => {
-  try {
-    const entries = performance.getEntriesByType('navigation') as { type?: string }[]
-    return entries[0]?.type === 'navigate'
-  } catch { return false }
+/* `arrivedByFreshNavigation` lives in `lib/routeHistoryPosition.ts` — the arrows'
+ * position store needs the same arrival distinction to decide whether a
+ * persisted Forward watermark is still true. */
+
+/**
+ * Step through the app's own history (the top-bar Back/Forward arrows and the
+ * ⌘/Ctrl+←/→ chords), asking the page on screen first when nothing else will.
+ *
+ * A history step is a POP, and a pop is the one navigation `useGuardedLeave`
+ * must NOT wrap unconditionally: while `NavigationBackGuard` has a trap armed,
+ * the pop lands on the trap's own duplicate entry and the guard asks THERE —
+ * an up-front ask would stack a second confirm on the same click. But the trap
+ * is best-effort by design (it stays out of the stack while the user has a
+ * Forward branch, and after a reload until recalibration — "a gap, not a
+ * loss"), and these controls are in-app surfaces, which are exactly the
+ * callers the provider contract says must ask. So: ask up front precisely when
+ * the current entry is NOT a trap duplicate — when it is, the pop is already
+ * guarded and the ask is deferred to it. Forward pops are never trap-guarded,
+ * but a trap entry can only be the current entry while it is the TOP of the
+ * stack (it is pushed, and a later push replaces it as this guard's concern),
+ * so Forward from one is unreachable and the same predicate serves both
+ * directions.
+ */
+export function useGuardedHistoryStep(): (delta: -1 | 1, onStep?: () => void) => void {
+  const navigate = useNavigate()
+  const mayLeave = useMayLeaveForNavigation()
+  return React.useCallback((delta: -1 | 1, onStep?: () => void) => {
+    // Read at click time, from the platform — the trap is pushed and consumed
+    // outside React's render cycle, so a rendered value could be stale.
+    if (!isTrapEntry(routerEntry().state) && !mayLeave()) return
+    // Runs only once the step is allowed, so work tied to the step (a timed
+    // one-shot) neither starts during the confirm nor leaks from a veto.
+    onStep?.()
+    navigate(delta)
+  }, [navigate, mayLeave])
 }
 
 /**

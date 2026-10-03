@@ -1,14 +1,12 @@
 """Exception safety of the deferred-note flush, at every seam that calls it.
 
-``slot.flush_deferred_notes()`` is called at four seams. Every one of them is a
+``slot.flush_deferred_notes()`` is called at three seams. Every one of them is a
 bare statement whose *following* code is what frees the slot, so a raise inside
 the flush does not merely delay a held note -- it skips that cleanup:
 
 * ``_start_next_queued_turn`` -- the successor turn is never dispatched.
 * ``_finish_queue_cycle`` -- ``append("done")`` / ``chat_done`` never run, so
   ``slot.task`` stays non-None and the UI spinner never clears.
-* ``_stage_loop``'s ``finally`` -- same wedge, and because the flush sits inside
-  a ``finally`` a raise there also replaces any in-flight exception.
 * the bulk-cleanup close path -- the slot has already been ``pop``ed from
   ``state._slots`` and the archive save below is skipped, so the transcript is
   lost outright.
@@ -202,54 +200,11 @@ class TestSeam2FinishQueueCycle:
             # has restored the data-home environment.
             patch.object(chat_runner, "generate_session_summary", new=AsyncMock()),
         ):
-            chat_runner._finish_queue_cycle(state, slot)
+            await chat_runner._finish_queue_cycle(state, slot)
             await asyncio.sleep(0)
 
         assert any(m.get("role") == "done" for m in slot.messages), "no done row => wedge"
         assert slot.task is None, "slot.task left set => the UI spinner never clears"
-        assert any(
-            c.args and c.args[0] == "chat_done" for c in state.broadcast_ws.call_args_list
-        ), "chat_done never broadcast => wedge"
-
-
-# ---------------------------------------------------------------------------
-# Seam 3 -- _stage_loop's finally
-# ---------------------------------------------------------------------------
-
-
-class TestSeam3StageLoopFinally:
-    @pytest.mark.asyncio
-    async def test_a_flush_raise_in_the_finally_still_closes_the_slot(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """A raise inside a ``finally`` skips the rest of it AND masks any
-        in-flight exception, so this is the worst-placed of the three."""
-        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
-        from kiro_crew.dashboard.chat import _stage_loop
-
-        state = MagicMock()
-        state.broadcast_ws = MagicMock()
-        state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
-
-        slot = _ChatSlot("stage-flush-guard", mode="orchestrator")
-        slot._titled = True
-        slot._stage_titles = ["A"]
-        slot._orch_tracker = None
-
-        async def _noop(s, sl, msg, **kw):
-            return None
-
-        monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator._run_chat", _noop)
-
-        with patch.object(type(slot), "flush_deferred_notes", _raising_flush()):
-            await _stage_loop(state, slot, auto_run=True)
-
-        assert slot._in_stage_execution is False
-        assert any(m.get("role") == "done" for m in slot.messages), "no done row => wedge"
-        assert slot.task is None, "slot.task left set => the slot is wedged"
         assert any(
             c.args and c.args[0] == "chat_done" for c in state.broadcast_ws.call_args_list
         ), "chat_done never broadcast => wedge"

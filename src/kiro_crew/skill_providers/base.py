@@ -82,6 +82,23 @@ class SkillSearchResult:
     """Install/download count reported by the provider (0 = unknown)."""
 
 
+@dataclass(frozen=True)
+class SkillProviderOutcome:
+    """Outcome of one provider leg in a skill catalog search."""
+
+    name: str
+    status: str
+    """One of ``ok``, ``timeout``, or ``error``."""
+
+
+@dataclass(frozen=True)
+class SkillSearchResponse:
+    """Merged search results plus one outcome for every attempted provider."""
+
+    results: list[SkillSearchResult]
+    provider_outcomes: list[SkillProviderOutcome]
+
+
 @runtime_checkable
 class SkillProvider(Protocol):
     """Protocol for skill discovery providers.
@@ -124,6 +141,27 @@ class SkillProvider(Protocol):
         return False when not configured, so the registry can skip them.
         """
         ...
+
+    # ---- optional methods ------------------------------------------------
+    #
+    # Neither is part of the structural check: the discover handler probes for
+    # them with ``getattr``/``hasattr``, so a provider that omits both is a
+    # complete provider. They are documented here because a provider author
+    # cannot otherwise discover that they exist.
+    #
+    # ``fetch_skill_bundle(skill_id) -> list[tuple[str, str]] | None``
+    #     Every file of the skill as ``(relative_path, content)``, not just the
+    #     instruction file. Preferred by both preview and install when present;
+    #     ``fetch_skill_content`` is the single-file fallback.
+    #
+    # ``install_slug(skill_id) -> str``
+    #     The provider's own local key for a skill, used when the default
+    #     ``_slugify(skill_id)`` is not injective over that provider's ids --
+    #     slugify lowercases and folds ``/``, ``@`` and ``:`` onto ``-``, so two
+    #     distinct case-sensitive addresses can otherwise share one key and one
+    #     install overwrites the other skill. The returned value is still
+    #     slugified and still validated as a single safe path segment, so this
+    #     names a key, it does not widen what a key may be.
 
 
 class ProviderRegistry:
@@ -182,54 +220,78 @@ class ProviderRegistry:
         provider: str | None = None,
         limit: int = 20,
     ) -> list[SkillSearchResult]:
-        """Fan-out search across all available providers (or a specific one).
+        """Search while preserving the existing results-only return contract."""
+        return (await self.search_with_outcomes(query, provider=provider, limit=limit)).results
 
-        Results are merged and returned in provider order. Each provider's
-        failures are caught and logged — a single provider timeout does not
-        break the entire search.
+    async def search_with_outcomes(
+        self,
+        query: str,
+        *,
+        provider: str | None = None,
+        limit: int = 20,
+    ) -> SkillSearchResponse:
+        """Search providers and report whether every attempted leg answered.
+
+        Results stay merged in provider order. A timeout or error contributes no
+        rows but remains visible in ``provider_outcomes`` so callers can distinguish
+        an incomplete search from a complete search with zero matches.
         """
-        if provider:
-            p = self._providers.get(provider)
-            if p is None or not provider_available(p):
-                return []
-            try:
-                return _stamp_provenance(
-                    await asyncio.wait_for(
-                        p.search(query, limit=limit), timeout=_SEARCH_TIMEOUT_SECS
-                    ),
-                    provider,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Provider %s timed out for query %r", provider, query)
-                return []
-            except Exception:
-                logger.warning("Provider %s failed for query %r", provider, query, exc_info=True)
-                return []
 
-        # Iterate (key, provider) pairs so failure logs name the vetted
-        # registration key instead of re-reading a provider-controlled
-        # ``name`` property inside an exception handler.
-        available = [(n, p) for n, p in self._providers.items() if provider_available(p)]
-        if not available:
-            return []
-
-        async def _search_one(name: str, p: SkillProvider) -> list[SkillSearchResult]:
+        # The timeout budget, the provenance re-stamp and the two failure
+        # handlers are one contract, so the single-provider request and every
+        # fan-out leg go through this one body: a divergence here would let a
+        # provider's own ``provider`` string survive on one path but not the
+        # other. *name* is the vetted registration key, never a re-read of the
+        # provider-controlled ``name`` property.
+        async def _search_one(name: str, p: SkillProvider) -> SkillSearchResponse:
             try:
-                return _stamp_provenance(
+                results = _stamp_provenance(
                     await asyncio.wait_for(
                         p.search(query, limit=limit), timeout=_SEARCH_TIMEOUT_SECS
                     ),
                     name,
                 )
+                return SkillSearchResponse(
+                    results=results,
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="ok")],
+                )
             except asyncio.TimeoutError:
                 logger.warning("Provider %s timed out for query %r", name, query)
-                return []
+                return SkillSearchResponse(
+                    results=[],
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="timeout")],
+                )
             except Exception:
                 logger.warning("Provider %s failed for query %r", name, query, exc_info=True)
-                return []
+                return SkillSearchResponse(
+                    results=[],
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="error")],
+                )
 
-        results_per_provider = await asyncio.gather(*[_search_one(n, p) for n, p in available])
+        if provider:
+            p = self._providers.get(provider)
+            if p is None or not provider_available(p):
+                return SkillSearchResponse(results=[], provider_outcomes=[])
+            # This path applies no ``[:limit]``: the provider was ASKED for at
+            # most *limit* rows and is trusted to honour it. The fan-out below
+            # re-caps because it merges several providers, not because any one
+            # of them is checked — a provider that ignores *limit* is capped
+            # nowhere on this path.
+            return await _search_one(provider, p)
+
+        # Iterate (key, provider) pairs so failure logs name the vetted
+        # registration key.
+        available = [(n, p) for n, p in self._providers.items() if provider_available(p)]
+        if not available:
+            return SkillSearchResponse(results=[], provider_outcomes=[])
+
+        responses = await asyncio.gather(*[_search_one(n, p) for n, p in available])
         merged: list[SkillSearchResult] = []
-        for results in results_per_provider:
-            merged.extend(results)
-        return merged[:limit]  # total cap matches what the caller asked for
+        outcomes: list[SkillProviderOutcome] = []
+        for response in responses:
+            merged.extend(response.results)
+            outcomes.extend(response.provider_outcomes)
+        return SkillSearchResponse(
+            results=merged[:limit],  # total cap matches what the caller asked for
+            provider_outcomes=outcomes,
+        )

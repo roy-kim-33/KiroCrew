@@ -8,6 +8,7 @@
 // same lightweight mock the sibling ChatPanel suites use.
 vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -31,14 +32,29 @@ vi.mock('../api/client', () => ({
     updateDashboardConfig: updateDashboardConfigMock,
     tipsStatus: tipsStatusMock,
     tipsFeedback: tipsFeedbackMock,
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
-function wrap(ui: React.ReactElement) {
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
+function wrap(ui: React.ReactElement, sub = 'transcript') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 function defer(mock: ReturnType<typeof vi.fn>) {
@@ -67,8 +83,7 @@ describe('ChatPanel — Feature Tips toggle through the overlay', () => {
   it('shows the flip immediately, and a failure rolls back only the tips path', async () => {
     const dTips = defer(tipsFeedbackMock)
     const dDash = defer(updateDashboardConfigMock)
-    wrap(<ChatPanel />)
-    await waitFor(() => expect(tipsToggle()).toBeChecked())
+    wrap(<ChatPanel />, 'composer')
     await waitFor(() => expect(quickSendToggle()).not.toHaveAttribute('aria-disabled'))
     expect(quickSendToggle()).not.toBeChecked()
 
@@ -77,6 +92,9 @@ describe('ChatPanel — Feature Tips toggle through the overlay', () => {
     fireEvent.click(quickSendToggle())
     await waitFor(() => expect(quickSendToggle()).toBeChecked())
 
+    // Feature Tips lives on the Discovery page; panel state survives the switch.
+    fireEvent.click(screen.getByRole('option', { name: 'Discovery' }))
+    await waitFor(() => expect(tipsToggle()).toBeChecked())
     fireEvent.click(tipsToggle())
     // Pre-settle: the toggle reads OFF while only the initial status fetch
     // has run — display comes from the overlay, not a cache write.
@@ -89,6 +107,7 @@ describe('ChatPanel — Feature Tips toggle through the overlay', () => {
     dTips.reject(new Error('boom'))
     await waitFor(() => expect(tipsToggle()).toBeChecked())
     expect(await screen.findByText(/Failed to save tips preference/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('option', { name: 'Composer' }))
     expect(quickSendToggle()).toBeChecked()
 
     dashboardConfigMock.mockImplementation(() =>
@@ -100,7 +119,7 @@ describe('ChatPanel — Feature Tips toggle through the overlay', () => {
 
   it('keeps the refetched opt-out after a successful settle', async () => {
     const dTips = defer(tipsFeedbackMock)
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'discovery')
     await waitFor(() => expect(tipsToggle()).toBeChecked())
     fireEvent.click(tipsToggle())
     await waitFor(() => expect(tipsToggle()).not.toBeChecked())
@@ -124,7 +143,7 @@ describe('ChatPanel — dashboard config through the overlay', () => {
     // save's settle from overwriting the second's display or cache write.
     const d1 = defer(updateDashboardConfigMock)
     const d2 = defer(updateDashboardConfigMock)
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'composer')
     await waitFor(() => expect(quickSendToggle()).not.toHaveAttribute('aria-disabled'))
     expect(quickSendToggle()).not.toBeChecked()
     const mergeToggle = screen.getByRole('switch', { name: 'Merge Queued Messages' })
@@ -155,7 +174,7 @@ describe('ChatPanel — dashboard config through the overlay', () => {
 
   it('a failed dashboard save rolls back its display and reports the failure', async () => {
     const d1 = defer(updateDashboardConfigMock)
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel />, 'composer')
     await waitFor(() => expect(quickSendToggle()).not.toHaveAttribute('aria-disabled'))
     expect(quickSendToggle()).not.toBeChecked()
     fireEvent.click(quickSendToggle())

@@ -1,12 +1,11 @@
 """Infer WHICH subject a monitor instruction is about, from its own text.
 
 The point of this module is that nothing new has to be passed in. A babysit
-instruction already names its subject -- "Babysit PR #7491
+instruction already names its subject -- "Babysit PR #42
 (kirodotdev/KiroCrew, branch ...)" -- so asking the caller to also supply a
-target parameter would add an opt-in, and an opt-in is what the previous
-attempts at this saving died of: the parameter existed, nobody passed it, and
-the measured adoption was zero. Inference has no adoption problem because there
-is nothing to adopt.
+target parameter would add an opt-in, and an opt-in only pays off for the
+callers that remember to pass it. Inference has no adoption problem because
+there is nothing to adopt.
 
 The whole design leans on one asymmetry. Failing to infer costs a loop that
 keeps its existing timer -- today's behaviour, no regression. Inferring the
@@ -21,11 +20,17 @@ import json
 import re
 from dataclasses import dataclass
 
-from kiro_crew.probes import GH_PR
+from kiro_crew.probes import GH_PR, WORK_LEDGER
 
 #: The host a public GitHub URL names, and the ONLY value this module ever pins.
 #: A shorthand subject deliberately gets no host at all -- see :func:`infer`.
 _PUBLIC_HOST = "github.com"
+
+#: ``host_key`` for a subject that has no remote host: a conductor's own work
+#: ledger is on this machine's disk. A distinct token rather than ``"default"``,
+#: which means "whatever the operator's gh is configured for" and would read as a
+#: remote this subject does not have.
+_LOCAL_HOST = "local"
 
 #: ``https://github.com/owner/name/pull/123`` (any host path prefix is refused
 #: by the anchor -- an enterprise host is a different API and a different probe).
@@ -43,18 +48,16 @@ _PR_URL = re.compile(
 #: ``owner/name#123``. NOT a gating source -- see :func:`infer` for why a shorthand
 #: cannot decide a subject -- but still needed to notice that the text names ANOTHER
 #: pull request besides the URL, which is what makes the URL ambiguous rather than
-#: authoritative. Round 23 deleted this pattern outright and that went too far: with
-#: only URLs scanned, "drive owner/name#42; blocked on <URL for #7>" silently gated
-#: on the BLOCKER, so #7 merging retired a loop whose own work was #42.
+#: authoritative. Scanning URLs alone is not enough: with no shorthand scan, "drive
+#: owner/name#42; blocked on <URL for #7>" gates on the BLOCKER, so #7 merging
+#: retires a loop whose own work is #42.
 #:
 #: The lookbehind refuses a PATH fragment. A babysit instruction routinely cites
-#: source locations, and ``src/kiro_crew/autonudge.py#1751`` would otherwise read as
-#: owner ``kiro_crew`` / repo ``autonudge.py`` / PR 1751 -- so it would manufacture
+#: source locations, and ``src/kiro_crew/autonudge.py#91`` would otherwise read as
+#: owner ``kiro_crew`` / repo ``autonudge.py`` / PR 91 -- so it would manufacture
 #: an ambiguity out of a line reference and refuse to gate anything.
 #:
-#: Quantifiers bounded for the same reason as the URL pattern's, and this is the one
-#: CodeQL flagged: it scans arbitrary prose looking for a SECOND reference, so it
-#: reads the whole instruction rather than stopping at a match.
+#: Quantifiers bounded for the same reason as the URL pattern's.
 _PR_SHORTHAND = re.compile(
     r"(?<![A-Za-z0-9._/#-])"
     r"(?P<owner>[A-Za-z0-9._-]{1,39})/(?P<repo>[A-Za-z0-9._-]{1,100})#(?P<pr>\d+)\b"
@@ -71,10 +74,10 @@ _PR_SHORTHAND = re.compile(
 #: once and then relies on it: matching only the first number let the second one
 #: through unseen, so a loop gated on the URL for #42 retired with the work on #7
 #: unfinished. The chain is bounded to ``#N`` separated by a comma, ``and`` or ``&``
-#: -- it stops at the first token that is neither -- so a later unrelated ``#7511``
+#: -- it stops at the first token that is neither -- so a later unrelated ``#88``
 #: elsewhere in the instruction is not swept in.
 _PR_BARE = re.compile(
-    r"\b(?:PRs?|pull requests?)\s*" r"(?P<chain>#\d{1,12}(?:\s*(?:,|and|&)\s*#\d{1,12})*)",
+    r"\b(?:PRs?|pull requests?)\s*(?P<chain>#\d{1,12}(?:\s*(?:,|and|&)\s*#\d{1,12})*)",
     re.IGNORECASE,
 )
 
@@ -100,37 +103,28 @@ class Target:
     host_key: str = "default"
 
 
-def infer(text: str) -> Target | None:
-    """Return the single subject *text* is about, or ``None``.
+def _pull_requests_named(text: str) -> set[tuple[str, str, int]]:
+    """Every distinct pull request *text* names by full URL.
 
-    ``None`` on every doubtful case, and specifically when the text names more
-    than one distinct pull request. That case is common and it is exactly where
-    guessing does damage: a babysit instruction routinely names its own PR *and*
-    a PR it is blocked on ("gated on #4137 merging first"), and a watch armed on
-    the blocker would report the blocker's progress while staying silent about
-    the PR the loop actually owns.
+    ONLY an explicit public pull-request URL gates a loop. A bare
+    ``owner/name#123`` proves neither of the two things this decision needs:
+
+    * not that the subject is a PULL REQUEST -- ``#123`` is equally an issue
+      reference, and a same-numbered pull request may exist and be merged, which
+      would retire a loop that was watching the issue;
+    * not WHICH SERVER it lives on -- a shorthand resolves through the operator's
+      ambient gh configuration, so on an enterprise host the same slug names a
+      different repository.
+
+    Requiring the full URL also narrows what an agent-written message can cause:
+    a credentialed (audited, read-only, fixed-argv) gh call now happens only for
+    a subject the instruction spelled out in full. A shorthand-only instruction
+    is simply not gated, which costs a turn per interval -- today's cost, and the
+    safe direction.
     """
-    if not isinstance(text, str) or not text:
-        return None
-
     found: set[tuple[str, str, int]] = set()
-    # ONLY an explicit public pull-request URL gates a loop. A bare
-    # ``owner/name#123`` was accepted here for several rounds and it proves
-    # neither of the two things this decision needs:
-    #
-    # * not that the subject is a PULL REQUEST -- ``#123`` is equally an issue
-    #   reference, and a same-numbered pull request may exist and be merged, which
-    #   would retire a loop that was watching the issue;
-    # * not WHICH SERVER it lives on -- a shorthand resolves through the operator's
-    #   ambient gh configuration, so on an enterprise host the same slug names a
-    #   different repository. That ambiguity produced three separate review
-    #   findings on its own.
-    #
-    # Requiring the full URL also narrows what an agent-written message can cause:
-    # a credentialed (audited, read-only, fixed-argv) gh call now happens only for
-    # a subject the instruction spelled out in full. A shorthand-only instruction
-    # is simply not gated, which costs a turn per interval -- today's cost, and the
-    # safe direction.
+    if not isinstance(text, str) or not text:
+        return found
     for match in _PR_URL.finditer(text):
         try:
             number = int(match.group("pr"))
@@ -145,6 +139,91 @@ def infer(text: str) -> Target | None:
         if number <= 0:
             continue
         found.add((match.group("owner"), match.group("repo"), number))
+    return found
+
+
+def work_ledger_target(slot_key: str) -> Target | None:
+    """The watch subject for *slot_key*'s OWN work ledger, or ``None``.
+
+    Public because the arming surface and the driver both need the same answer,
+    and because this is the one subject :func:`infer` cannot reach from text.
+
+    A session's own identity is not in its prose. An instruction says "dispatch
+    the queue and verify what comes back" -- the session key is nowhere in it, and
+    no pattern can recover it, so the inference asymmetry the rest of this module
+    relies on does not apply: there is nothing to guess wrong, only nothing to
+    guess. That is why the work-ledger watch is asked for by an explicit field
+    while the pull-request watch is inferred, and it is not an inconsistency to
+    fix by adding a field to the other one: a PR watch has a nameable subject and
+    an opt-in field for it would see the adoption this module's header describes.
+    """
+    key = str(slot_key or "").strip()
+    if not key:
+        return None
+    return Target(
+        kind=WORK_LEDGER,
+        subject=key,
+        host_key=_LOCAL_HOST,
+        message=json.dumps({"conductor": key}),
+    )
+
+
+def names_pull_request(text: str) -> bool:
+    """Whether *text* names a pull request in ANY grammar this module reads.
+
+    Not the URL grammar alone. :func:`infer` SELECTS a subject only from a full URL,
+    but it treats an ``owner/name#123`` shorthand or a bare ``PR #42`` as naming one
+    too -- that is how it notices a second subject and refuses. A caller deciding
+    whether some OTHER string may supply the subject has to use that same wider
+    notion, or the ordinary "Babysit PR #42; blocked on <URL for #7>" instruction
+    reads as naming nothing, the other string's entry is taken, and the subject
+    becomes the BLOCKER -- so #7 merging retires the loop whose work is #42.
+
+    Wider than ``infer(text) is not None`` in the other direction as well: text
+    naming SEVERAL pull requests infers ``None`` while still naming one here, so an
+    ambiguity this module deliberately refuses to resolve cannot be resolved by
+    another string instead.
+
+    Presence only, never selection: a shorthand still carries no host and ``#123`` is
+    still equally an issue reference, so nothing here is a subject a loop can gate
+    on. It answers one question -- is this text talking about a pull request at all.
+    """
+    if _pull_requests_named(text):
+        return True
+    if not isinstance(text, str) or not text:
+        return False
+    if _PR_SHORTHAND.search(text):
+        return True
+    return any(_PR_BARE_NUMBER.search(bare.group("chain")) for bare in _PR_BARE.finditer(text))
+
+
+def infer(text: str, *, watch: str = "", slot_key: str = "") -> Target | None:
+    """Return the single subject *text* is about, or ``None``.
+
+    ``None`` on every doubtful case, and specifically when the text names more
+    than one distinct pull request. That case is common and it is exactly where
+    guessing does damage: a babysit instruction routinely names its own PR *and*
+    a PR it is blocked on ("gated on #7 merging first"), and a watch armed on
+    the blocker would report the blocker's progress while staying silent about
+    the PR the loop actually owns.
+
+    *watch* names a subject kind EXPLICITLY and wins over the text when it is a
+    kind that cannot be inferred. Today that is ``work-ledger`` alone, whose
+    subject is the caller's own session (*slot_key*) -- see
+    :func:`work_ledger_target`. A watch instruction is free to mention a pull
+    request as well, so the explicit field has to take precedence rather than
+    merge: a conductor's instruction that cites the PR its worker is driving
+    still means "watch my ledger", and inferring the PR from it would arm the
+    wrong subject with full confidence. Any other value FALLS THROUGH to the text
+    -- including ``gh-pr``, which is inferrable, so passing a loop's own stored
+    kind back in is always safe and never turns a working watch into ``None``.
+    """
+    if str(watch or "").strip() == WORK_LEDGER:
+        return work_ledger_target(slot_key)
+    if not isinstance(text, str) or not text:
+        return None
+
+    found = _pull_requests_named(text)
 
     # Exactly one subject, or nothing. Ambiguity is not resolved by preferring
     # the first mention: reading order does not tell which PR the loop owns, and
@@ -168,25 +247,29 @@ def infer(text: str) -> Target | None:
         if (other.group("owner"), other.group("repo"), other_number) != (owner, repo, number):
             return None
     # The same argument for the BARE form, which is how a person actually writes it:
-    # "Babysit PR #42; blocked on <URL for #7>" gated on #7, so #7 merging retired a
-    # loop whose real work on #42 was unfinished. Only a DIFFERENT number refuses --
-    # "watch PR #42 <URL for #42>" is one subject named twice, which is the ordinary
-    # phrasing and must keep gating. Over-refusing costs tokens; under-refusing stops
-    # work, so this resolves the way the rest of the design does.
+    # "Babysit PR #42; blocked on <URL for #7>" would otherwise gate on #7, so #7
+    # merging retires a loop whose real work on #42 is unfinished. Only a DIFFERENT
+    # number refuses -- "watch PR #42 <URL for #42>" is one subject named twice, which
+    # is the ordinary phrasing and must keep gating. Over-refusing costs tokens;
+    # under-refusing stops work, so this resolves the way the rest of the design does.
     for bare in _PR_BARE.finditer(text):
         for found_number in _PR_BARE_NUMBER.findall(bare.group("chain")):
             try:
-                if int(found_number) != number:
-                    return None
+                bare_number = int(found_number)
             except ValueError:
                 continue
+            if bare_number != number:
+                return None
     slug = f"{owner}/{repo}"
-    config: dict[str, object] = {"repo": slug, "pr": number}
-    # Always pinned, because the only spelling that reaches here NAMED the host.
-    # The pin stops an ambient ``GH_HOST`` from re-pointing the slug at a
-    # different server, where a same-numbered pull request could be merged and
-    # retire a watch on a live one.
-    config["host"] = _PUBLIC_HOST
+    config: dict[str, object] = {
+        "repo": slug,
+        "pr": number,
+        # Always pinned, because the only spelling that reaches here NAMED the
+        # host. The pin stops an ambient ``GH_HOST`` from re-pointing the slug at
+        # a different server, where a same-numbered pull request could be merged
+        # and retire a watch on a live one.
+        "host": _PUBLIC_HOST,
+    }
     return Target(
         kind=GH_PR,
         subject=f"{slug}#{number}",

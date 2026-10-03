@@ -24,6 +24,18 @@ export interface AgentRow {
   label?: string
   last_tool?: string
   ok?: boolean
+  /**
+   * Wall-clock span between this agent's `agent_started` and `agent_finished`
+   * events, in ms. Derived from the `ts` both events already carry, so no
+   * backend change feeds it.
+   *
+   * Undefined for three distinct cases, all of which must render as "no time"
+   * rather than a zero: the agent is still running, its stream was truncated so
+   * one of the two events is missing, or either `ts` does not parse. A negative
+   * span is also dropped — the wire carries whatever clock the producer had, and
+   * a backwards duration is worse than none.
+   */
+  elapsed_ms?: number
 }
 
 export interface PhaseGroup {
@@ -31,10 +43,41 @@ export interface PhaseGroup {
   agents: AgentRow[]
 }
 
+/**
+ * Whether a run is over. `running` and `paused` are the two active states; any
+ * other status is terminal, and a terminal run has no agent still working in it.
+ */
+export function isTerminalRunStatus(status: string | null | undefined): boolean {
+  return !!status && status !== 'running' && status !== 'paused'
+}
+
+/** How one agent row reads, given the status of the run it belongs to. */
+export type AgentState = 'running' | 'stopped' | 'ok' | 'failed'
+
+/**
+ * Derive an agent's state from its row AND the run status.
+ *
+ * An `ok` of undefined means the stream carries no `agent_finished` for the
+ * agent. While the run is active that is an agent still at work. Once the run
+ * is terminal it cannot be: the runner records no `agent_finished` for work a
+ * cancel or a ceiling cuts off, so the run's status is the only fact the view
+ * has about that agent, and it says the agent was stopped. The same reading
+ * covers a stream truncated before the agent's finish; a stopped mark says
+ * less than a spinner would claim.
+ */
+export function agentState(row: Pick<AgentRow, 'ok'>, runStatus: string | null | undefined): AgentState {
+  if (row.ok === undefined) return isTerminalRunStatus(runStatus) ? 'stopped' : 'running'
+  return row.ok ? 'ok' : 'failed'
+}
+
 /** Fold a run event stream into ordered phases each holding their agent rows. */
 export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
   const phases: PhaseGroup[] = []
   const byId = new Map<string, AgentRow>()
+  // Start instants live here rather than on AgentRow: a consumer needs the span,
+  // not the bookkeeping, and keeping it local means a truncated stream cannot
+  // surface a half-measured row.
+  const startedAt = new Map<string, number>()
   let current = ''
   const ensure = (title: string): PhaseGroup => {
     let p = phases.find(x => x.title === title)
@@ -52,6 +95,8 @@ export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
       // renders, which a lint pass has no business deciding.
       const row: AgentRow = { agent_id: e.data.agent_id as string, label: e.data.label as string | undefined }
       byId.set(e.data.agent_id as string, row)
+      const started = Date.parse(e.ts)
+      if (Number.isFinite(started)) startedAt.set(e.data.agent_id as string, started)
       ensure((e.data.phase as string | undefined) ?? current).agents.push(row)
     } else if (e.type === 'agent_progress') {
       const row = byId.get(e.data.agent_id as string)
@@ -59,6 +104,11 @@ export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
     } else if (e.type === 'agent_finished') {
       const row = byId.get(e.data.agent_id as string)
       if (row) row.ok = !!e.data.ok
+      const started = startedAt.get(e.data.agent_id as string)
+      const finished = Date.parse(e.ts)
+      if (row && started !== undefined && Number.isFinite(finished) && finished >= started) {
+        row.elapsed_ms = finished - started
+      }
     }
   }
   return phases

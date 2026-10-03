@@ -76,6 +76,8 @@ const mockApi = vi.hoisted(() => ({
   createKirocrewAgent: vi.fn(),
   updateKirocrewAgent: vi.fn(),
   deleteKirocrewAgent: vi.fn(),
+  agentCatalog: vi.fn(),
+  members: vi.fn(),
   agentResolvedModel: vi.fn(),
   setDefaultAgent: vi.fn(),
   createChatSlot: vi.fn(),
@@ -154,15 +156,18 @@ function createTestStore() {
 function renderPage() {
   const store = createTestStore()
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
-    <QueryClientProvider client={qc}>
-      <Provider store={store}>
-        <MemoryRouter>
-          <KiroCrewAgentsPage />
-        </MemoryRouter>
-      </Provider>
-    </QueryClientProvider>,
-  )
+  return {
+    ...render(
+      <QueryClientProvider client={qc}>
+        <Provider store={store}>
+          <MemoryRouter>
+            <KiroCrewAgentsPage />
+          </MemoryRouter>
+        </Provider>
+      </QueryClientProvider>,
+    ),
+    queryClient: qc,
+  }
 }
 
 /* The default crew deliberately does NOT point at a workspace or memory store
@@ -202,6 +207,13 @@ beforeEach(() => {
   mockApi.createKirocrewAgent.mockResolvedValue({})
   mockApi.updateKirocrewAgent.mockResolvedValue({})
   mockApi.deleteKirocrewAgent.mockResolvedValue({})
+  mockApi.agentCatalog.mockResolvedValue({
+    agents: [
+      { name: 'kirocrew', selection_kind: 'template' },
+      { name: 'oncall-agent', selection_kind: 'template' },
+    ],
+  })
+  mockApi.members.mockResolvedValue({ members: [] })
   mockApi.setDefaultAgent.mockResolvedValue({})
   mockApi.createWorkspace.mockResolvedValue({ name: 'staging' })
 })
@@ -215,45 +227,45 @@ async function renderRoster(expectCards = 2) {
   return rendered
 }
 
-/** Escape, dispatched where Radix listens for it.
- *
- *  Radix's DismissableLayer binds `keydown` on `document`; the hand-rolled dialog
- *  this page used to render bound it on `window`. An event dispatched directly AT
- *  `window` never passes through `document`, so `fireEvent.keyDown(window, ...)`
- *  is invisible to Radix — it is not a faithful simulation either way, since a
- *  real keypress targets the focused element and bubbles up through both. */
-function pressEscape() {
-  fireEvent.keyDown(document, { key: 'Escape' })
-}
-
 /** A roster card, addressed by the accessible name the card exposes. */
 function crewCard(name: string) {
-  return screen.getByRole('button', { name: `Edit agent ${name}` })
+  return screen.getByRole('button', { name: `Edit crewmate ${name}` })
 }
 
 /** Open the editor dialog on `name` and return the dialog element. */
 async function openEditor(name: string): Promise<HTMLElement> {
   fireEvent.click(crewCard(name))
-  return await screen.findByRole('dialog', { name: `Edit agent ${name}` })
+  return await screen.findByRole('dialog', { name: `Edit crewmate ${name}` })
 }
 
-/** Open the editor dialog in create mode and return the dialog element. */
+/** Open the create dialog (`NewCrewmateDialog`) and return its element. The
+ *  create door opens the Crewmates page's simple dialog, titled "New crewmate". */
 async function openCreate(): Promise<HTMLElement> {
   fireEvent.click(screen.getByTestId('new-crew'))
-  return await screen.findByRole('dialog', { name: 'Create a new agent' })
+  return await screen.findByRole('dialog', { name: 'New crewmate' })
 }
 
 describe('crew editor — collision warning', () => {
-  it('warns as soon as the picker points at a store another crew uses', async () => {
+  it('shows no page-level memory banner above the roster', async () => {
+    // The roster opens on the crewmates themselves; the memory explanation
+    // lives in the create dialog and the per-binding tips, never a page banner.
+    expect(screen.queryByText(/Every named member has its own private Memory V2/)).toBeNull()
+  })
+
+  it('keeps the Global V1 warning when an in-flight workspace overlaps', async () => {
     // Reading the PERSISTED binding here meant the warning only appeared after
     // a save and a reopen — by which point the collision it exists to prevent
     // has already happened.
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [{ ...DEFAULT_CREW, name: 'default', memory_store: 'default' }, OTHER_CREW],
+      default_agent: 'default',
+    })
     await renderRoster()
-    const sheet = await openEditor('oncall')
+    const sheet = await openEditor('default')
     // Both the picker and the warning live on the workspace/memory pane.
     fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
 
-    // oncall starts on its own store, so nothing collides yet.
+    // The ordinary assistant starts on its own workspace and Global V1 store.
     expect(within(sheet).queryByText(/Also used by/)).not.toBeInTheDocument()
 
     // `userEvent`, not `fireEvent`, for a Radix Select inside a Radix Dialog.
@@ -265,12 +277,12 @@ describe('crew editor — collision warning', () => {
     // steps, which is also what a real browser does — the same interaction is
     // proven end-to-end in scripts/verify-crews-dialog-select.mjs.
     const user = userEvent.setup()
-    await user.click(within(sheet).getByRole('combobox', { name: 'Memory Store' }))
-    await user.click(await screen.findByRole('option', { name: 'core-mem' }))
+    await user.click(within(sheet).getByRole('combobox', { name: 'Workspace' }))
+    await user.click(await screen.findByRole('option', { name: 'oncall' }))
 
-    // kirocrew is already on core-mem, so the warning must name it immediately.
+    // The workspace collision appears before saving; memory stays unchanged.
     await waitFor(() =>
-      expect(within(sheet).getByText(/Also used by kirocrew/)).toBeInTheDocument(),
+      expect(within(sheet).getByText(/Also used by oncall/)).toBeInTheDocument(),
     )
     expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
 
@@ -280,53 +292,122 @@ describe('crew editor — collision warning', () => {
     // sharing count with no pill on the node that caused it.
     fireEvent.click(within(sheet).getByTestId('crew-rail-overview'))
     await waitFor(() =>
-      expect(within(sheet).getByTestId('crew-wire-memory')).toHaveTextContent('Shared'),
+      expect(within(sheet).getByTestId('crew-wire-workspace')).toHaveTextContent('Shared'),
     )
-    expect(within(sheet).getByTestId('crew-wire-workspace')).not.toHaveTextContent('Shared')
+    expect(within(sheet).getByTestId('crew-wire-memory')).not.toHaveTextContent('Shared')
+  })
+
+  it('keeps V1 data and cached conversations without an update provisioning action', async () => {
+    const view = await renderRoster()
+    view.queryClient.setQueryData(['member-thread', 'oncall'], { slot_key: 'member-oncall-v1' })
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
+    expect(within(sheet).getByText('This crewmate keeps its current memory (V1). Its own memory (V2) is only available when creating a new crewmate.')).toBeVisible()
+    expect(within(sheet).queryByRole('button', { name: /Create.*memory/i })).toBeNull()
+    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
+    expect(view.queryClient.getQueryData(['member-thread', 'oncall'])).toEqual({ slot_key: 'member-oncall-v1' })
+  })
+
+  it('keeps an existing owned V2 on its immutable store without offering creation', async () => {
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [
+        { ...DEFAULT_CREW, name: 'default', memory_store: 'default' },
+        { ...OTHER_CREW, workspace: 'core-ws', memory_store: 'oncall-mem' },
+      ],
+      default_agent: 'oncall',
+    })
+    mockApi.kirocrewConfig.mockResolvedValue({ memory_stores: {
+      default: {},
+      'oncall-mem': { memory_version: 2, owner_member: 'oncall' },
+    } })
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByRole('tab', { name: 'Workspace · Memory Shared' }))
+    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory Shared' })
+
+    expect(within(panel).getByText('oncall-mem', { exact: true })).toBeVisible()
+    expect(within(panel).getByText('This crewmate has its own memory (V2).')).toBeVisible()
+    expect(within(panel).getByRole('button', { name: 'Manage memory' })).toBeEnabled()
+    expect(within(panel).queryByRole('button', { name: 'Create private memory' })).toBeNull()
+    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['an undeclared named store', {}, 'This member’s configured memory store is unavailable. Inspect the cause on the gateway: kirocrew doctor'],
+    ['a V2 store owned by another member', { 'oncall-mem': { memory_version: 2, owner_member: 'other' } }, 'This member’s configured memory store belongs to another member. It cannot be used here. Inspect the cause on the gateway: kirocrew doctor'],
+  ] as const)('does not present %s as usable V1 or offer a downgrade', async (_case, memoryStores, reason) => {
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [
+        { ...DEFAULT_CREW, name: 'default', memory_store: 'default' },
+        { ...OTHER_CREW, workspace: 'core-ws', memory_store: 'oncall-mem' },
+      ],
+      default_agent: 'oncall',
+    })
+    mockApi.kirocrewConfig.mockResolvedValue({ memory_stores: { default: {}, ...memoryStores } })
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByRole('tab', { name: 'Workspace · Memory Shared' }))
+    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory Shared' })
+
+    expect(within(panel).getByText(reason, { exact: true })).toBeVisible()
+    expect(within(panel).queryByText(/Open the crew manager/i)).toBeNull()
+    expect(within(panel).queryByText(/This crewmate keeps its current memory \(V1\)\. Its own memory \(V2\) is only available when creating a new crewmate\./)).toBeNull()
+    expect(within(panel).queryByRole('button', { name: 'Create private memory' })).toBeNull()
+    expect(within(panel).queryByRole('button', { name: 'Manage memory' })).toBeNull()
+    expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
   })
 })
 
-describe('crew editor — keyboard (via a binding select)', () => {
-  it('gives the nested workspace dialog sole ownership of Escape', async () => {
+describe('crew editor — a registry write re-reads the config snapshot', () => {
+  /* The memory row is the only field on this page that reads `['kirocrewConfig']`
+     rather than the registry: `memberMemoryState` decides it from
+     `kirocrewCfg.memory_stores`. Creating a member writes BOTH records in one
+     config.json write, so a create that invalidates only `['kirocrew-agents']`
+     leaves the pre-write config in cache — the just-created store key is absent
+     from it, and the row reports a store the gateway calls valid as
+     "unavailable … kirocrew doctor". Reported against a member created at 06:48
+     whose store probed `lineage=crew`, owner matching, on the same install whose
+     `kirocrew doctor` printed `valid binding` for it. */
+  it('shows the created member as private V2 instead of unavailable', async () => {
+    // The roster and the config BOTH move with the write. First resolution is
+    // the pre-write world (no such member, no such store); every later one is
+    // the post-write world. Only a second config read can reach it.
+    mockApi.kirocrewAgents
+      .mockResolvedValueOnce(AGENTS_RESPONSE)
+      .mockResolvedValue({
+        agents: [DEFAULT_CREW, OTHER_CREW, {
+          name: 'fix', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'member-fix-1',
+        }],
+        default_agent: 'kirocrew',
+      })
+    mockApi.kirocrewConfig
+      .mockResolvedValueOnce(CONFIG_RESPONSE)
+      .mockResolvedValue({
+        memory_stores: {
+          ...CONFIG_RESPONSE.memory_stores,
+          'member-fix-1': { memory_version: 2, owner_member: 'fix' },
+        },
+      })
+
     await renderRoster()
-    const sheet = await openCreate()
+    const create = await openCreate()
+    fireEvent.change(within(create).getByPlaceholderText('e.g. Radar or Dr. Eggbot'), { target: { value: 'fix' } })
+    // "Built from" defaults to the built-in kirocrew template (the list leads
+    // with it), so no template pick is needed to fire the create.
+    fireEvent.click(within(create).getByRole('button', { name: 'Create crewmate' }))
 
-    fireEvent.click(within(sheet).getByRole('combobox', { name: 'Workspace' }))
-    fireEvent.click(await screen.findByText('+ New workspace…'))
-    const modal = await screen.findByRole('dialog', { name: 'Create Workspace' })
+    await waitFor(() => expect(mockApi.createKirocrewAgent).toHaveBeenCalled())
+    // The dialog invalidates BOTH ['kirocrew-agents'] and ['kirocrewConfig'] in
+    // its own success path, so the memory row's config read is refreshed — not a
+    // window refocus or the server's generic refresh broadcast, which are not
+    // firing here.
+    await waitFor(() => expect(mockApi.kirocrewConfig.mock.calls.length).toBeGreaterThanOrEqual(2))
 
-    // Focus moves INTO the nested layer — Radix's FocusScope owns this, where the
-    // hand-rolled version had to be told to stop trapping. Focus on `body` would
-    // mean Tab walks the obscured page behind both overlays.
-    const active = document.activeElement as HTMLElement
-    expect(active).not.toBe(document.body)
-    expect(modal.contains(active)).toBe(true)
-
-    // While the nested layer is up, the editor beneath is `aria-hidden` and so is
-    // deliberately NOT exposed as a dialog to assistive tech. That is Radix doing
-    // the right thing, and it is why this is asserted through the DOM rather than
-    // by role: the editor must still be MOUNTED (the form is not destroyed) even
-    // though it is hidden from AT.
-    const editorEl = document.querySelector('[aria-label="Create a new agent"]')
-    expect(editorEl).toBeTruthy()
-    expect(editorEl!.closest('[aria-hidden="true"]')).toBeTruthy()
-
-    pressEscape()
-
-    // The inner dialog takes the key; the editor must NOT close underneath it, or
-    // the user loses the whole form to one keypress. Radix's layer stack does this
-    // natively — the old implementation needed a `paused` flag threaded down.
+    const sheet = await openEditor('fix')
+    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
     await waitFor(() =>
-      expect(screen.queryByRole('dialog', { name: 'Create Workspace' })).not.toBeInTheDocument(),
-    )
-    // ...and with the nested layer gone the editor is exposed to AT again.
-    expect(screen.getByRole('dialog', { name: 'Create a new agent' })).toBeInTheDocument()
-
-    // Once the nested dialog is gone the editor owns Escape again.
-    pressEscape()
-    await waitFor(() =>
-      expect(screen.queryByRole('dialog', { name: 'Create a new agent' })).not.toBeInTheDocument(),
-    )
+      expect(within(sheet).getByText('This crewmate has its own memory (V2).')).toBeVisible())
+    expect(within(sheet).queryByText(/configured memory store is unavailable/)).toBeNull()
   })
 })
 

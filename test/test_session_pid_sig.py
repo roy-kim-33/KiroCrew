@@ -36,7 +36,7 @@ def records_from_this_module(caplog, level="ERROR"):
     Nothing about this module had changed.
 
     Scoping by logger name is strictly narrower than scoping by level: these
-    assertions still require an exact count, they just no longer count other
+    assertions still require an exact count, they just do not count other
     people's records as ours.
     """
     return [
@@ -140,7 +140,7 @@ class TestVerify:
 
     def test_tampered_txt_refused(self, cfg):
         """FORGERY: legitimate pair, then the .txt is redirected at another
-        slot — the old signature no longer matches."""
+        slot — the old signature does not match."""
         session_pid_sig.publish_session_pid(4242, SESSION_KEY)
         (cfg / "session_pid_4242.txt").write_text(
             "dashboard:victim", encoding="utf-8"
@@ -205,6 +205,88 @@ class TestVerify:
         assert session_pid_sig.verify_session_pid(4242) == ""
 
 
+class TestMalformedInput:
+    """Every malformed value is an ordinary refusal: ``verify`` never raises.
+
+    The MAC is compared as BYTES. ``hmac.compare_digest`` raises ``TypeError``
+    on a ``str`` holding a non-ASCII character, and ``peer_resolve`` catches only
+    ``OSError``, so a raise here would not be a refusal at all -- it would leave
+    the resolver before the walk could report the mapping it failed to trust.
+    """
+
+    @pytest.mark.parametrize(
+        "sidecar",
+        ["é" * 64, "0" * 63 + "é", "チ", "", "  \n"],
+        ids=["non-ascii", "one-non-ascii-char", "short-non-ascii", "empty", "blank"],
+    )
+    def test_a_sidecar_that_is_not_a_hex_mac_is_refused(self, cfg, sidecar):
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        (cfg / "session_pid_4242.sig").write_text(sidecar, encoding="utf-8")
+        mapping = session_pid_sig.verify_session_pid_mapping(4242)
+        assert mapping.session_key == ""
+        assert mapping.refusal == session_pid_sig.REFUSAL_MALFORMED
+
+    def test_a_sidecar_that_is_not_utf8_is_refused(self, cfg):
+        """A lone surrogate cannot be decoded out of the file, so its encoded
+        bytes make the sidecar unreadable: the same answer as deleting it, which
+        any same-uid process can already do."""
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        lone_surrogate = "\udcff".encode("utf-8", "surrogatepass")
+        (cfg / "session_pid_4242.sig").write_bytes(b"0" * 63 + lone_surrogate)
+        mapping = session_pid_sig.verify_session_pid_mapping(4242)
+        assert mapping.session_key == ""
+        assert mapping.refusal == session_pid_sig.REFUSAL_ABSENT
+
+    @pytest.mark.parametrize(
+        "pid",
+        ["4242\udcff", "4242\ud800", "4242\x00", "", "٤٢"],
+        ids=["escaped-surrogate", "lone-surrogate", "nul", "empty", "non-ascii-digits"],
+    )
+    def test_a_malformed_str_pid_is_refused_by_both_readers(self, cfg, pid):
+        """``pid`` is ``int | str``. A NUL, or a surrogate the filesystem encoding
+        cannot carry, is refused by the path conversion with a ``ValueError``."""
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        assert session_pid_sig.verify_session_pid_mapping(pid).session_key == ""
+        assert session_pid_sig.read_session_pid_mapping(pid).session_key == ""
+        # The good mapping is untouched, so the refusals above are not vacuous.
+        assert session_pid_sig.verify_session_pid(4242) == SESSION_KEY
+
+    def test_a_surrogate_pid_with_a_planted_mapping_is_refused(self, cfg):
+        """Reaches the MAC compute, not only the path: the directory is same-uid
+        writable, so a pair CAN exist at the name a surrogate-bearing pid names,
+        and without one the refusal above stops at the absent-file arm."""
+        pid = "4242\udcff"
+        session_pid_sig.publish_session_pid(4242, SESSION_KEY)
+        try:
+            for ext in ("txt", "sig"):
+                (cfg / f"session_pid_{pid}.{ext}").write_bytes(
+                    (cfg / f"session_pid_4242.{ext}").read_bytes()
+                )
+        except (OSError, ValueError):
+            pytest.skip("this filesystem cannot name a file with a lone surrogate")
+        # The mismatch warning names the pid, and a captured record carrying a
+        # lone surrogate cannot cross the xdist channel back to the controller.
+        with patch.object(session_pid_sig, "logger") as logger:
+            mapping = session_pid_sig.verify_session_pid_mapping(pid)
+        assert mapping.session_key == ""
+        assert mapping.refusal == session_pid_sig.REFUSAL_MALFORMED
+        assert "signature mismatch" in logger.warning.call_args.args[0]
+
+    def test_a_non_ascii_session_key_round_trips_with_plain_utf8_bytes(self, cfg):
+        """Publication signs the bytes verification checks, and they are still
+        plain UTF-8: an independently derived MAC over the strict encoding
+        matches, so every sidecar already on disk keeps verifying."""
+        import hashlib
+        import hmac
+
+        key = "slack:é-チャンネル"
+        session_pid_sig.publish_session_pid(4242, key)
+        assert session_pid_sig.verify_session_pid(4242) == key
+        subkey = hmac.new(b"\x01" * 32, session_pid_sig._SUBKEY_DOMAIN, hashlib.sha256).digest()
+        strict = hmac.new(subkey, f"4242:{key}".encode("utf-8"), hashlib.sha256).hexdigest()
+        assert (cfg / "session_pid_4242.sig").read_text(encoding="utf-8") == strict
+
+
 class TestLenientReader:
     """``read_session_pid_txt`` is the lenient (unsigned) read for callers
     that tolerate misattribution — but it MUST share the strict verifier's
@@ -237,10 +319,10 @@ class TestLenientReader:
 
 
 class TestPidRecycleGuard:
-    """Issue #8343: the mapping and its MAC bound only the pid NUMBER, so a
-    recycled pid kept verifying and answered with the previous owner's
-    session key until the next restart's orphan sweep. Publication now also
-    records the process START TOKEN (``platform_compat.get_process_start_id``
+    """The mapping and its MAC binding only the pid NUMBER let a recycled pid
+    keep verifying and answer with the previous owner's session key until the
+    next restart's orphan sweep. Publication also records the process START
+    TOKEN (``platform_compat.get_process_start_id``
     — the same incarnation identity ``session_pid.py``'s
     ``<gw>:<pid>:<start_token>`` sweep records use), the signature covers it,
     and BOTH readers refuse on a proven mismatch.
@@ -281,6 +363,31 @@ class TestPidRecycleGuard:
             session_pid_sig.publish_session_pid(4242, SESSION_KEY)
             assert session_pid_sig.verify_session_pid(4242) == SESSION_KEY
             assert session_pid_sig.read_session_pid_txt(4242) == SESSION_KEY
+
+    def test_a_recycled_mapping_attests_no_membership(self, cfg):
+        """A proven recycle discards the TENANT SECTION too, not just the key.
+
+        The roster belonged to the pid's previous owner. Carried through the
+        refusal it would still satisfy ``shared`` (``tenant_count > 1``), which
+        is one half of ``peer_resolve``'s stop condition (``session_key or
+        shared``) -- so a mapping this very function disproved would become the
+        peer walk's ANSWER, and ``admits`` would then deny a legitimate caller
+        against a stale roster with a ``peer_session_mismatch`` 403.
+        """
+        with self._live_token("111"):
+            session_pid_sig.publish_session_pid(
+                4242, SESSION_KEY, co_tenants=[SESSION_KEY, "dashboard:chat-8-999"]
+            )
+        with self._live_token("222"):
+            mapping = session_pid_sig.read_session_pid_mapping(4242)
+        assert mapping.refusal == session_pid_sig.REFUSAL_RECYCLED
+        assert mapping.session_key == ""
+        # The three membership answers a stale mapping must not give.
+        assert mapping.shared is False
+        assert mapping.membership_complete is False
+        assert mapping.admits(SESSION_KEY) is False
+        assert mapping.tenants == ()
+        assert mapping.tenant_count == 0
 
     def test_legacy_tokenless_file_still_resolves(self, cfg):
         """BACKWARD COMPATIBILITY: a signed mapping written before the
@@ -433,8 +540,8 @@ class TestDomainSeparation:
 
 class TestTrustRootRecovery:
     """SEL signs from key bytes it cached at init, while this protocol re-reads
-    the file on every call. Since #2588 the shared accessor re-resolves a key
-    that MOVED (a concurrent legacy -> ``trust/`` migration), so what reaches
+    the file on every call. The shared accessor re-resolves a key that MOVED
+    (a concurrent legacy -> ``trust/`` migration), so what reaches
     recovery is the residue no path can resolve: a key deleted, unreadable,
     truncated, or replaced by bytes that are not the anchor. Those would
     otherwise take this protocol down for the life of the process — with a
@@ -513,7 +620,7 @@ class TestTrustRootRecovery:
 
 
 class TestTrustRootRelocationIsFollowed:
-    """#2588 item 1, from the dependent protocol's side.
+    """Trust-root relocation is followed, from the dependent protocol's side.
 
     Deliberately does NOT use the ``cfg`` fixture: that fixture patches
     ``sel_hmac_key_path`` to a fixed path, which is exactly the seam under test.

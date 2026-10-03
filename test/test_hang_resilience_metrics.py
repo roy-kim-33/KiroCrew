@@ -1,5 +1,5 @@
-"""Hang-resilience telemetry — the kirocrew.* series added after the silent
-child-permission hang incidents (issue #3785, PRs #3786/#3889).
+"""Hang-resilience telemetry — the kirocrew.* series for the silent
+child-permission hang class.
 
 Each test drives the REAL production emit site (never a reimplementation)
 with the recorder mocked, so a renamed metric, changed attr enum, or removed
@@ -136,7 +136,7 @@ def test_handle_reject_emits_child_permission_denied(recorded):
 async def test_routed_child_permission_emits_routed(recorded):
     """A child permission request delivered to the owner's queue (the
     mode-parity pipeline) counts as ROUTED — the impact numerator: each one
-    would have been a silent 2h hang before #3786."""
+    would otherwise be a silent 2h hang."""
     rt, reader, _ = _make_runtime()
     queues = _register(rt, "parent-session")
     task = asyncio.ensure_future(rt._reader_loop())
@@ -210,13 +210,15 @@ async def test_subagent_child_reject_emits_denied(recorded):
         sub_session_id="child-a",
     )
     with patch("kiro_crew.subagent.sel"):
-        await SubagentManager._reject_and_log(client, 9, "k", ev, error="child_escalation_limit")
+        await SubagentManager._reject_and_log(
+            client, 9, "k", ev, cause=None, error="child_escalation_limit"
+        )
     hits = [a for n, a in recorded if n == metric_events.CHILD_PERMISSION_DENIED]
     assert {"surface": "subagent", "reason": "child_escalation_limit"} in hits
     # Parent-origin rejections do NOT emit (child series only).
     ev2 = LLMEvent(kind=EVENT_PERMISSION_REQUEST, request_id=10, title="t")
     with patch("kiro_crew.subagent.sel"):
-        await SubagentManager._reject_and_log(client, 10, "k", ev2, error="hook_deny")
+        await SubagentManager._reject_and_log(client, 10, "k", ev2, cause=None, error="hook_deny")
     assert len([a for n, a in recorded if n == metric_events.CHILD_PERMISSION_DENIED]) == 1
 
 

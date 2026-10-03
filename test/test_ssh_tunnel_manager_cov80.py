@@ -4,8 +4,9 @@
 the ssh error classifier. What it leaves unobserved is everything that runs when
 a tunnel goes DOWN, plus the whole SSM error vocabulary:
 
-* ``_port_reachable`` — the one-second loopback probe both the readiness wait and
-  the health loop are built on, in both directions;
+* ``_port_reachable`` — the one-second loopback probe the readiness wait
+  (``_wait_until_ready``) is built on, in both directions; the health loop
+  instead checks ``_forward_alive`` (an end-to-end request through the forward);
 * ``_monitor`` — the unexpected-exit path: it must drain stderr, land ERROR with a
   classified message, and notify the manager's ``on_exit`` seam, while a
   DELIBERATE stop stays silent (no ERROR, no self-heal notification);
@@ -31,6 +32,7 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.instances.ssh_tunnel_manager import (
     TunnelState,
+    _sanitize_banner,
     _SshTunnel,
     _TransportParams,
 )
@@ -143,6 +145,163 @@ class TestPortReachable:
 
         monkeypatch.setattr(asyncio, "open_connection", _accepted)
         assert await _tunnel()._port_reachable() is True
+
+
+class _FakeHealthSession:
+    """An ``aiohttp.ClientSession`` stand-in for ``GET /api/health``.
+
+    ``get_raises`` drives the zombie/dead-forward paths (a bytes-less stall that
+    the client times out on surfaces here as an exception, exactly as it would
+    in ``_forward_alive``'s except arm); ``status`` drives the answered-response
+    paths. Records the requested URL so a test can assert the probe went through
+    the local forward.
+    """
+
+    def __init__(self, *, status: int = 200, get_raises: BaseException | None = None) -> None:
+        self._status = status
+        self._get_raises = get_raises
+        self.requested_url = ""
+
+    def __call__(self, *_a: Any, **_kw: Any) -> "_FakeHealthSession":
+        return self
+
+    async def __aenter__(self) -> "_FakeHealthSession":
+        return self
+
+    async def __aexit__(self, *_a: Any) -> bool:
+        return False
+
+    def get(self, url: str, **_kw: Any) -> Any:
+        self.requested_url = url
+        if self._get_raises is not None:
+            raise self._get_raises
+        status = self._status
+
+        class _Resp:
+            def __init__(self) -> None:
+                self.status = status
+
+            async def __aenter__(self) -> "_Resp":
+                return self
+
+            async def __aexit__(self, *_a: Any) -> bool:
+                return False
+
+        return _Resp()
+
+
+class TestForwardAlive:
+    """``_forward_alive`` — the steady-state end-to-end liveness probe.
+
+    A bare TCP connect is answered by whatever holds the local listening socket,
+    so a zombie SSM forward — ``session-manager-plugin`` alive but relaying
+    nothing — passes ``_port_reachable`` forever and the tunnel is reported
+    CONNECTED while every request through it stalls. ``_forward_alive`` requires
+    a completed ``GET /api/health`` response, which the far end cannot produce
+    when the forward is dead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_zombie_forward_that_never_answers_is_not_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap this probe closes: the connect is accepted, then the far end
+        sends zero bytes and the client times out. That stall must read as NOT
+        alive — a connect-only probe answers True here and misses the zombie
+        entirely."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(get_raises=asyncio.TimeoutError())
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        t = _tunnel()
+        assert await t._forward_alive() is False
+        assert fake.requested_url == "http://127.0.0.1:53997/api/health"
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_forward_that_answers_200_is_alive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=200)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is True
+
+    @pytest.mark.asyncio
+    async def test_a_non_2xx_answer_is_still_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A completed response of ANY status proves the far end sent bytes back,
+        so a non-2xx answer still reads as a live forward and is NOT torn down."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=404)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is True
+
+    @pytest.mark.asyncio
+    async def test_a_fargate_forward_is_probed_at_the_container_liveness_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fargate tunnel (its ``turn_url`` is set) must probe the container's
+        own ``/health``, not the gateway's ``/api/health`` — the container
+        authorises before routing and would log a control deny for every probe
+        aimed at a path it does not serve."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(status=200)
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        t = _tunnel()
+        t.status.turn_url = "http://127.0.0.1:53997/v1/chat/completions"  # marks fargate
+        assert await t._forward_alive() is True
+        assert fake.requested_url == f"http://127.0.0.1:53997{stm.FARGATE_HEALTH_PATH}"
+
+    @pytest.mark.asyncio
+    async def test_a_connection_error_is_not_alive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        fake = _FakeHealthSession(get_raises=OSError(111, "Connection refused"))
+        monkeypatch.setattr(stm.aiohttp, "ClientSession", fake)
+        assert await _tunnel()._forward_alive() is False
+
+    @pytest.mark.asyncio
+    async def test_an_unallocated_port_is_not_alive(self) -> None:
+        """No forward end to probe — a zero port is refused before any request."""
+        t = _SshTunnel("cd-1", "cd-1-alias", 0, 7777)
+        assert await t._forward_alive() is False
+
+    @pytest.mark.asyncio
+    async def test_the_probe_loop_checks_the_forward_end_to_end_not_just_the_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wiring guard: the health loop must consult ``_forward_alive``, not
+        ``_port_reachable``. A zombie whose local socket is bound
+        (``_port_reachable`` True) but whose far end is dead (``_forward_alive``
+        False) has to tear the tunnel down."""
+        from kiro_crew.instances import ssh_tunnel_manager as stm
+
+        monkeypatch.setattr(stm, "_PROBE_INTERVAL", 0.01)
+        called = {"port_reachable": 0, "forward_alive": 0}
+
+        t = _tunnel(probe_failure_threshold=2)
+        t._proc = _FakeProc(returncode=None)
+        t.status.state = TunnelState.CONNECTED
+
+        async def _socket_bound() -> bool:
+            called["port_reachable"] += 1
+            return True  # a zombie: the listener is still bound
+
+        async def _far_end_dead() -> bool:
+            called["forward_alive"] += 1
+            return False  # but nothing traverses to the remote gateway
+
+        t._port_reachable = _socket_bound  # type: ignore[assignment]
+        t._forward_alive = _far_end_dead  # type: ignore[assignment]
+        await asyncio.wait_for(t._probe_loop(), timeout=2)
+        await asyncio.sleep(0.05)
+
+        assert called["forward_alive"] >= 2  # the loop consulted the end-to-end check
+        assert called["port_reachable"] == 0  # never the connect-only check
+        assert t._probe_failed is True
+        assert "health probe failed" in t._exit_error(-15)
 
 
 class TestCaptureStderr:
@@ -434,3 +593,90 @@ class TestTransportParams:
             "aws_profile": "zibble",
             "aws_region": "us-west-2",
         }
+
+
+class TestExitErrorDetailWindow:
+    """The 200-char detail budget must not be spent on benign stderr written
+    BEFORE the classified failure line: under launchd/systemd with no ``TERM``,
+    arbitrary ``LocalCommand`` output (repeated ``tput`` warnings) precedes the
+    real diagnostic, so a head slice surfaces the cosmetic warning while the
+    classifier state is correct. The window must anchor on the matched
+    phrase."""
+
+    # 5 x 45 chars = 225 chars of benign noise, > the 183-char budget remainder.
+    _NOISE = "tput: No value for $TERM and no -T specified\n" * 5
+
+    def test_classified_reason_survives_leading_localcommand_noise(self) -> None:
+        tunnel = _tunnel()
+        tunnel._stderr_buf = self._NOISE + "client_loop: send disconnect: Connection reset by peer"
+        error = tunnel._exit_error(255)
+        assert error.startswith("ssh tunnel transport drop:")
+        assert "Connection reset by peer" in error
+
+    def test_unclassified_stderr_keeps_the_head_slice(self) -> None:
+        tunnel = _tunnel()
+        tunnel._stderr_buf = self._NOISE + "some entirely unclassified failure text"
+        error = tunnel._exit_error(255)
+        assert error.startswith("ssh exited 255: tput: No value for $TERM")
+        assert "unclassified failure" not in error
+
+    def test_ssm_detail_window_is_also_anchored(self) -> None:
+        tunnel = _tunnel(transport="ssm", ssm_target="i-0123456789abcdef0")
+        tunnel._stderr_buf = (
+            "z" * 250 + "\nAn error occurred (TargetNotConnected) when calling StartSession"
+        )
+        error = tunnel._ssm_exit_error(1)
+        assert "not a connected managed node" in error
+        assert "TargetNotConnected" in error
+
+
+class TestSanitizeBannerAnchor:
+    def test_short_text_is_returned_whole(self) -> None:
+        assert _sanitize_banner("short", anchor="connection reset") == "short"
+
+    def test_banner_scrub_is_the_exfil_first_composition(self) -> None:
+        """A long-query exfil URL in a proxy banner loses its WHOLE url.
+
+        The banner buffer is proxy-controlled, and `redact_exfiltration_urls`
+        classifies partly by query length before replacing the entire url — a
+        hand-sequenced creds-first pair here would shorten `?token=<long>`
+        first and defeat it, leaving the destination and payload parameters in
+        the tunnel status detail. The scrub must stay the canonical
+        `security.redact()` composition (the seam `discover.py`'s
+        TestRedactExternalLayerOrder pins).
+        """
+        banner = (
+            "refused: https://collect.attacker.example/?token=" + "aB3" * 70 + "&host=corp-laptop"
+        )
+        out = _sanitize_banner(banner)
+        assert "corp-laptop" not in out
+        assert "?token=" not in out
+
+    def test_no_anchor_takes_the_head(self) -> None:
+        assert _sanitize_banner("a" * 300) == "a" * 200
+
+    def test_anchor_centers_the_window_on_the_matched_line(self) -> None:
+        text = "n" * 250 + "\nError: Connection reset by peer"
+        out = _sanitize_banner(text, anchor="connection reset")
+        assert "Connection reset by peer" in out
+        assert len(out) == 200
+
+    def test_a_long_single_line_still_keeps_the_phrase_in_the_window(self) -> None:
+        """The proxy controls the buffer, so LocalCommand output with no
+        trailing newline can merge onto ssh's diagnostic into one arbitrarily
+        long line; centering on the phrase (not its line) must still surface
+        the reason."""
+        text = "x" * 400 + "client_loop: send disconnect: Connection reset by peer"
+        out = _sanitize_banner(text, anchor="connection reset")
+        assert "Connection reset by peer" in out
+        assert len(out) == 200
+
+    def test_redaction_happens_before_the_window_is_taken(self) -> None:
+        token = "ghp_" + "a1B2" * 9
+        text = "m" * 250 + f"\ntoken {token} then Connection reset by peer"
+        out = _sanitize_banner(text, anchor="connection reset")
+        assert token not in out
+        assert "Connection reset by peer" in out
+
+    def test_a_missing_anchor_falls_back_to_the_head(self) -> None:
+        assert _sanitize_banner("b" * 300, anchor="connection refused") == "b" * 200

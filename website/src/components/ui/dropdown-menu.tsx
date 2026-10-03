@@ -1,13 +1,78 @@
 import * as React from 'react'
 import * as DropdownMenuPrimitive from '@radix-ui/react-dropdown-menu'
 import { cn } from '../../lib/utils'
+import { useCloseOnFileDrag } from '../../hooks/useCloseOnFileDrag'
+import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
+import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from './phoneSubmenu'
 
-const DropdownMenu = DropdownMenuPrimitive.Root
+type DropdownMenuProps = React.ComponentProps<typeof DropdownMenuPrimitive.Root>
+
+/**
+ * Radix `DropdownMenu.Root`, plus two rules.
+ *
+ * Non-modal by default on touch devices. A modal Radix menu sets
+ * `pointer-events: none` on `document.body` while open, so on a phone the
+ * first tap outside the menu only closes it and the control under the finger
+ * never gets the tap; the user has to tap again. Non-modal, Radix dismisses a
+ * touch outside on the tap's own `click`, after the tapped control has handled
+ * it, so one tap closes the menu and activates the control. Without the modal
+ * scroll lock the page behind can scroll; the menu stays anchored to its
+ * trigger while it does, the same as every Popover here. Mouse devices keep
+ * the modal default, and an explicit `modal` prop wins on every device.
+ *
+ * An open modal menu closes the moment a file drag from outside the page
+ * enters the window, so the chat composer's drop zone can receive the drop.
+ * The mechanism is documented on `useCloseOnFileDrag`; `ContextMenu` applies
+ * the same rule.
+ *
+ * Controlled (`open`) and uncontrolled (`defaultOpen`) usage both work: the
+ * close goes through the same path as a click-outside, so `onOpenChange(false)`
+ * fires for callers that track the state themselves.
+ */
+function DropdownMenu({ open: openProp, defaultOpen, onOpenChange, modal: modalProp, ...rest }: DropdownMenuProps) {
+  const isTouch = useIsTouchDevice()
+  const modal = modalProp ?? !isTouch
+  const isControlled = openProp !== undefined
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(defaultOpen ?? false)
+  const open = isControlled ? openProp : uncontrolledOpen
+
+  const handleOpenChange = React.useCallback((next: boolean) => {
+    if (!isControlled) setUncontrolledOpen(next)
+    onOpenChange?.(next)
+  }, [isControlled, onOpenChange])
+  const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
+
+  useCloseOnFileDrag(open && modal, close)
+
+  return <DropdownMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
+}
 const DropdownMenuTrigger = DropdownMenuPrimitive.Trigger
 const DropdownMenuGroup = DropdownMenuPrimitive.Group
 const DropdownMenuPortal = DropdownMenuPrimitive.Portal
-const DropdownMenuSub = DropdownMenuPrimitive.Sub
 const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup
+
+type SubPhoneContextValue = { isPhone: boolean; expanded: boolean; toggle: () => void }
+const DropdownSubPhoneContext = React.createContext<SubPhoneContextValue | null>(null)
+
+const DropdownMenuSub = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Sub>
+>(function DropdownMenuSub({ children, open, defaultOpen, onOpenChange, ...rest }, ref) {
+  const isPhone = useIsTouchDevice()
+  const { expanded, toggle } = usePhoneSubState(open, defaultOpen, onOpenChange)
+  if (isPhone) {
+    return (
+      <DropdownSubPhoneContext.Provider value={{ isPhone: true, expanded, toggle }}>
+        <div ref={ref} className="w-full" {...(rest as React.HTMLAttributes<HTMLDivElement>)}>
+          {children}
+        </div>
+      </DropdownSubPhoneContext.Provider>
+    )
+  }
+  return (
+    <DropdownMenuPrimitive.Sub open={open} defaultOpen={defaultOpen} onOpenChange={onOpenChange} {...rest}>{children}</DropdownMenuPrimitive.Sub>
+  )
+})
 
 const DropdownMenuContent = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Content>,
@@ -47,7 +112,7 @@ const DropdownMenuItem = React.forwardRef<
   <DropdownMenuPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       inset && 'pl-8',
       className
@@ -70,7 +135,7 @@ const DropdownMenuRadioItem = React.forwardRef<
   <DropdownMenuPrimitive.RadioItem
     ref={ref}
     className={cn(
-      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
+      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       className
     )}
@@ -106,38 +171,76 @@ DropdownMenuLabel.displayName = DropdownMenuPrimitive.Label.displayName
 const DropdownMenuSubTrigger = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.SubTrigger>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubTrigger> & { inset?: boolean }
->(({ className, inset, children, ...props }, ref) => (
-  <DropdownMenuPrimitive.SubTrigger
-    ref={ref}
-    className={cn(
-      'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-none transition-colors',
-      'focus:bg-bg-hover data-[state=open]:bg-bg-hover',
-      inset && 'pl-8',
-      className
-    )}
-    {...props}
-  >
-    {children}
-  </DropdownMenuPrimitive.SubTrigger>
-))
+>(({ className, inset, children, onClick, onKeyDown, ...props }, ref) => {
+  const ctx = React.useContext(DropdownSubPhoneContext)
+  if (ctx?.isPhone) {
+    return (
+      <PhoneSubTriggerDiv
+        ref={ref as React.Ref<HTMLDivElement>}
+        inset={inset}
+        expanded={ctx.expanded}
+        onToggle={ctx.toggle}
+        className={className}
+        onClick={onClick as unknown as React.MouseEventHandler<HTMLDivElement> | undefined}
+        onKeyDown={onKeyDown as unknown as React.KeyboardEventHandler<HTMLDivElement> | undefined}
+        {...(props as React.HTMLAttributes<HTMLDivElement>)}
+      >
+        {children}
+      </PhoneSubTriggerDiv>
+    )
+  }
+  return (
+    <DropdownMenuPrimitive.SubTrigger
+      ref={ref}
+      className={cn(
+        'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
+        'focus:bg-bg-hover data-[state=open]:bg-bg-hover',
+        inset && 'pl-8',
+        className
+      )}
+      onClick={onClick as unknown as React.MouseEventHandler<HTMLDivElement> | undefined}
+      onKeyDown={onKeyDown as unknown as React.KeyboardEventHandler<HTMLDivElement> | undefined}
+      {...props}
+    >
+      {children}
+    </DropdownMenuPrimitive.SubTrigger>
+  )
+})
 DropdownMenuSubTrigger.displayName = DropdownMenuPrimitive.SubTrigger.displayName
 
 const DropdownMenuSubContent = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.SubContent>,
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent>
->(({ className, ...props }, ref) => (
-  <DropdownMenuPrimitive.Portal>
-    <DropdownMenuPrimitive.SubContent
-      ref={ref}
-      className={cn(
-        'z-[9999] min-w-[8rem] max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
-        'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
-        className
-      )}
-      {...props}
-    />
-  </DropdownMenuPrimitive.Portal>
-))
+>(({ className, children, ...props }, ref) => {
+  const ctx = React.useContext(DropdownSubPhoneContext)
+  if (ctx?.isPhone) {
+    if (!ctx.expanded) return null
+    return (
+      <PhoneSubContentDiv
+        ref={ref as React.Ref<HTMLDivElement>}
+        className={className}
+        {...(props as React.HTMLAttributes<HTMLDivElement>)}
+      >
+        {children}
+      </PhoneSubContentDiv>
+    )
+  }
+  return (
+    <DropdownMenuPrimitive.Portal>
+      <DropdownMenuPrimitive.SubContent
+        ref={ref}
+        className={cn(
+          'z-[9999] min-w-[8rem] max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto overscroll-contain rounded-lg border border-border bg-bg-elevated p-1 text-text shadow-lg',
+          'data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95',
+          className
+        )}
+        {...props}
+      >
+        {children}
+      </DropdownMenuPrimitive.SubContent>
+    </DropdownMenuPrimitive.Portal>
+  )
+})
 DropdownMenuSubContent.displayName = DropdownMenuPrimitive.SubContent.displayName
 
 export {

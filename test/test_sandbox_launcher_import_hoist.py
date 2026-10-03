@@ -6,7 +6,7 @@ A first-time stdlib import reads module files off disk. The launcher's Steps
 whose LSM restricts unprivileged user namespaces that post-unshare read is
 denied: Ubuntu 24.04 with ``apparmor_restrict_unprivileged_userns=1`` killed
 ``import platform`` at seccomp-install time with ``ModuleNotFoundError``, so
-every sandboxed spawn died inside the launcher (#8151). The isolation probe in
+every sandboxed spawn dies inside the launcher. The isolation probe in
 Auto-Improvement then read that crash as "push is not disabled".
 
 The structural rule these tests pin: every ``import`` in the generated launcher
@@ -28,10 +28,12 @@ calls ``os.getuid()``, absent on Windows.
 from __future__ import annotations
 
 import ast
+import os
 import sys
 
 import pytest
 
+import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.sandbox import _build_launcher_script
 
 pytestmark = pytest.mark.skipif(
@@ -44,6 +46,18 @@ pytestmark = pytest.mark.skipif(
 #: files), so asserting one level could miss an import reintroduced in a branch
 #: another level renders.
 _LEVELS = ("standard", "cc", "strict")
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every test here parses the generated launcher; none is about that probe, and a
+    real ssh spawned from the test process is a host dependency the launcher text
+    must not vary with. Pinned at the module seam ``_build_launcher_script`` reads,
+    so no binary runs.
+    """
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
 
 
 @pytest.fixture(params=_LEVELS, ids=_LEVELS)
@@ -136,13 +150,16 @@ def test_probe_failure_markers_round_trip_against_the_launcher(level: str) -> No
     a launcher failure; each prefix must exist in the generated launcher (and
     the traceback marker must match the launcher's real filename prefix), or
     the list has drifted and real launcher deaths fall back to the misleading
-    push-isolation refusal this pairing exists to prevent (#8151).
+    push-isolation refusal this pairing exists to prevent.
     """
-    import inspect
-
-    import kiro_crew.sandbox as sandbox_mod
     from kiro_crew.apps.builtins.auto_improvement.backend.clone_setup import (
         _LAUNCHER_EXIT_PREFIXES,
+        _LAUNCHER_TRACEBACK_RE,
+    )
+    from kiro_crew.sandbox import (
+        _LAUNCHER_SCRIPT_SUFFIX,
+        _SANDBOX_ARTIFACT_PREFIX,
+        namespace_launcher_script_dir,
     )
 
     script = _build_launcher_script(level)
@@ -151,8 +168,23 @@ def test_probe_failure_markers_round_trip_against_the_launcher(level: str) -> No
             f"probe marker {prefix!r} no longer appears in the generated launcher — "
             "update clone_setup._LAUNCHER_EXIT_PREFIXES together with the launcher"
         )
-    # The traceback-frame marker keys on the launcher's on-disk filename prefix.
-    assert 'prefix=f"kirocrew_sandbox_' in inspect.getsource(sandbox_mod), (
-        "the launcher's tempfile prefix changed — update the traceback regex in "
-        "clone_setup (_LAUNCHER_TRACEBACK_RE) to match"
+    # The traceback-frame marker keys on the launcher's on-disk filename, so this is a
+    # ROUND TRIP against a frame built from the two constants ``namespace_argv``'s
+    # ``mkstemp`` is passed -- never a pin on how ``sandbox.py`` spells that call, which
+    # would fail on any refactor of the writer while real drift went unnoticed.
+    launcher_path = os.path.join(
+        namespace_launcher_script_dir(),
+        f"{_SANDBOX_ARTIFACT_PREFIX}4242_ab12cd{_LAUNCHER_SCRIPT_SUFFIX}",
     )
+    frame = f'  File "{launcher_path}", line 1, in <module>'
+    assert _LAUNCHER_TRACEBACK_RE.search(frame) is not None, (
+        "the launcher's tempfile name no longer matches the traceback regex in "
+        f"clone_setup (_LAUNCHER_TRACEBACK_RE); frame was {frame!r}"
+    )
+    # And it is still a TRACEBACK-frame match, not a bare substring: a repository may
+    # legally be named after the prefix, which puts it in a clone path git echoes.
+    assert _LAUNCHER_TRACEBACK_RE.search(f"fatal: could not read {launcher_path}") is None
+    # The regex is keyed on THAT prefix and not on any crew-looking name, so a frame from
+    # a differently-named file is not classified as a launcher death.
+    other = launcher_path.replace(_SANDBOX_ARTIFACT_PREFIX, "kirocrew_other_")
+    assert _LAUNCHER_TRACEBACK_RE.search(f'  File "{other}", line 1, in <module>') is None

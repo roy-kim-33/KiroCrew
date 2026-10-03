@@ -24,6 +24,7 @@ import asyncio
 import importlib
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import kiro_crew.messaging.dispatch as _pipeline
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN
@@ -51,7 +52,7 @@ class TestSlack:
     def test_release_survives_a_close_failure(self, monkeypatch) -> None:
         """Pre-fix this leaked the semaphore for the whole conversation."""
         monkeypatch.setattr(slack_dispatch, "_get_default_agent", lambda: "")
-        monkeypatch.setattr(slack_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(slack_dispatch, "_hydrate_thread_overrides", AsyncMock(return_value=None))
         monkeypatch.setattr(slack_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(slack_dispatch, "_thread_agents", {})
 
@@ -168,6 +169,11 @@ class TestRatchet:
             pkg.glob("*/transport_dispatch.py")
         )
         assert len(targets) >= 5, f"expected the dispatcher set, found {targets}"
+        # A composed dispatcher's owners (``<channel>/dispatch/``) are read too, so a
+        # close moved out of a facade stays inside this ratchet.
+        owners = sorted(pkg.glob("*/dispatch/*.py"))
+        assert len(owners) >= 8, f"expected telegram's dispatch owners, found {owners}"
+        targets += owners
 
         offenders = {
             str(p.relative_to(pkg)): lines

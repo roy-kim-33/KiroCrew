@@ -32,7 +32,10 @@ import asyncio
 import base64
 import json
 import logging
+import sys
+import threading
 import time
+from pathlib import Path
 from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -56,10 +59,12 @@ from kiro_crew.mcp_gateway.backend import (
     _inject_client_extensions,
     _inject_tenant_meta,
     _is_heartbeat_id,
+    _log_safe_identifier,
     _mcp_apps_enabled,
     _PendingRequest,
     _pump_stderr,
     _strip_caller_meta,
+    _tool_call_error_text,
     _write_json_line,
     send_initialize,
     spawn_backend,
@@ -227,8 +232,8 @@ class TestFrameHelpers:
     def test_strip_caller_meta_also_removes_a_forged_TENANT_block(self) -> None:
         """The nonce decides which namespace an unnamed co-tenant lands in.
 
-        A stub allowed to supply its own would pick a PEER's namespace — #5322's
-        collision chosen instead of accidental — so the nonce is stripped on the
+        A stub allowed to supply its own would pick a PEER's namespace — a chosen
+        collision rather than an accidental one — so the nonce is stripped on the
         same trust boundary as the identity, by the same function, on every
         forwarded frame.
         """
@@ -401,6 +406,46 @@ class TestAttachDetachAndAccounting:
 
 
 class TestForwardFromStub:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_caller", [True, False])
+    async def test_only_admitted_gateway_caller_reaches_backend(self, with_caller) -> None:
+        backend = _make_backend()
+        backend.supports_caller_identity = True
+        caller = (
+            None
+            if not with_caller
+            else CallerContext(
+                session_key="reviewer",
+                from_gateway=True,
+            )
+        )
+        msg = {
+            "method": "tools/call",
+            "id": 23,
+            "params": {
+                "name": "memory_recall",
+                "_meta": {
+                    CALLER_META_KEY: {
+                        "schemaVersion": 1,
+                        "sessionKey": "victim",
+                        "memberMemoryProof": "forged.signature",
+                    },
+                    "progressToken": "visible-progress",
+                },
+            },
+        }
+        await backend.forward_from_stub("s1", msg, caller=caller)
+        meta = _frames(backend)[0]["params"]["_meta"]
+        parsed = CallerContext.from_meta(meta)
+        if caller is None:
+            assert parsed is None
+        else:
+            assert parsed is not None
+            assert parsed.session_key == "reviewer"
+        assert "forged.signature" not in json.dumps(meta)
+        assert meta["progressToken"] == "visible-progress"
+        assert "forged.signature" in json.dumps(msg)
+
     @pytest.mark.asyncio
     async def test_dead_backend_raises_backend_gone(self) -> None:
         backend = _make_backend()
@@ -1768,8 +1813,8 @@ class TestRouteBackendLine:
     async def test_replay_grant_for_a_detached_stub_releases_the_lease(self) -> None:
         """Detach cannot see a sentinel-owned replay pending, so the response
         arm must catch the mid-replay disconnect itself: a grant for a stub
-        that is no longer attached is released, never recorded against the
-        dead UUID (which would pin the lease to a stub that cannot drain it)."""
+        that is already detached is released, never recorded against the dead
+        UUID (which would pin the lease to a stub that cannot drain it)."""
         backend = _make_backend()
         await backend.attach_stub("s1")
         await backend.attach_stub("s2")
@@ -2074,6 +2119,233 @@ class TestRouteBackendLine:
         assert inbox.empty()
 
 
+class TestToolCallFailureLogging:
+    """A failed MCP tool call leaves a greppable trace.
+
+    The metric scores a ``result`` with ``isError: true`` as a failure
+    (``ok: false``), and a WARNING line goes to the gateway log naming the
+    server, tool, session and a truncated error so an operator searching the
+    log for an MCP outage finds the failing call, not just the session's
+    lifecycle lines.
+    """
+
+    @pytest.mark.parametrize(
+        "msg, expected",
+        [
+            # JSON-RPC error: message string is used.
+            ({"error": {"code": -32000, "message": "boom"}}, "boom"),
+            # JSON-RPC error with no message: compact JSON of the error object.
+            ({"error": {"code": -32000}}, '{"code":-32000}'),
+            # String error (some servers send a bare string).
+            ({"error": "nope"}, "nope"),
+            # isError result: text content parts are joined.
+            (
+                {"result": {"isError": True, "content": [
+                    {"type": "text", "text": "IAM role not found"},
+                ]}},
+                "IAM role not found",
+            ),
+            # isError result with no text part: compact JSON fallback.
+            (
+                {"result": {"isError": True, "content": [{"type": "image"}]}},
+                '{"isError":true,"content":[{"type":"image"}]}',
+            ),
+        ],
+    )
+    def test_detects_both_failure_shapes(self, msg, expected) -> None:
+        assert _tool_call_error_text(msg) == expected
+
+    def test_success_and_malformed_return_none(self) -> None:
+        # A settled success.
+        assert _tool_call_error_text({"result": {"content": []}}) is None
+        # isError explicitly false.
+        assert _tool_call_error_text({"result": {"isError": False}}) is None
+        # Malformed frame carrying neither error nor result.
+        assert _tool_call_error_text({"id": 1}) is None
+
+    def test_long_error_is_truncated_and_single_line(self) -> None:
+        text = _tool_call_error_text(
+            {"error": {"message": "x\ny\n" + "A" * 1000}}
+        )
+        assert text is not None
+        assert len(text) <= backend_mod._TOOL_ERROR_LOG_MAX
+        assert "\n" not in text  # newlines collapsed so the log line stays one line
+        assert text.endswith("\u2026")  # ellipsis marks the truncation
+
+    def test_credential_in_error_is_redacted(self) -> None:
+        # A secret in the untrusted server error must not survive into the
+        # breadcrumb (credentials and exfil URLs are redacted before logging).
+        text = _tool_call_error_text(
+            {"error": {"message": "auth failed with key AKIAIOSFODNN7EXAMPLE"}}
+        )
+        assert text is not None
+        assert "AKIAIOSFODNN7EXAMPLE" not in text
+
+    @pytest.mark.asyncio
+    async def test_iserror_result_scored_not_ok_and_warned(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        metrics = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", str(metrics))
+        backend = _make_backend()
+        caller = CallerContext(session_key="cron:f3933807", session_type="cron")
+        await backend.forward_from_stub(
+            "s1", {"method": "tools/call", "id": 1,
+                   "params": {"name": "get_aws_creds"}},
+            caller=caller,
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await backend._route_backend_line(_line({
+                "id": "gw-4242-1",
+                "result": {"isError": True, "content": [
+                    {"type": "text", "text": "IAM role not found: ReadOnly"},
+                ]},
+            }))
+            await _settle(backend)
+
+        # Metric scored the tool failure as not ok.
+        record = json.loads(metrics.read_text().splitlines()[-1])
+        assert record["ok"] is False
+        assert record["method"] == "tools/call"
+
+        # One greppable WARNING naming server, tool, session, error.
+        assert "mcp tool call failed" in caplog.text
+        assert "tool=get_aws_creds" in caplog.text
+        assert "session=cron:f3933807" in caplog.text
+        assert "IAM role not found: ReadOnly" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_jsonrpc_error_scored_not_ok_and_warned(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        metrics = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", str(metrics))
+        backend = _make_backend()
+        await backend.forward_from_stub(
+            "s1", {"method": "tools/call", "id": 1, "params": {"name": "search"}})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await backend._route_backend_line(_line({
+                "id": "gw-4242-1",
+                "error": {"code": -32000, "message": "r5 status: 429"},
+            }))
+            await _settle(backend)
+
+        record = json.loads(metrics.read_text().splitlines()[-1])
+        assert record["ok"] is False
+        assert "mcp tool call failed" in caplog.text
+        assert "r5 status: 429" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_newline_in_tool_name_cannot_forge_a_log_line(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A tool name is caller input; a newline in it must not split the
+        WARNING into a second forged log record."""
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", None)
+        backend = _make_backend()
+        await backend.forward_from_stub(
+            "s1", {"method": "tools/call", "id": 1,
+                   "params": {"name": "evil\nWARNING forged line"}})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await backend._route_backend_line(_line({
+                "id": "gw-4242-1", "error": {"code": -32000, "message": "x"},
+            }))
+            await _settle(backend)
+
+        (rec,) = [r for r in caplog.records if "mcp tool call failed" in r.getMessage()]
+        assert "\n" not in rec.getMessage()
+        assert "tool=evil WARNING forged line" in rec.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_success_scored_ok_and_not_warned(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        metrics = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", str(metrics))
+        backend = _make_backend()
+        await backend.forward_from_stub(
+            "s1", {"method": "tools/call", "id": 1, "params": {"name": "ok_tool"}})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await backend._route_backend_line(_line({
+                "id": "gw-4242-1", "result": {"content": [{"type": "text", "text": "fine"}]},
+            }))
+            await _settle(backend)
+
+        record = json.loads(metrics.read_text().splitlines()[-1])
+        assert record["ok"] is True
+        assert "mcp tool call failed" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_non_tools_call_error_scored_not_ok_but_not_warned(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A JSON-RPC error on a non-tools/call method still scores ok:false
+        (unchanged metric behaviour) but does NOT emit the tool-failure
+        WARNING — the breadcrumb is scoped to tool calls."""
+        metrics = tmp_path / "metrics.jsonl"
+        monkeypatch.setattr(backend_mod, "_METRICS_PATH", str(metrics))
+        backend = _make_backend()
+        await backend.forward_from_stub("s1", {"method": "tools/list", "id": 1})
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await backend._route_backend_line(_line({
+                "id": "gw-4242-1", "error": {"code": -32601, "message": "no"},
+            }))
+            await _settle(backend)
+
+        record = json.loads(metrics.read_text().splitlines()[-1])
+        assert record["ok"] is False
+        assert "mcp tool call failed" not in caplog.text
+
+    def test_stringy_iserror_is_not_a_failure(self) -> None:
+        """``isError`` is scored by strict identity, not truthiness: a server
+        that stringifies the flag (``"isError": "false"``) must not turn a
+        successful call into a logged failure whose own content is dumped."""
+        # Truthy string "false" would pass a bare ``get("isError")`` check.
+        assert _tool_call_error_text(
+            {"result": {"isError": "false", "content": [
+                {"type": "text", "text": "secret-looking body"},
+            ]}}
+        ) is None
+        # Only a real boolean True is a failure.
+        assert _tool_call_error_text(
+            {"result": {"isError": True, "content": [
+                {"type": "text", "text": "real failure"},
+            ]}}
+        ) == "real failure"
+
+    def test_control_characters_are_collapsed_in_error_text(self) -> None:
+        """A terminal escape / NUL / BEL in the untrusted error must not reach
+        the log raw — ``str.split()`` only strips whitespace, so these are
+        filtered by ``isprintable``."""
+        text = _tool_call_error_text(
+            {"error": {"message": "red\x1b[31mtext\x00\x07 end"}}
+        )
+        assert text is not None
+        for ch in ("\x1b", "\x00", "\x07"):
+            assert ch not in text
+        # The non-printable bytes are gone; the printable remainder survives.
+        assert "red" in text and "text" in text and "end" in text
+
+    def test_log_safe_identifier_redacts_and_caps(self) -> None:
+        """A server/tool name is redacted (a credential-shaped name cannot leak)
+        and capped (a long name cannot push structured fields off the line);
+        control characters are collapsed."""
+        # Credential-shaped identifier is redacted.
+        redacted = _log_safe_identifier("tool-AKIAIOSFODNN7EXAMPLE")
+        assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+        # Over-long identifier is capped with an ellipsis.
+        capped = _log_safe_identifier("x" * 500)
+        assert len(capped) <= backend_mod._MCP_IDENT_LOG_MAX
+        assert capped.endswith("\u2026")
+        # Control characters collapsed; empty-after-clean falls back.
+        assert "\n" not in _log_safe_identifier("a\nb")
+        assert _log_safe_identifier("\x00\x1b", fallback="?") == "?"
+
+
 # --- subscription response hardening ----------------------------------------
 
 
@@ -2372,8 +2644,8 @@ class TestSubscriptionResponseHardening:
     async def test_grant_commits_every_rider_before_replies(self) -> None:
         """The coalesced grant commits the forwarder AND every rider before
         any reply: a mid-loop detach that empties the entry would otherwise
-        delete it from the table, stranding later riders in a stale set
-        alias that no longer routes."""
+        delete it from the table, stranding later riders in a stale set alias
+        that routes nowhere."""
         backend = _make_backend()
         s1_inbox = await backend.attach_stub("s1")
         s2_inbox = await backend.attach_stub("s2")
@@ -3329,11 +3601,11 @@ class TestSubscriptionResponseHardening:
 
     @pytest.mark.asyncio
     async def test_respawn_capture_survives_backend_death(self) -> None:
-        """The backend-gone cleanup clears the pending table — previously
-        erasing an in-flight replay's only record, so a replacement dying
-        before its replay responses arrived left the NEXT respawn's capture
-        empty and the subscription permanently dark. Death now preserves the
-        replay-target URIs for the capture. A rekey-evicted replay
+        """The backend-gone cleanup clears the pending table, which is an
+        in-flight replay's only record: erase it and a replacement dying before
+        its replay responses arrive leaves the NEXT respawn's capture empty and
+        the subscription permanently dark. Death preserves the replay-target URIs
+        for the capture. A rekey-evicted replay
         (``replay_stub`` scoped to ``""``) is correctly NOT preserved."""
         backend = _make_backend()
         await backend.attach_stub("s1")
@@ -4072,6 +4344,54 @@ class TestRecycleIfIdle:
         assert await backend.recycle_if_idle() is False
         cast(Any, backend_mod.platform_compat.kill_process_tree_async).assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_a_signal_the_fallback_could_not_deliver_is_audited_failed_not_killed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A kill that was refused all the way down is recorded as a failure, not a kill.
+
+        Both signals were suppressed and the audit still said ``killed`` with
+        the process alive -- the shape the sub-agent and cron reapers record as
+        ``failed``. The pool still drops the backend (no consumer is left); its
+        reason and the audit row name what the signal could not do.
+        """
+        monkeypatch.setattr(
+            backend_mod.platform_compat, "kill_process_tree_async",
+            AsyncMock(side_effect=PermissionError("Operation not permitted")))
+        monkeypatch.setattr(
+            backend_mod.platform_compat, "kill_pid_async",
+            AsyncMock(side_effect=PermissionError("Operation not permitted")))
+        backend = _make_backend()
+        assert await backend.recycle_if_idle() is True
+        audit = cast(Any, backend_mod.SecurityEventLog).return_value.log_api_access
+        audit.assert_called_once()
+        assert audit.call_args.kwargs["outcome"] == "failed", (
+            "the audit says killed for a process the signal left alive: "
+            f"{audit.call_args.kwargs!r}"
+        )
+        assert "; kill failed: PermissionError: Operation not permitted" in (
+            audit.call_args.kwargs["error"]
+        )
+        assert "; kill failed: PermissionError" in (backend.dead_reason or "")
+        assert backend.is_alive is False
+
+    @pytest.mark.asyncio
+    async def test_a_process_gone_before_the_fallback_signal_is_a_kill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: ``ProcessLookupError`` on the fallback means the process is gone -- killed."""
+        monkeypatch.setattr(
+            backend_mod.platform_compat, "kill_process_tree_async",
+            AsyncMock(side_effect=OSError("tree not signalable")))
+        monkeypatch.setattr(
+            backend_mod.platform_compat, "kill_pid_async",
+            AsyncMock(side_effect=ProcessLookupError()))
+        backend = _make_backend()
+        assert await backend.recycle_if_idle() is True
+        audit = cast(Any, backend_mod.SecurityEventLog).return_value.log_api_access
+        assert audit.call_args.kwargs["outcome"] == "killed"
+        assert "kill failed" not in (backend.dead_reason or "")
+
 
 class TestBackgroundTasksAndShutdown:
     @pytest.mark.asyncio
@@ -4474,7 +4794,7 @@ class TestCallMetrics:
 
 
 class TestBackendTmpContainment:
-    """Issue #5064: spawn injects a contained temp dir; shutdown reclaims it."""
+    """Spawn injects a contained temp dir; shutdown reclaims it."""
 
     @pytest.mark.asyncio
     async def test_spawn_contains_temp_under_managed_root(
@@ -4504,31 +4824,209 @@ class TestBackendTmpContainment:
         assert (contained / bt.OWNER_FILENAME).is_file()
 
     @pytest.mark.asyncio
-    async def test_operator_declared_temp_wins(self, fake_spawn, monkeypatch, tmp_path) -> None:
-        # A spec that sets TMPDIR deliberately points a heavy server at
-        # chosen storage; containment must not trade litter for ENOSPC.
-        # Declaration is the CALLER's signal (declared_temp_keys), carried
-        # from the gatewayd closure that knows the declared-env set.
+    async def test_unsealed_declaration_is_honored_verbatim(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
         from kiro_crew.mcp_gateway import backend_tmp as bt
 
         home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setattr(bt, "config_dir", lambda: home)
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", lambda _path: None)
 
         await spawn_backend(
             _pool_key(),
             "/usr/bin/example-mcp",
             [],
-            {"TMPDIR": "/mnt/bigdisk/tmp"},
+            {"tmpdir": "/mnt/bigdisk/tmp"},
+            "/nonexistent-work-dir",
+            declared_temp_keys=("tmpdir",),
+        )
+
+        env = fake_spawn["kwargs"]["env"]
+        assert env["TMPDIR"] == "/mnt/bigdisk/tmp"
+        assert "tmpdir" not in env
+        assert not (home / "run" / "mcp-tmp").exists() or not any(
+            (home / "run" / "mcp-tmp").iterdir()
+        )
+
+    @pytest.mark.asyncio
+    async def test_sealed_declaration_uses_managed_temp_and_warns(
+        self, fake_spawn, monkeypatch, tmp_path, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        declared = str(home / "run" / "custom-tmp")
+        loop_thread = threading.get_ident()
+        classifier_threads: list[int] = []
+
+        def _sealed(_path: str) -> str:
+            classifier_threads.append(threading.get_ident())
+            return "sealed"
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await spawn_backend(
+                _pool_key(),
+                "/usr/bin/example-mcp",
+                [],
+                {"TMPDIR": declared},
+                "/nonexistent-work-dir",
+                declared_temp_keys=("TMPDIR",),
+            )
+
+        env = fake_spawn["kwargs"]["env"]
+        managed = Path(env["TMPDIR"])
+        assert managed.parent == home / "run" / "mcp-tmp"
+        assert env["TMP"] == env["TEMP"] == str(managed)
+        assert declared not in env.values()
+        assert classifier_threads and all(thread != loop_thread for thread in classifier_threads)
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "ignoring spec-declared" in record.getMessage()
+        )
+        assert f"TMPDIR={declared!r}" in warning
+        assert "inside the sandbox-sealed runtime parent" in warning
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="nothing seals run/ on Windows")
+    @pytest.mark.asyncio
+    async def test_real_classifier_refuses_a_sealed_declaration(
+        self, fake_spawn, monkeypatch, tmp_path
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        (home / "run").mkdir(parents=True)
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        monkeypatch.setattr(sandbox_mod, "config_dir", lambda: home)
+        declared = str(home / "run" / "custom-tmp")
+
+        await spawn_backend(
+            _pool_key(),
+            "/usr/bin/example-mcp",
+            [],
+            {"TMPDIR": declared},
             "/nonexistent-work-dir",
             declared_temp_keys=("TMPDIR",),
         )
 
         env = fake_spawn["kwargs"]["env"]
-        assert env["TMPDIR"] == "/mnt/bigdisk/tmp"
-        assert not (home / "run" / "mcp-tmp").exists() or not any(
-            (home / "run" / "mcp-tmp").iterdir()
+        managed = Path(env["TMPDIR"])
+        assert managed.parent == home / "run" / "mcp-tmp"
+        assert declared not in env.values()
+
+    @pytest.mark.asyncio
+    async def test_secret_backed_refusal_never_logs_the_resolved_path(
+        self, fake_spawn, monkeypatch, tmp_path, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        resolved_secret = str(home / "run" / "vault-secret-value")
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", lambda _path: "sealed")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await spawn_backend(
+                _pool_key(),
+                "/usr/bin/example-mcp",
+                [],
+                {"TMPDIR": resolved_secret},
+                "/nonexistent-work-dir",
+                declared_temp_keys=("TMPDIR",),
+                secret_env_keys=("TMPDIR",),
+            )
+
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "ignoring spec-declared" in record.getMessage()
         )
+        assert resolved_secret not in warning
+        assert "TMPDIR='<resolved secret>'" in warning
+
+    @pytest.mark.asyncio
+    async def test_check_failure_uses_managed_temp_and_warns(
+        self, fake_spawn, monkeypatch, tmp_path, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+        from kiro_crew.mcp_gateway import backend_tmp as bt
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setattr(bt, "config_dir", lambda: home)
+        declared = str(home / "run" / "custom-tmp")
+
+        def _raise(_path: str) -> None:
+            raise OSError("classifier unavailable\nFORGED")
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _raise)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await spawn_backend(
+                _pool_key(),
+                "/usr/bin/example-mcp",
+                [],
+                {"TMPDIR": declared},
+                "/nonexistent-work-dir",
+                declared_temp_keys=("TMPDIR",),
+            )
+
+        env = fake_spawn["kwargs"]["env"]
+        managed = Path(env["TMPDIR"])
+        assert managed.parent == home / "run" / "mcp-tmp"
+        assert declared not in env.values()
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "ignoring spec-declared" in record.getMessage()
+        )
+        assert "seal check itself failed" in warning
+        assert "\\nFORGED" in warning
+        assert "\nFORGED" not in warning
+
+    @pytest.mark.asyncio
+    async def test_refusal_allocation_failure_uses_the_platform_default(
+        self, fake_spawn, monkeypatch, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", lambda _path: "sealed")
+        monkeypatch.setattr(
+            backend_mod,
+            "allocate_backend_tmp",
+            MagicMock(side_effect=OSError("disk full")),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.backend"):
+            await spawn_backend(
+                _pool_key(),
+                "/usr/bin/example-mcp",
+                [],
+                {"TMPDIR": "/sealed/temp"},
+                "/nonexistent-work-dir",
+                declared_temp_keys=("TMPDIR",),
+            )
+
+        env = fake_spawn["kwargs"]["env"]
+        assert not [key for key in env if key.upper() in ("TMPDIR", "TMP", "TEMP")]
+        allocation_warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "could not allocate a contained temp dir" in record.getMessage()
+        )
+        assert "platform default" in allocation_warning
+        assert "inherited temp" not in allocation_warning
 
     @pytest.mark.asyncio
     async def test_partial_declaration_strips_competing_ambient_keys(

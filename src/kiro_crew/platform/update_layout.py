@@ -11,6 +11,7 @@ import os
 import re
 from typing import NamedTuple
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.beacon import distribution
 from kiro_crew.config.paths import data_home
 from kiro_crew.platform.update_capability import (
@@ -28,9 +29,10 @@ RELEASE_CHANNELS = ("stable", "insider", "nightly")
 #: to the copy shown for them. Built from the capability module's table so the
 #: CLI and the dashboard cannot show different words for the same state.
 #:
-#: The Linux packages add the package manager that receives the new bytes, which
-#: is the one detail a .deb or .rpm user needs and the shared sentence cannot
-#: carry. The sentence itself still has one source.
+#: The packaged shapes whose updater hands the bytes to a second installer name
+#: it: dpkg, rpm, or the NSIS installer. That is the one detail a .deb, .rpm or
+#: Windows user needs and the shared sentence cannot carry. The sentence itself
+#: still has one source.
 _APP_MANAGED = EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_APP]
 
 
@@ -47,6 +49,7 @@ EXTERNALLY_MANAGED = {
     "appimage": _APP_MANAGED,
     "deb": _app_managed_via("dpkg", ".deb"),
     "rpm": _app_managed_via("rpm", ".rpm"),
+    "nsis": _app_managed_via("the NSIS installer", "Setup .exe"),
     "docker": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_IMAGE],
 }
 
@@ -54,7 +57,7 @@ EXTERNALLY_MANAGED = {
 class InstallLayout(NamedTuple):
     """Describes how this Kiro Crew instance was installed."""
 
-    kind: str  # "git", "wheel", "dmg", "appimage", "deb", "rpm", "docker", or "source"
+    kind: str  # "git", "wheel", "dmg", "appimage", "deb", "rpm", "nsis", "docker", or "source"
     proj: str  # KIROCREW_PROJECT_DIR value (may be empty for non-git)
     is_git: bool
     is_externally_managed: bool
@@ -114,7 +117,7 @@ def release_channel() -> str:
     update check, and ``config_dir()`` is resolve-AND-MAINTAIN -- it refreshes the
     recovery breadcrumb and re-runs the leftover-archive sweep, which can
     ``shutil.rmtree``. Doing that on the event loop as a side effect of asking
-    where a directory is, is issue #1057.
+    where a directory is is the blocking hazard this avoids.
     """
     try:
         raw = (data_home() / "channel").read_text(encoding="utf-8", errors="replace")
@@ -134,7 +137,7 @@ def set_release_channel(channel: str) -> str:
     ``ValueError``; nothing unvalidated ever reaches the file, and
     :func:`release_channel` re-validates on read as defence in depth.
 
-    Written via a temp file + ``os.replace`` so a crash or a full disk cannot
+    Written through :func:`atomic_write` so a crash or a full disk cannot
     leave a half-written channel name behind — a truncated value would silently
     fall back to ``stable`` and move the install off its lane. The byte format is
     ``<channel>\\n``, matching what ``cli.sh`` writes, so the two writers stay
@@ -148,19 +151,7 @@ def set_release_channel(channel: str) -> str:
         raise ValueError(
             f"unknown release channel {channel!r} (expected one of {RELEASE_CHANNELS})"
         )
-    target = data_home() / "channel"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(f"{normalized}\n", encoding="utf-8")
-        os.replace(tmp, target)
-    finally:
-        # A failed replace leaves the temp file behind; an orphan in the data
-        # home would be read by nothing but is still litter.
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    atomic_write(data_home() / "channel", f"{normalized}\n")
     return normalized
 
 

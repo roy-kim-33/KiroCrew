@@ -13,9 +13,12 @@ so the suite skips on native Windows.
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -48,6 +51,7 @@ def _run_cli_with_fake_env(
     with_uv: str | None = None,
     curl_stub: str | None = None,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run cli.sh with a PATH that has NO usable python3 and a recording
     ``curl`` stub. Returns the process result plus the marker directory the
@@ -129,12 +133,10 @@ def _run_cli_with_fake_env(
         )
         stub.chmod(0o755)
 
-    # openssl needs to exist so cli.sh's tool preflight passes and it reaches
-    # the Python block; it is never actually reached in these scenarios, but
-    # `command -v` must find it.
-    openssl = tools / "openssl"
-    openssl.write_text("#!/bin/sh\nexit 0\n")
-    openssl.chmod(0o755)
+    # openssl must be REAL: the trust-root self-check runs before the Python
+    # block (fail-before-network), so these scenarios execute it for the
+    # embedded key before reaching the interpreter ladder under test.
+    _link_real("openssl")
 
     env = {
         # Isolated: ONLY the fake tools dir. No system bin dirs, so no real
@@ -142,6 +144,7 @@ def _run_cli_with_fake_env(
         "PATH": str(tools),
         "HOME": str(tmp_path / "home"),
         "KIROCREW_HOME": str(tmp_path / "data-home"),
+        **(extra_env or {}),
     }
     argv = [str(tools / "sh"), str(CLI_SH), *(extra_args or [])]
     result = run_bounded(argv, env)
@@ -151,7 +154,7 @@ def _run_cli_with_fake_env(
 def test_cli_fails_over_from_a_wedged_interpreter_candidate(tmp_path: Path) -> None:
     """A version-manager shim that never answers must not wedge the install.
 
-    python3.12 is probed FIRST, so a shim that hangs there used to hold
+    python3.12 is probed FIRST, so a shim that hangs there would hold
     _resolve_python forever and leak a spinning orphan per invocation. The probe
     is bounded, so resolution has to reach the usable python3 below it.
     """
@@ -233,51 +236,28 @@ def test_cli_falls_back_to_pinned_uv_when_no_python(tmp_path: Path) -> None:
     assert "Python >=3.12 is required and could not be found or provisioned" in combined
 
 
-def test_cli_uses_installed_uv_before_downloading_one(tmp_path: Path) -> None:
-    """An already-present `uv` on PATH is the user's own trust decision — the
-    installer must drive IT (python install + python find) instead of
-    downloading another copy."""
+def test_cli_never_executes_a_path_uv(tmp_path: Path) -> None:
+    """A `uv` on PATH must NEVER be executed. With managed as the default,
+    every install and update run reaches the provisioning path, and PATH
+    commonly leads with user-writable directories (~/.local/bin) an agent
+    session can write -- a planted shim there would run inside the user's own
+    unattended update. Only the pinned, SHA-256-verified tarball is trusted."""
     uv_marker = tmp_path / "markers" / "uv"
-    fake_python = tmp_path / "tools" / "uv-python"
     uv_stub = (
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{uv_marker}"\n'
-        'case "$*" in\n'
-        f'  *"python find"*) echo "{fake_python}" ;;\n'
-        "esac\n"
         "exit 0\n"
     )
-    result, markers = _run_cli_with_fake_env(
-        tmp_path,
-        with_uv=uv_stub,
-        # The provisioned interpreter must satisfy the same >=3.12 usability
-        # probe as a system one; this stub models the PBS python uv installed.
-        interpreters={
-            "uv-python": (
-                "#!/bin/sh\n"
-                'case "$*" in\n'
-                "  *version_info*) exit 0 ;;\n"
-                "  *--version*) echo 'Python 3.12.0' ;;\n"
-                "  *) exit 0 ;;\n"
-                "esac\n"
-            ),
-        },
-    )
+    result, markers = _run_cli_with_fake_env(tmp_path, with_uv=uv_stub)
 
-    recorded = (markers / "uv").read_text()
-    assert "python install cpython-3.12" in recorded
-    assert "python find cpython-3.12" in recorded
-    # No uv tarball download happened: the only curl traffic (if any) is the
-    # manifest fetch that comes AFTER the python gate passed.
-    curl_marker = markers / "curl"
-    if curl_marker.exists():
-        assert "astral-sh/uv" not in curl_marker.read_text()
-    # The run got PAST the python gate: whatever it fails on later (this
-    # hermetic env cannot satisfy the trust-root/manifest steps), it must not
-    # be the interpreter requirement.
-    combined = result.stdout + result.stderr
-    assert "Python >=3.12 is required" not in combined, combined
-    assert "could not provision a managed Python" not in combined, combined
+    # The planted PATH uv was never invoked ...
+    assert not (markers / "uv").exists(), (
+        "cli.sh executed a uv found on PATH -- the pinned-tarball-only "
+        "trust decision has been lost"
+    )
+    # ... and the pinned tarball download was attempted instead.
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
 
 
 def test_cli_managed_python_flag_skips_system_interpreters(tmp_path: Path) -> None:
@@ -459,6 +439,121 @@ def test_cli_link_removal_never_reaches_a_symlinked_venv(tmp_path: Path) -> None
     assert '[ ! -L "${VENV%/}" ]' in CLI_SH.read_text()
 
 
+def test_cli_restores_the_previous_venv_when_the_wheel_install_fails(
+    tmp_path: Path,
+) -> None:
+    """A venv rebuild is transactional: the working venv is MOVED ASIDE before
+    the fresh build, and a wheel-install failure puts it back. Without this,
+    a default migration that relinks the venv to a different interpreter
+    series and then loses the network at the pip step leaves a venv that
+    cannot import its old site-packages -- the previous install is
+    destroyed by a run that delivered nothing."""
+    ver = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    venv_dir = tmp_path / "crew-venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv_dir)],
+        check=True,
+        cwd=tmp_path,
+    )
+    survivor = venv_dir / "lib" / f"python{ver}" / "site-packages" / "keepme.txt"
+    survivor.parent.mkdir(parents=True, exist_ok=True)
+    survivor.write_text("previous working install")
+
+    # The exact transactional shape cli.sh runs: back up, rebuild, simulate a
+    # failed pip step, restore.
+    script = (
+        f'V="{venv_dir}"; BK=""; '
+        f'if [ -f "$V/pyvenv.cfg" ] && [ ! -L "$V" ]; then '
+        f'BK="$V.pre-rebuild.$$"; mv "$V" "$BK" || BK=""; fi; '
+        f'"{sys.executable}" -m venv --without-pip "$V"; '
+        f"if ! false; then "  # the pip step, failing
+        f'if [ -n "$BK" ] && [ -d "$BK" ]; then '
+        f'rm -rf "$V"; mv "$BK" "$V" && exit 3; fi; exit 4; fi'
+    )
+    result = subprocess.run(["sh", "-c", script], cwd=tmp_path)
+
+    assert result.returncode == 3, "the restore path did not run"
+    assert survivor.read_text() == "previous working install", (
+        "the pre-rebuild venv was not restored after the failed wheel "
+        "install -- the migration is no longer rollback-safe"
+    )
+    assert not list(tmp_path.glob("crew-venv.pre-rebuild.*")), (
+        "the restore left a stray backup tree behind"
+    )
+    # Pin the transactional shape in cli.sh itself.
+    text = CLI_SH.read_text()
+    assert 'mv "$VENV" "$_VENV_BACKUP"' in text, (
+        "cli.sh no longer moves the working venv aside before the rebuild"
+    )
+    assert '_restore_tree "$_VENV_BACKUP" "$VENV"' in text, (
+        "cli.sh no longer restores the pre-rebuild venv on a failed wheel "
+        "install"
+    )
+    # The restore goes through _restore_tree, which refuses to `mv` onto a
+    # path that survived `rm -rf` (the move would nest the backup and read
+    # as a restore that never happened).
+    assert 'mv "$1" "$2"' in text and 'if [ -e "$2" ] || [ -L "$2" ]; then' in text, (
+        "cli.sh's restore helper no longer checks the target is gone before moving"
+    )
+    # The venv-creation step after the move-aside must be guarded too:
+    # under `set -eu` an unguarded `"$PY" -m venv` failure (disk full at
+    # ensurepip time) would exit past the restore and orphan the backup.
+    # The creation runs through the `_run_step` progress wrapper, which
+    # returns the command's own exit status, so the `if !` guard still sees
+    # the failure.
+    venv_guard = re.search(
+        r'if ! _run_step "[^"]*" "[^"]*" "\$PY" -m venv "\$VENV"; then', text
+    )
+    assert venv_guard is not None, (
+        "cli.sh runs venv creation unguarded after the move-aside -- a "
+        "creation failure under set -eu skips the restore and destroys the "
+        "working install"
+    )
+    # A tree already at the backup path (recycled PID) may be the only
+    # WORKING install left by an interrupted earlier run, so it is never
+    # deleted -- the move-aside picks the next free sibling instead.
+    assert 'rm -rf "$_VENV_BACKUP"' not in text[: venv_guard.start()], (
+        "cli.sh deletes whatever sits at the backup path before the "
+        "move-aside -- an interrupted earlier run parks the working venv "
+        "exactly there, so a recycled PID would destroy it"
+    )
+    assert 'while [ -e "$_VENV_BACKUP" ]; do' in text, (
+        "cli.sh no longer steps past an occupied backup path before the "
+        "move-aside -- mv would nest the venv inside the stale tree"
+    )
+
+
+def test_cli_venv_rebuild_preserves_a_stale_backup(tmp_path: Path) -> None:
+    """A tree already sitting at the backup path is a working venv parked by
+    an interrupted earlier run (rename done, restore never reached). With a
+    recycled PID the new run must NOT delete it: it steps to the next free
+    sibling, so both the parked venv and the one being rebuilt survive a
+    second failure."""
+    venv_dir = tmp_path / "crew-venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (venv_dir / "marker").write_text("current")
+
+    script = (
+        f'V="{venv_dir}"; STALE="$V.pre-rebuild.$$"; '
+        f'mkdir "$STALE"; echo parked > "$STALE/marker"; '
+        # The exact path-selection shape cli.sh runs.
+        f'BK="$V.pre-rebuild.$$"; n=0; '
+        f'while [ -e "$BK" ]; do n=$((n + 1)); BK="$V.pre-rebuild.$$.$n"; done; '
+        f'mv "$V" "$BK" || exit 4; '
+        f'[ "$(cat "$STALE/marker")" = parked ] || exit 5; '
+        f'[ "$(cat "$BK/marker")" = current ] || exit 6; '
+        f'[ "$BK" = "$STALE.1" ] || exit 7'
+    )
+    result = subprocess.run(["sh", "-c", script], cwd=tmp_path)
+    assert result.returncode == 0, (
+        f"exit {result.returncode}: the move-aside destroyed or nested into "
+        "the stale backup instead of stepping past it"
+    )
+    backups = sorted(p.name for p in tmp_path.glob("crew-venv.pre-rebuild.*"))
+    assert len(backups) == 2, backups
+
+
 def test_cli_reuses_a_recorded_managed_python_choice(tmp_path: Path) -> None:
     """A completed --managed-python install records its mode; a later run
     WITHOUT the flag must reuse it -- most importantly the re-run that
@@ -518,6 +613,179 @@ def test_cli_system_python_flag_overrides_the_recorded_choice(tmp_path: Path) ->
     curl_marker = markers / "curl"
     if curl_marker.exists():
         assert "astral-sh/uv" not in curl_marker.read_text()
+
+
+_USABLE_PY312_STUB = (
+    "#!/bin/sh\n"
+    'case "$*" in\n'
+    "  *version_info*) exit 0 ;;\n"
+    "  *--version*) echo 'Python 3.12.0' ;;\n"
+    "  *) exit 0 ;;\n"
+    "esac\n"
+)
+
+
+def test_cli_defaults_to_managed_python(tmp_path: Path) -> None:
+    """With no flag, no env value, and no recorded pin, the installer must go
+    for the managed interpreter EVEN THOUGH a usable system python3.12 is on
+    PATH -- managed is the default, not the fallback."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Using a managed Python (the default" in combined
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+
+
+def test_cli_legacy_system_marker_migrates_to_managed(tmp_path: Path) -> None:
+    """A bare `system` marker is what earlier installers recorded for EVERY
+    default install -- it is not an opt-out. Such installs must migrate onto
+    the managed default; only `system-pinned` (written by --system-python)
+    holds an install on the system interpreter."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("system\n")
+
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Reusing the recorded system-python choice" not in combined
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+
+
+def test_cli_system_pinned_marker_stays_on_system(tmp_path: Path) -> None:
+    """A recorded `system-pinned` marker (the --system-python opt-out) must
+    survive a flag-less re-run -- the exact shape `kirocrew update` performs --
+    and never reach for uv."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("system-pinned\n")
+
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    assert "Reusing the recorded system-python choice" in combined
+    assert "Python >=3.12 is required" not in combined, combined
+    curl_marker = markers / "curl"
+    if curl_marker.exists():
+        assert "astral-sh/uv" not in curl_marker.read_text()
+
+
+def test_cli_default_managed_falls_back_to_system_on_provision_failure(
+    tmp_path: Path,
+) -> None:
+    """The managed DEFAULT must not turn a working install path into a hard
+    network dependency: when the uv download fails and a usable system
+    interpreter exists, the run degrades to it with a warning. Only an
+    EXPLICIT managed request (flag / env / recorded pin) fails hard -- that
+    contract is pinned by test_cli_managed_python_flag_skips_system_interpreters."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    # The uv download was attempted (default = managed) ...
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+    # ... failed (recording curl exits 22), and the run degraded to the
+    # system interpreter instead of dying at the python gate.
+    assert "could not provision a managed Python (network?)" in combined
+    assert "Python >=3.12 is required" not in combined, combined
+    # A transient fallback must never freeze into a pin: the fallback branch
+    # writes no python-mode marker, so the next run retries managed.
+    text = CLI_SH.read_text()
+    assert '_write_marker python-mode system-pinned' in text
+    assert '_write_marker python-mode system\n' not in text
+    assert 'PY_MODE_FALLBACK' in text
+
+
+def test_cli_never_executes_a_store_interpreter_directly(tmp_path: Path) -> None:
+    """An interpreter already sitting in the store must NOT be executed or
+    reused by a direct scan: the store lives on an agent-writable disk, so a
+    planted executable there would run inside the user's own unattended
+    update. Interpreters are only ever resolved through the pinned,
+    SHA-256-verified uv binary."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("managed\n")
+    store = tmp_path / "data-home-python" / "cpython-3.12.10-linux" / "bin"
+    store.mkdir(parents=True)
+    executed_marker = tmp_path / "markers" / "store-python-executed"
+    planted = store / "python3.12"
+    planted.write_text(
+        "#!/bin/sh\n"
+        f'printf ran > "{executed_marker}"\n'
+        'case "$*" in\n'
+        "  *version_info*) exit 0 ;;\n"
+        "  *--version*) echo 'Python 3.12.0' ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    planted.chmod(0o755)
+
+    result, markers = _run_cli_with_fake_env(tmp_path)
+
+    assert not executed_marker.exists(), (
+        "cli.sh executed an interpreter found by scanning the store -- the "
+        "resolve-only-through-pinned-uv decision has been lost"
+    )
+    # The run went for the pinned uv tarball instead.
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+
+
+def test_cli_marker_driven_managed_run_falls_back_on_provision_failure(
+    tmp_path: Path,
+) -> None:
+    """A `managed` marker records a DEFAULTED choice, not an explicit request:
+    when the uv download fails on a marker-driven re-run (the shape every
+    `kirocrew update` takes after the first successful default install) and a
+    usable system interpreter exists, the run must degrade to it instead of
+    hard-failing -- otherwise the first successful install would turn every
+    later update into a hard network dependency on the uv download. Only a
+    flag/env request made THIS run fails hard (pinned by
+    test_cli_managed_python_flag_skips_system_interpreters)."""
+    data_home = tmp_path / "data-home"
+    data_home.mkdir()
+    (data_home / "python-mode").write_text("managed\n")
+
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        interpreters={"python3.12": _USABLE_PY312_STUB},
+    )
+
+    combined = result.stdout + result.stderr
+    # The uv download was attempted (marker kept the managed choice) ...
+    assert "astral-sh/uv/releases/download" in (markers / "curl").read_text()
+    # ... failed, and the run degraded instead of dying at the python gate.
+    assert "could not provision a managed Python (network?)" in combined
+    assert "Python >=3.12 is required" not in combined, combined
+
+
+def test_cli_uv_download_honors_a_mirror_base(tmp_path: Path) -> None:
+    """KIROCREW_UV_URL points air-gapped / proxied hosts at a mirror of the uv
+    release tree. The URL must be built from it -- and the SHA-256 pin still
+    applies, so a mirror can serve the bytes but never substitute them (pinned
+    by test_cli_rejects_a_tampered_uv_download)."""
+    result, markers = _run_cli_with_fake_env(
+        tmp_path,
+        extra_env={"KIROCREW_UV_URL": "https://mirror.example.com/uv/"},
+    )
+
+    recorded = (markers / "curl").read_text()
+    assert "https://mirror.example.com/uv/" in recorded, result.stderr
+    assert "github.com/astral-sh" not in recorded
+    assert ".tar.gz" in recorded
 
 
 def _run_marker_write_shape(data_home: Path, tmp_path: Path) -> subprocess.CompletedProcess[bytes]:
@@ -609,12 +877,13 @@ def test_cli_marker_write_refuses_a_directory_target(tmp_path: Path) -> None:
 def test_cli_marker_read_ignores_a_planted_symlink(tmp_path: Path) -> None:
     """The marker READ is guarded like the write: a planted symlink at
     python-mode (e.g. to /dev/zero, which would wedge an unbounded cat, or to
-    an attacker file spoofing 'managed') must be ignored -- the run proceeds
-    on the system interpreter as if no marker existed."""
+    an attacker file spoofing 'system-pinned' to freeze the install off the
+    managed default) must be ignored -- the run proceeds on the managed
+    default as if no marker existed."""
     data_home = tmp_path / "data-home"
     data_home.mkdir()
     spoof = tmp_path / "spoof"
-    spoof.write_text("managed\n")
+    spoof.write_text("system-pinned\n")
     (data_home / "python-mode").symlink_to(spoof)
 
     result, markers = _run_cli_with_fake_env(
@@ -632,10 +901,10 @@ def test_cli_marker_read_ignores_a_planted_symlink(tmp_path: Path) -> None:
     )
 
     combined = result.stdout + result.stderr
-    assert "Reusing the recorded managed-python choice" not in combined
-    curl_marker = markers / "curl"
-    if curl_marker.exists():
-        assert "astral-sh/uv" not in curl_marker.read_text()
+    assert "Reusing the recorded system-python choice" not in combined
+    # The spoofed pin was ignored: the run went for the managed default.
+    assert (markers / "curl").exists(), result.stderr
+    assert "astral-sh/uv" in (markers / "curl").read_text()
     # And the read guards must still be present in cli.sh.
     text = CLI_SH.read_text()
     assert '[ ! -L "$_py_mode_file" ]' in text
@@ -666,3 +935,323 @@ def test_cli_marker_read_never_opens_a_fifo(tmp_path: Path) -> None:
 
     combined = result.stdout + result.stderr
     assert "Reusing the recorded managed-python choice" not in combined
+
+
+# ── Progress output ──────────────────────────────────────────────────────────
+# The slow steps (wheel download, pip, venv creation) run through `_run_step`,
+# which must keep a non-interactive log readable (one line per step plus a
+# heartbeat, never a spinner), capture the command's output to the log the
+# failure reporter reads, and return the command's own exit status so the
+# `if !` guards around it still see a failure.
+
+
+def _progress_helpers() -> str:
+    """The helper block of cli.sh, extracted so it can be sourced alone."""
+    text = CLI_SH.read_text()
+    start = text.index("# ── Progress output")
+    end = text.index("# Dependencies come from prebuilt wheels only.")
+    return text[start:end]
+
+
+def test_run_step_off_a_terminal_prints_done_line_and_passes_exit_status(
+    tmp_path: Path,
+) -> None:
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    log = tmp_path / "step.log"
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; '
+        f'echo "tty=$_tty curl=$CURL_PROGRESS"; '
+        f"_run_step \"{log}\" \"Installing things\" sh -c 'echo Collecting aiohttp; echo oops >&2; exit 3' "
+        f'|| echo "rc=$?"'
+    )
+    # Bytes, not text=True: universal newlines would fold a leaked \r into \n
+    # and the "no spinner off a terminal" assertion below could never fail.
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "TERM": "xterm"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert b"\r" not in result.stdout, "spinner redraws leaked into a non-terminal run"
+    stdout = result.stdout.decode()
+    stderr = result.stderr.decode()
+    # stdout is a pipe here, so the terminal path must be off regardless of TERM.
+    assert "tty=0 curl=-s" in stdout
+    assert "rc=3" in stdout, "the wrapper did not return the command's exit status"
+    assert "Installing things ... FAILED after" in stderr
+    # Both streams of the wrapped command land in the log the failure report reads.
+    assert log.read_text() == "Collecting aiohttp\noops\n"
+
+
+def test_run_step_reports_success_with_elapsed_time(tmp_path: Path) -> None:
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; '
+        f'_run_step "{tmp_path}/ok.log" "Creating virtual environment" true'
+    )
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert re.search(r"Creating virtual environment \.\.\. done \(\d+s\)", result.stdout)
+
+
+def test_run_step_interrupt_terminates_the_child_and_fails_the_step(
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C during a step must stop the command, not just the spinner.
+
+    The command runs asynchronously, and POSIX starts an async child of a
+    non-interactive shell with SIGINT ignored, so the shell's INT trap is the
+    only thing that can reach it. The step must end with the child's signal
+    status (so the caller's `if !` restore path runs, the same status a
+    foreground pip returns for the keypress), the child must be gone, and
+    the caller's own traps must be back in place afterwards.
+    """
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    grandchild_pid = tmp_path / "grandchild.pid"
+    script = (
+        f'set -eu; TMP="{tmp_path}"; trap \'echo "outer trap"\' INT; . "{helpers}"; '
+        # The child ignores INT itself (as pip would, inherited), so only the
+        # helper's TERM can end it, and it forks a grandchild the way
+        # `python -m venv` forks ensurepip. 30 s is the test's failure mode.
+        f'_run_step "{tmp_path}/slow.log" "Installing" '
+        f"sh -c 'trap \"\" INT; sleep 30 & echo $! > \"{grandchild_pid}\"; wait' "
+        f'|| echo "rc=$?"; '
+        f'if kill -0 "$_rs_pid" 2>/dev/null; then echo child-alive; else echo child-dead; fi; '
+        f"trap"
+    )
+    # Its own session, so a timed-out run can be reaped as a group in
+    # `finally` instead of leaving the sleeps behind.
+    proc = subprocess.Popen(
+        ["sh", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        start_new_session=True,
+    )
+    try:
+        time.sleep(1.0)  # let the step start; the child is 30 s of sleep
+        proc.send_signal(signal.SIGINT)
+        try:
+            out, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("SIGINT did not end the step; the child kept running")
+        # Measured before the cleanup below, which would otherwise take the
+        # grandchild down itself and hide a survivor.
+        gc_pid = int(grandchild_pid.read_text().strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _pid_alive(gc_pid):
+            time.sleep(0.1)
+        grandchild_survived = _pid_alive(gc_pid)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=10)
+    assert proc.returncode == 0, out
+    assert "Installing ... interrupted (SIGINT)" in out
+    assert "rc=143" in out, out
+    assert "child-dead" in out, out
+    # The whole process group went, not just the direct child: the sleep the
+    # child forked must be gone too, or a surviving ensurepip would keep
+    # writing into the tree the caller then restores over.
+    assert not grandchild_survived, "the step's grandchild survived the interrupt"
+    assert "outer trap" in out and "INT" in out.split("child-dead", 1)[1], (
+        "the caller's INT trap was not restored after the step"
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # Zombies answer kill -0; read the state so a dead-but-unreaped sleep
+    # does not count as a survivor.
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def test_tolerate_swallows_a_failure_but_not_an_interrupt(tmp_path: Path) -> None:
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; '
+        f'_rs_optional=1; _run_step "{tmp_path}/opt.log" "Updating pip" false || _tolerate $?; '
+        f'echo "after-failure"; _tolerate 143; echo "after-interrupt"'
+    )
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 143, result.stderr
+    assert "after-failure" in result.stdout
+    assert "after-interrupt" not in result.stdout
+    # A tolerated step never says FAILED on an install that goes on to succeed.
+    assert "FAILED" not in result.stderr
+    assert "Updating pip ... skipped (exit 1" in result.stderr
+
+
+def test_tolerate_restores_the_moved_aside_venv_on_an_interrupt(tmp_path: Path) -> None:
+    """Ctrl-C during the tolerated pip upgrade must not strand the old install.
+
+    By then the working venv has been moved to the backup path and the new
+    one has no kirocrew yet; every other exit after the move-aside restores
+    it, and this one has to as well.
+    """
+    helpers = tmp_path / "helpers.sh"
+    venv = tmp_path / "venv"
+    backup = tmp_path / "venv.pre-rebuild.1"
+    venv.mkdir()
+    (venv / "new").write_text("half-built\n")
+    backup.mkdir()
+    (backup / "bin").mkdir()
+    (backup / "bin" / "kirocrew").write_text("old launcher\n")
+    restore = CLI_SH.read_text()
+    start = restore.index("_restore_tree() {")
+    end = restore.index("\n}\n", start) + 3
+    helpers.write_text(_progress_helpers() + restore[start:end])
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; '
+        f'VENV="{venv}"; _VENV_BACKUP="{backup}"; '
+        f'_tolerate 130; echo "after-interrupt"'
+    )
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+    )
+    assert result.returncode == 130, result.stderr
+    assert "after-interrupt" not in result.stdout
+    assert "previous install was restored" in result.stderr
+    assert (venv / "bin" / "kirocrew").read_text() == "old launcher\n"
+    assert not (venv / "new").exists()
+    assert not backup.exists()
+
+
+def test_cli_downloads_use_the_progress_flag_and_pip_is_wrapped() -> None:
+    text = CLI_SH.read_text()
+    # Wheel and uv downloads: silent in a log (the flag resolves to -s), a
+    # progress bar on a terminal. Never both -s and --progress-bar at once.
+    assert re.search(r'curl -f \$CURL_PROGRESS -S --proto \'=https\' "\$WHEEL_URL"', text)
+    assert re.search(r"curl -f \$CURL_PROGRESS -S -L --proto '=https'", text)
+    assert 'CURL_PROGRESS="-s"' in text and 'CURL_PROGRESS="--progress-bar"' in text
+    # Every pip/pipx install goes through the wrapper and keeps writing the
+    # log _report_pip_failure reads.
+    assert re.search(
+        r'_run_step "\$TMP/pip-install\.log" "[^"]*" \\\n\s+pipx install --force', text
+    )
+    assert re.search(
+        r'_run_step "\$TMP/pip-install\.log" "[^"]*" \\\n\s+"\$VENV/bin/pip" install --progress-bar off',
+        text,
+    )
+    assert "pip\" install --quiet $PIP_BINARY_ONLY" not in text, (
+        "the wheel install went back to --quiet; the progress line and the "
+        "failure report both need pip's Collecting/Downloading lines"
+    )
+
+
+def test_run_step_is_portable_to_dash() -> None:
+    """The one-line install runs under /bin/sh, which is dash on Debian.
+
+    dash prints nothing for `trap` inside a command substitution, so the
+    caller's traps have to be saved through a file, and its `kill` accepts a
+    process group only as `kill -s SIG -- -PGID`. Job control cannot be
+    enabled off a tty there, so the group comes from setsid(1) when present.
+    """
+    helpers = _progress_helpers()
+    code = "\n".join(
+        line for line in helpers.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "$(trap)" not in code
+    assert re.search(r'trap > "\$_rs_traps"', code)
+    assert re.search(r'\. "\$_rs_traps"', code)
+    assert 'kill -s TERM -- "-$_rs_pid"' in code
+    assert not re.search(r"kill -TERM -- ", code)
+    assert re.search(r"command -v setsid .*\n\s+setsid \"\$@\"", code)
+
+
+def test_run_step_redrawn_line_fits_the_terminal_width(tmp_path: Path) -> None:
+    """Every `\\r`-redrawn frame must be shorter than the terminal.
+
+    A frame that wraps is not overwritten by the next `\\r`: it leaves a new
+    row per redraw and the "one live line" turns into a wall of spinner
+    lines. `tput cols` is what the helper measures, so drive it with a fake
+    tput and a pty-free stand-in for the terminal test (`_tty=1` forced).
+    """
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tput").write_text("#!/bin/sh\necho 72\n")
+    (fake_bin / "tput").chmod(0o755)
+    long_line = "Downloading " + "x" * 200 + ".whl (310 kB)"
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; _tty=1; '
+        f'_run_step "{tmp_path}/wide.log" "Installing kirocrew 1.2.3 and its dependencies" '
+        f"sh -c 'echo \"{long_line}\"; sleep 1'"
+    )
+    # Bytes, not text=True: universal newlines would fold the \r redraws into \n.
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "TERM": "xterm"},
+    )
+    assert result.returncode == 0, result.stderr
+    frames = re.findall(r"\r\x1b\[K([^\r\n]*)(?=\r)", result.stdout.decode())
+    assert frames, "no redrawn frames on the forced-terminal path"
+    tails = [f for f in frames if "Downloading" in f]
+    assert tails, "the command's last line never made it onto the progress line"
+    assert max(len(f) for f in frames) < 72, max(frames, key=len)
+
+
+def test_run_step_prefix_is_cut_on_a_terminal_narrower_than_the_message(
+    tmp_path: Path,
+) -> None:
+    """On a 40-column terminal even the spinner + message + elapsed prefix is
+    wider than the row; it must be truncated, not left to wrap."""
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(_progress_helpers())
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "tput").write_text("#!/bin/sh\necho 40\n")
+    (fake_bin / "tput").chmod(0o755)
+    script = (
+        f'set -eu; TMP="{tmp_path}"; . "{helpers}"; _tty=1; '
+        f'_run_step "{tmp_path}/narrow.log" "Installing kirocrew 1.2.3 and its dependencies with pipx" '
+        f"sh -c 'echo Collecting-something-long-enough-to-matter; sleep 1'"
+    )
+    result = subprocess.run(
+        ["sh", "-c", script],
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "TERM": "xterm"},
+    )
+    assert result.returncode == 0, result.stderr
+    frames = re.findall(r"\r\x1b\[K([^\r\n]*)(?=\r)", result.stdout.decode())
+    assert frames, "no redrawn frames on the forced-terminal path"
+    assert max(len(f) for f in frames) < 40, max(frames, key=len)
+    assert all(f.startswith(("|", "/", "-", "\\")) for f in frames), frames

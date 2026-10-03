@@ -53,6 +53,7 @@ HOST = "dev.azure.com"
 PROJECT_GUID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 ADA_GUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 TEAM_GUID = "9c5b94b1-35ad-49bb-b118-8e8fc24abf80"
+REPO_GUID = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
 SHA = "a" * 40
 
 
@@ -227,7 +228,7 @@ class TestNormPull(unittest.TestCase):
 
     def test_a_deactivated_label_is_dropped(self):
         # Azure keeps a removed PR label as a row with ``active: false``. Rendering
-        # it would show a tag the PR no longer carries.
+        # it would show a tag the PR does not carry.
         row = azure_client._norm_pull(
             _pr_payload(
                 labels=[
@@ -971,6 +972,7 @@ class TestPrChecks(unittest.TestCase):
 
     def setUp(self):
         azure_client._project_id_cache.clear()
+        azure_client._repo_id_cache.clear()
 
     def _az(
         self,
@@ -988,6 +990,7 @@ class TestPrChecks(unittest.TestCase):
             policy = raiser
         return _Az(
             build_builds={"value": builds or []},
+            git_repositories={"id": REPO_GUID},
             git_pullRequests=_paged(pulls if pulls is not None else [_pr_payload()]),
             core_projects={"id": PROJECT_GUID},
             policy_evaluations=policy,
@@ -1034,7 +1037,7 @@ class TestPrChecks(unittest.TestCase):
 
     def test_a_build_for_another_commit_is_not_reported(self):
         # Azure's build list has no commit filter, so the match happens locally.
-        # A run against an older commit describes code that no longer exists.
+        # A run against an older commit describes code that is not in the head.
         az = self._az(
             builds=[
                 {
@@ -1198,6 +1201,60 @@ class TestPrChecks(unittest.TestCase):
             [q["searchCriteria.status"] for q in az.queries("git/pullRequests")],
             ["active", "all"],
         )
+
+
+class TestBuildFilterUsesTheRepositoryGuid(unittest.TestCase):
+    """``build/builds`` filtered by ``repositoryType=TfsGit`` needs a GUID.
+
+    Azure refuses a ``"project/repo"`` name there server-side, which took out the
+    whole PR checks/activity tab while the work item tabs (no repository
+    dimension) kept working.
+    """
+
+    def setUp(self):
+        azure_client._project_id_cache.clear()
+        azure_client._repo_id_cache.clear()
+
+    def _az(self) -> _Az:
+        return _Az(
+            build_builds={"value": []},
+            git_repositories={"id": REPO_GUID},
+            git_pullRequests=_paged([_pr_payload()]),
+            core_projects={"id": PROJECT_GUID},
+            policy_evaluations={"value": []},
+        )
+
+    def test_the_guid_is_what_reaches_the_build_query(self):
+        az = self._az()
+        with az.patch():
+            azure_client.list_pr_checks(OWNER, REPO, SHA, host=HOST)
+        self.assertEqual([q["repositoryId"] for q in az.queries("build/builds")], [REPO_GUID])
+        # And the GUID is read by the repository's NAME, which is the one form
+        # git/repositories accepts.
+        self.assertEqual(
+            [dict(c.get("route") or {}) for c in az.calls if c["resource"] == "repositories"],
+            [{"project": "Widgets", "repositoryId": REPO}],
+        )
+
+    def test_the_guid_is_resolved_once_per_repository(self):
+        # A repository GUID is immutable, so a second lookup is pure latency on a
+        # panel that already makes several calls.
+        az = self._az()
+        with az.patch():
+            azure_client.list_pr_checks(OWNER, REPO, SHA, host=HOST)
+            azure_client.list_pr_checks(OWNER, REPO, SHA, host=HOST)
+        self.assertEqual(az.targets().count("git/repositories"), 1)
+        self.assertEqual(az.targets().count("build/builds"), 2)
+
+    def test_an_unresolvable_repository_raises_rather_than_sending_a_name(self):
+        # Same contract as ``_project_id``: falling back to the name would put the
+        # opaque Azure refusal back, which is the bug this replaced.
+        az = self._az()
+        az._handlers["git_repositories"] = {"id": ""}  # type: ignore[index]
+        with az.patch(), self.assertRaises(ProviderCliError) as caught:
+            azure_client.list_pr_checks(OWNER, REPO, SHA, host=HOST)
+        self.assertIn("could not resolve the repository id", str(caught.exception))
+        self.assertNotIn("build/builds", az.targets())
 
 
 class TestSummarizeChecks(unittest.TestCase):

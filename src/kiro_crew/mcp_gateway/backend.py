@@ -23,12 +23,16 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.constants import (
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+    SUBAGENT_TIMEOUT_SECS,
+)
 from kiro_crew.executors import image_executor, maintenance_executor
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
@@ -61,6 +65,13 @@ from kiro_crew.mcp_gateway.image_budget import (
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
 from kiro_crew.mcp_gateway.spill import maybe_spill_response
 from kiro_crew.mcp_gateway.tool_surface import ToolSurface, project_tool_surface
+from kiro_crew.process_identity import failure_name, with_kill_failure
+from kiro_crew.sandbox import (
+    CANONICAL_TEMP_KEYS,
+    classify_declared_temp_env,
+    declared_temp_refusal_reasons,
+    format_declared_temp_refusals,
+)
 from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
@@ -92,6 +103,11 @@ INTERNAL_STUB_PREFIXES: tuple[str, ...] = ("__app_call__", TOOL_SURFACE_STUB_PRE
 # Schema (one JSONL record per completed request):
 #   {"ts": epoch_ms_int, "method": "tools/call", "dur_ms": 2.34,
 #    "pool": "example-mcp::kirocrew::...", "pid": 12345, "ok": true}
+#
+# ``ok`` is false for either failure shape: a JSON-RPC ``error`` response, or
+# a tools/call ``result`` carrying ``isError: true`` (the tool ran and
+# reported its own failure). A failed tool call also emits one WARNING line to
+# the gateway log naming the server, tool, session and a truncated error.
 #
 # Ring-buffer-free — we trust log rotation on the consumer side.
 _METRICS_PATH = os.environ.get("MCP_GATEWAY_CALL_METRICS_PATH")
@@ -177,8 +193,18 @@ PING_STALE_SECS = 150.0
 
 # Absolute ceiling: recycle regardless of ping freshness. Protects against a
 # pathological case where the tool itself is stuck but the MCP server's read
-# loop still services ping requests. Set to wait_max (1800s) + 5-min margin.
-HARD_WEDGE_CEILING_SECS = 2100.0
+# loop still services ping requests.
+#
+# It has to sit ABOVE the longest LEGITIMATE in-flight request, or it stops
+# being a wedge detector and becomes a deadline: a blocking ``spawn_sub_agents``
+# is in flight for as long as its slowest member runs, so a ceiling at or below
+# the subagent deadline recycles the backend under a caller whose work is
+# healthy, reporting ``backend gone`` while the subagent keeps running detached
+# and its result is stranded. The subagent deadline is therefore the binding
+# term (``wait``'s 1800s max is well under it), plus a 5-minute margin. An
+# operator who raises ``agent.subagent_timeout_secs`` past the default re-opens
+# that gap; the load-time clamp bounds how far.
+HARD_WEDGE_CEILING_SECS = float(SUBAGENT_TIMEOUT_SECS + 300)
 
 # Upper bound on a single stub's pending-delivery inbox. Backend->stub frames
 # are enqueued by the stdout pump without awaiting the stub's socket drain, so
@@ -319,6 +345,70 @@ class _PendingRequest:
     # subscribe/unsubscribe against an unresponsive server would grow the
     # pending table without bound. Cap accounting only; never routed to.
     origin_stub: str = ""
+    # The frame as forwarded upstream, kept only for a method in
+    # ``_REHANDSHAKE_RETRY_METHODS`` so the request can be sent once more after
+    # the backend is handshaken again. ``None`` for every other request, and on
+    # the retry itself, which is never retried a second time.
+    retry_frame: Optional[dict[str, Any]] = None
+
+
+# A request the Python MCP SDK refuses because ITS session is not initialized
+# comes back as exactly this error (``mcp.shared.session``: the
+# ``Received request before initialization was complete`` RuntimeError is
+# reported as INVALID_PARAMS with this message and an empty ``data``). The same
+# frame answers a request that fails the SDK's ``ClientRequest`` validation, so
+# on its own it does not prove the session was lost -- which is why the answer
+# to it is one rehandshake and one retry, never a loop.
+#
+# The gateway reaches it when the server process behind the pipe was replaced
+# without a handshake while the pipe stayed up. A pooling multiplexer does this
+# when the command the gateway spawned is its thin client: the client keeps its
+# connection to the multiplexer's daemon, and the daemon respawns a retired or
+# dead server instance cold, sending it nothing before the next request. kiro-cli
+# sends ``initialize`` once per session and the gateway answers every later stub
+# from its cache, so without the rehandshake every later call on that backend
+# fails until the gateway itself restarts.
+_LOST_SESSION_ERROR_CODE = -32602
+_LOST_SESSION_ERROR_MESSAGE = "Invalid request parameters"
+
+# Requests safe to send twice: the refusal above is issued before the SDK
+# dispatches anything, and none of these hold gateway-side lease state.
+# ``resources/subscribe`` / ``unsubscribe`` are left out because their
+# response drives the lease bookkeeping, and ``initialize`` is the cache's.
+_REHANDSHAKE_RETRY_METHODS: frozenset[str] = frozenset({
+    "tools/call",
+    "tools/list",
+    "prompts/list",
+    "prompts/get",
+    "resources/list",
+    "resources/read",
+    "resources/templates/list",
+    "completion/complete",
+})
+
+# ``stub_uuid`` of the gateway's own re-sent ``initialize``: its reply is
+# swallowed, never delivered to a stub.
+_REHANDSHAKE_STUB_SENTINEL = "__rehandshake__"
+
+
+def _is_lost_session_error(msg: dict[str, Any]) -> bool:
+    """Whether ``msg`` is the Python MCP SDK's not-initialized refusal."""
+    error = msg.get("error")
+    return (
+        isinstance(error, dict)
+        and error.get("code") == _LOST_SESSION_ERROR_CODE
+        and error.get("message") == _LOST_SESSION_ERROR_MESSAGE
+        # Empty in every SDK release that sends it; absent is tolerated so a
+        # release that drops the member is still recognised.
+        and error.get("data", "") == ""
+    )
+
+
+def _without_id(msg: dict[str, Any]) -> dict[str, Any]:
+    """A shallow copy of ``msg`` with no ``id``."""
+    out = dict(msg)
+    out.pop("id", None)
+    return out
 
 
 def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
@@ -335,8 +425,8 @@ def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
     BOTH gateway-owned blocks are stripped here, in ONE place, deliberately: the
     tenant nonce decides which namespace an unnamed co-tenant's per-tenant state
     lands in, so a stub allowed to supply its own could choose to land in a
-    PEER's namespace — the same collision #5322 fixed, only chosen instead of
-    accidental. Giving the nonce its own strip function would have added a second
+    PEER's namespace — the same collision the nonce prevents, only chosen instead
+    of accidental. Giving the nonce its own strip function would add a second
     site that every future forward path has to remember; both call sites of this
     one (``forward_from_stub`` and ``_handle_initialize``) already exist.
     """
@@ -409,6 +499,120 @@ def _is_success_response(msg: dict[str, Any]) -> bool:
     return "error" not in msg and "result" in msg
 
 
+# Maximum length of the error string carried in the per-call failure WARNING.
+# The point is a greppable breadcrumb an operator can anchor on, not the whole
+# payload; a multi-KB tool error would otherwise push the useful fields
+# (server, tool, session) off the end of a wrapped log line.
+_TOOL_ERROR_LOG_MAX = 300
+
+# Upper bound on the untrusted error prefix handed to ``redact`` before the
+# final ``_TOOL_ERROR_LOG_MAX`` truncation. Far larger than the logged cap (so
+# redaction still sees enough context to match a secret spanning a few hundred
+# bytes) but small enough that the credential/exfiltration scan on the shared
+# stdout pump is bounded regardless of the frame size.
+_TOOL_ERROR_PRESCAN_MAX = 8192
+
+
+def _tool_call_error_text(msg: dict[str, Any]) -> Optional[str]:
+    """Return a truncated error string when ``msg`` is a FAILED tool-call
+    response, else ``None``.
+
+    Two distinct wire shapes mean "this tool call failed":
+
+    * a JSON-RPC ``error`` object — the server could not run the tool at all;
+    * a ``result`` carrying ``isError: true`` — the tool ran and reported a
+      failure in its own content (the MCP ``CallToolResult`` error channel).
+
+    Both reach the model as a failed call. A plain ``"error" not in msg``
+    check misses the second shape (``isError`` lives inside ``result``), so
+    this recognises both and extracts a short, greppable description for the
+    breadcrumb.
+
+    Returns ``None`` for a settled success and for a malformed frame carrying
+    neither ``error`` nor ``result`` (nothing to attribute as a failure).
+    """
+    err = msg.get("error")
+    if isinstance(err, dict):
+        text = err.get("message")
+        if not isinstance(text, str) or not text:
+            text = json.dumps(err, separators=(",", ":"))
+    elif isinstance(err, str) and err:
+        text = err
+    else:
+        result = msg.get("result")
+        if not isinstance(result, dict) or result.get("isError") is not True:
+            return None
+        text = _mcp_result_error_text(result)
+    # ``text`` is untrusted server output. Slice it to a bounded prefix FIRST
+    # (well above ``_TOOL_ERROR_LOG_MAX``) so the credential/exfiltration
+    # ``redact`` pass — the same one the backend stderr pump applies — runs on
+    # a few KiB rather than a frame bounded only by ``READ_BUFFER_LIMIT_BYTES``;
+    # this routing happens on the shared stdout pump, so an O(payload) scan here
+    # would add head-of-line latency to every co-pooled session's frames.
+    # ``_collapse_nonprintable`` then maps every control character (newlines,
+    # escapes, NUL included) to a space so the value cannot forge a second log
+    # line or clear the operator's terminal, and the record stays one line.
+    if len(text) > _TOOL_ERROR_PRESCAN_MAX:
+        text = text[:_TOOL_ERROR_PRESCAN_MAX]
+    text = _collapse_nonprintable(redact(text))
+    if len(text) > _TOOL_ERROR_LOG_MAX:
+        text = text[: _TOOL_ERROR_LOG_MAX - 1] + "\u2026"
+    return text
+
+
+def _mcp_result_error_text(result: dict[str, Any]) -> str:
+    """Best-effort human string from an ``isError: true`` CallToolResult.
+
+    An MCP tool error is reported in the result's ``content`` list (text parts
+    carry the message); fall back to a compact JSON dump when no text part is
+    present so there is always something to log."""
+    content = result.get("content")
+    if isinstance(content, list):
+        parts = [
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        if parts:
+            return " ".join(parts)
+    return json.dumps(result, separators=(",", ":"))
+
+
+# A caller/server-supplied identifier (tool name, session key, server name)
+# interpolated into the failed-tool-call WARNING. Cap it so a long name cannot
+# push the structured fields off a wrapped log line.
+_MCP_IDENT_LOG_MAX = 120
+
+
+def _collapse_nonprintable(value: str) -> str:
+    """Replace every non-printable character (and whitespace run) with a single
+    space.
+
+    ``str.split()`` only recognises Python's whitespace set, so an escape
+    (``\\x1b``), NUL, BEL or DEL would otherwise survive into the log line and
+    could clear the terminal or overwrite preceding records. Map every
+    character ``str.isprintable()`` rejects to a space, then collapse runs.
+    """
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())
+
+
+def _log_safe_identifier(value: str, fallback: str = "?") -> str:
+    """Make a caller/server-supplied identifier safe to interpolate into a log
+    line.
+
+    A tool name or session key is caller input (``params.name`` on a
+    tools/call) and a server name is operator/registry input; any of them could
+    carry a newline (forging a second gateway/dashboard log entry), a terminal
+    escape, or a credential/exfiltration URL. Run the module's ``redact`` pass,
+    map every non-printable character to a space, cap the length, and fall back
+    to ``fallback`` when nothing printable remains.
+    """
+    cleaned = _collapse_nonprintable(redact(value))
+    if len(cleaned) > _MCP_IDENT_LOG_MAX:
+        cleaned = cleaned[: _MCP_IDENT_LOG_MAX - 1] + "\u2026"
+    return cleaned or fallback
+
+
 # Deadline for the out-of-band ``resources/read`` round-trip. On timeout the
 # original tools/call response is delivered unmodified — the app render is
 # best-effort and MUST NOT wedge or drop the tool result.
@@ -453,7 +657,7 @@ def _mcp_apps_enabled() -> bool:
        shared without its server-authored UI.
     2. A stored ``mcp_gateway.apps_enabled = false`` -> disabled, EVEN with the
        env flag on. This key is retired going forward — nothing writes it, the
-       MCP Management page does not surface it, and the docs no longer teach it —
+       MCP Management page does not surface it, and the docs do not teach it —
        but a released version honoured it as a trustworthy opt-out, so a config
        that already carries ``false`` keeps its opt-out. Dropping it here would
        silently start executing server-authored UI for the one operator who took
@@ -550,7 +754,7 @@ def _inject_tenant_meta(msg: dict[str, Any], nonce: str) -> dict[str, Any]:
     including the ones with no caller — that is the case it exists for. A backend
     serving a caller the gateway cannot name falls back to a per-PROCESS
     namespace, which on a pooled backend is one namespace for every unnamed
-    co-tenant (#5322); the nonce splits it per connection.
+    co-tenant; the nonce splits it per connection.
 
     Deliberately NOT on the gateway's own synthesized lease frames
     (``resources/subscribe`` / ``resources/unsubscribe`` replays): those carry the
@@ -608,6 +812,19 @@ class Backend:
     created_at: float
     last_used_at: float
     supports_caller_identity: bool = False
+    # True only when the spawn that produced this process was Kiro Crew's own
+    # packaged control plane -- the resolved command and args matched what the
+    # managed spec emits, not merely a reserved server NAME. It gates the one
+    # thing a pooled backend is ever handed beyond the caller's identity: the
+    # session's bearer token. A server that merely calls itself
+    # ``kirocrew-core`` stays False.
+    control_plane: bool = False
+    # Why ``control_plane`` is False for a backend spawned under a RESERVED name
+    # (empty for a third-party name, and for an accepted control plane). Carried
+    # to that backend on every forwarded frame as the caller's ``identity_denial``
+    # so its ``identity_unattested`` refusal can say what the daemon saw; the
+    # daemon's own log line is the only other place the reason exists.
+    control_plane_denial: str = ""
     _shutdown_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # --- Sharing boundary state (Milestone 2) -------------------------------
     # Each attached stub appears in ``_stub_inboxes`` keyed by stub_uuid; the
@@ -722,6 +939,12 @@ class Backend:
     _init_pending: list[tuple[str, Any]] = field(default_factory=list)
     _init_first_stub: Optional[str] = None
     _init_first_id: Any = None
+    # The ``initialize`` frame this backend was handshaken with, as forwarded
+    # upstream minus its id. Kept so a backend whose server lost its MCP session
+    # behind the pipe can be handshaken again (``_retry_after_rehandshake``):
+    # kiro-cli sends ``initialize`` once per session and the cache above answers
+    # every later stub, so no stub will ever send another one.
+    _upstream_init_frame: Optional[dict[str, Any]] = None
     # Set once the upstream initialize resolves (ready OR failed). The
     # transparent-respawn path (gatewayd) awaits this after re-priming a
     # freshly spawned backend so stub traffic only resumes when the new
@@ -735,6 +958,12 @@ class Backend:
     # state and reaps the process group. Respawn priming carries its own
     # bounded wait, so only the lazy first handshake arms this.
     _init_deadline_task: Optional[asyncio.Task[None]] = None
+    # Bound on the first ``initialize`` window, set at construction from the
+    # daemon's configured value (``mcp_gateway.initialize_timeout_secs``). A
+    # field rather than a module constant so the configured value reaches every
+    # backend spawned by this daemon; the spawn-gate watcher reads the same
+    # field, which is what keeps its permit window and this deadline aligned.
+    initialize_timeout_secs: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS
     _dead_reason: Optional[str] = None
     # Idempotency guard for _broadcast_backend_gone (see there): the terminal
     # "backend gone" broadcast is reachable near-simultaneously from several
@@ -1262,7 +1491,7 @@ class Backend:
         alongside (3) and independently of it: a caller the gateway cannot name
         gets no identity block but still gets a nonce, which is what keeps two
         unnamed co-tenants of one pooled backend out of each other's per-tenant
-        state (#5322). Empty means "no separator available" and leaves the
+        state. Empty means "no separator available" and leaves the
         backend on its own per-process fallback.
         """
         if not self.is_alive:
@@ -1302,11 +1531,14 @@ class Backend:
         # method) pass through without rewrite. Pure responses are kiro-cli
         # answering a server-to-client request — the backend owns that id
         # table, not us.
+        retry_fid: Optional[str] = None
         if isinstance(msg, dict):
             orig_id = msg.get("id")
             has_method = "method" in msg
             if has_method and orig_id is not None:
                 fid = self._next_forward_id()
+                if method in _REHANDSHAKE_RETRY_METHODS:
+                    retry_fid = fid
                 msg = dict(msg)  # shallow copy — we mutate id + maybe _meta
                 msg["id"] = fid
                 progress_token = None
@@ -1379,6 +1611,12 @@ class Backend:
                 msg = _inject_caller_meta(msg, caller)
             if self.supports_caller_identity and tenant_nonce:
                 msg = _inject_tenant_meta(msg, tenant_nonce)
+            if retry_fid is not None:
+                # The frame exactly as it goes upstream -- identity blocks
+                # included -- so a retry after a rehandshake is the same request.
+                retry_pending = self._pending_requests.get(retry_fid)
+                if retry_pending is not None:
+                    retry_pending.retry_frame = msg
 
         self.touch()
         try:
@@ -1425,6 +1663,7 @@ class Backend:
         # the KIROCREW_MCP_APPS flag is on). Must follow the strip so the
         # injected frame is our copy, never the stub's.
         forward_msg = _inject_client_extensions(forward_msg)
+        self._upstream_init_frame = _without_id(forward_msg)
         forward_msg["id"] = fid
         self.touch()
         try:
@@ -1447,7 +1686,7 @@ class Backend:
         if self._init_deadline_task is not None and not self._init_deadline_task.done():
             return
         self._init_deadline_task = asyncio.create_task(
-            self._init_deadline(_DEFAULT_INITIALIZE_TIMEOUT_SECS)
+            self._init_deadline(self.initialize_timeout_secs)
         )
 
     def _cancel_init_deadline(self) -> None:
@@ -1558,6 +1797,7 @@ class Backend:
             # MCP Apps: same injection as _handle_initialize so a respawned
             # backend sees the identical ui capability (flag-gated no-op).
             forward_msg = _inject_client_extensions(forward_msg)
+            self._upstream_init_frame = _without_id(forward_msg)
             forward_msg["id"] = fid
             self.touch()
             try:
@@ -2000,20 +2240,53 @@ class Backend:
                     self.pid, msg_id,
                 )
                 return
+            if pending.stub_uuid == _REHANDSHAKE_STUB_SENTINEL:
+                if "error" in msg:
+                    logger.warning(
+                        "backend pid=%s refused the re-sent initialize: %s",
+                        self.pid, _tool_call_error_text(msg),
+                    )
+                return
+            if (
+                pending.retry_frame is not None
+                and _is_lost_session_error(msg)
+                and await self._retry_after_rehandshake(pending)
+            ):
+                return
             if pending.t_start_ms:
                 # Fire-and-forget: awaiting the emit here (even with its file
                 # I/O offloaded to a thread) yields the shared stdout pump,
                 # adding head-of-line latency to co-pooled sessions whenever
                 # the metrics volume is slow. Schedule it off the hot path.
+                #
+                # ``error_text`` is non-None for BOTH failure shapes (a
+                # JSON-RPC ``error`` and a ``result`` with ``isError: true``),
+                # so a tool that ran and reported its own failure is scored
+                # ``ok: false`` here rather than counted as a success.
+                error_text = _tool_call_error_text(msg)
                 self._spawn_metric_task({
                     "ts": int(time.time() * 1000),
                     "method": pending.method,
                     "dur_ms": round(time.monotonic() * 1000.0 - pending.t_start_ms, 3),
                     "pool": self.pool_key.human_readable(),
                     "pid": self.pid,
-                    "ok": "error" not in msg,
+                    "ok": error_text is None,
                     "stub": pending.stub_uuid,
                 })
+                if error_text is not None and pending.method == "tools/call":
+                    # One greppable breadcrumb per failed tool call (isError or
+                    # a JSON-RPC error), so an operator searching gateway.log
+                    # for an MCP outage finds the failing call rather than only
+                    # the session's lifecycle lines. WARNING matches the
+                    # severity of the per-session claim-push outcomes logged on
+                    # this seam.
+                    logger.warning(
+                        "mcp tool call failed: server=%s tool=%s session=%s error=%s",
+                        _log_safe_identifier(self.pool_key.server_name),
+                        _log_safe_identifier(pending.tool_name),
+                        _log_safe_identifier(pending.session_key),
+                        error_text,
+                    )
             if pending.stub_uuid == "__init__":
                 await self._on_upstream_initialize(msg)
                 return
@@ -2270,6 +2543,66 @@ class Backend:
                 await self._broadcast_backend_gone(reason)
             return
         logger.debug("backend pid=%s emitted malformed JSON-RPC: %r", self.pid, msg)
+
+    async def _retry_after_rehandshake(self, pending: _PendingRequest) -> bool:
+        """Handshake the server again and send ``pending``'s request once more.
+
+        Called when a forwarded request came back as the not-initialized refusal
+        (:func:`_is_lost_session_error`). Returns True when the request is back
+        on the wire, so its first answer must not reach the stub; False leaves
+        the caller to deliver that answer unchanged.
+
+        The ``initialize``, the ``notifications/initialized`` and the retried
+        request go out in ONE write. A server reads its stdin in order, so the
+        retry cannot overtake the handshake, and no co-tenant's request can land
+        between the two halves of it -- a Python server that has just seen an
+        ``initialize`` refuses everything until ``initialized`` arrives. The
+        reply to the ``initialize`` is swallowed: the cache already answered
+        every stub, and the server is the same one.
+        """
+        init_frame = self._upstream_init_frame
+        if init_frame is None or self._init_state != "ready" or not self.is_alive:
+            return False
+        async with self._inbox_lock:
+            attached = pending.stub_uuid in self._stub_inboxes
+        if not attached:
+            return False
+        assert pending.retry_frame is not None
+        init_fid = self._next_forward_id()
+        retry_fid = self._next_forward_id()
+        self._pending_requests[init_fid] = _PendingRequest(
+            stub_uuid=_REHANDSHAKE_STUB_SENTINEL, original_id=None, method="initialize",
+            # Stamped like every other pending: the wedge sweep reads an unset
+            # start as an hour-old request.
+            t_start_ms=time.monotonic() * 1000.0,
+        )
+        retry_frame = dict(pending.retry_frame)
+        retry_frame["id"] = retry_fid
+        # Same stub, original id, start time and captured tool fields, so the
+        # answer, a cancel and the metrics all read as the one request it is.
+        self._pending_requests[retry_fid] = replace(pending, retry_frame=None)
+        logger.warning(
+            "backend pid=%s server=%s refused %s as not initialized; its MCP session "
+            "was lost behind the pipe (a pooling proxy respawned it cold?) -- "
+            "re-sending initialize and retrying once",
+            self.pid,
+            _log_safe_identifier(self.pool_key.server_name),
+            _log_safe_identifier(pending.method),
+        )
+        frames = [
+            {**init_frame, "id": init_fid},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            retry_frame,
+        ]
+        self.touch()
+        try:
+            await _write_json_lines(self.stdin, frames)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            self._pending_requests.pop(init_fid, None)
+            self._pending_requests.pop(retry_fid, None)
+            self._dead_reason = f"stdin closed during rehandshake: {exc}"
+            return False
+        return True
 
     def _record_hazard(self, code: str) -> None:
         """Note that this server exhibited per-client behaviour while shared.
@@ -3674,7 +4007,7 @@ class Backend:
         * ``"idle"``   -- no stubs attached (``refcount == 0``). LEFT ALONE:
           the idle-sweep owns eviction of these on its own timer. Recycling
           idle-but-healthy backends here would re-introduce the cr-guide
-          over-reaping regression (MCPool 0.2.7).
+          over-reaping regression.
         * ``"wedged"`` -- a stub is attached AND BOTH: (1) an in-flight request
           exceeds :data:`HEARTBEAT_TIMEOUT_SECS`, AND (2) no ping response has
           arrived within :data:`PING_STALE_SECS` (backend unresponsive). OR the
@@ -3868,6 +4201,11 @@ class Backend:
             # loop. On POSIX it dispatches inline to the sync helper, so
             # os.killpg/os.getpgid monkeypatching still intercepts.
             recycled = True
+            # What the fallback below could not do, named for the record and the
+            # audit -- never swallowed. A refused or failed signal here left the
+            # process alive while the audit said ``killed``: the same suppressed-
+            # failure shape the sub-agent and cron reapers record as ``failed``.
+            kill_failed: str | None = None
             try:
                 await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
             except ValueError:
@@ -3876,17 +4214,31 @@ class Backend:
             except (ProcessLookupError, PermissionError, OSError):
                 # Tree already gone or not signalable — fall back to a
                 # pid-scoped kill, as this call site did before.
-                with contextlib.suppress(
-                    ProcessLookupError, PermissionError, OSError, ValueError
-                ):
+                try:
                     await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
+                except ProcessLookupError:
+                    # Gone before the signal landed: that IS the kill.
+                    pass
+                except (PermissionError, OSError, ValueError) as exc:
+                    kill_failed = failure_name(exc)
             if recycled:
                 self._dead_reason = "recycled after last stub detached with in-flight work"
-                logger.info(
-                    "backend pid=%s recycled (killed): last stub detached with "
-                    "in-flight work",
-                    pid,
-                )
+                if kill_failed is None:
+                    logger.info(
+                        "backend pid=%s recycled (killed): last stub detached with "
+                        "in-flight work",
+                        pid,
+                    )
+                else:
+                    # The pool drops the backend either way (no consumer is left
+                    # to serve); the reason it carries and the audit row say the
+                    # process was NOT killed, in the two supervisors' spelling.
+                    self._dead_reason = with_kill_failure(self._dead_reason, kill_failed)
+                    logger.warning(
+                        "backend pid=%s recycled but its process was not killed: %s",
+                        pid,
+                        kill_failed,
+                    )
                 # SEL audit: SIGKILLing a pooled backend is a security-relevant
                 # action — record it in the HMAC-chained event log regardless
                 # of which path (abort frame or plain disconnect) got us here.
@@ -3894,7 +4246,8 @@ class Backend:
                     SecurityEventLog().log_api_access(
                         caller="gatewayd",
                         operation="mcp-gateway.backend-recycle-kill",
-                        outcome="killed",
+                        # Never ``killed`` for a process the signal left alive.
+                        outcome="killed" if kill_failed is None else "failed",
                         source="gateway",
                         resources=f"pid={pid} server={self.pool_key.server_name}",
                         error=self._dead_reason,
@@ -3973,20 +4326,30 @@ async def spawn_backend(
     env: Mapping[str, str],
     work_dir: str,
     declared_temp_keys: tuple[str, ...] = (),
+    secret_env_keys: tuple[str, ...] = (),
+    initialize_timeout_secs: float = _DEFAULT_INITIALIZE_TIMEOUT_SECS,
 ) -> Backend:
     """Spawn a real MCP subprocess and wrap it in a :class:`Backend`.
+
+    ``initialize_timeout_secs`` bounds the backend's first ``initialize``
+    window (``Backend.initialize_timeout_secs``); the daemon threads its
+    configured value here so a constructor argument, not a module setter,
+    carries it.
 
     ``declared_temp_keys`` are the temp-key names (``TMPDIR``/``TMP``/``TEMP``,
     any casing) the operator's agent spec DECLARES for this server -- the
     caller knows the declared-env set and this function does not (``env``
     also carries the daemon's ambient values, which must not suppress
-    containment; see the containment block below).
+    containment; see the containment block below). ``secret_env_keys`` marks
+    values resolved from ``secret://`` URIs so a refusal can name its key and
+    cause without persisting the resolved value in the daemon log.
 
-    ``env`` is passed verbatim — callers MUST NOT rely on parent process
-    env inheritance. The rewriter layer computes the effective env for
-    each :class:`PoolKey` and includes it in the hash; spawning with a
-    different env than the key claims is a correctness bug that would
-    allow cross-tenant leakage.
+    ``env`` is the complete effective environment; callers MUST NOT rely on
+    parent-process inheritance. The temp rule may replace its declared temp
+    keys, and this function adds the positive spawn marker. The PoolKey still
+    hashes the caller's original effective map, so a refused declaration may
+    conservatively split two equivalent managed-temp backends but can never
+    collapse specs that declared different environments into one pool.
 
     Security boundary (accepted risk, documented in
     ``docs/system-specs/modules/security.md`` under MCP Gateway): backends
@@ -4012,7 +4375,9 @@ async def spawn_backend(
     """
     logger.info(
         "spawning backend pool=%s command=%s args=%s",
-        pool_key.human_readable(), command, redact(" ".join(args)),
+        pool_key.human_readable(),
+        command,
+        redact(" ".join(args)),
     )
     # Positive-identity marker for the orphan sweep. Safe re: the pooled-backend
     # PoolKey invariant — the marker is a compile-time constant, so it is
@@ -4020,52 +4385,80 @@ async def spawn_backend(
     # identity (unlike a per-session value, which would be a correctness bug).
     spawn_env = dict(env)
     spawn_env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
-    # Per-process temp containment (#5064). Safe re: the pooled-backend
+    # Per-process temp containment. Safe re: the pooled-backend
     # PoolKey invariant for the same reason as the marker above -- the value
     # is derived from the key's own digest plus a token generated AFTER
     # pool-identity resolution and is never folded into the hash, so it can
-    # neither split nor collapse pool identity. Allocated off-loop (mkdir is
-    # filesystem work), and fail-open: containment is hygiene, not a spawn
-    # prerequisite -- a host where the dir cannot be created still gets a
-    # working backend with today's inherited-temp behavior.
+    # neither split nor collapse pool identity. Allocation and declaration
+    # classification run off-loop because both touch the filesystem.
     #
-    # An OPERATOR-DECLARED temp wins: a spec that sets any of TMPDIR/TMP/TEMP
-    # deliberately points a heavy server at chosen storage (e.g. a capacity
-    # volume), and overriding it would trade litter for ENOSPC. No allocation
-    # happens at all in that case -- no empty dir, nothing to sweep.
+    # An operator-declared temp wins only when the shared sandbox rule clears
+    # every declared key. One refusal drops the whole declaration: ``tempfile``
+    # may consult a sibling key first, so keeping a surviving key would make
+    # the result depend on spelling order. The managed temp takes over. If its
+    # allocation fails after a refusal, no temp key survives to point the child
+    # back at the refused path.
     #
-    # Declaration is signalled by the CALLER (``declared_temp_keys``), not
-    # read off ``spawn_env``: the resolver folds the daemon's own inherited
-    # environment into ``env``, and macOS always exports TMPDIR (Windows
-    # always exports TMP/TEMP), so an env-membership test would read the
-    # ambient value as a declaration and silently disable containment on
-    # those platforms. Ambient keys are OVERRIDDEN by the managed triple on
-    # success, left untouched on allocation failure (the documented fail-open
-    # "inherited temp" fallback), and PRUNED down to the declared set when
-    # the operator declared a temp (see the else branch).
+    # Declaration is signalled by the caller, not inferred from ``spawn_env``.
+    # The resolver folds the daemon's ambient temp into ``env`` on macOS and
+    # Windows, and an env-membership test would mistake that for operator input.
     backend_tmp: Optional[Path] = None
-    _declared_upper = {key.upper() for key in declared_temp_keys}
+    _declared_upper: set[str] = set()
+    refused: dict[str, tuple[str, str]] = {}
+    failure = ""
+    if declared_temp_keys:
+        accepted, refused, failure = await asyncio.to_thread(
+            classify_declared_temp_env,
+            spawn_env,
+            declared_temp_keys,
+        )
+        _declared_upper = set(accepted)
+        if refused:
+            logger.warning(
+                "MCP backend [%s]: ignoring spec-declared %s — %s; spawning with the "
+                "managed temp instead",
+                pool_key.server_name,
+                format_declared_temp_refusals(
+                    refused,
+                    hidden_keys=secret_env_keys,
+                    redactor=redact,
+                ),
+                "; ".join(
+                    declared_temp_refusal_reasons(
+                        refused,
+                        failure,
+                        redactor=redact,
+                    )
+                ),
+            )
+            spawn_env = {
+                key: value
+                for key, value in spawn_env.items()
+                if key.upper() not in CANONICAL_TEMP_KEYS
+            }
     if not _declared_upper:
         try:
-            backend_tmp = await asyncio.to_thread(
-                allocate_backend_tmp, pool_key.stable_hash()
-            )
+            backend_tmp = await asyncio.to_thread(allocate_backend_tmp, pool_key.stable_hash())
             spawn_env.update(tmp_env(backend_tmp))
         except OSError:
+            has_inherited_temp = any(key.upper() in CANONICAL_TEMP_KEYS for key in spawn_env)
+            fallback = "inherited temp" if has_inherited_temp else "platform default"
             logger.warning(
-                "backend-tmp: could not allocate a contained temp dir; spawning "
-                "with inherited temp",
+                "backend-tmp: could not allocate a contained temp dir; spawning with %s",
+                fallback,
                 exc_info=True,
             )
     else:
-        # Yielding is not enough on its own: the daemon's AMBIENT temp keys
-        # are still in ``spawn_env``, and ``tempfile`` consults TMPDIR before
-        # TMP -- a spec declaring only ``TMP`` on macOS would silently write
-        # through the inherited ambient TMPDIR. Strip the canonical keys the
-        # operator did NOT declare so the declared one actually governs.
-        for key in ("TMPDIR", "TMP", "TEMP"):
-            if key not in _declared_upper:
-                spawn_env.pop(key, None)
+        # Keep only the declared values and re-emit their canonical spellings.
+        # Ambient siblings cannot outrank the declaration, and lowercase spec
+        # keys govern on POSIX as well as on case-insensitive Windows env maps.
+        declared_values = {
+            key.upper(): value for key, value in spawn_env.items() if key.upper() in _declared_upper
+        }
+        spawn_env = {
+            key: value for key, value in spawn_env.items() if key.upper() not in CANONICAL_TEMP_KEYS
+        }
+        spawn_env.update(declared_values)
     try:
         process = await asyncio.create_subprocess_exec(
             command,
@@ -4114,6 +4507,7 @@ async def spawn_backend(
         stdout=process.stdout,
         created_at=now,
         last_used_at=now,
+        initialize_timeout_secs=float(initialize_timeout_secs),
     )
     backend._last_ping_response_mono = now  # cold-start: not insta-stale
     backend._stderr_task = stderr_task
@@ -4230,7 +4624,15 @@ async def _write_json_line(writer: asyncio.StreamWriter, obj: Any) -> None:
     OS pipe buffer fill and silently stall the gateway loop (Phase-0
     item #2). Every write goes through this helper.
     """
-    payload = json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n"
+    await _write_json_lines(writer, [obj])
+
+
+async def _write_json_lines(writer: asyncio.StreamWriter, objs: list[Any]) -> None:
+    """:func:`_write_json_line` for several frames in ONE write and one drain,
+    so no other writer's frame can land between them."""
+    payload = b"".join(
+        json.dumps(obj, separators=(",", ":")).encode("utf-8") + b"\n" for obj in objs
+    )
     lock = getattr(writer, "_mc_write_lock", None)
     guard: Any = lock if lock is not None else contextlib.nullcontext()
     async with guard:

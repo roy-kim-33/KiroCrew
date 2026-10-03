@@ -16,6 +16,7 @@ import os
 import time
 from unittest.mock import patch
 
+from conftest import make_dir_link
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway.spill import (
     cleanup_old_spill_files,
@@ -121,7 +122,7 @@ class TestSpillToFile:
             wrong: list[str] = []
             monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: calls.append(str(p)))
             # The file-shaped helper must NOT be what a directory goes through:
-            # its icacls grants carry no (OI)(CI), so spilled payloads written
+            # its grants carry no (OI)(CI), so spilled payloads written
             # into the directory afterwards would not inherit the lockdown.
             monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(str(p)))
         loose = tmp_path / "mcp_spill"
@@ -157,13 +158,24 @@ class TestSpillFailure:
         }
         line = json.dumps(msg, separators=(",", ":")).encode("utf-8") + b"\n"
 
-        # Point at a non-existent path that can't be created
-        fake_home = "/nonexistent/path/that/cannot/be/created"
+        # A home that cannot be created ON ANY HOST: a path beneath a regular
+        # file, so `mkdir(parents=True)` fails with NotADirectoryError /
+        # FileExistsError everywhere. The previous `/nonexistent/path/...`
+        # literal only looked uncreatable: on Windows a leading slash is
+        # drive-relative, so it resolved to a writable `C:\nonexistent\...`,
+        # the spill SUCCEEDED, and a 300 KiB sidecar was left at the drive
+        # root -- which then made `install_app("/nonexistent/path")` in
+        # test_app_manager see a real directory.
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"")
+        fake_home = str(blocker / "home")
         with patch.dict(os.environ, {"KIROCREW_HOME": fake_home}):
             result = maybe_spill_response(line, "server", 100_000)
 
-        # Original returned unmodified
+        # Original returned unmodified, and nothing was written anywhere.
         assert result == line
+        assert blocker.is_file()
+        assert not (blocker / "home").exists()
 
 
 # --- (f) Non-tool-result frames over threshold pass through ---
@@ -350,3 +362,30 @@ class TestSpillCleanup:
 
         assert deleted == 0
         assert fresh_file.exists()
+
+    def test_cleanup_refuses_a_junction_at_the_spill_dir(self, tmp_path):
+        """A directory JUNCTION at the spill dir name must not be swept THROUGH.
+
+        A junction answers ``is_dir()`` True and ``is_symlink()`` False, so an
+        ``is_symlink()`` guard let it past and the sweep deleted 24h-old files
+        under the junction's target -- a confused-deputy delete outside the data
+        home. ``is_link_or_junction`` refuses it. ``make_dir_link`` plants a real
+        junction on Windows and a directory symlink on POSIX, so the refusal is
+        pinned on every shard.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        old_file = outside / "old-response.json"
+        old_file.write_text("not ours to delete")
+        old_time = time.time() - (25 * 3600)
+        os.utime(old_file, (old_time, old_time))
+
+        # KIROCREW_HOME/mcp_spill IS the junction, aimed at ``outside``.
+        make_dir_link(tmp_path / "mcp_spill", outside)
+
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            deleted = cleanup_old_spill_files()
+
+        assert deleted == 0
+        # The sweep never followed the junction: the target's old file survives.
+        assert old_file.exists()

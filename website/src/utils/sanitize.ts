@@ -115,8 +115,41 @@ export function sanitizeCredentials(text: string): string {
   return out
 }
 
-// ── Exfiltration URL detection (matches redact_exfiltration_urls in security.py) ──
+// ── Exfiltration URL detection (mirrors redact_exfiltration_urls in security.py) ──
+// Unlike the backend, a URL that stops at `)` is judged with the text after it (#8638),
+// up to the next scheme or space (URL_TAIL_RE), then cut back to where its link ends.
 const URL_RE = /https?:\/\/([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(:\d+)?(\/[^\s)"'>]*)?/g
+const URL_TAIL_RE = /[^\s"'>]*?(?=https?:\/\/|[\s"'>]|$)/y
+// Drop trailing `)` that have no `(` partner in the URL, plus punctuation after them.
+function trimWrapperParen(url: string): string {
+  let extra = url.split(')').length - url.split('(').length
+  let keep = url.length
+  for (let i = url.length - 1; i >= 0 && extra > 0; i--) {
+    if (url[i] === ')') { extra--; keep = i } else if (!'.,;:!?'.includes(url[i])) break
+  }
+  return url.slice(0, keep)
+}
+
+// A markdown `](...)` target ends at its first `)` with no `(` partner, as CommonMark does.
+function linkTarget(url: string): string {
+  let depth = 0
+  for (let i = 0; i < url.length; i++) {
+    if (url[i - 1] === '\\') continue // a `\(` or `\)` escape stays in the target, as in CommonMark
+    if (url[i] === '(') depth++
+    else if (url[i] === ')' && --depth < 0) return url.slice(0, i)
+  }
+  return url
+}
+
+// True when the `]` at `i` closes a real `[label]` (CommonMark caps a label at 999 chars).
+function closesLabel(text: string, i: number): boolean {
+  let depth = 0
+  for (let j = i - 1; j >= 0 && j >= i - 1000; j--) {
+    if (text[j] === ']') depth++
+    else if (text[j] === '[' && depth-- === 0) return true
+  }
+  return false
+}
 const EXFIL_QUERY_MIN_LEN = 200
 
 // PATTERN signals: each names a shape rather than a size, and each runs for
@@ -148,108 +181,75 @@ const EXFIL_CREDENTIAL_RE = new RegExp(
 // or splitting the query on `+` before testing — let an attacker `+`-chunk a 40+
 // char secret straight past it. A false positive on prose costs a placeholder; a
 // chunking bypass costs the payload.
-const EXFIL_B64_RE = /[A-Za-z0-9+/=]{40,}/i
+//
+// `=` is different: it counts only as trailing padding, never as a joiner, so a
+// parameter name, its `=` and a short value (`trainingId=` plus a 32-char ID) do
+// not fuse into one 40-char run. That opens no chunking channel `&`, `.`, `-` and
+// `_` do not already provide, and the aggregate length signal still bounds the
+// query. Padding still counts toward the 40 chars (38 plus `==`, 39 plus `=`),
+// so a minimum-length encoded payload is caught. Same spelling as the backend.
+const EXFIL_B64_RE = /[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{39}=|[A-Za-z0-9+/]{38}==/i
 
 // Aggregate query LENGTH is the one signal that names no shape at all: it fires on
 // any richly-parameterised URL, which is why prefilled issue links —
-// `…/issues/new?title=…&body=<a paragraph of prose>&labels=…` — were rendered as a
-// `[REDACTED: suspicious URL]` placeholder. It is the only check the carve-out
-// below waives, and it is waived only for a URL whose every component is
-// accounted for. A query that ALSO trips a pattern signal is still redacted, so a
-// `+`-spelled prose body stays a placeholder even inside the validated shape.
+// `…/issues/new?title=…&body=<a paragraph of prose>&labels=…` — render as a
+// `[REDACTED: suspicious URL]` placeholder.
 //
-// The carve-out validates the payload's SHAPE rather than trusting a destination.
-// That is nearer the backend's Slack app-create link check than its
-// companion-owned host-exemption tier, but it is not the same move: the backend
-// narrows the payload to its one caller-controlled span and keeps that span under
-// every heuristic, which is unavailable here because every GitHub prefill
-// parameter value is caller-controlled and there is no constant template to
-// subtract. So one SIGNAL is waived here where one SPAN is there.
-// `github.com` cannot earn destination trust either:
-// it is a public multi-tenant WRITE sink, so a prefilled issue submitted there
-// lands in whichever repository the URL names, including an attacker's own. What
-// is trustworthy is not the host but this exact shape, whose every span is either
-// a fixed literal or a parameter GitHub itself defines.
-const EXFIL_ISSUE_SCHEME = 'https://'
-const EXFIL_ISSUE_HOST = 'github.com'
-// Each of the two segments is dot-SEPARATED rather than dot-permissive, so
-// neither may end with a dot or contain `..`: a traversal spelling names a path
-// GitHub never served (a browser normalises it away before sending), so it is an
-// unaccounted-for component like any other. A single LEADING dot stays legal —
-// `.github` is an ordinary repository name.
+// It is NOT waived for that shape, deliberately, and no future shape-based waiver
+// belongs here either. `isPrefilledIssueUrl` used to waive it (#7824), first on
+// shape alone and later pinned to this project's own tracker; both spellings are
+// exfiltration primitives, because what this function sanitizes is MODEL-AUTHORED
+// text. Injected content steers the model into emitting a prefill URL whose `body`
+// carries percent-encoded private context, the waiver skips the length check, the
+// link renders as the familiar "file an issue" affordance, the user submits it —
+// and the issue is PUBLIC, so the attacker reads it. Pinning the repository does
+// not help: this project's tracker is world-readable, which is the point of it.
 //
-// A RegExp literal spliced by `.source`, not a pattern string: the escaping then
-// reads at one level (`\.`, the character, rather than `\\.`, two characters that
-// happen to compile to it), which is what makes a dot-SEPARATED class auditable
-// against a dot-permissive one at a glance.
-const EXFIL_ISSUE_SEGMENT = /\.?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/
-const EXFIL_ISSUE_PATH_RE = new RegExp(
-  `^/${EXFIL_ISSUE_SEGMENT.source}/${EXFIL_ISSUE_SEGMENT.source}/issues/new$`,
-)
-// GitHub's documented issue-prefill parameters. A query carrying ANY other key is
-// refused whole rather than having the unknown key judged on its own: an extra
-// parameter is the obvious smuggling shape, and a key that is empty or cased
-// differently is one GitHub would not prefill from either.
-const EXFIL_ISSUE_PARAMS = new Set([
-  'assignee',
-  'assignees',
-  'body',
-  'labels',
-  'milestone',
-  'projects',
-  'template',
-  'title',
-])
-
-/**
- * True only for a GitHub issue-creation URL whose scheme, host, port, path and
- * complete parameter-key set are all accounted for. Anything unaccounted-for
- * fails closed, leaving the length check in force.
- */
-function isPrefilledIssueUrl(
-  url: string,
-  host: string,
-  port: string,
-  path: string,
-  query: string,
-): boolean {
-  if (url.slice(0, EXFIL_ISSUE_SCHEME.length).toLowerCase() !== EXFIL_ISSUE_SCHEME) return false
-  // Host is compared lowercased (RFC 4343 leaves DNS case insignificant) and
-  // EXACTLY, never by suffix, so `github.com.evil.example` is not the same host.
-  // An explicit port is refused outright: `github.com:8080` is not a destination
-  // GitHub serves, so it is somebody redirecting the name somewhere else.
-  if (host !== EXFIL_ISSUE_HOST || port) return false
-  if (!EXFIL_ISSUE_PATH_RE.test(path)) return false
-  return query.split('&').every((pair) => {
-    const eq = pair.indexOf('=')
-    // `eq > 0` also rejects a pair with no `=` at all and one whose key is empty:
-    // neither presents a key that can be checked, so it counts as unknown.
-    return eq > 0 && EXFIL_ISSUE_PARAMS.has(pair.slice(0, eq))
-  })
-}
+// A URL's shape says nothing about who authored it, and a marker placed IN the
+// text travels in the channel the injection already controls. Provenance has to
+// come from a different channel, which the product already has: the backend's
+// `diagnostics._issue_url` assembles the prefill link from STRUCTURED fields and
+// the dashboard renders its own anchor from the `github_issue_url` JSON field,
+// which no redactor scans (`ReportProblemModal`, `ReportProblemCard`). A link that
+// never enters model prose never needs a waiver.
+//
+// If you are here to make a long legitimate URL render, narrow or replace this
+// heuristic for EVERY host on its own merits (#7820 also reports
+// monitorportal.amazon.com) — do not reintroduce a per-shape escape hatch.
 
 export function sanitizeExfiltrationUrls(text: string): string {
-  let out = text
+  let out = ''
+  let last = 0
   URL_RE.lastIndex = 0
-  for (const m of text.matchAll(URL_RE)) {
+  let m: RegExpExecArray | null
+  while ((m = URL_RE.exec(text))) {
     const domain = m[1]
-    const host = domain.toLowerCase()
-    const pathAndQuery = m[3] || ''
+    const end = m.index + m[0].length
+    URL_TAIL_RE.lastIndex = end
+    const full = m[0] + (text[end] === ')' ? (URL_TAIL_RE.exec(text)?.[0] ?? '') : '')
+    const inLink = text.slice(m.index - 2, m.index) === '](' && closesLabel(text, m.index - 2)
+    // End at the first unpaired `)` when that already keeps the `?`, so glued prose after it
+    // never votes or is spliced; otherwise the query lies past the `)`, so keep scanning it.
+    const cut = linkTarget(full)
+    const url = inLink || cut.includes('?') ? cut : trimWrapperParen(full)
+    // A pattern signal past the cut still counts (glued prose can only trip the length one).
+    const past = inLink ? '' : full.slice(url.length)
+    const hit = EXFIL_PERCENT_RE.test(past) || EXFIL_CREDENTIAL_RE.test(past) || EXFIL_B64_RE.test(past)
+    const pathAndQuery = url.slice(m[0].length - (m[3] || '').length)
     const qmark = pathAndQuery.indexOf('?')
-    if (qmark === -1) continue
+    if (qmark === -1 && !hit) continue
     const query = pathAndQuery.slice(qmark + 1)
-    let redact =
+    const redact = hit ||
       EXFIL_PERCENT_RE.test(query) ||
       EXFIL_CREDENTIAL_RE.test(query) ||
-      EXFIL_B64_RE.test(query)
-    if (!redact && query.length >= EXFIL_QUERY_MIN_LEN) {
-      redact = !isPrefilledIssueUrl(m[0], host, m[2] || '', pathAndQuery.slice(0, qmark), query)
-    }
+      EXFIL_B64_RE.test(query) ||
+      query.length >= EXFIL_QUERY_MIN_LEN
     if (redact) {
-      out = out.replace(m[0], i18nT('utils.sanitize.redacted_suspicious_url', { domain }))
+      out += text.slice(last, m.index) + i18nT('utils.sanitize.redacted_suspicious_url', { domain })
+      last = m.index + (hit ? trimWrapperParen(full) : url).length
     }
   }
-  return out
+  return out + text.slice(last)
 }
 
 /** Combined sanitizer — runs both credential and exfiltration redaction. */

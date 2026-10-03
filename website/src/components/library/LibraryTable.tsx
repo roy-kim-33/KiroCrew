@@ -12,6 +12,7 @@ import { useImeGuard } from '../../hooks/useImeGuard'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { FOLDER_COLOR_PALETTE } from '../folderColorCatalog'
 import { i18nT } from '../../i18n/t'
+import { publishNoticeKey } from '../PublishHub'
 import type { Artifact, ArtifactFolder, SessionDoc } from '../../types'
 
 export type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
@@ -77,7 +78,7 @@ export function FolderColorSwatches({ value, onPick, size = 16 }: { value?: stri
           title={label()}
           onClick={(e) => { e.stopPropagation(); onPick(c) }}
           onPointerDown={(e) => e.stopPropagation()}
-          className={`rounded-full border cursor-pointer transition-transform hover:scale-110 ${
+          className={`rounded-full border cursor-pointer hover:brightness-125 swatch-cue ${
             value === c ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border'
           }`}
           style={{ width: size, height: size, background: c }}
@@ -91,8 +92,8 @@ export function FolderColorSwatches({ value, onPick, size = 16 }: { value?: stri
         title={i18nT('pages.artifactsPage.no_color')}
         onClick={(e) => { e.stopPropagation(); onPick('') }}
         onPointerDown={(e) => e.stopPropagation()}
-        className={`rounded-full border cursor-pointer transition-transform hover:scale-110 flex items-center justify-center text-muted bg-transparent ${
-          !value ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border'
+        className={`rounded-full border cursor-pointer hover:brightness-125 swatch-cue flex items-center justify-center text-muted bg-transparent ${
+          !value ? 'ring-2 ring-accent ring-offset-1 ring-offset-bg border-transparent' : 'border-border hover:border-border-strong'
         }`}
         style={{ width: size, height: size }}
       >
@@ -147,7 +148,7 @@ export function FolderNameInput({ initial = '', placeholder = 'Folder name', onC
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
-      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text focus-ring"
+      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-hidden text-sm select-text focus-ring"
       {...ime.bindEnter<HTMLInputElement>({
         onFocus: (e) => (e.target as HTMLInputElement).select(),
         onEnter: () => { (document.activeElement as HTMLInputElement)?.blur() },
@@ -245,7 +246,21 @@ export const ARTIFACT_COLUMNS: LibraryColumn[] = [
   { key: 'updated', label: 'pages.artifactsPage.updated', className: 'w-[110px]' },
 ]
 
-export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = ARTIFACT_COLUMNS, actionsLabelKey = 'pages.artifactsPage.actions' }: {
+/**
+ * The surface a pinned cell sits ON, so its opaque fill and its seam gradient
+ * paint the same colour as the page behind the table. `--card` and `--bg`
+ * differ in every theme, so a cell that always paints `bg-card` inside a table
+ * with no card fill renders as a permanently tinted right-hand stripe.
+ */
+export type TableSurface = 'card' | 'bg'
+
+/** The opaque fill + `right-full` gradient pair for a pinned cell on a surface. */
+export const PINNED_SURFACE: Record<TableSurface, { fill: string; seam: string }> = {
+  card: { fill: 'bg-card', seam: 'from-card' },
+  bg: { fill: 'bg-bg', seam: 'from-bg' },
+}
+
+export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = ARTIFACT_COLUMNS, actionsLabelKey = 'pages.artifactsPage.actions', surface = 'card' }: {
   sort: SortState
   onSort: (key: SortKey) => void
   edgeRight?: boolean
@@ -253,7 +268,10 @@ export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = AR
    *  written literally below because its pin is the fragile part. */
   columns?: LibraryColumn[]
   actionsLabelKey?: string
+  /** What the table sits on; the pinned cell paints that colour. */
+  surface?: TableSurface
 }) {
+  const pinned = PINNED_SURFACE[surface]
   const th = 'text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium'
   const sortable = (key: SortKey, label: string, extra: string) => {
     const active = sort?.key === key
@@ -306,9 +324,9 @@ export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = AR
             left of the pin (says "columns continue"). Same treatment as the
             hooks and schedule tables, adapted for auto layout where a
             wrapper-anchored cue cannot know the pinned column's left edge. */}
-        <th className={`${th} w-[120px] sticky right-0 bg-card`}>
+        <th className={`${th} w-[120px] sticky right-0 ${pinned.fill}`}>
           {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
-          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+          {edgeRight && <div aria-hidden="true" className={`pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l ${pinned.seam} to-transparent`} />}
           {i18nT(actionsLabelKey)}
         </th>
       </tr>
@@ -373,8 +391,8 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
               {a.publication && (
                 <Share2
                   size={12}
-                  className={a.publication.last_error ? 'text-danger' : 'text-ok'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
+                  className={a.publication.last_error ? 'text-danger' : a.publication.notice ? 'text-warn' : 'text-ok'}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>
@@ -453,7 +471,9 @@ export function SessionDocStar({ d, busy, onMaterialize }: { d: SessionDoc; busy
     <IconButton
       variant="accent"
       disabled={busy}
-      onClick={() => onMaterialize(d.path, d.session_key)}
+      // stopPropagation: the star sits inside rows that open the read-only
+      // preview on click — starring must not ALSO open the preview.
+      onClick={(e) => { e.stopPropagation(); onMaterialize(d.path, d.session_key) }}
       title={i18nT('pages.artifactsPage.star_creates_a_starred_artifact_from_this_docume')}
       aria-label={i18nT('pages.artifactsPage.star_document')}
       className="shrink-0"
@@ -464,12 +484,25 @@ export function SessionDocStar({ d, busy, onMaterialize }: { d: SessionDoc; busy
 }
 
 /** A single unsaved session-document row (from "your chats"). Leading star
- * materializes it into a real, starred artifact. Shares the same columns as
- * ArtifactRow so both live in one unified table. */
-export function SessionDocRow({ d, busy, onMaterialize, edgeRight = false }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void; edgeRight?: boolean }) {
+ * materializes it into a real, starred artifact; clicking the row opens the
+ * read-only preview (same gesture as ArtifactRow's click-to-open). Shares the
+ * same columns as ArtifactRow so both live in one unified table. */
+export function SessionDocRow({ d, busy, onMaterialize, onPreview, edgeRight = false }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void; onPreview?: (d: SessionDoc) => void; edgeRight?: boolean }) {
   const ftype = docFileType(d.path)
   return (
-    <tr className="group/docrow transition-colors hover:bg-bg-hover">
+    <tr
+      className={`group/docrow transition-colors hover:bg-bg-hover ${onPreview ? 'cursor-pointer' : ''}`}
+      onClick={onPreview ? () => onPreview(d) : undefined}
+      // Keyboard twin of the click: the row is focusable and Enter/Space open
+      // the preview. The target guard keeps keys from the nested star button
+      // (its own Enter/Space bubble up here) from ALSO opening the preview —
+      // and preventDefault on those would cancel the star's native click.
+      tabIndex={onPreview ? 0 : undefined}
+      onKeyDown={onPreview ? (e) => {
+        if (e.target !== e.currentTarget) return
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPreview(d) }
+      } : undefined}
+    >
       <td className="px-2.5 py-2 border-b border-border text-center">
         <SessionDocStar d={d} busy={busy} onMaterialize={onMaterialize} />
       </td>
@@ -513,6 +546,7 @@ export function LibraryTable({
   pinningSlug,
   sessionDocs = [],
   onMaterialize,
+  onPreviewDoc,
   materializingPath = null,
 }: {
   items: Artifact[]
@@ -525,6 +559,8 @@ export function LibraryTable({
   pinningSlug: string | null
   sessionDocs?: SessionDoc[]
   onMaterialize?: (path: string, sessionKey?: string) => void
+  /** Row click opens the read-only session-doc preview. */
+  onPreviewDoc?: (d: SessionDoc) => void
   materializingPath?: string | null
 }) {
   // The pinned Actions column's seam is painted only while the scroller hides
@@ -541,7 +577,7 @@ export function LibraryTable({
             <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} edgeRight={edges.right} />
           ))}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} onPreview={onPreviewDoc} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>
@@ -598,7 +634,10 @@ export function FolderRow({ folder, folders, depth, expanded, onToggle, actions,
                   <span className="text-[11px] text-muted">
                     {stats.artifactCount}{stats.subfolderCount > 0 ? ` · ${i18nT('pages.artifactsPage.folder', { count: stats.subfolderCount })}` : ''}
                   </span>
-                  <span className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                  {/* The cell spans the whole table, which scrolls sideways on a
+                      phone, so `ml-auto` would park the always-visible touch menu
+                      past the viewport edge. Touch keeps it inline after the count. */}
+                  <span className="ml-auto [@media(hover:none)]:ml-0 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity">
                     <FolderMenu folder={folder} folders={folders} actions={actions} />
                   </span>
                 </div>
@@ -614,7 +653,7 @@ export function FolderRow({ folder, folders, depth, expanded, onToggle, actions,
 /** Nested, collapsible tree table (browse mode): folders in pre-order with
  * their artifacts indented beneath, Unfiled at the end. Collapsed by default —
  * expansion is client-local (localStorage), by design (§2.5). */
-export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand, folderActions, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug, overFolderId, dragActive, sessionDocs = [], onMaterialize, materializingPath = null }: {
+export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand, folderActions, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug, overFolderId, dragActive, sessionDocs = [], onMaterialize, onPreviewDoc, materializingPath = null }: {
   items: Artifact[]
   sort: SortState
   onSort: (key: SortKey) => void
@@ -633,6 +672,8 @@ export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggl
   dragActive: boolean
   sessionDocs?: SessionDoc[]
   onMaterialize?: (path: string, sessionKey?: string) => void
+  /** Row click opens the read-only session-doc preview. */
+  onPreviewDoc?: (d: SessionDoc) => void
   materializingPath?: string | null
 }) {
   // See LibraryTable: the pinned Actions seam is gated on measured overflow,
@@ -643,6 +684,7 @@ export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggl
   // mount at once (library page + a side panel) and a repeated id would point
   // both lanes at the first one's label.
   const unfiledLabelId = useId()
+  const docsLabelId = useId()
   const folderIds = new Set(folders.map(f => f.id))
   const byFolder = new Map<string, Artifact[]>()
   for (const a of items) {
@@ -735,8 +777,20 @@ export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggl
               edgeRight={edges.right}
             />
           ))}
+          {onMaterialize && sessionDocs.length > 0 && (
+            // Its own labelled lane, so the Unfiled count above is not read as
+            // covering these rows (#9910). Not a DndDroppable: a session doc has
+            // no store slug to file, so there is no drop target to offer.
+            <tr aria-labelledby={docsLabelId}>
+              <td colSpan={9} className="px-2.5 border-b border-border" style={{ paddingTop: 6, paddingBottom: 6 }}>
+                <span id={docsLabelId} className="text-[11px] uppercase tracking-[.04em] text-muted font-medium">
+                  {i18nT('pages.artifactsPage.from_your_chats')} · {sessionDocs.length}
+                </span>
+              </td>
+            </tr>
+          )}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} onPreview={onPreviewDoc} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>

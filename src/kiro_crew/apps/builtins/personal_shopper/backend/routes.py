@@ -481,9 +481,10 @@ def _sites_path() -> Path:
 async def _handle_get_sites(request: web.Request) -> web.Response:
     def _read():
         path = _sites_path()
-        if path.exists():
+        try:
             return json.loads(path.read_text(encoding="utf-8"))
-        return {"sites": []}
+        except FileNotFoundError:
+            return {"sites": []}
 
     data = await asyncio.to_thread(_read)
     return web.json_response(data)
@@ -520,6 +521,27 @@ async def _handle_put_sites(request: web.Request) -> web.Response:
 
 
 # ── Registration ──
+
+
+async def _close_store(_app: web.Application) -> None:
+    """Release the store singleton's sqlite handles at gateway shutdown.
+
+    The connection runs in WAL mode, so leaving it open pins ``preferences.db``
+    plus its ``-wal`` and ``-shm`` siblings for the gateway's whole lifetime.
+    POSIX tolerates that -- an unlinked file with a live handle just disappears
+    later -- but Windows refuses to delete or rename a file that is still open,
+    so disabling, uninstalling or resetting the app afterwards failed with a
+    ``PermissionError`` on files nothing was using any more.
+
+    The singleton is cleared before the blocking close so a request arriving
+    mid-shutdown rebuilds a fresh store instead of reusing a closed connection.
+    ``close`` takes the store's lock and touches the filesystem, so it goes off
+    the event loop like every other store call in this module.
+    """
+    global _store
+    store, _store = _store, None
+    if store is not None:
+        await asyncio.to_thread(store.close)
 
 
 def register_routes(app: web.Application) -> None:
@@ -559,3 +581,5 @@ def register_routes(app: web.Application) -> None:
     # Sites
     app.router.add_get(f"{_PREFIX}/sites", _require_enabled(_handle_get_sites))
     app.router.add_put(f"{_PREFIX}/sites", _require_enabled(_handle_put_sites))
+    # Shutdown: close the sqlite connection so the data directory stays removable.
+    app.on_cleanup.append(_close_store)

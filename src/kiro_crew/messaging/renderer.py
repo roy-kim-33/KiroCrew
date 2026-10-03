@@ -17,7 +17,13 @@ a widget-capable renderer that skips the helper fails that test.
 Channels declaring ``max_buttons=0`` render no widget and route the whole
 trailer through :func:`render_options_as_text`, which reaches the same helper
 with zero widget slots: every choice becomes a numbered line the user answers by
-typing, rather than being deleted along with the trailer.
+typing, rather than being deleted along with the trailer. Four channels deliver the
+numbered list -- Weixin, iMessage and Feishu through this function, WeCom through
+its own streaming-aware copy (see below) -- and
+``test/test_options_cap_contract.py`` drives each one. WhatsApp declares ``max_buttons=0`` and does NOT: its renderer strips a
+complete trailer (``whatsapp/turn_renderer.py::_strip_options``) and the choices
+are lost, which is a gap rather than a position -- so a ``0`` here is not on its
+own a promise that the list survives.
 
 Webex is the widget channel that ALSO always ships the numbered text: it declares
 Adaptive Card actions, but the inbound half of a press rides an undocumented
@@ -32,14 +38,26 @@ from __future__ import annotations
 import hashlib
 import secrets
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER, strip_control_comments
+from kiro_crew.constants import (
+    MARKER_CLOSERS,
+    OPTIONS_RE_TRAILER,
+    _leading_wrapper_start,
+    relocate_glued_tail_marker,
+    strip_control_comments,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 
 # Abstract output event kinds.
 TEXT_CHUNK = "text_chunk"
@@ -66,7 +84,14 @@ class OutputEvent:
     # tool_call announces it, prompt_choice asks permission for it. Carrying them
     # on the prompt is what lets a renderer name the tool the request is actually
     # about instead of the last one it happened to see.
-    title: str = ""  # tool_call / prompt_choice (tool name / "Running: X")
+    title: str = ""  # tool_call / prompt_choice (display title: derived, or "Running: X")
+    # tool_call: the tool's PROGRAMMATIC identity (`_meta.kiro.toolName`), kept
+    # apart from ``title`` because the title is display copy — derived from the
+    # arguments, localisable, and free to change — while a renderer's behaviour
+    # rules (the Slack `wait` stream rollover) must key on what the tool IS.
+    # Empty when the transport sent no identity; renderers then fall back to the
+    # title, which is what they matched on before the identity travelled.
+    tool_name: str = ""
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
     tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
@@ -78,6 +103,10 @@ class OutputEvent:
     tool_input: str = ""
     context_usage_pct: float = 0.0  # compaction
     stop_reason: str = ""  # done
+    # done: the driver's empty-turn verdict (``driver.empty_turn_notice``) --
+    # the sentence to post in place of a bare placeholder when the turn closed
+    # with no assistant text, ``""`` when it produced text or was cancelled.
+    notice: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,11 +121,12 @@ class OutputEvent:
             "request_id": self.request_id,
             "context_usage_pct": self.context_usage_pct,
             "stop_reason": self.stop_reason,
+            "notice": self.notice,
         }
 
 
 def chunk_text(text: str, max_chars: int) -> list[str]:
-    """Split ``text`` into chunks no longer than ``max_chars``.
+    """Split ``text`` into chunks of at most ``max_chars`` characters.
 
     Pure helper used by Renderers to honor ``capabilities.max_message_chars``.
     Returns ``[]`` for empty input. A non-positive ``max_chars`` disables
@@ -109,7 +139,12 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
-def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[str]:
+def chunk_for_transport(
+    text: str,
+    capabilities: TransportCapabilities,
+    *,
+    redactor: Callable[[str], str] | None = None,
+) -> list[str]:
     """Split *text* into parts the transport will accept, in ITS unit.
 
     Prefers ``max_message_bytes`` when the platform declares one, because a
@@ -127,10 +162,23 @@ def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[
     rewrites the ``**``/``#``/``- `` INSIDE the code -- and a sub-agent diff or
     cron log dump is exactly that shape. Callers that want a raw fixed-width cut
     reach for :func:`chunk_text` directly.
+
+    ``redactor`` is the credential grader threaded into the seam checks on both
+    paths. It defaults to ``_default_redactor``, but a COMPOSED host (a session
+    carrying companion-contributed credential patterns) must pass its own
+    ``redact_via_context``: the default pair does not know the companion patterns,
+    so a companion-only credential split across a seam would be graded by the
+    narrower pair and delivered whole across two adjacent messages. The Slack and
+    dashboard sinks already redact their DISPLAY text with ``redact_via_context``;
+    passing the same grader here keeps the seam check as wide as the display pass.
     """
     # Local imports: split.py is a heavier pure-Python module and only these
     # paths need it, so the renderer contract stays cheap to import.
     #
+    # ``redactor`` defaults to ``_default_redactor`` (resolved here, not as a def
+    # default, because that helper is defined below this function).
+    if redactor is None:
+        redactor = _default_redactor
     # ``getattr`` with the field's own ``0`` default, not attribute access: the
     # real ``TransportCapabilities`` always carries ``max_message_bytes``, but a
     # capabilities-shaped object from before the field existed must degrade to the
@@ -138,12 +186,82 @@ def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[
     # default the dataclass declares.
     max_bytes = getattr(capabilities, "max_message_bytes", 0)
     if max_bytes > 0:
-        from kiro_crew.messaging.split import split_markdown_bytes
+        from kiro_crew.messaging.split import (
+            _made_collapse_clean,
+            bounded_for_delivery,
+            chunk_utf8_bytes,
+            repaired_for_delivery,
+            split_markdown_bytes,
+        )
 
-        return split_markdown_bytes(text, max_bytes)
-    from kiro_crew.messaging.split import split_markdown_safe
+        # Graded after the split rather than during it: every caller of this helper
+        # sends each unit as its own message, so a boundary here is a seam between
+        # two messages a reader reads in order, and a key written across a line
+        # break is invisible to a per-message scan yet whole on screen once the
+        # break is gone. The byte splitter takes no redactor -- it reaches its
+        # budget by shrinking a CHARACTER limit and retrying, which a cut that may
+        # decline to cut would not terminate on -- so the guarantee is established
+        # on the sequence it produced. ``bounded_for_delivery`` grades only the
+        # slices IT cuts inside a chunk, never the splitter's own inter-chunk seams,
+        # so those seams are graded here with ``repaired_for_delivery``.
+        #
+        # The repaired body is RE-SPLIT and RE-GRADED, not trusted after one pass:
+        # ``repaired_for_delivery`` can answer with the source UNCHANGED (no literal
+        # span collapses to a key and the whole-text canonical collapse reads clean),
+        # and a position-dependent rule like the ``^``-anchored heading marker can
+        # still rejoin a key once a byte cut makes a ``#`` piece-leading -- so a
+        # single re-split can reproduce the exact unsafe sequence.
+        # Shrink the byte budget and re-split until the delivered sequence rejoins
+        # no key (``repaired_for_delivery`` returns ``None``). The budget is halved
+        # all the way to the 1-byte floor -- a small ``max`` tries would stop far
+        # above it (eight halvings of a 7 KiB cap lands at ~58, not 1), returning a
+        # still-unsafe sequence. If even the floor cannot separate the halves (a
+        # run wider than one byte between them), fall back to the splitter's own
+        # fail-closed answer, ``_made_collapse_clean``, which gives up the rejoining
+        # whitespace rather than the key. The final ``bounded_for_delivery`` then
+        # caps each chunk with the byte cutter.
+        body = text
+        budget = max_bytes
 
-    return split_markdown_safe(text, capabilities.max_message_chars)
+        def _cut_bytes(repaired: str) -> list[str]:
+            # The rule the byte path will cut a repair by, threaded into the grade
+            # so the repair is judged by the same reading that refused the pieces.
+            return split_markdown_bytes(repaired, budget)
+
+        pieces = split_markdown_bytes(body, budget)
+        while True:
+            repaired = repaired_for_delivery(body, pieces, redactor, _cut_bytes)
+            if repaired is None:
+                break  # the current sequence rejoins no key -- deliver it.
+            # ``repaired`` is a collapse fixed point; re-split and re-grade it at the
+            # same budget first.
+            body = repaired
+            pieces = split_markdown_bytes(body, budget)
+            if repaired_for_delivery(body, pieces, redactor, _cut_bytes) is None:
+                break
+            if budget <= 1:
+                # The 1-byte floor still rejoins (a run wider than one byte between
+                # the halves): give up the whitespace, not the key. ``_made_collapse
+                # _clean`` returns a body safe to cut at any budget.
+                body = _made_collapse_clean(body, redactor)
+                pieces = split_markdown_bytes(body, max_bytes)
+                break
+            budget = max(1, budget // 2)
+            pieces = split_markdown_bytes(body, budget)
+        return bounded_for_delivery(pieces, max_bytes, redactor, chunk_utf8_bytes)
+    from kiro_crew.messaging.split import bounded_for_delivery, split_markdown_safe
+
+    units = split_markdown_safe(text, capabilities.max_message_chars, redactor=redactor)
+    # Bounded for the same reason every capped caller does it: the credential-aware
+    # cut is fail-closed and can answer with the text whole, and a transport that
+    # caps by slicing would drop that answer's tail after every scan has run. Pass
+    # ``chunk_text`` as the LAST-RESORT cutter rather than defaulting to
+    # ``split_markdown_safe``: that default is documented to return a chunk OVER the
+    # budget by its fence scaffolding (a long opener/info string), which every caller
+    # then delivers as one message and the transport truncates with no signal.
+    # ``chunk_text`` is the hard character cut that guarantees the budget, and the
+    # grade covers the boundaries it creates.
+    return bounded_for_delivery(units, capabilities.max_message_chars, redactor, chunk_text)
 
 
 def cap_choices(
@@ -181,7 +299,7 @@ def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
 
     Control-tag comments are stripped first, same as :func:`display_safe` —
     the deterministic backstop against a dashboard-authored control tag
-    reaching channel users as literal text (#7948).
+    reaching channel users as literal text.
     """
     text = strip_control_comments(text or "")
     safe, _ = redact_for_display(text, _default_redactor)
@@ -256,7 +374,7 @@ def display_safe(text: str) -> str:
 
     Control-tag comments are stripped first (fence/inline-code aware): channel
     formatters render HTML comments literally, so a dashboard-authored
-    ``<!-- keep-visible -->`` (#7948) or ``deliver:``/``plan_task_id:`` tag
+    ``<!-- keep-visible -->`` or ``deliver:``/``plan_task_id:`` tag
     delivered to a channel would otherwise reach end users as visible text.
     The prompt rule only contains the emitter; this is the deterministic
     backstop on the message itself.
@@ -302,6 +420,110 @@ def credential_redaction_notice(count: int) -> str:
         "redaction placeholder. Any command shown will not work if you paste it "
         "as-is; supply the secret yourself on the machine where you run it."
     )
+
+
+def redaction_notice(cred_count: int, url_count: int) -> str:
+    """The notice a channel sends after delivering text EITHER redactor rewrote.
+
+    Every channel delivery surface runs two body rewriters over the text it
+    ships -- ``security.redact_exfiltration_urls`` then
+    ``security.redact_credentials`` -- so the placeholder a reader sees can come
+    from either. ``cred_count`` is the number of ``CREDENTIAL_REDACTION_TAGS``
+    placeholders in the delivered text; ``url_count`` is the number of
+    ``EXFILTRATION_REDACTION_TAG_PREFIX`` placeholders (that tag interpolates the
+    redacted domain, so callers count it by prefix, never by equality). Like
+    :func:`credential_redaction_notice`, this carries NO secret bytes and no
+    redacted URL: only the counts are used, so the domain the tag names never
+    reaches the sentence.
+
+    Worded BY KIND because the remedies differ: a credential needs the secret
+    re-entered where the command runs; a rewritten URL needs the original link
+    re-checked from a trusted source. Telling a reader whose URL was rewritten to
+    "supply the secret yourself" names a remedy that cannot help them, which is
+    the gap this closes. The credential-only sentence is delegated to
+    :func:`credential_redaction_notice` unchanged, so a surface that adopts this
+    builder ships byte-identical wording for the case it already covered.
+
+    Same delivery contract as the credential notice: plain text, no markup, no
+    emoji, one string for every channel, sent as its own message BELOW the
+    answer. At least one count must be non-zero -- the caller gates on that, and
+    a zero/zero call is a caller bug rather than a silent empty message.
+    """
+    if cred_count < 0 or url_count < 0 or not (cred_count or url_count):
+        raise ValueError("redaction_notice needs at least one placeholder to describe")
+    if not url_count:
+        return credential_redaction_notice(cred_count)
+    subjects: list[str] = []
+    if cred_count:
+        subjects.append("a credential" if cred_count == 1 else f"{cred_count} credentials")
+    subjects.append("a suspicious URL" if url_count == 1 else f"{url_count} suspicious URLs")
+    subject = " and ".join(subjects)
+    subject = subject[0].upper() + subject[1:]
+    verb = "was" if (cred_count + url_count) == 1 else "were"
+    if cred_count:
+        remedy = (
+            "supply the secret yourself on the machine where you run it, and "
+            "re-check any redacted URL against a trusted source."
+        )
+    else:
+        remedy = "re-check the original URL against a trusted source before using it."
+    return (
+        f"Security notice: {subject} in the message above {verb} replaced with a "
+        f"redaction placeholder. Any command or link shown will not work if you "
+        f"paste it as-is; {remedy}"
+    )
+
+
+def count_redaction_tags(text: str) -> tuple[int, int]:
+    """Count both redaction placeholder kinds in delivered text.
+
+    Returns ``(cred_count, url_count)`` — the two arguments
+    :func:`redaction_notice` takes, in its order. Every delivery surface that
+    posts a notice needs the same two tallies over the text that actually
+    shipped, and each kind counts differently: a credential tag is a CLOSED set
+    of constant strings (``CREDENTIAL_REDACTION_TAGS``), matched exactly and
+    summed so an encoded-credential-only answer is not missed, while the URL
+    tag interpolates the redacted domain and so has no constant form — it is
+    counted by ``EXFILTRATION_REDACTION_TAG_PREFIX`` prefix, never by equality.
+
+    One shared counter exists so a surface cannot adopt half the tally: a
+    site that counts credentials but forgets the URL prefix (or vice versa)
+    posts a notice worded for the wrong remedy, which is the gap the two-kind
+    notice closes. Count from the DELIVERED text rather than a redactor's
+    warnings list: chunked surfaces redact on the way out, so re-redacting the
+    assembled answer reports nothing while the placeholders are plainly
+    visible in what shipped.
+    """
+    cred_count = sum(text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    url_count = text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    return cred_count, url_count
+
+
+def repaired_after_a_sent_tail(
+    sent_tail: str, remainder: str, redactor: Callable[[str], str]
+) -> str | None:
+    """*remainder* with the span that completes a key after *sent_tail* given up.
+
+    ``None`` when the pair is clean, which is the common answer.
+
+    A streaming channel seals a chunk whose tail is a credential PREFIX. That
+    prefix matches nothing, so every scan passes it and the message is sent; the
+    characters completing the key arrive afterwards, and the reader scrolling the
+    two messages reads the key whole while neither message holds it. The sent
+    message cannot be recalled, so the side still open to repair is the one not yet
+    delivered, and giving up the span that completes the key is what closes the
+    seam: the delivered message keeps a fragment, which is not a credential.
+
+    Only that leading span is given up. Everything after it is the reply as written,
+    sliced rather than reassembled, so no break and no markup is lost anywhere else
+    in the message.
+    """
+    from kiro_crew.messaging.split import offset_clear_of_a_sent_tail
+
+    offset = offset_clear_of_a_sent_tail(sent_tail, remainder, redactor)
+    if not offset:
+        return None
+    return CREDENTIAL_REDACTION_TAGS[0] + remainder[offset:]
 
 
 def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
@@ -438,7 +660,12 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
       status frame). The text is still arriving, so a partial marker really may be
       a marker mid-flight, and showing reserved protocol as raw text is the cost
       being avoided. Safe there precisely because the frame is transient: the next
-      frame, or the sealed answer, re-renders from the full buffer.
+      frame, or the sealed answer, re-renders from the full buffer. Held back is
+      only a tail that can still BECOME the trailer -- ``[OPTIONS`` as the final
+      bytes, or ``[OPTIONS:`` with its content still open. A tail where any other
+      byte follows ``[OPTIONS`` is grammar-dead (the trailer opens ``[OPTIONS:``),
+      so it is quoted prose and is kept even here: cutting it would be the
+      permanent loss described below, wearing a streaming excuse.
     * ``False`` -- a BUFFERED surface that sends once (Slack's extraction, Webex's
       final answer, and this module's own zero-widget path). Such a caller cannot
       tell a live fragment from the assistant's prose, and cutting prose is
@@ -454,24 +681,72 @@ def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str
     Stripping a genuine steering frame is ``TurnDriver``'s job and happens before
     a renderer sees the text.
     """
+    text = relocate_glued_tail_marker(text)
     match = OPTIONS_RE_TRAILER.search(text)
     if match:
-        choices = [c.strip() for c in match.group(1).split("|") if c.strip()]
+        choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
         return text[: match.start()].rstrip(), choices
     if hide_partial:
         idx = text.rfind("[OPTIONS")
-        if idx != -1 and "]" not in text[idx:]:
-            return text[:idx].rstrip(), []
+        # "Holds no CLOSER at all", over the whole ``MARKER_CLOSERS`` set rather
+        # than ASCII ``]`` alone. A tail that already holds a closer is not in
+        # flight: either it reads as a marker, in which case the search above
+        # took it, or the grammar declined it and it is PROSE -- which is the
+        # rule ``test_hide_partial_does_not_touch_a_closed_bracket_elsewhere``
+        # already pins for ASCII. Spelling it ASCII-only made that rule miss a
+        # marker whose only closers are lookalikes (``[OPTIONS: 【重要】修复 |
+        # 跳过】``), and the cut there is the permanent kind described below:
+        # WeCom's sealed frame and its persisted history entry, and the Discord
+        # and Telegram ``self._buf = [body]`` reseat, would show the leading
+        # prose with the entire option list deleted and no pills to recover it
+        # from. Widening here can only ever KEEP more text, never cut more.
+        #
+        # Not the same question as ``split_trailing_protocol_suffix``'s probe,
+        # which asks "is this tail COMPLETE?" and must stay ASCII-only (see the
+        # comment there): presence of a closer is not completeness, but it is
+        # conclusive evidence of not-in-flight, and only the latter is asked
+        # here. The two checks differ because the questions differ.
+        if idx != -1 and not any(c in text[idx:] for c in MARKER_CLOSERS):
+            # Judge the fragment against the grammar it would have to satisfy,
+            # not by substring presence alone. :data:`OPTIONS_RE_TRAILER` opens
+            # ``[OPTIONS:`` -- once any byte other than ``:`` follows the
+            # substring, no later bytes can complete a marker there, so the
+            # fragment is the assistant's PROSE and holding it back protects
+            # nothing. It costs plenty: the trim point is wherever the quoted
+            # token sits, everything after it to buffer end goes with it, and
+            # when no ``]`` ever arrives the sealed frame re-trims too, so the
+            # transient-frame consolation above does not apply. Locating a
+            # marker by substring without asking whether it READS as one is
+            # the bug fixed at the directive seam; this is the same
+            # rule at the trailer seam. Only the tail-most occurrence can be
+            # mid-flight -- a stream appends, so text after an opener means
+            # that opener was never in flight -- which is why one viability
+            # check here beats walking earlier occurrences.
+            tail = text[idx + len("[OPTIONS") :]
+            if not tail or tail.startswith(":"):
+                # A LINE-LEADING Markdown wrapper run abutting the fragment is
+                # part of the marker-to-be (``**[OPTIONS: A``): cutting at the
+                # ``[`` alone publishes a stray ``**`` on this frame. Widen the
+                # cut with the same rule the grammar and
+                # ``split_trailing_protocol_suffix`` apply, so every backend
+                # partial path agrees; a mid-line run is prose and stays.
+                return text[: _leading_wrapper_start(text, idx)].rstrip(), []
     return text, []
 
 
 def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
     """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
 
-    The whole trailer handling for a channel that renders no widget, so every
-    channel that renders none shares one implementation instead of a copy each.
+    The whole trailer handling for a channel that renders no widget, so a channel
+    that renders none shares one implementation instead of keeping a copy each.
     Returns the body only; the widget half of :func:`apply_options_cap` has
     nothing to keep at ``max_buttons == 0``.
+
+    Three of the five zero-widget channels call it: Weixin, iMessage and Feishu.
+    WeCom reaches the same outcome through its own ``_render_options_as_text``, for
+    the ``hide_partial`` reason below, so it does not call this one. WhatsApp is the
+    channel that reaches the outcome NOWHERE: its renderer strips the trailer
+    instead, so its choices never arrive here or anywhere.
 
     Parsing is :func:`split_options_trailer`, at its buffered default: this path's
     callers do not stream — they buffer a whole turn and send once — so an
@@ -494,6 +769,22 @@ class Renderer(ABC):
     """Maps abstract ``OutputEvent``s onto a transport's native surface."""
 
     channel_type: str = ""
+    #: Programmatic identity of the tool call ``on_tool_call`` is currently
+    #: rendering (``OutputEvent.tool_name``), set by :meth:`dispatch` before the
+    #: hook runs. ``on_tool_call`` receives the DISPLAY title; a renderer whose
+    #: behaviour depends on which tool ran (Slack's ``wait`` stream rollover)
+    #: reads this instead of matching the title. ``""`` when the transport sent
+    #: no identity.
+    current_tool_name: str = ""
+    #: The driver's empty-turn verdict for the turn being finalized
+    #: (``OutputEvent.notice`` on ``DONE``), set by :meth:`dispatch` before
+    #: ``on_done`` runs. Non-empty means the turn closed with no assistant text
+    #: and this is the sentence the user is owed; a renderer whose body is empty
+    #: at ``on_done`` posts it where its bare placeholder would otherwise go, so
+    #: a turn that produced nothing never reads as a finished reply. ``""`` for a
+    #: turn that produced text, a cancelled turn, and every turn on a renderer
+    #: that never received a ``DONE`` (a close after an exception).
+    empty_turn_notice: str = ""
 
     def __init__(self, capabilities: TransportCapabilities) -> None:
         self.capabilities = capabilities
@@ -674,6 +965,7 @@ class Renderer(ABC):
         elif event.kind == THINKING:
             await self.on_thinking(event.text)
         elif event.kind == TOOL_CALL:
+            self.current_tool_name = event.tool_name or ""
             await self.on_tool_call(
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
@@ -688,6 +980,7 @@ class Renderer(ABC):
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:
+            self.empty_turn_notice = event.notice or ""
             await self.on_done(event.stop_reason)
         elif event.kind == STEER_CONSUMED:
             await self.on_steer_consumed(event.text)
@@ -718,7 +1011,7 @@ class SilentRenderer(Renderer):
     ``on_prompt_choice`` is dropped like the rest, matching the Slack gate that
     withholds the linked approval prompt from a disconnected thread: the
     dashboard renders the same prompt, and soliciting a decision in the
-    conversation the user just left would ask where they are no longer looking.
+    conversation the user just left would ask where they are not looking.
     """
 
     def __init__(self, capabilities: Any = None, channel_type: str = "") -> None:

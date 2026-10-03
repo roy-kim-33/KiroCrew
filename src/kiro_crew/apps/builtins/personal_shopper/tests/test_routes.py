@@ -1,9 +1,9 @@
 """Tests for the Personal Shopper HTTP routes.
 
 The load-bearing ones here pin the boundary between a CLIENT error and a SERVER
-error. Every field these handlers read used to go straight into a string or int
-operation, so a wrong TYPE — not a wrong value — raised inside the handler and
-surfaced as a 500. A 500 tells a caller "the server is broken" and is what gets
+error. A field these handlers read must not go straight into a string or int
+operation: a wrong TYPE — not a wrong value — then raises inside the handler and
+surfaces as a 500. A 500 tells a caller "the server is broken" and is what gets
 paged on; the correct answer to ``{"text": 1}`` is a 400 naming the offending
 field, which is what these assert.
 
@@ -135,8 +135,8 @@ class TestJsonObjectCatchWidth(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_charset_codec_is_a_400_not_a_500(self) -> None:
         # An unknown ``charset=`` on the request makes aiohttp's decode step raise
-        # LookupError (not a ValueError), which used to escape ``_json_object`` as
-        # a 500. It is a client-input mistake and must answer 400.
+        # LookupError (not a ValueError), which escapes ``_json_object`` as a 500
+        # unless it is caught. It is a client-input mistake and must answer 400.
         body, err = await routes_mod._json_object(
             _req_raising(LookupError("unknown encoding: bogus-codec"))
         )
@@ -224,6 +224,24 @@ class TestFeedbackIsConstrained(RoutesTestCase):
 
 
 class TestSitesShapeValidation(RoutesTestCase):
+    async def test_get_treats_a_vanished_sites_file_as_empty(self) -> None:
+        """Deleting sites.json during discovery must not turn GET into a 500."""
+        sites_file = routes_mod._sites_path()
+        sites_file.write_text('{"sites": []}', encoding="utf-8")
+        real_read_text = Path.read_text
+
+        def vanish_before_read(path, *args, **kwargs):
+            if path == sites_file:
+                path.unlink()
+                raise FileNotFoundError(path)
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", vanish_before_read):
+            resp = await self.client.get(f"{_PREFIX}/sites")
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(await resp.json(), {"sites": []})
+
     async def test_sites_must_be_an_array_of_objects(self) -> None:
         resp = await self.client.put(f"{_PREFIX}/sites", json={"sites": ["amazon"]})
         self.assertEqual(resp.status, 400)
@@ -394,10 +412,23 @@ class TestTheSuiteHasNoSideEffects(RoutesTestCase):
         )
 
     async def test_the_real_data_home_is_never_resolved(self) -> None:
-        """The patched path must not be the operator's home under any spelling."""
-        resolved = str(routes_mod._sites_path().resolve())
-        self.assertNotIn(".kiro/crew/apps", resolved)
-        self.assertNotIn(".kirocrew/apps", resolved)
+        """The patched path must not be the operator's home under any spelling.
+
+        Compared through ``as_posix()`` rather than ``str()``: ``str()`` of a
+        resolved path spells the separator the way the host does, so on Windows
+        the forward-slash needles could never match and this guard went green
+        even if the write HAD escaped into the operator's real data home. The
+        containment assertion is the positive form of the same claim and depends
+        on no separator spelling at all.
+        """
+        resolved = routes_mod._sites_path().resolve()
+        spelling = resolved.as_posix()
+        self.assertNotIn(".kiro/crew/apps", spelling)
+        self.assertNotIn(".kirocrew/apps", spelling)
+        self.assertTrue(
+            resolved.is_relative_to(Path(self._tmp).resolve()),
+            f"sites.json resolved outside the tmpdir and landed at {resolved}",
+        )
 
 
 if __name__ == "__main__":

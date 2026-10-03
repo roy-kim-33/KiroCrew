@@ -16,6 +16,7 @@ import PrBulkBar from './PrBulkBar'
 import { providerTerms } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 /** Above this many rendered rows we skip the per-card enter/layout animation
  * (same rationale as IssueList — Framer's layout pass janks on large lists). */
 const ANIM_CAP = 200
@@ -248,7 +249,7 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
             onChange={(e) => setPrQuery(e.target.value)}
             placeholder={i18nT('apps.issueRadar.components.prList.search', { label: terms.changeRequestPluralTitle })}
             aria-label={i18nT('apps.issueRadar.components.prList.search_2', { label: terms.changeRequestPluralTitle })}
-            className="flex-1 min-w-0 bg-transparent py-2.5 text-[13px] text-text placeholder:text-muted outline-none"
+            className="flex-1 min-w-0 bg-transparent py-2.5 text-[13px] text-text placeholder:text-muted outline-hidden"
           />
           {prQuery && (
             <button
@@ -271,7 +272,8 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
             <ListSkeleton />
           </div>
         )}
-        {pullsError && <div className="px-4 py-2 text-[14px] text-danger">{pullsError.message}</div>}
+        {/* A list read; the search box above is a filter, not a draft. */}
+        <ErrorNotice message={pullsError?.message} askAgent className="mx-4 my-2" />
         {!pullsLoading && filteredPulls.length === 0 && (
           <div className="px-4 pb-2">
             <ListEmptyState searching={Boolean(prQuery.trim())} label={terms.changeRequestPluralTitle} />

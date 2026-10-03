@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import SchedulePage from '../pages/SchedulePage'
@@ -33,7 +33,10 @@ vi.mock('../api/client', () => ({
     cronToChat: vi.fn().mockResolvedValue({}),
     cronHistoryAll: vi.fn().mockResolvedValue({ runs: [] }),
     kirocrewAgents: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
-    syncKirocrewAgents: vi.fn().mockResolvedValue({}),
+    agentCatalog: vi.fn().mockResolvedValue({ agents: [], default_agent: '' }),
+    // The page now SAYS when the default-agent read fails; an unmocked
+    // `api.defaultAgent` would surface that notice in every case here.
+    defaultAgent: vi.fn().mockResolvedValue({ default_agent: '' }),
   },
 }))
 
@@ -47,6 +50,41 @@ const openGallery = async () => {
   fireEvent.keyDown(screen.getByLabelText('Browse schedule templates'), { key: 'Enter' })
   fireEvent.click(await screen.findByText('Browse all templates'))
 }
+
+describe('SchedulePage next-run ordering', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.removeItem('sort:cron-schedule')
+  })
+
+  afterEach(() => localStorage.removeItem('sort:cron-schedule'))
+
+  it.each([null, undefined])('sorts upcoming jobs before a paused job with next_run_ts=%s', async nextRun => {
+    const { api } = await import('../api/client')
+    const now = Date.now() / 1000
+    vi.mocked(api).crons.mockReset().mockResolvedValue({
+      jobs: [
+        mkJob({ id: 'paused', name: 'Paused job', enabled: false, next_run_ts: nextRun }),
+        mkJob({ id: 'later', name: 'Later job', next_run_ts: now + 7200 }),
+        mkJob({ id: 'soon', name: 'Soon job', next_run_ts: now + 3600 }),
+      ],
+    })
+
+    renderWithProviders(<SchedulePage />)
+    await screen.findByRole('checkbox', { name: 'Select Paused job' })
+    const rowNames = () => screen.getAllByRole('row').slice(1).map(row =>
+      within(row).getByRole('checkbox').getAttribute('aria-label'))
+    const expected = ['Select Soon job', 'Select Later job', 'Select Paused job']
+
+    expect(screen.getByRole('columnheader', { name: 'Next Run' })).toHaveAttribute('aria-sort', 'ascending')
+    expect(rowNames()).toEqual(expected)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Name', exact: true }))
+    fireEvent.click(screen.getByRole('button', { name: 'Next Run', exact: true }))
+    expect(screen.getByRole('columnheader', { name: 'Next Run' })).toHaveAttribute('aria-sort', 'ascending')
+    expect(rowNames()).toEqual(expected)
+  })
+})
 
 describe('SchedulePage delete button state machine', () => {
   beforeEach(() => {
@@ -320,7 +358,7 @@ describe('SchedulePage empty-state preset cards', () => {
     // view is itself a dialog now, so a `queryByRole('dialog')` check here
     // would be satisfied only if the thing under test had failed to open.
     await waitFor(() => expect(screen.queryByRole('button', { name: `Use the ${preset.title} template` })).not.toBeInTheDocument())
-    const nameInput = (await screen.findByLabelText('Name')) as HTMLInputElement
+    const nameInput = (await screen.findByLabelText('Name', { selector: 'input' })) as HTMLInputElement
     expect(nameInput.value).toBe(preset.prefill.name)
     const msgInput = screen.getByLabelText('Message') as HTMLTextAreaElement
     expect(msgInput.value).toContain(preset.prefill.message)
@@ -358,7 +396,7 @@ describe('SchedulePage template gallery (non-empty state)', () => {
 
     fireEvent.click(screen.getByText('Error Digest'))
 
-    const nameInput = (await screen.findByLabelText('Name')) as HTMLInputElement
+    const nameInput = (await screen.findByLabelText('Name', { selector: 'input' })) as HTMLInputElement
     expect(nameInput.value).toBe('Error Digest')
     const msgInput = screen.getByLabelText('Message') as HTMLTextAreaElement
     expect(msgInput.value).toContain('production errors')
@@ -444,7 +482,11 @@ describe('SchedulePage write-capable preset indicator', () => {
     await screen.findByRole('dialog')
     fireEvent.click(screen.getByRole('button', { name: `Use the ${writesPreset.title} template` }))
 
-    expect(await screen.findByRole('note')).toHaveTextContent(/not enforced policy/i)
+    // Addressed by test id rather than by role: the create dialog can carry a
+    // SECOND advisory note (the cheaper-execution-mode hint), and a bare
+    // `role="note"` query cannot tell the two apart. The contract here is about
+    // the writes notice specifically.
+    expect(await screen.findByTestId('schedule-writes-notice')).toHaveTextContent(/not enforced policy/i)
   })
 
   it('re-selecting the SAME preset resets the form (pins the selection-nonce remount)', async () => {
@@ -545,7 +587,7 @@ describe('SchedulePage write-capable preset indicator', () => {
     fireEvent.click(screen.getByRole('button', { name: `Use the ${readOnlyPreset.title} template` }))
 
     await waitFor(() => expect(screen.getByDisplayValue(readOnlyPreset.prefill.name)).toBeInTheDocument())
-    expect(screen.queryByRole('note')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('schedule-writes-notice')).not.toBeInTheDocument()
   })
 })
 
@@ -568,6 +610,39 @@ describe('SchedulePage job detail dialog', () => {
     expect(dialog).toBeInTheDocument()
     // The form is the detail view's payload, not just a titled shell.
     expect(await screen.findByDisplayValue('Nightly report')).toBeInTheDocument()
+  })
+
+  it('?job=<id> opens that job\'s detail once the list loads (the Crewmate Profile link)', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob({ id: 'job-7', name: 'Linked job' })] })
+
+    renderWithProviders(<SchedulePage />, { route: '/schedule?job=job-7' })
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(await screen.findByDisplayValue('Linked job')).toBeInTheDocument()
+  })
+
+  it('keeps ?job=<id> through a failed first load so Retry can still open it', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons
+      .mockReset()
+      .mockRejectedValueOnce(new Error('first load failed'))
+      .mockResolvedValue({ jobs: [mkJob({ id: 'job-7', name: 'Linked job' })] })
+
+    renderWithProviders(<SchedulePage />, { route: '/schedule?job=job-7' })
+    expect(await screen.findByText('first load failed')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    expect(await screen.findByDisplayValue('Linked job')).toBeInTheDocument()
+  })
+
+  it('?job=<unknown id> lands on the list with no dialog', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({ jobs: [mkJob()] })
+
+    renderWithProviders(<SchedulePage />, { route: '/schedule?job=gone' })
+    await waitFor(() => expect(screen.getByText('Nightly report')).toBeInTheDocument())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('keeps the job selected after the dialog is dismissed, so the Executions filter survives', async () => {
@@ -596,5 +671,72 @@ describe('SchedulePage job detail dialog', () => {
     await waitFor(() => expect(api.cronHistoryAll).toHaveBeenCalledWith(
       expect.objectContaining({ jobId: 'job-1' }),
     ))
+  })
+})
+
+describe('SchedulePage failed-job error surface', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  // A job's `last_error` is an error by origin, and AUTOSDE names `title=`-only
+  // error text as no surface at all: invisible on touch, unreadable to a screen
+  // reader, no hand-off. These pin both halves of that -- the row must not be
+  // the only place it appears, and the dialog must show it for EVERY job type,
+  // not just the `script` ones the guard used to allow.
+
+  it('a failed row carries NEITHER the error nor a stale earlier success in its title', async () => {
+    // Dropping last_error from the title is only half of it. last_result is the
+    // PREVIOUS run's output, so leaving it on a failed row makes a red Error
+    // badge read "ran ok" on hover -- stale success contradicting the very
+    // state the badge flags.
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({
+      jobs: [mkJob({ last_status: 'error', last_error: 'boom: exit 1', last_result: 'ran ok' })],
+    })
+
+    renderWithProviders(<SchedulePage />)
+    await screen.findByText('Nightly report')
+
+    const titles = (Array.from(document.querySelectorAll('[title]')) as HTMLElement[]).map(el => el.title)
+    expect(titles.some(t => t.includes('boom: exit 1'))).toBe(false)
+    expect(titles.some(t => t.includes('ran ok'))).toBe(false)
+  })
+
+  it('a row that did NOT fail still carries its output in the title', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({
+      jobs: [mkJob({ last_status: 'ok', last_result: 'ran ok' })],
+    })
+
+    renderWithProviders(<SchedulePage />)
+    await screen.findByText('Nightly report')
+
+    const titles = (Array.from(document.querySelectorAll('[title]')) as HTMLElement[]).map(el => el.title)
+    expect(titles.some(t => t.includes('ran ok'))).toBe(true)
+  })
+
+  it('a failed COMMAND job shows its error in the detail dialog, not only on hover', async () => {
+    // The guard used to be `job?.script && job.last_error`, so a command job --
+    // which has no `script` -- reached this dialog with no error surface at all.
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({
+      jobs: [mkJob({ command: 'backup.sh', last_status: 'error', last_error: 'disk full' })],
+    })
+
+    renderWithProviders(<SchedulePage />)
+    fireEvent.click(await screen.findByText('Nightly report'))
+
+    expect(await screen.findByTestId('schedule-job-last-error')).toHaveTextContent('disk full')
+  })
+
+  it('a COMMAND job that succeeded shows its output in the detail dialog', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api).crons.mockResolvedValue({
+      jobs: [mkJob({ command: 'backup.sh', last_status: 'ok', last_result: '12 files copied' })],
+    })
+
+    renderWithProviders(<SchedulePage />)
+    fireEvent.click(await screen.findByText('Nightly report'))
+
+    expect(await screen.findByText('12 files copied')).toBeInTheDocument()
   })
 })

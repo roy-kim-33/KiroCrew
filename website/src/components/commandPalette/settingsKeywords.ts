@@ -18,11 +18,13 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
 
   // Chat
   'chat.default-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
-  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort'],
+  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort', 'how long models think', 'think before answering', 'thinking time'],
   'chat.auto-compact-threshold': ['context window', 'compaction', 'memory', 'conversation length'],
   'chat.show-timestamps': ['time', 'clock', 'message time'],
   'chat.merge-queued-messages': ['queue', 'batch', 'combine messages'],
   'chat.quick-send': ['fast send', 'enter to send', 'hotkey'],
+  'chat.spell-check-message-input': ['spell check', 'spellcheck', 'spelling', 'red underline', 'squiggle', 'dictionary'],
+  'chat.split-side-by-side-diffs': ['split', 'unified', 'split view', 'unified view', 'diff layout', 'side by side'],
 
   // Voice
   'voice.enabled': ['tts', 'speak', 'read aloud', 'narrate', 'text-to-speech'],

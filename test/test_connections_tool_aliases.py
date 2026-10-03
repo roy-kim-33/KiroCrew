@@ -49,12 +49,35 @@ from kiro_crew.connections.tool_aliases import (
     resolve_tool_aliases,
     statically_visible_tool_names,
 )
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    The real-rebuild tests below drive ``rebuild_agent_config``, which ends in
+    ``_write_derived_permissions`` and reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``: one real ``kiro-cli --version``
+    spawn per binary identity, process-cached, so whichever test in the worker
+    rebuilds first pays it against the HOST's install with the checkout as the
+    child's cwd. Pinned to the floor release, as ``test_agent.py`` and the
+    generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
+
 
 URLS = {
     "github": "https://api.githubcopilot.com/mcp/",
     "linear": "https://mcp.linear.app/mcp/readonly",
     "vercel": "https://mcp.vercel.com",
     "gitlab": "https://gitlab.com/api/v4/mcp",
+    "atlassian": "https://mcp.atlassian.com/v1/mcp/authv2",
+    "neon": "https://mcp.neon.tech/mcp?readonly=true",
+    "todoist": "https://ai.todoist.net/mcp",
 }
 
 
@@ -83,6 +106,44 @@ def test_issue_tools_are_declared_across_every_issue_tracker():
         assert {"list_issues", "get_issue"} <= set(declared[slug]), slug
 
 
+def test_every_server_with_a_bare_search_or_fetch_declares_the_rename():
+    """``search`` and ``fetch`` are the tool pair ChatGPT's connector spec asks a
+    server to ship, so several vendors use the bare names. A server that ships one
+    must declare it, or whichever of them mounts second shadows the others."""
+    declared = declared_tool_aliases()
+    bare = {
+        "atlassian": {"search", "fetch"},
+        "gitlab": {"search"},
+        "neon": {"search", "fetch"},
+        "todoist": {"search", "fetch"},
+    }
+    for slug, tools in bare.items():
+        assert tools <= set(declared[slug]), slug
+
+
+def test_todoist_and_atlassian_mounted_together_rename_both_sides():
+    assert _aliases(_servers("todoist", "atlassian"), ["@todoist", "@atlassian"]) == {
+        "@atlassian/fetch": "atlassian_fetch",
+        "@atlassian/search": "atlassian_search",
+        "@todoist/fetch": "todoist_fetch",
+        "@todoist/search": "todoist_search",
+    }
+
+
+def test_gitlab_and_todoist_share_only_search():
+    """GitLab ships ``search`` but no ``fetch``, so Todoist's ``fetch`` keeps its
+    name: a rename fires per colliding tool, not per pair of providers."""
+    assert _aliases(_servers("todoist", "gitlab"), ["@todoist", "@gitlab"]) == {
+        "@gitlab/search": "gitlab_search",
+        "@todoist/search": "todoist_search",
+    }
+
+
+def test_todoist_alone_keeps_its_natural_tool_names():
+    """Invariant 3: a declaration renames nothing without a real collision."""
+    assert _aliases(_servers("todoist"), ["@todoist"]) == {}
+
+
 def test_every_declared_alias_is_globally_unique():
     aliases = [alias for tools in declared_tool_aliases().values() for alias in tools.values()]
     assert len(aliases) == len(set(aliases))
@@ -104,7 +165,7 @@ def test_every_declared_alias_equals_its_derivation():
 
 
 def test_providers_without_collisions_declare_nothing():
-    assert not {"notion", "stripe", "atlassian"} & set(declared_tool_aliases())
+    assert not {"notion", "stripe"} & set(declared_tool_aliases())
 
 
 # ── table rows 1-3: whole-server exposure, identity matched ──
@@ -441,7 +502,7 @@ def test_natural_tool_names_are_the_exposed_pre_alias_names():
         ("@linear/list_issues", "linear_issues", False),
         ("@notion/search", "notion_search", False),
         ("@vercel/list_projects", "vercel_list_projects", False),
-        # NOT claimed: right ref, but the value no longer matches the recorded
+        # NOT claimed: right ref, but the value does not match the recorded
         # form. Membership of the whole triple IS the byte-equality test.
         ("@linear/list_projects", "linear_list_projects ", False),
         ("@linear/list_projects", "Linear_List_Projects", False),
@@ -550,7 +611,7 @@ def test_a_committed_record_is_fingerprint_gated(tmp_path, monkeypatch):
         {_L, _V}
     )
 
-    # The user edits one alias, so the map is no longer the recorded generation. The
+    # The user edits one alias, so the map is not the recorded generation. The
     # claim is withdrawn wholesale; the siblings linger (the accepted cost above).
     edited = {**_MAP_LV, "@linear/list_projects": "my_projects"}
     assert load_claimed(spec_fingerprint(edited)) == frozenset()
@@ -629,77 +690,6 @@ def test_the_ownership_record_is_write_protected_from_agent_tools():
         assert f"{prefix}/{_RECORD_FILENAME}" in protected, (
             f"the ownership record is agent-writable under {prefix}"
         )
-
-
-def test_the_ownership_record_is_write_protected_from_the_shell(tmp_path, monkeypatch):
-    """The file-tool gate alone leaves the forgery reachable through a redirect.
-
-    ``is_sensitive_write_path`` screens the file-edit tool's target, so an agent refused
-    there can still reach the same file with ``echo … > ~/.kiro/crew/connections-tool-aliases.json``
-    and forge the committed record that authorizes deleting a user-authored alias. The bash
-    gate is what closes that path, and it blocks VERB-INDEPENDENTLY -- any command naming the
-    leaf -- so a quoted redirect, a copy, or a Python one-liner cannot walk around an
-    enumerated write-verb list.
-
-    Derived from the module's own filename and the live leaf list, so moving the record
-    without moving its shell protection fails here.
-    """
-    from kiro_crew import security
-    from kiro_crew.connections.alias_record import _RECORD_FILENAME
-
-    # drift guard: the bash leaf list must stay pinned to the file the module writes
-    assert _RECORD_FILENAME in security._WRITE_PROTECTED_BASH_LEAVES
-    # and the anchor-independent list too: the anchored entry alone falls to one ``cd``
-    assert _RECORD_FILENAME in security._BARE_TOKEN_PROTECTED_LEAVES
-
-    for prefix in security.crew_home_prefixes():
-        # The resolved literal is native-spelled on Windows (``C:\Users\u\.kiro\crew\…``),
-        # which the leaf branch's Windows form gates -- see
-        # test_security.py::TestWindowsPathShapes for the whole-tuple coverage.
-        for record in (
-            f"~/{prefix}/{_RECORD_FILENAME}",
-            f"$HOME/{prefix}/{_RECORD_FILENAME}",
-            str(Path.home() / prefix / _RECORD_FILENAME),
-        ):
-            for cmd in (
-                f"echo forged > {record}",
-                f"echo forged >> {record}",
-                f'echo forged > "{record}"',  # quoted redirect target
-                f"tee {record}",
-                f"touch {record}",
-                f"rm {record}",
-                f"mv /tmp/forged.json {record}",
-                f"cp /tmp/forged.json {record}",
-                f"python -c \"open('{record}','w')\"",  # script open
-                f"cat {record}",  # read (blocked too -- the record holds no secret)
-            ):
-                assert security.is_sensitive_bash_command(cmd) is not None, cmd
-        # ANCHORING IS NOT PART OF THE CONTRACT. Every anchored spelling above requires a
-        # home and a crew prefix, so a single ``cd`` into the home defeats all of them and
-        # the forgery lands anyway. This filename authorizes deletion, so it is matched as
-        # a bare path SEGMENT: naming it at all is refused, however the command spells the
-        # way there. See test_security.py::TestBareTokenProtectedLeaves for the full grid.
-        for cmd in (
-            f"cd ~/{prefix} && echo forged > {_RECORD_FILENAME}",
-            f"cd $HOME/{prefix}; echo forged >{_RECORD_FILENAME}",
-            f"cd ~/{prefix} && tee {_RECORD_FILENAME}",
-            f"echo forged > ./{_RECORD_FILENAME}",
-            f"echo forged > .\\{_RECORD_FILENAME}",
-        ):
-            assert security.is_sensitive_bash_command(cmd) is not None, cmd
-        # unrelated writes under the crew home stay allowed
-        assert security.is_sensitive_bash_command(f"touch ~/{prefix}/sessions.db") is None
-    # and a DIFFERENT file whose name merely ends with the record's is not fenced
-    assert security.is_sensitive_bash_command(f"touch my-{_RECORD_FILENAME}") is None
-
-    # The module's own writer does not route through either gate, so both record writes
-    # still work: it opens the path directly via ``atomic_write`` in Python, not via bash.
-    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
-    target = _gen(_MAP_L, {_L})
-    commit_transaction(target)
-    assert record_path().exists()
-    assert json.loads(record_path().read_text())["status"] == "committed"
-    assert load_claimed(target.fingerprint) == frozenset({_L})
 
 
 def test_an_absent_record_reads_as_empty(tmp_path, monkeypatch):
@@ -810,8 +800,8 @@ def test_a_no_op_transaction_resolves_to_its_target(tmp_path, monkeypatch):
 
 
 def test_committing_replaces_the_pending_record(tmp_path, monkeypatch):
-    """After a clean pass the previous generation is no longer recoverable, and must
-    not be: it no longer describes anything on disk."""
+    """After a clean pass the previous generation is not recoverable, and must
+    not be: it does not describe anything on disk."""
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     previous, target = _gen(_MAP_LV, {_L, _V}), _gen(_MAP_L, {_L})
     begin_transaction(previous, target)
@@ -820,7 +810,7 @@ def test_committing_replaces_the_pending_record(tmp_path, monkeypatch):
     assert load_claimed(target.fingerprint) == frozenset({_L})
     # Querying with the retired generation's fingerprint claims NOTHING, not the
     # previous claim and not the new one: a committed record answers only for the
-    # generation it describes. That is the stronger form of "no longer recoverable" --
+    # generation it describes. That is the stronger form of "not recoverable" --
     # the rollback candidate is gone, and the record does not answer for a map that
     # is not the one it was committed for either.
     assert load_claimed(previous.fingerprint) == frozenset()
@@ -1073,7 +1063,7 @@ def test_a_broken_registry_does_not_abort_the_rebuild_at_import_time(tmp_path, m
 
 def test_an_empty_emission_relinquishes_every_earlier_claim(tmp_path, monkeypatch):
     """Committing an EMPTY emission is not a no-op: it is how the pass gives up pairs
-    it no longer writes. Skipping it would leave a superseded triple claimable."""
+    it does not write. Skipping it would leave a superseded triple claimable."""
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     commit_transaction(_gen(_MAP_L, {_L}))
     relinquished = _gen(None, frozenset())
@@ -1463,7 +1453,7 @@ def test_a_hand_written_notion_search_survives_a_rebuild():
 
 def test_a_user_edited_generated_alias_survives():
     """Once the user changes the VALUE, the spec's triple stops matching the
-    recorded one, so the pair is no longer claimed. Invariant 3 in the field."""
+    recorded one, so the pair is not claimed. Invariant 3 in the field."""
     first = _apply(_spec("linear", "vercel"))
     assert first["toolAliases"]["@linear/list_projects"] == "linear_list_projects"
 
@@ -1983,7 +1973,7 @@ def test_reverting_to_derivational_ownership_deletes_a_hand_written_notion_searc
 
 
 def test_narrowing_ownership_to_declared_providers_strands_the_pair_forever():
-    """The fix attempted in round 3 and reverted: withdrawing a declaration takes
+    """A rejected fix: withdrawing a declaration takes
     its slug out of the test, so the pair that declaration stranded can never be
     recognised again -- permanently unclearable, on every future rebuild."""
     from kiro_crew.connections import tool_aliases as ta
@@ -1991,7 +1981,7 @@ def test_narrowing_ownership_to_declared_providers_strands_the_pair_forever():
     stale = dict(_apply(_spec("linear", "vercel"))["toolAliases"])
 
     # The record clears it, because the record remembers the emission the
-    # withdrawn declaration no longer describes.
+    # withdrawn declaration does not describe.
     with patch.object(ta, "declared_tool_aliases", return_value={}):
         fixed = _apply({**_spec("linear", "vercel"), "toolAliases": dict(stale)})
     assert "toolAliases" not in fixed
@@ -2012,7 +2002,7 @@ def test_dropping_the_alias_from_the_record_key_deletes_a_user_edit():
     The record is written by hand here so that its fingerprint IS the map on disk,
     which keeps the committed branch's equality gate INERT and leaves the ownership
     rule as the only thing deciding. This boundary is defended twice -- the gate also
-    refuses a record that no longer describes the map -- and a mutation test has to
+    refuses a record that does not describe the map -- and a mutation test has to
     isolate the defence it is probing or it stops probing anything.
     """
     first = _apply(_spec("linear", "vercel"))
@@ -2022,7 +2012,7 @@ def test_dropping_the_alias_from_the_record_key_deletes_a_user_edit():
 
     # A committed record FOR THE EDITED GENERATION that still names the original
     # triples: the exact state invariant 3 adjudicates -- the record holds a pair
-    # whose alias is no longer the value the map carries.
+    # whose alias is not the value the map carries.
     record_path().write_text(
         json.dumps(
             {
@@ -2376,7 +2366,7 @@ def test_an_overlapping_rebuild_cannot_resurrect_a_removed_alias(tmp_path):
     Two rebuilds overlap. The first removes vercel's alias and writes the spec. The
     second is still holding the alias map it read BEFORE the lock, so without the
     reconcile it writes that stale map back and the removed alias returns -- and its
-    fingerprint would certify a generation that is no longer on disk.
+    fingerprint would certify a generation that is not on disk.
     """
     from kiro_crew import agent
 
@@ -2499,7 +2489,7 @@ def test_a_registry_endpoint_change_degrades_to_shadowing_not_worse():
     """A retired ``mcp_url`` makes an existing install's entry stop matching, so
     its tools keep their natural names -- the pre-feature behaviour, and the
     fail-safe direction. The old generated refs go with it, so no dead ref is
-    left pointing at a rename that is no longer applied."""
+    left pointing at a rename that is not applied."""
     aliased = _apply(_spec("linear", "vercel"))
     assert aliased["toolAliases"]
 

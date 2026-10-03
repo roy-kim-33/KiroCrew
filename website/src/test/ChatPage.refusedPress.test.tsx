@@ -50,6 +50,7 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn(async () => ({ messages: detail.messages, running: false, has_more: false, total: detail.messages.length })),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
@@ -104,6 +105,15 @@ function makeStore(messages: Msg[]) {
   })
 }
 
+/**
+ * Ceiling for the refused-press notice. The press awaits the (rejected) slot
+ * request, then the notice is committed by a state update that re-renders the
+ * WHOLE ChatPage behind it -- a chain that ran past the 1000ms default under load
+ * in one of four full runs. A named ceiling, not a longer guess
+ * (website/docs/testing.md).
+ */
+const NOTICE_READY = { timeout: 5000 }
+
 async function renderWith(messages: Msg[]) {
   detail.messages = messages
   const store = makeStore(messages)
@@ -152,7 +162,7 @@ describe('refused presses render the notice above the composer', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Regenerate response' }))
 
-    const notice = await screen.findByTestId('refused-press-error')
+    const notice = await screen.findByTestId('refused-press-error', NOTICE_READY)
     expect(notice.textContent).toContain("Couldn't regenerate")
     expect(notice.textContent).toContain('A turn is already running')
   })
@@ -163,7 +173,7 @@ describe('refused presses render the notice above the composer', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Previous version' }))
 
-    const notice = await screen.findByTestId('refused-press-error')
+    const notice = await screen.findByTestId('refused-press-error', NOTICE_READY)
     expect(notice.textContent).toContain("Couldn't switch version")
     expect(notice.textContent).toContain('stop in progress')
     expect(switchVariant).toHaveBeenCalledWith('slot-a', 0)
@@ -184,7 +194,7 @@ describe('refused presses render the notice above the composer', () => {
 
     fireEvent.click(screen.getByTestId('composer-continue'))
 
-    const notice = await screen.findByTestId('refused-press-error')
+    const notice = await screen.findByTestId('refused-press-error', NOTICE_READY)
     expect(notice.textContent).toContain("Couldn't continue")
     expect(notice.textContent).toContain('sub-agents are running')
   })
@@ -194,7 +204,7 @@ describe('refused presses render the notice above the composer', () => {
     const store = await renderWith(plainTurn)
 
     fireEvent.click(screen.getByRole('button', { name: 'Regenerate response' }))
-    await screen.findByTestId('refused-press-error')
+    await screen.findByTestId('refused-press-error', NOTICE_READY)
 
     // The turn starting is the success signal for whatever the slot was busy
     // with — the old reason would now describe a state that passed.

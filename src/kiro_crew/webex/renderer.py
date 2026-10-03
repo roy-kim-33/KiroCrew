@@ -34,6 +34,7 @@ Dependency direction is ``webex -> messaging`` (allowed).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -41,6 +42,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 
+from kiro_crew.constants import strip_control_comments
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
@@ -51,10 +53,12 @@ from kiro_crew.messaging.outbound_files import (
 from kiro_crew.messaging.renderer import (
     Renderer,
     apply_options_cap,
+    count_redaction_tags,
     new_approval_nonce,
+    redaction_notice,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import chunk_utf8_bytes
+from kiro_crew.messaging.split import bounded_for_delivery, chunk_utf8_bytes
 from kiro_crew.messaging.tables import TABLE_POLICY_CARDS
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -110,6 +114,22 @@ def _redact_all(text: str) -> str:
     out, _ = redact_exfiltration_urls(text)
     out, _ = redact_credentials(out)
     return out
+
+
+def _bounded_chunks(content: str) -> list[str]:
+    """Credential-safe chunks of *content*, none over Webex's byte cap.
+
+    The splitter answers with the text WHOLE when no budget cuts without rejoining
+    a key, which is its fail-closed answer and costs the caller a chunk over the
+    budget. This client's cap is hard -- it truncates a larger payload and the
+    answer's tail goes with no notice -- so the sequence is graded once more and,
+    when the grade repairs it, cut again to the budget. The repair is safe to bound
+    again by contract, which is what makes one pass enough here.
+
+    Runs on a worker thread: the grade rescans the text per candidate boundary.
+    """
+    chunks = chunk_utf8_bytes(content, WEBEX_MAX_TEXT, redactor=_redact_all)
+    return bounded_for_delivery(chunks, WEBEX_MAX_TEXT, _redact_all, chunk_utf8_bytes)
 
 
 def webex_display_safe(text: str) -> str:
@@ -170,7 +190,7 @@ _TOOL_LABEL_MAX = 120
 #
 # ``_`` is deliberately NOT in the set: real tool names are ``fs_write``,
 # ``execute_bash``, ``mcp__server__tool``, and stripping it renders the label
-# ``fswrite`` — so the user can no longer tell WHICH tool they are approving,
+# ``fswrite`` — so the user cannot tell WHICH tool they are approving,
 # which is the entire job of this string. Emphasis is cosmetic anyway: it cannot
 # remove text or create a target, and inside the body's code span an underscore
 # is literal.
@@ -337,7 +357,14 @@ class WebexRenderer(Renderer):
         # cutting it would be permanent -- a reply ending ``see the [OPTIONS
         # section`` keeps its last four words. The status frame above trades the
         # other way, because a frame is transient.
-        body, choices = split_options_trailer("".join(self._buf).strip())
+        # Control-tag lines are peeled BEFORE the outer whitespace trim: the trim
+        # would erase the indentation that marks a quoted, 4-space-indented tag
+        # as code, and the tail grammar would then read it as protocol. Both
+        # sides of the trailer (a message carrying both puts one of them last);
+        # complete tags only, for the same reason as the trailer: the answer is
+        # sent once, so a partial tail here is prose and stays.
+        body, choices = split_options_trailer(strip_control_comments("".join(self._buf)))
+        body = strip_control_comments(body).strip()
         # Cap the choices for the widget and degrade the remainder to numbered
         # text through the SHARED helper, so the cap is enforced in one place and
         # a choice past it is still visible rather than silently dropped.
@@ -383,7 +410,22 @@ class WebexRenderer(Renderer):
         # budget) that a hand-rolled copy of this loop spins forever on. And
         # deliberately the FENCE-BLIND one, not ``split_markdown_bytes``: the
         # answer path above re-seals its own fences.
-        chunks = chunk_utf8_bytes(content, WEBEX_MAX_TEXT) or ["…"]
+        # OFFLOADED, like every other site that hands this splitter a redactor:
+        # the grade redacts and rescans the text once per candidate boundary and
+        # the search tries many budgets, so a final answer where no cut is clean
+        # holds the thread for seconds. This gateway runs every channel, every turn
+        # and the liveness heartbeat on one loop, and the watchdog exits the
+        # process when that loop goes quiet.
+        #
+        # RE-BOUND after the grade, because this transport's cap is hard: when no
+        # budget cuts safely the splitter declines to cut and answers with the text
+        # whole, and this client truncates anything over its byte cap, which would
+        # drop the answer's tail with no notice. ``repaired_for_delivery`` makes a
+        # sequence safe to bound again, so the result can be re-cut to the budget.
+        chunks = await asyncio.to_thread(_bounded_chunks, content) or ["…"]
+        # The chunks that ship, not the source they were cut from: a boundary repair
+        # can add a placeholder of its own, which the notice below has to count.
+        delivered_text = "\n".join(chunks)
         first, rest = chunks[0], chunks[1:]
         delivered = False
         if self._placeholder_id is not None:
@@ -467,6 +509,26 @@ class WebexRenderer(Renderer):
                     self._room_id,
                     self._numbered_text("", kept).lstrip("\n"),
                     parent_id=self._thread_id,
+                )
+        # Post-answer redaction notice, counted over the assembled answer the
+        # chunks above were cut from (the reference shape iMessage uses). A
+        # follow-up chunk that failed already announced its truncation, so a
+        # count over the full content can at most describe a placeholder the
+        # reader did not receive — the safe direction. Best-effort by the
+        # shared contract: the answer is out, so a failed notice send is
+        # logged, never raised.
+        cred_count, url_count = count_redaction_tags(delivered_text)
+        if cred_count or url_count:
+            try:
+                await self._client.send_message(
+                    self._room_id,
+                    redaction_notice(cred_count, url_count),
+                    parent_id=self._thread_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Webex: could not deliver the redaction notice (answer already sent)",
+                    exc_info=True,
                 )
 
     async def close(self) -> None:
@@ -552,7 +614,12 @@ class WebexRenderer(Renderer):
         raw text -- even for one frame -- is what this hides. Safe here and not on
         the answer path because the next frame re-renders from the same buffer.
         """
-        return split_options_trailer("".join(self._buf).strip(), hide_partial=True)[0]
+        # A control-tag line still arriving is hidden from the frame the same
+        # way -- peeled before the whitespace trim so indentation that marks a
+        # quoted tag as code is still in view when the grammar looks.
+        raw = strip_control_comments("".join(self._buf), hide_partial=True)
+        body = split_options_trailer(raw, hide_partial=True)[0]
+        return strip_control_comments(body, hide_partial=True).strip()
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd as the upload root.

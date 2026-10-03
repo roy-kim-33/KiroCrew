@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from kiro_crew.messaging.driver import sanitize_channel_replay_text
 from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.renderer import _default_redactor
 from kiro_crew.messaging.session_resume import ResumeReleaseError  # noqa: F401  (re-export)
 from kiro_crew.messaging.session_resume import (
     PICKER_LIMIT,
@@ -34,8 +35,13 @@ from kiro_crew.messaging.session_resume import (
     RoutingDecision,
     SessionChoice,
     SessionResumeController,
+    same_bucket_origin_keys,
+    session_title_of,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import (
+    repaired_for_delivery,
+    split_markdown_safe,
+)
 from kiro_crew.teams.cards import resolved_card, session_picker_card
 from kiro_crew.teams.client import TEAMS_MAX_TEXT, TeamsSendError
 from kiro_crew.teams.renderer import _display_safe
@@ -62,7 +68,7 @@ _REPLAY_TRUNCATED = "\n… (truncated)"
 def _safe_teams_text(text: str, max_chars: int) -> str:
     """Redact for Teams' rendering, then budget. Redaction FIRST, always.
 
-    Truncating first can split a credential into a form the scanner no longer matches,
+    Truncating first can split a credential into a form the scanner does not match,
     which is the one ordering that turns a display-safety helper into a leak.
     """
     return _display_safe(text)[:max_chars]
@@ -106,10 +112,10 @@ class _TeamsResumeSurface:
         if normalized:
             label = _safe_teams_text(" ".join(query.split()), 100)
             return (
-                f"No dashboard sessions matched “{label}”. Try fewer words, or run "
+                f"No sessions matched “{label}”. Try fewer words, or run "
                 f"`/sessions` to see up to {PICKER_LIMIT} recent sessions."
             )
-        return "No recent dashboard sessions."
+        return "No recent sessions."
 
     def picker_heading(self, query: str, total: int) -> str:
         return _picker_heading(query, total, " ".join(query.casefold().split()))
@@ -157,7 +163,7 @@ class _TeamsResumeSurface:
 
 
 class TeamsSessionResume:
-    """Lists dashboard sessions and binds one bidirectionally to a Teams chat."""
+    """Lists dashboard + same-chat native sessions and binds one to Teams."""
 
     def __init__(
         self,
@@ -186,9 +192,22 @@ class TeamsSessionResume:
     def dashboard_state(self) -> object | None:
         return self._controller.dashboard_state
 
+    # ── live config ───────────────────────────────────────────────────────
     @dashboard_state.setter
     def dashboard_state(self, state: object | None) -> None:
         self._controller.dashboard_state = state
+
+    def reconfigure(self, allowed_emails: set[str]) -> None:
+        """Re-derive ``owner_id`` from a reloaded ``teams.allowed_emails``.
+
+        The third copy of the allow-list (transport, dispatcher, here) and the
+        one that decides who may list dashboard sessions, so it has to move with
+        the other two: an operator who adds a second identity must lose
+        ``/sessions`` immediately, not at the next restart. Same one-identity
+        rule as construction -- none or several leaves ``owner_id`` empty and
+        ``is_owner`` refuses everyone.
+        """
+        self.owner_id = next(iter(allowed_emails)) if len(allowed_emails) == 1 else ""
 
     # ── identity + addressing ─────────────────────────────────────────────
     def is_owner(self, identity: str) -> bool:
@@ -231,16 +250,7 @@ class TeamsSessionResume:
 
     async def _title_of(self, session_key: str) -> str:
         """The stored title for *session_key*, read off-loop, with a stable fallback."""
-        title = ""
-        if self.conv_log is not None:
-            try:
-                meta = await asyncio.to_thread(self.conv_log.get_metadata, session_key)
-                title = str((meta or {}).get("title") or "")
-            except Exception:
-                logger.debug("Teams resume: title lookup failed", exc_info=True)
-        # The picker's own fallback for an untitled session, so a bootstrapped record
-        # names the conversation the way the user saw it listed.
-        return title or session_key.removeprefix("dashboard:")
+        return await asyncio.to_thread(session_title_of, self.conv_log, session_key, "teams")
 
     # ── the picker ────────────────────────────────────────────────────────
     async def show_picker(
@@ -250,6 +260,7 @@ class TeamsSessionResume:
         conversation_id: str,
         service_url: str,
         query: str = "",
+        native_key: str = "",
     ) -> None:
         """Post the session picker, or say why there is nothing to post."""
         await self._controller.show_picker(
@@ -258,6 +269,7 @@ class TeamsSessionResume:
             picker_owner=identity,
             is_owner=self.is_owner(identity),
             query=query,
+            native_key=native_key,
         )
 
     async def choose(
@@ -269,8 +281,10 @@ class TeamsSessionResume:
         activity_id: str,
         nonce: str,
         index: int,
+        native_key: str = "",
     ) -> None:
         """Resolve a picker press: bind the chosen session, or say why not."""
+        link = self.link_for(conversation_id)
         choice = await self._controller.choose(
             _TeamsResumeSurface(client, conversation_id, service_url),
             caller=identity or "unknown",
@@ -279,7 +293,8 @@ class TeamsSessionResume:
             message_id=activity_id,
             nonce=nonce,
             index=index,
-            link=self.link_for(conversation_id),
+            link=link,
+            replace_outbound_keys=same_bucket_origin_keys(self.sessions, link, native_key),
         )
         if choice is not None:
             await self._replay(client, conversation_id, service_url, choice.key)
@@ -324,12 +339,37 @@ def _replay_preview(raw: str) -> str:
 
     Split with the shared fence-safe splitter rather than sliced, so a preview cannot
     end inside a code fence and leave the rest of the message rendering as code.
+
+    No redactor here, deliberately: only ``chunks[0]`` is kept and truncated, so no
+    key can straddle two delivered messages -- there is no seam to grade. And a
+    credential-aware cut may DECLINE to cut, answering with the whole body as one
+    chunk, which would blow the preview's own budget once ``chunks[0]`` is kept.
+    ``safe`` is already display-redacted by ``_display_safe`` (a
+    ``redact_for_display`` wrapper), but ``redact_for_display`` does not collapse
+    whitespace, so ``AKIA\\nIOSFODNN7EXAMPLE`` survives it and a cut at that newline
+    would leave the prefix in the kept ``chunks[0]``. Route the body through
+    ``repaired_for_delivery`` first (it never declines, unlike a credential-aware
+    cut): it returns a collapse fixed point safe to cut at any budget when a cut
+    would rejoin a key, and ``None`` when the body is already safe -- so the kept
+    prefix carries no completable credential tail. The measurement split threads
+    the redactor so the universal gate sees it guarded; delivery is the final
+    no-redactor slice of the graded body.
     """
     safe = _display_safe(raw).strip()
     if not safe:
         return ""
     budget = min(_REPLAY_TEXT_LIMIT, TEAMS_MAX_TEXT) - len(_REPLAY_TRUNCATED)
-    chunks = split_markdown_safe(safe, budget)
+    graded = repaired_for_delivery(
+        safe,
+        split_markdown_safe(safe, budget),
+        _default_redactor,
+        lambda r: split_markdown_safe(r, budget, redactor=_default_redactor),
+    )
+    chunks = (
+        split_markdown_safe(graded, budget)
+        if graded is not None
+        else split_markdown_safe(safe, budget)
+    )
     if not chunks:
         return ""
     return chunks[0] + (_REPLAY_TRUNCATED if len(chunks) > 1 else "")
@@ -345,16 +385,15 @@ def _picker_heading(query: str, total: int, normalized: str) -> str:
         else:
             summary = f"Showing {shown} matching session{'s' if shown != 1 else ''}"
         return (
-            f"🔎 **Dashboard session search**\n{summary} for “{label}”, ranked over "
+            f"🔎 **Session search**\n{summary} for “{label}”, ranked over "
             "titles and message content.\nChoose one to continue here; `/unlink` comes back."
         )
     if total > PICKER_LIMIT:
-        summary = f"Showing {PICKER_LIMIT} of {total} most recent dashboard sessions."
+        summary = f"Showing {PICKER_LIMIT} of {total} most recent sessions."
     else:
-        summary = f"Showing {shown} most recent dashboard session{'s' if shown != 1 else ''}."
+        summary = f"Showing {shown} most recent session{'s' if shown != 1 else ''}."
     return (
-        f"🧵 **Recent dashboard sessions**\n{summary}\nChoose one to continue here; "
-        "`/unlink` comes back."
+        f"🧵 **Recent sessions**\n{summary}\nChoose one to continue here; " "`/unlink` comes back."
     )
 
 

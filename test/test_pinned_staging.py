@@ -17,6 +17,7 @@ import errno
 import json
 import os
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -181,6 +182,30 @@ def test_open_dir_pinned_refuses_a_parent_that_became_a_link(tmp_path: Path) -> 
     assert "became a symbolic link" in str(excinfo.value)
 
 
+@pinned_only
+def test_a_refused_link_names_both_causes_rather_than_asserting_a_swap(tmp_path: Path) -> None:
+    """The refusal must not report an attack it cannot see.
+
+    A link met on the walk has two causes: swapped after the caller resolved
+    the path, or there all along because the caller never resolved it. Nothing
+    reachable from here tells them apart - the filesystem is read after the
+    swap either way - so the message names both and asserts neither. Claiming
+    a swap sends a reader hunting an attacker who was never there; claiming a
+    caller error denies one who was.
+    """
+    real = tmp_path / "real"
+    (real / "inside").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    with pytest.raises(pinned_fs.PinnedPathRefusal) as excinfo:
+        pinned_fs.pin_parent(str(link / "inside"), what="staging root")
+    message = str(excinfo.value)
+    assert "became a symbolic link after the path was checked" in message
+    assert "was one all along because this path was handed in unresolved" in message
+    assert "is not a directory at all" in message
+
+
 # ── Hardlink aliases ─────────────────────────────────────────────────────────
 
 
@@ -223,6 +248,122 @@ def test_a_single_link_regular_file_still_copies_with_mode_and_mtime(tmp_path: P
     assert dst.stat().st_mtime_ns == src.stat().st_mtime_ns
 
 
+def test_an_oversize_source_is_refused_before_the_destination_exists(tmp_path: Path) -> None:
+    """GPT review r12: a ceiling checked only AFTER a copy lets the copy itself
+    exhaust the destination volume. The fstat pre-check refuses first -- and
+    fstat reports a sparse file's LOGICAL size, so a swapped-in sparse giant is
+    refused with zero bytes written and no destination entry at all."""
+    src = tmp_path / "huge.bin"
+    src.write_bytes(b"x" * 64)
+    dst = tmp_path / "copied.bin"
+    reasons: list[tuple[str, str]] = []
+
+    copied = pinned_fs.copy_file_pinned(
+        str(src), str(dst), max_bytes=16, on_skip=lambda r, p: reasons.append((r, p))
+    )
+
+    assert copied is False
+    assert reasons and reasons[0][0] == pinned_fs.SKIP_TOO_LARGE
+    assert not dst.exists(), "the pre-check must fire before the destination is created"
+
+
+def test_a_source_that_is_not_the_vetted_inode_is_refused(tmp_path: Path) -> None:
+    """GPT review r29 (meetings import): the descriptor pin proves the copied
+    inode is the OPENED inode, not that it is the inode the caller's validation
+    judged. ``expected_src_ident`` closes that validate->copy window: a regular
+    single-link file swapped in at the name fstats to a different identity and
+    is refused with zero bytes written."""
+    src = tmp_path / "vetted.bin"
+    src.write_bytes(b"vetted")
+    st = os.stat(src)
+    vetted = (st.st_dev, st.st_ino)
+    # Allocate the replacement while the original still exists: unlink+recreate
+    # lets the filesystem hand the new file the SAME inode number (observed on
+    # CI), which would make this test flaky rather than a swap replay.
+    swapped = tmp_path / "swapped.bin"
+    swapped.write_bytes(b"swapped-in")
+    assert (os.stat(swapped).st_dev, os.stat(swapped).st_ino) != vetted
+    os.replace(swapped, src)
+    dst = tmp_path / "copied.bin"
+    reasons: list[tuple[str, str]] = []
+
+    copied = pinned_fs.copy_file_pinned(
+        str(src), str(dst), expected_src_ident=vetted, on_skip=lambda r, p: reasons.append((r, p))
+    )
+
+    assert copied is False
+    assert reasons and reasons[0][0] == pinned_fs.SKIP_IDENTITY_CHANGED
+    assert not dst.exists(), "no byte of an unvetted inode may land"
+
+
+def test_a_source_matching_the_vetted_inode_is_copied(tmp_path: Path) -> None:
+    src = tmp_path / "vetted.bin"
+    src.write_bytes(b"vetted")
+    st = os.stat(src)
+    dst = tmp_path / "copied.bin"
+
+    assert (
+        pinned_fs.copy_file_pinned(str(src), str(dst), expected_src_ident=(st.st_dev, st.st_ino))
+        is True
+    )
+    assert dst.read_bytes() == b"vetted"
+
+
+def test_a_source_grown_after_fstat_aborts_at_the_first_excess_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one case the fstat pre-check cannot see: bytes appended between the
+    fstat and the read. The copy loop is bounded, so the excess aborts the copy
+    and empties what was written through the descriptor."""
+    src = tmp_path / "growing.bin"
+    src.write_bytes(b"x" * 64)
+    dst = tmp_path / "copied.bin"
+    reasons: list[tuple[str, str]] = []
+
+    real_fstat = os.fstat
+
+    def lying_fstat(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        if st.st_size == 64:  # only our source; every other caller sees the truth
+            return os.stat_result(
+                (
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_dev,
+                    st.st_nlink,
+                    st.st_uid,
+                    st.st_gid,
+                    8,
+                    st.st_atime,
+                    st.st_mtime,
+                    st.st_ctime,
+                )
+            )
+        return st
+
+    monkeypatch.setattr(os, "fstat", lying_fstat)
+    copied = pinned_fs.copy_file_pinned(
+        str(src), str(dst), max_bytes=16, on_skip=lambda r, p: reasons.append((r, p))
+    )
+    monkeypatch.undo()
+
+    assert copied is False
+    assert reasons and reasons[0][0] == pinned_fs.SKIP_TOO_LARGE
+    # The destination entry exists (created before the loop) but holds no bytes:
+    # the partial content was emptied through the descriptor.
+    assert dst.stat().st_size == 0
+
+
+def test_the_ceiling_does_not_refuse_a_source_at_exactly_the_limit(tmp_path: Path) -> None:
+    """Boundary: max_bytes is a ceiling, not an exclusive bound."""
+    src = tmp_path / "exact.bin"
+    src.write_bytes(b"x" * 16)
+    dst = tmp_path / "copied.bin"
+
+    assert pinned_fs.copy_file_pinned(str(src), str(dst), max_bytes=16) is True
+    assert dst.read_bytes() == b"x" * 16
+
+
 # ── The restore side ─────────────────────────────────────────────────────────
 
 
@@ -230,7 +371,7 @@ def test_a_single_link_regular_file_still_copies_with_mode_and_mtime(tmp_path: P
 def test_restore_moves_a_symlinked_core_file_aside_instead_of_writing_through_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#3797's third finding, plus the silent partial restore hiding behind it.
+    """The silent partial restore, and the failure hiding behind it.
 
     Before this change the name-based screen declined to MOVE a symlinked core file to
     the backup and then ``shutil.copy2`` wrote through the very link it had just
@@ -468,7 +609,7 @@ def test_core_files_alone_still_consult_the_platform_gate(
 
 
 def test_the_manifest_records_what_was_omitted(tmp_path: Path) -> None:
-    """A skipped file used to be a console warning and nothing else.
+    """A skipped file must be recorded, not left as only a console warning.
 
     That is the same "silent partial" shape this PR fixes on the restore side: exit 0,
     a success message, and an archive quietly missing a file. Raised in review. The
@@ -644,7 +785,7 @@ def test_the_import_path_passes_its_staging_decision_to_both_branches() -> None:
 def test_mode_and_mtime_are_applied_through_the_written_descriptor(tmp_path: Path) -> None:
     """`chmod(name, dir_fd=...)` re-resolves the name; `fchmod(fd)` cannot be redirected.
 
-    The metadata calls used to address the destination by name under the pinned
+    The metadata calls must not address the destination by name under the pinned
     directory, which leaves a window where the final component is swapped between the
     write and the chmod and the mode lands on the replacement. Asserted here as the
     ordinary-case behaviour the descriptor form has to preserve.
@@ -701,7 +842,7 @@ def test_the_destination_root_is_created_through_a_pinned_parent(tmp_path: Path)
     which one this buys, because my first version of this test claimed the stronger one
     and passed for the wrong reason:
 
-    1. A missing ancestor is no longer silently materialised through whatever the path
+    1. A missing ancestor is not silently materialised through whatever the path
        resolves to. The parent must already exist, so a caller cannot accidentally
        write a tree into a linked directory it never validated. Asserted below.
     2. An ancestor swapped for a link AFTER the parent was resolved is refused, by
@@ -738,7 +879,7 @@ def test_the_destination_root_is_created_through_a_pinned_parent(tmp_path: Path)
     )
 
 
-# ── Round 3: the alias hazard reached the databases too ──────────────────────
+# ── The alias hazard reaches the databases too ──────────────────────
 
 
 def test_merge_consults_the_gate_before_writing_any_core_file(
@@ -791,6 +932,289 @@ def test_a_linked_destination_root_raises_the_refusal_not_a_raw_oserror(
     with pytest.raises(pinned_fs.PinnedPathRefusal) as excinfo:
         pinned_fs.stage_tree_pinned(src, holder / "dest", what="tree")
     assert "symbolic link or not a directory" in str(excinfo.value)
+
+
+# ── The window between creating a directory and opening it ──────────
+
+
+def _vanishing_mkdir(
+    target: Path, *, once: bool, counter: list[int], plant: Path | None = None
+) -> Callable[..., None]:
+    """A ``mkdir`` that makes *target* and then removes it again, as a remover would.
+
+    The removal lands exactly where a concurrent one would: after the directory
+    exists and before anything has opened it. Deterministic, so the window is a
+    test fixture rather than something to reproduce under load. With *plant*, a
+    link to that path is left at the name instead of nothing, which is the other
+    thing an actor who won the race can do.
+    """
+    real_mkdir = os.mkdir
+
+    def vanishing(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+        if name != target.name or (once and counter):
+            return
+        counter.append(1)
+        os.rmdir(name, dir_fd=dir_fd)  # type: ignore[arg-type]
+        if plant is not None:
+            _symlink_or_skip(target, plant)
+
+    return vanishing
+
+
+@pinned_only
+def test_a_destination_removed_between_its_mkdir_and_its_open_is_re_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creating a directory and opening it are two syscalls (GH-12043).
+
+    A removal between them is an interleaving no ordering closes, and tolerating
+    only the `FileExistsError` half handled a concurrent writer while a concurrent
+    remover ended the operation. The pair is re-run, so the caller gets the
+    descriptor it asked for.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    removals: list[int] = []
+    monkeypatch.setattr(os, "mkdir", _vanishing_mkdir(target, once=True, counter=removals))
+
+    fd = pinned_fs.create_and_open_dir_pinned(target, what="destination")
+    try:
+        assert removals == [1], "the race did not happen, so the retry is not what passed"
+        assert os.fstat(fd).st_ino == target.stat().st_ino
+    finally:
+        os.close(fd)
+
+
+@pinned_only
+def test_a_destination_removed_on_every_attempt_names_the_whole_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exhaustion reports the PATH, not the bare leaf `openat` was handed.
+
+    `'dest'` on its own reads as a working-directory bug and is not one -- that
+    unreadable filename is half of what GH-12034 cost, and it is asserted as the
+    contract rather than left to whichever `openat` lost. The attempt count is
+    asserted too: this must report rather than spin.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    removals: list[int] = []
+    monkeypatch.setattr(os, "mkdir", _vanishing_mkdir(target, once=False, counter=removals))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(target, what="destination")
+    assert excinfo.value.filename == str(target)
+    assert str(target) in str(excinfo.value)
+    assert "was removed" in str(excinfo.value)
+    # The exact ceiling, not merely "more than one": an assertion that only read
+    # the constant would stay green if the bound were raised to fifty, and a
+    # fifty-deep retry on a directory something is deleting is the failure mode
+    # the bound exists to prevent.
+    assert len(removals) == pinned_fs._CREATE_ATTEMPTS == 3
+    assert not target.exists()
+
+
+@pinned_only
+def test_the_retry_does_not_weaken_the_must_create_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An occupied name is still refused, and refused on the FIRST attempt.
+
+    `must_create` exists so that meeting an existing directory is a refusal to
+    report, not a condition to work around. A retry that re-asked `mkdir` without
+    re-asking this would paper over exactly what the flag is for, so both halves
+    are pinned: the refusal type, and that no second attempt is made.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    target.mkdir()
+    attempts: list[int] = []
+    real_mkdir = os.mkdir
+
+    def counting(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        if name == target.name:
+            attempts.append(1)
+        real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "mkdir", counting)
+
+    with pytest.raises(pinned_fs.PinnedPathRefusal) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(target, what="destination", must_create=True)
+    assert "already exists" in str(excinfo.value)
+    assert attempts == [1], "must_create was re-attempted instead of refusing"
+
+
+@pinned_only
+def test_a_link_planted_at_the_name_mid_sequence_is_refused_not_re_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a REMOVAL is re-run. A link that replaces the directory is refused, once.
+
+    This is the property that makes the retry safe: it is reached from
+    `FileNotFoundError` alone, so an actor who removes the directory and plants a
+    link where it was meets `O_NOFOLLOW` on the first attempt and gets the module's
+    refusal, with nothing created inside what the link points at.
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    removals: list[int] = []
+    monkeypatch.setattr(
+        os, "mkdir", _vanishing_mkdir(target, once=True, counter=removals, plant=victim)
+    )
+
+    with pytest.raises(pinned_fs.PinnedPathRefusal) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(target, what="destination")
+    assert "symbolic link or not a directory" in str(excinfo.value)
+    assert removals == [1]
+    assert list(victim.iterdir()) == [], "the retry wrote through the planted link"
+
+
+@pinned_only
+def test_a_parent_removed_under_its_pin_is_reported_rather_than_re_attempted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing can be created inside an unlinked directory, so this reports at once.
+
+    The retry is for a directory that was removed after it existed; a pinned PARENT
+    that is gone makes every further attempt fail identically, and spending two more
+    on it would only delay the same answer.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    attempts: list[int] = []
+    real_mkdir = os.mkdir
+
+    def removing_the_parent(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        if name == target.name:
+            attempts.append(1)
+            os.rmdir(parent)
+        real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "mkdir", removing_the_parent)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(target, what="destination")
+    assert excinfo.value.filename == str(target)
+    assert attempts == [1]
+
+
+@pinned_only
+def test_a_parent_that_never_existed_is_not_reported_as_a_removal(tmp_path: Path) -> None:
+    """The removal report is a claim about what happened, so it is not made loosely.
+
+    A parent that simply is not there fails in `pin_parent`, above the sequence, and
+    keeps its own error -- otherwise every ordinary mistyped path would read as a
+    concurrent removal.
+    """
+    with pytest.raises(FileNotFoundError) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(tmp_path / "absent" / "dest", what="destination")
+    assert "was removed" not in str(excinfo.value)
+
+
+@pinned_only
+def test_a_destination_this_call_only_MET_is_never_re_created_when_it_vanishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry covers a directory this call made. A met one is reported instead.
+
+    Found by review. When `mkdir` raises `FileExistsError` the destination was already
+    there holding the caller's files, so re-creating it after a removal hands back an
+    EMPTY directory -- and a merge (`must_create=False`) then stages the archive into
+    it and reports success while the files it was merging with are gone for good. The
+    contents are unrecoverable either way; what this pins is that the loss is reported
+    rather than hidden behind a fresh directory.
+    """
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "dest"
+    target.mkdir()
+    (target / "pre-existing.txt").write_text("the user's file\n", encoding="utf-8")
+    attempts: list[int] = []
+    real_mkdir = os.mkdir
+
+    def removing_the_met_directory(
+        name: object, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        if name == target.name:
+            attempts.append(1)
+            try:
+                real_mkdir(name, mode, dir_fd=dir_fd)
+            finally:
+                # Whatever mkdir answered, the directory is gone by the time the open
+                # runs: the removal lands in the window, taking the file with it.
+                if target.exists():
+                    (target / "pre-existing.txt").unlink()
+                    target.rmdir()
+            return
+        real_mkdir(name, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", removing_the_met_directory)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        pinned_fs.create_and_open_dir_pinned(target, what="destination")
+    assert excinfo.value.filename == str(target)
+    assert "already existed when this call met it" in str(excinfo.value)
+    assert attempts == [1], "a met destination's removal was re-attempted"
+    assert not target.exists(), "the met destination was re-created empty"
+
+
+@pinned_only
+def test_a_merge_whose_destination_vanishes_mid_create_fails_instead_of_reporting_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The product-level shape of the case above, through `stage_tree_pinned`.
+
+    A merge passes `must_create=False` because meeting an existing destination is what
+    merging IS. If that destination is removed inside the create-then-open window, the
+    files the merge was adding to are gone; the one thing that must not happen is the
+    archive landing in a fresh empty directory and the merge returning normally, which
+    would report success over unrecoverable loss.
+    """
+    src = tmp_path / "source"
+    src.mkdir()
+    (src / "from-archive.txt").write_text("archive\n", encoding="utf-8")
+
+    dst = tmp_path / "live"
+    dst.mkdir()
+    (dst / "only-on-disk.txt").write_text("not in the archive\n", encoding="utf-8")
+    real_mkdir = os.mkdir
+    removals: list[int] = []
+
+    def removing_the_live_tree(
+        name: object, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        # ONCE, and only for the destination this merge MET. A wrapper that removed the
+        # directory on every attempt would make the call fail by exhaustion whatever the
+        # code does, and would assert nothing: the discriminating run is the one where a
+        # retry WOULD succeed, into a directory recreated after the live tree was lost.
+        if name == dst.name and not removals:
+            removals.append(1)
+            try:
+                real_mkdir(name, mode, dir_fd=dir_fd)
+            finally:
+                if dst.exists():
+                    (dst / "only-on-disk.txt").unlink()
+                    dst.rmdir()
+            return
+        real_mkdir(name, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", removing_the_live_tree)
+
+    with pytest.raises(OSError):
+        pinned_fs.stage_tree_pinned(src, dst, what="tree", skip_existing=True)
+    assert removals == [1]
+    assert not (dst / "from-archive.txt").exists(), (
+        "the merge staged the archive into a directory recreated after the live tree "
+        "was removed, which reports success over the loss"
+    )
 
 
 def test_metadata_falls_back_to_a_path_where_fd_operations_do_not_exist(
@@ -852,13 +1276,13 @@ def test_a_restored_security_file_is_locked_down_regardless_of_the_archive_mode(
         ) == 0o600, "the archive's permissive mode was inherited onto a restored secret"
 
 
-# ── Round 5: skips that precede a delete, and a validation that gets discarded ──
+# ── Skips that precede a delete, and a validation that gets discarded ──
 
 
 def test_replace_refuses_rather_than_deleting_a_tree_its_backup_could_not_copy(
     tmp_path: Path,
 ) -> None:
-    """The data-loss finding that closed the earlier attempt (#2446), carried forward here.
+    """The data-loss finding this test pins.
 
     Replace mode's next step after the backup is `rmtree` on the LIVE tree. The staging
     walk legitimately skips a hardlink alias -- right when producing an archive, and
@@ -1208,7 +1632,7 @@ def test_staged_directories_do_not_inherit_the_sources_mode_or_mtime(tmp_path: P
 
     Applying it required knowing that WE created the directory. That flag came from the
     `mkdir` while the descriptor came from a separate `open`, so a directory replaced between
-    the two left the flag true for an object we no longer held, and the archive's mode and
+    the two left the flag true for an object we do not hold, and the archive's mode and
     mtime were then written onto a directory belonging to somebody else. There is no sound
     repair: a stat taken after the mkdir observes the replacement just as happily as our own
     directory, POSIX has no atomic create-and-open for a directory, and under a same-user
@@ -1694,9 +2118,9 @@ def test_a_destination_collision_surfaces_as_a_refusal_not_a_traceback(
     (src / "f.txt").write_text("payload\n", encoding="utf-8")
     dst = tmp_path / "dest"
     dst.mkdir()
-    # The name is taken BEFORE the walk reaches it. This was previously reproduced by
-    # creating the name mid-copy, in the window between the copy and the publish -- that
-    # window no longer exists now that the destination itself is opened O_EXCL up front, so
+    # The name is taken BEFORE the walk reaches it. Creating the name mid-copy, in
+    # the window between the copy and the publish, cannot reproduce the bug: that
+    # window is gone now that the destination itself is opened O_EXCL up front, so
     # occupying the name first is the only way the test still proves anything.
     (dst / "f.txt").write_text("SOMEONE ELSE\n", encoding="utf-8")
 
@@ -1787,7 +2211,7 @@ def test_a_replace_refuses_a_destination_root_that_came_back(tmp_path: Path) -> 
     """A replace that finds its root already there must refuse, not merge into it.
 
     The replace path removes the live tree and then stages the archive into its place. The
-    walk used to accept a root that existed again, so if the gateway recreated it in that
+    walk must not accept a root that exists again, or if the gateway recreates it in that
     window, files the archive does not contain survived a REPLACE that reported success --
     the silent-partial shape this change exists to remove, in the one mode that promises the
     destination will be exactly the archive. Review found it. The per-child names already

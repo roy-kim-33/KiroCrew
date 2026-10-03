@@ -8,7 +8,6 @@ without touching ilinkai.weixin.qq.com.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
@@ -24,9 +23,7 @@ from kiro_crew.weixin.client import (
     WeixinSendError,
     _base_info,
     _headers,
-    load_weixin_account,
     protocol_error_code,
-    save_weixin_account,
 )
 from kiro_crew.weixin.renderer import (
     WEIXIN_CHUNK_LIMIT,
@@ -128,77 +125,6 @@ def test_typing_ticket_cache_returns_fresh_entries():
     cache.set("u1", "ticket")
     assert cache.get("u1") == "ticket"
     assert cache.get("absent") is None
-
-
-def test_account_credentials_persist_and_round_trip(tmp_path):
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None
-    assert loaded["base_url"] == "https://x"
-    assert loaded["user_id"] == "u9"
-    assert load_weixin_account(str(tmp_path), "missing") is None
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
-def test_account_credentials_are_owner_only(tmp_path):
-    """NTFS reports synthetic mode bits, so this guarantee is POSIX-checked;
-    cross-platform enforcement comes from platform_compat.restrict_to_owner."""
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-    path = tmp_path / "weixin" / "accounts" / "acct1.json"
-    assert path.stat().st_mode & 0o077 == 0
-
-
-def test_account_credentials_lockdown_precedes_content(tmp_path, monkeypatch):
-    """The token must never exist in a file that has not been locked down yet.
-
-    On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
-    ``restrict_to_owner`` is the only protection; applying it after the write
-    left the bot credential readable under the parent directory's inherited ACL
-    for the whole write window (issue #5285). Asserted by measuring the file's
-    SIZE at the moment the lockdown is applied — zero means no payload byte
-    existed yet. A post-write stat passes on the buggy ordering too, so it
-    would not be a regression test.
-    """
-    from kiro_crew import platform_compat
-
-    sizes: list[int] = []
-    real_restrict = platform_compat.restrict_to_owner
-
-    def _measuring_restrict(target):
-        sizes.append(os.stat(target).st_size)
-        return real_restrict(target)
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
-
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-
-    assert sizes, "premise: the lockdown ran at all"
-    assert (
-        sizes[0] == 0
-    ), f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
-
-
-def test_account_credentials_survive_a_failed_lockdown(tmp_path, monkeypatch):
-    """``restrict_on_error="warn"`` keeps this site's established policy: the
-    credential write matters more than the permissions, so a lockdown failure
-    is logged but must not cost the account file."""
-    from kiro_crew import platform_compat
-
-    def _refuse(_target):
-        raise OSError("cannot resolve the invoking user's SID")
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
-
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None, "warn policy must keep the write"
-    assert loaded["token"] == "s3cr3t"
-    assert loaded["user_id"] == "u9"
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────
@@ -463,6 +389,62 @@ def test_gateway_home_follows_the_configured_data_home(tmp_path, monkeypatch):
     import kiro_crew.weixin.gateway as gw
 
     assert gw.data_home is paths_mod.data_home
+
+
+def test_gateway_wires_the_transport_into_the_dispatcher_before_connect(tmp_path):
+    """The config applier that pushes a reloaded ``weixin`` roster at the transport
+    resolves it through ``dispatcher.transport`` and treats a missing holder as
+    "not built yet, it will read the fresh section". That is only true while the
+    transport does not exist. Once it is constructed from the boot roster, a
+    revocation dispatched during the ``connect()`` await must find it wired, or
+    the removed user stays authorized until the next edit or a restart.
+    """
+    from types import SimpleNamespace
+
+    import kiro_crew.weixin.gateway as gw
+
+    class _Cfg:
+        class agent:
+            default_agent = "kirocrew"
+            approval_mode = "auto"
+
+        class messaging:
+            idle_reset_minutes = 0
+            daily_reset_hour = -1
+            dm_scope = "user"
+
+    class _CtxBuilder:
+        hooks = None
+
+        def build_message(self, text, is_new, session_key, **kw):
+            return (text, {})
+
+    holder_at_connect: list[object] = []
+
+    async def _connect(self):
+        # ``_dispatch`` is the dispatcher's bound handle_message; its __self__ is
+        # the dispatcher whose ``transport`` attribute the applier will read.
+        holder_at_connect.append(getattr(self._dispatch.__self__, "transport", None))
+
+    orch = SimpleNamespace(
+        _weixin_enabled=True,
+        _weixin_token="tok",
+        _weixin_account_id="acct1",
+        _weixin_home=str(tmp_path),
+        _weixin_allowed_user_ids=["friend"],
+        _approval_mode="auto",
+        _cfg=_Cfg(),
+        sessions=object(),
+        ctx_builder=_CtxBuilder(),
+        dashboard_state=None,
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(gw.WeixinTransport, "connect", _connect)
+        client = asyncio.run(gw.maybe_start_weixin(orch))
+
+    assert client is not None, "the channel must have started"
+    assert len(holder_at_connect) == 1
+    assert isinstance(holder_at_connect[0], WeixinTransport)
 
 
 def test_rejected_sender_does_not_get_context_persisted(tmp_path, monkeypatch):

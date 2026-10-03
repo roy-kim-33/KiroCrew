@@ -29,6 +29,7 @@
  */
 
 import { safeSetSessionItem } from './safeStorage'
+import { errMessage } from './thunkError'
 
 /** Where the error was observed. */
 export type ErrorSource =
@@ -58,7 +59,7 @@ export interface ErrorReport {
   status?: number
   /**
    * Machine-readable `code` from a JSON error body. Backend-owned error bodies
-   * carry one by convention (AGENTS.md § User-facing strings) precisely so a
+   * carry one by convention (docs/system-specs/common/code-style.md) precisely so a
    * client can act on the failure instead of regex-matching prose.
    */
   code?: string
@@ -183,17 +184,27 @@ export function requestPath(url: string | undefined): string | undefined {
   }
 }
 
-/** Pull the backend's machine-readable `code` out of a JSON error body, if present. */
-export function parseErrorCode(body: string | undefined): string | undefined {
+/** Pull one non-empty string field out of a JSON error body, if present. The
+ *  one parse of a backend error envelope -- trimmed, object-shaped, well-formed
+ *  -- so a caller after `code`, or after another field the route names beside
+ *  it (`mode` on a refused consolidation target), reads it here rather than
+ *  parsing the body again on its own. */
+export function parseErrorField(body: string | undefined, field: string): string | undefined {
   if (!body) return undefined
   const trimmed = body.trim()
   if (!trimmed.startsWith('{')) return undefined
   try {
-    const parsed = JSON.parse(trimmed) as { code?: unknown }
-    return typeof parsed.code === 'string' && parsed.code ? parsed.code : undefined
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+    const value = parsed[field]
+    return typeof value === 'string' && value ? value : undefined
   } catch {
     return undefined
   }
+}
+
+/** Pull the backend's machine-readable `code` out of a JSON error body, if present. */
+export function parseErrorCode(body: string | undefined): string | undefined {
+  return parseErrorField(body, 'code')
 }
 
 // Newest first. Plain module state: the journal is per-tab, per-page-load
@@ -267,6 +278,46 @@ export function findReport(message: string | null | undefined): ErrorReport | un
   const needle = redactSecrets(message).trim()
   if (!needle) return undefined
   return _journal.find(r => r.message.trim() === needle)
+}
+
+/** Where {@link attachReport} pins the report on its error. A string key, not a symbol, so the
+ *  entry is visible on the rejection in devtools; defined NON-enumerable so a spread or JSON copy
+ *  of the error's fields does not carry the report's route and detail along with them. */
+const ATTACHED_REPORT = 'errorReport'
+
+/**
+ * Pin a journal entry to the rejection it describes.
+ *
+ * {@link findReport} resolves by EXACT MESSAGE over a newest-first journal, which is the right
+ * precision for the `setError(e.message)` sites it was built for -- but the client's bounded reads
+ * all reject with the same contract message (`deadline exceeded`), so two of them failing in
+ * sequence both resolve to whichever journaled LAST, and one notice hands the agent the other
+ * read's endpoint. The transport holds the report at the moment it rethrows, so it pins it here;
+ * {@link reportForError} reads that first and falls back to the message match only for a
+ * rejection nothing pinned to.
+ */
+export function attachReport<E extends object>(error: E, report: ErrorReport): E {
+  Object.defineProperty(error, ATTACHED_REPORT, { value: report, enumerable: false, configurable: true })
+  return error
+}
+
+/** The report {@link attachReport} pinned to this rejection, if any. Shape-checked rather than
+ *  trusted, because the error is `unknown` and the key is an ordinary property. */
+function attachedReport(error: unknown): ErrorReport | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const pinned = (error as Record<string, unknown>)[ATTACHED_REPORT]
+  if (typeof pinned !== 'object' || pinned === null) return undefined
+  const r = pinned as Partial<ErrorReport>
+  return typeof r.id === 'string' && typeof r.message === 'string' ? (r as ErrorReport) : undefined
+}
+
+/**
+ * The structured report behind a caught error: its own pinned entry when the transport attached
+ * one, else the newest journal entry with the same message. The read every notice that renders a
+ * bounded read's failure should use, for the reason {@link attachReport} gives.
+ */
+export function reportForError(error: unknown): ErrorReport | undefined {
+  return attachedReport(error) ?? findReport(errMessage(error))
 }
 
 /** Subscribe to journal changes. Returns an unsubscribe. */
@@ -452,11 +503,16 @@ recoverClaimedChatHandoffs()
 // imperative seam so non-page modules can navigate without importing a page.
 
 let _softNavigate: ((to: string) => void) | null = null
+let _maySoftNavigate: (() => boolean) | null = null
 const _handoffListeners = new Set<() => void>()
 
-/** Install (or clear, with `null`) the in-app navigator. Called by App.tsx. */
-export function installSoftNavigate(fn: ((to: string) => void) | null): void {
+/** Install (or clear, with `null`) the in-app navigator and its leave guard. Called by App.tsx. */
+export function installSoftNavigate(
+  fn: ((to: string) => void) | null,
+  mayNavigate: (() => boolean) | null = null,
+): void {
   _softNavigate = fn
+  _maySoftNavigate = fn ? mayNavigate : null
 }
 
 /**
@@ -482,19 +538,32 @@ export function subscribeChatHandoff(fn: () => void): () => void {
  * unmount the surface the user was on and deliver them to an empty chat — it
  * destroys context and gains nothing. Staying put keeps the error, and whatever
  * they had typed, on screen. Returns whether the hand-off proceeded.
+ *
+ * `leaveGranted: true` says the caller has ALREADY asked the page's leave
+ * guard through its own gate (`AskAgentButton`'s `gate`, built on
+ * `useGuardedLeave`) and the page agreed. The installed `mayNavigate` is that
+ * same channel, so asking it again here would pose the discard question a
+ * second time — and a page guard that confirms a draft away does not clear the
+ * draft until it unmounts, so the second ask is a live confirm, not a free
+ * `true`. Cancelling it would abort a hand-off the user had just accepted.
+ * Ungated callers keep the ask.
  */
-export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): boolean {
+export function sendErrorToChat(prompt: string, opts: { hard?: boolean; leaveGranted?: boolean } = {}): boolean {
+  // The app-level leave guard must run before staging: if the page refuses to
+  // leave, a queued prompt would ambush the next chat the user opens even
+  // though this click did not navigate. Hard mode is the root-boundary escape
+  // hatch and deliberately bypasses the live React tree.
+  const softNavigate = !opts.hard ? _softNavigate : null
+  if (softNavigate && !opts.leaveGranted && _maySoftNavigate && !_maySoftNavigate()) return false
   if (!handoffToChat(prompt)) return false
-  if (!opts.hard) {
+  if (softNavigate) {
     // Notify before navigating: an already-mounted ChatPage drains here, and a
     // not-yet-mounted one drains on mount instead.
     for (const fn of _handoffListeners) {
       try { fn() } catch { /* a bad subscriber must not strand the hand-off */ }
     }
-    if (_softNavigate) {
-      _softNavigate('/chat')
-      return true
-    }
+    softNavigate('/chat')
+    return true
   }
   try { window.location.assign('/chat') } catch { /* nothing left to try */ }
   return true
@@ -503,5 +572,6 @@ export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): 
 /** Test seam — the seam is module state. */
 export function __resetNavSeamForTests(): void {
   _softNavigate = null
+  _maySoftNavigate = null
   _handoffListeners.clear()
 }

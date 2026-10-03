@@ -13,7 +13,7 @@
  *   4. the unread "your turn" dot leads the secondary line too — NOT absolutely
  *      positioned at the row's right edge — and yields to any more specific state,
  *   5. there is NO absolute status gutter at the row's left edge. The marker used to
- *      live there, inside the row's `pl-3.5`, occupying x 1..13. That band is shared
+ *      live there, inside the row's then-`pl-3.5`, occupying x 1..13. That band is shared
  *      with two decorations that paint over it: the recency tint (an opaque accent
  *      stripe up to 7px wide, `recencyTintShadow`) and the session-colour bar (2px,
  *      `.session-colored::before`). An accent spinner on an accent stripe is a 1:1
@@ -84,7 +84,17 @@ import ChatSidebar from '../pages/ChatSidebar'
 import type { RootState } from '../store'
 import type { ChatSlot } from '../types'
 
-function renderSidebar(slots: ChatSlot[], unread: string[] = [], chat: Record<string, unknown> = {}) {
+function renderSidebar(slots: ChatSlot[], unread: string[] = [], chat: Record<string, unknown> = {}, folders: Array<Record<string, unknown>> = []) {
+  const legacyFixtures = chat.goalLoops as Record<string, { cycle_count: number; max_cycles: number }> | undefined
+  const { goalLoops: _legacyFixtures, ...chatState } = chat
+  const automations = Object.fromEntries(Object.entries(legacyFixtures ?? {}).map(([slotKey, loop]) => [
+    slotKey,
+    {
+      kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+      maxCycles: loop.max_cycles, cycleCount: loop.cycle_count, active: true,
+      lastFireAt: 0, stoppedReason: '',
+    },
+  ]))
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -93,10 +103,10 @@ function renderSidebar(slots: ChatSlot[], unread: string[] = [], chat: Record<st
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
     } as unknown as RootState['dashboard'],
-    chat: { activeSlot: null, slotStatusDetail: {}, ...chat } as unknown as RootState['chat'],
+    chat: { activeSlot: null, slotStatusDetail: {}, ...chatState, automations } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  qc.setQueryData(['chat-folders'], [])
+  qc.setQueryData(['chat-folders'], folders)
   return render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -184,6 +194,33 @@ describe('chat sidebar — status marker leads the secondary line', () => {
     expect(container.querySelector('.session-row .absolute.right-1\\.5.rounded-full')).toBeNull()
   })
 
+  it('paints the unread dot with the semantic status token, not the brand accent', () => {
+    // The dot signals STATE (agent finished, result unread), so it reads
+    // `--ok` like the sidebar's `recent` filter and the connection-status
+    // dot -- never `--accent`, which a theme cannot separate from
+    // links/chips/buttons (#10479).
+    const { container } = renderSidebar([slot({ last_message: 'done' })], ['k1'])
+    const dot = markerOf(container)!
+    expect(dot).toBeTruthy()
+    expect(dot.style.background).toBe('var(--ok)')
+  })
+
+  it('paints the collapsed-folder unread rollup dot with the status token too', () => {
+    // Same unread state rolled up onto the folder header; it is a separate
+    // render site, so the session-row assertion above cannot catch a
+    // regression here. This fixture renders both markers (the folder rollup
+    // and the child row's own dot), so pin them BOTH to the token.
+    const { container } = renderSidebar(
+      [slot({ folder_id: 'f1', last_message: 'done' })], ['k1'], {},
+      [{ id: 'f1', name: 'Work', order: 0, collapsed: true }],
+    )
+    const dots = container.querySelectorAll('span[role="img"].rounded-full')
+    expect(dots).toHaveLength(2)
+    for (const dot of Array.from(dots)) {
+      expect((dot as HTMLElement).style.background).toBe('var(--ok)')
+    }
+  })
+
   it('renders the line for an unread row that has said nothing yet', () => {
     // The dot IS the content then; dropping the line would drop the only signal.
     const { container } = renderSidebar([slot()], ['k1'])
@@ -212,7 +249,7 @@ describe('chat sidebar — status marker leads the secondary line', () => {
     // "fixed" by putting a spacer back at the row's left edge.
     const { container } = renderSidebar([slot({ running: true })])
     const row = container.querySelector('.session-row') as HTMLElement
-    expect(row.className).toMatch(/\bpl-3\.5\b/)
+    expect(row.className).toMatch(/\bpl-2\.5\b/)
     expect(row.children[0]).toBe(colOf(container))
   })
 

@@ -1,5 +1,8 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+// Live `watchCursorAway` subscriptions in this renderer; see that method.
+let cursorAwaySubscribers = 0;
+
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
   isElectron: true,
@@ -23,11 +26,22 @@ contextBridge.exposeInMainWorld("kirocrew", {
   // Caption controls for the frameless Linux window. macOS keeps its traffic
   // lights and Windows its titleBarOverlay when frameless; Linux gets neither,
   // so main.js injects header buttons that round-trip through this channel.
-  // The action vocabulary is validated in main.js (applyWindowControl).
+  // The splash (loading.html) also sends `close` through it on every
+  // platform, since it can be painted into a window whose native close
+  // control is hidden. The action vocabulary and the per-platform admission
+  // are validated in the main process (handleWindowControl /
+  // applyWindowControl).
   windowControl: (action) => ipcRenderer.send("window-control", String(action || "")),
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
+  // Evict the HTTP cache of one remote-crew pane origin (a loopback tunnel
+  // port) before reloading it. Used when the pane's module graph reports a
+  // load error: a hashed chunk the gateway once answered 404+immutable is
+  // replayed from cache forever, and only eviction gets the pane past Loading.
+  // Resolves to whether a purge ran; the caller reloads regardless.
+  clearPaneHttpCache: (origin) =>
+    ipcRenderer.invoke("pane:clear-http-cache", String(origin || "")),
   onStatus: (cb) => {
     const handler = (_e, msg) => cb(msg);
     ipcRenderer.on("status", handler);
@@ -59,6 +73,37 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // coordinate, so the renderer cannot hide or move them itself — with the header
   // collapsed they would sit over the reclaimed content.
   setFocusModeChrome: (visible) => ipcRenderer.send("focus-mode-chrome", !!visible),
+  // Focus mode: how far the cursor has travelled OUTSIDE this window, reduced to
+  // the single transition the reveal overlays care about. Call it once the
+  // pointer has left the window with an overlay open; the callback fires exactly
+  // once, with `true` when the cursor is far enough away that the overlay should
+  // be dismissed and `false` when it came back inside instead. Returns an
+  // unsubscribe that also disarms the main-process poll, so nothing polls while
+  // no overlay is waiting on an answer.
+  //
+  // This cannot be done in the page: the renderer gets no mouse events past a
+  // window edge, which is why the reveal's own dismissal has to round-trip
+  // through the main process at all. A plain browser has no bridge here.
+  //
+  // The main process keeps ONE watch per window, but several callers in this
+  // renderer can be waiting at once (the top bar, the rail, a pane relayed
+  // through this frame). So subscriptions are counted here: every subscribe
+  // (re-)arms the watch, and only the last unsubscribe disarms it -- one caller
+  // letting go must not cancel the answer another is still waiting for.
+  watchCursorAway: (cb) => {
+    const handler = (_e, away) => cb(!!away);
+    ipcRenderer.on("focus-mode:cursor-away", handler);
+    cursorAwaySubscribers += 1;
+    ipcRenderer.send("focus-mode-watch-cursor", true);
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      ipcRenderer.removeListener("focus-mode:cursor-away", handler);
+      cursorAwaySubscribers -= 1;
+      if (cursorAwaySubscribers === 0) ipcRenderer.send("focus-mode-watch-cursor", false);
+    };
+  },
   // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
@@ -141,6 +186,23 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
+// Crash-artifact notice for the dashboard banner (CrashReportNotice).
+//
+// The app already captures a minidump and, on macOS, the OS writes an .ips
+// report — and until now nothing ever mentioned that either exists, which is how
+// a main-process crash reaches us as "it closed by itself" with the evidence
+// still unread on the reporter's disk. This bridge is what closes that loop.
+//
+// `get` resolves { newCount } and NOTHING else: no paths, no filenames, no
+// exception codes, not even a timestamp. `reveal` takes no argument — main.js knows
+// where the log is from the scan it performed, so this cannot be turned into a
+// request to open an arbitrary file. Absent in plain browsers and in the PWA,
+// where there is no local disk to reveal; the banner hides itself.
+contextBridge.exposeInMainWorld("crashReportsAPI", {
+  get: () => ipcRenderer.invoke("crash-reports:get"),
+  reveal: () => ipcRenderer.invoke("crash-reports:reveal"),
+});
+
 // Read-only WSL2 host-runtime readout for the Host runtime card on System >
 // Services (HostRuntimeCard). Detection only — no config writes, no
 // persistence. The main-process handler rejects every sender whose gateway is
@@ -150,6 +212,16 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
 // shell" and renders nothing.
 contextBridge.exposeInMainWorld("wslAPI", {
   detect: () => ipcRenderer.invoke("wsl:detect"),
+});
+
+// File-open bridge for the chat path chip's "Open in editor" affordance. Hands
+// a filesystem PATH — never a URL scheme — to the main process, which validates
+// it and calls shell.openPath so the file opens in the OS default handler on the
+// user's own machine. Resolves { ok, error? }. Absent in a plain browser and in
+// the PWA — the renderer treats a missing bridge as "cannot open externally" and
+// hides the control, keeping the built-in viewer as the only path there.
+contextBridge.exposeInMainWorld("fileOpenAPI", {
+  open: (filePath) => ipcRenderer.invoke("dashboard:open-file", String(filePath || "")),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
@@ -200,6 +272,11 @@ contextBridge.exposeInMainWorld("browserAPI", {
     ipcRenderer.invoke("browser:set-control-owner", panelId, owner),
   getControl: (panelId) => ipcRenderer.invoke("browser:get-control", panelId),
   control: (panelId, op, args) => ipcRenderer.invoke("browser:control", panelId, op, args),
+  // Human-initiated element annotation on the page in the native view:
+  // start/stop pick mode, poll the notes the user typed in the in-page
+  // overlay, remove/edit/clear, capture a screenshot with the markers. Read
+  // through executeJavaScript + capturePage, not the agent control plane.
+  annotate: (panelId, op, args) => ipcRenderer.invoke("browser:annotate", panelId, op, args),
   // Declares that a chat session may host a browser panel, so the agent command
   // channel polls for it even before the Browser tab is ever opened. Grants no
   // authorization — authorization to drive the built-in browser is Browser Mode

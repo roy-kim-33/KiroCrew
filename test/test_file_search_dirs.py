@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.file_index import FileIndex
 from kiro_crew.dashboard.handlers import api_file_search
@@ -25,8 +26,11 @@ def _make_app(index=None) -> web.Application:
     app.router.add_get("/api/file-search", api_file_search)
     state = MagicMock()
     state.file_indexes.get.return_value = index
+    # A MagicMock attribute reads as a non-empty configured owner id, which no
+    # caller can equal, so the owner gate would answer every row alike.
+    state.owner_id = ""
     app["state"] = state
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -47,12 +51,12 @@ def _populate(tmp_path):
     (nested / "leaf.py").write_text("z")
     # An empty directory: proof dirs are walked, not derived from file paths.
     (tmp_path / "widgetsempty").mkdir()
-    # A dot-prefixed dir IS offered as a candidate (issue #5677): it must not be
+    # A dot-prefixed dir IS offered as a candidate: it must not be
     # descended into, but the directory itself is a valid @-mention target.
     (tmp_path / ".widgetshidden").mkdir()
     # Skip-listed dirs stay excluded from both descent and results -- including
     # the dot-prefixed skip-listed ones (.git, .cache, .venv), which the shared
-    # _SKIP_DIRS names explicitly now that candidacy no longer filters on a dot.
+    # _SKIP_DIRS names explicitly, since candidacy does not filter on a dot.
     nm = tmp_path / "node_modules"
     nm.mkdir()
     (nm / "widgetsdep").mkdir()
@@ -119,7 +123,7 @@ class TestFileIndexDirs:
 
     @pytest.mark.asyncio
     async def test_index_offers_dot_dirs_but_not_skip_dirs(self, tmp_path):
-        """Dot-prefixed dirs ARE candidates (#5677); skip-listed dirs are not."""
+        """Dot-prefixed dirs ARE candidates; skip-listed dirs are not."""
         _populate(tmp_path)
         idx = FileIndex(str(tmp_path))
         await idx.start()
@@ -135,7 +139,7 @@ class TestFileIndexDirs:
     async def test_index_dot_skip_dirs_are_not_offered(self, tmp_path):
         """A dot-prefixed SKIP-listed dir (.git, .cache) is never a candidate.
 
-        Regression for #5677 review: candidacy no longer filters on a leading
+        Candidacy does not filter on a leading
         dot, so the shared _SKIP_DIRS must name .git/.cache/.venv explicitly --
         otherwise the indexed fast path would start offering them.
         """
@@ -269,7 +273,7 @@ class TestApiFileSearchDirs:
 
     @pytest.mark.asyncio
     async def test_walk_fallback_offers_dot_dirs_but_not_skip_dirs(self, tmp_path, mock_sel):
-        """The walk fallback offers dot-dirs (#5677) but never skip-listed dirs."""
+        """The walk fallback offers dot-dirs but never skip-listed dirs."""
         _populate(tmp_path)
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(
@@ -285,7 +289,7 @@ class TestApiFileSearchDirs:
         """The walk fallback never offers a dot-prefixed skip-listed dir.
 
         Same source of truth as the fast path (shared _SKIP_DIRS), so the two
-        paths of this endpoint agree on .git/.cache/.venv -- the #5677 review gap.
+        paths of this endpoint agree on .git/.cache/.venv.
         """
         _populate(tmp_path)
         async with TestClient(TestServer(_make_app())) as client:
@@ -357,7 +361,7 @@ class TestApiFileSearchDirs:
         lose it is to never collect it.
         """
         # max_collect is max_results * 10 = 150, so 400 matching directories
-        # would previously exhaust it before the file was reached.
+        # would exhaust it before the file was reached.
         for i in range(400):
             (tmp_path / f"zzz_widgets{i:03d}").mkdir()
         (tmp_path / "widgets.py").write_text("x")
@@ -369,15 +373,22 @@ class TestApiFileSearchDirs:
         assert "widgets.py" in names, "the file was crowded out by directory candidates"
 
     @pytest.mark.asyncio
-    async def test_files_and_dirs_have_independent_scan_budgets(self, tmp_path, mock_sel):
+    async def test_files_and_dirs_have_independent_scan_budgets(
+            self, tmp_path, mock_sel, monkeypatch):
         """A file-heavy root must not starve the directory scan.
 
         A single shared scan counter let files spend the whole budget before any
         directory was examined, so directory search returned nothing even though
         it was enabled. Non-matching files are used so only the SCAN budget (not
         the candidate cap) is under test.
+
+        Budgets patched DOWN (module-level exactly so tests can, per
+        ``files.py``'s comment on ``_WALK_MAX_SCAN_SCOPED``) so a much smaller
+        tree still exceeds them and exercises the same starvation path.
         """
-        for i in range(5_000):
+        monkeypatch.setattr(files_mod, "_WALK_MAX_SCAN_SCOPED", 100)
+        monkeypatch.setattr(files_mod, "_WALK_MAX_SCAN_UNSCOPED", 100)
+        for i in range(200):
             (tmp_path / f"zz{i:04d}.py").write_text("x")
         (tmp_path / "widgets_dir").mkdir()
 

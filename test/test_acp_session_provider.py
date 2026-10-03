@@ -24,6 +24,7 @@ def _make_handle(
     """Create a mock AcpSessionHandle with configurable defaults."""
     handle = MagicMock()
     handle.session_id = session_id
+    handle.memory_mode = "persistent"
     handle.is_turn_active = is_turn_active
     handle.last_prompt_stats = AcpPromptStats(
         context_pct=context_pct,
@@ -245,8 +246,7 @@ class TestAcpSessionProviderStream:
     async def test_stream_command_routes_through_handle_stream_command(self):
         """Slash commands go through the handle's NATIVE commands/execute path,
         never through prompt() — a prompt round-trip would hand the command to
-        the model, which summarizes kiro-cli's output instead of returning it
-        (issue #4972)."""
+        the model, which summarizes kiro-cli's output instead of returning it."""
         handle = _make_handle()
         events = [
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="13 tools"),
@@ -728,7 +728,7 @@ class TestAcpSessionProviderRound4Parity:
         assert runtime._crew_agent == ""
 
     def test_rekey_resets_context_state(self):
-        """#2932 -- the handoff must drop the previous session's context state
+        """The handoff must drop the previous session's context state
         (mirror of AcpClient.rekey): _make_handle seeds pct=42/5000/200000, so
         a leak here would hand those numbers to the claiming session and let
         check_context_usage compact its empty conversation."""
@@ -974,6 +974,34 @@ class TestAcpSessionProviderContractParity:
         with pytest.raises(AcpProcessDied):
             await provider.steer("go")
 
+    @pytest.mark.parametrize("own_frame_buffered", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_steer_is_ambiguous_only_when_its_own_frame_was_buffered(
+        self, own_frame_buffered
+    ):
+        """The session's outstanding prompt makes a TURN's death ambiguous, but
+        not a steer that was refused before its first byte: marking that steer
+        possibly delivered would make the next turn skip an instruction the
+        backend never received."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.acp.runtime import AcpRuntimeStdinStalled
+
+        handle = _make_handle()
+        handle.prompt_outstanding_on_stall = True
+        handle.steer = AsyncMock(
+            side_effect=(
+                AcpRuntimeStdinStalled("stdin stalled", ambiguous_delivery=True)
+                if own_frame_buffered
+                else AcpRuntimeDead("runtime is dead")
+            )
+        )
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+        with pytest.raises(AcpProcessDied) as ei:
+            await provider.steer("also add tests")
+        assert ei.value.ambiguous_delivery is own_frame_buffered
+
     @pytest.mark.asyncio
     async def test_approve_tool_explicit_option_id(self):
         """approve_tool honors an explicit option_id (signature parity)."""
@@ -1010,10 +1038,36 @@ class TestNewConversation:
         await provider.new_conversation()
 
         # Fresh session/new on the SAME runtime (cwd+agent from the runtime).
-        runtime.create_session.assert_awaited_once_with(cwd="/tmp/ws", agent="kirocrew")
+        runtime.create_session.assert_awaited_once_with(
+            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent", session_key=""
+        )
         # Handle swapped to the fresh session → next prompt starts clean.
         assert provider._handle is new_handle
         assert provider.session_id == "fresh-session-2"
+
+    @pytest.mark.asyncio
+    async def test_owning_shutdown_stops_in_flight_hook_executions(self):
+        handle = _make_handle(session_id="owned")
+        handle._cancel_hook_tasks = MagicMock()
+        runtime = _make_runtime()
+        runtime.kill = AsyncMock()
+        provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
+
+        await provider.shutdown()
+
+        handle._cancel_hook_tasks.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_the_fresh_session_keeps_the_providers_owner(self):
+        # The hooks execute path keys its record and its governance by the owning
+        # session, so a fresh conversation must not come back unowned.
+        old = _make_handle(session_id="old-session-1")
+        runtime, _new_handle = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime, session_key="slot:owner")
+
+        await provider.new_conversation()
+
+        assert runtime.create_session.await_args.kwargs["session_key"] == "slot:owner"
 
     @pytest.mark.asyncio
     async def test_destroys_old_session_to_free_context(self):
@@ -1052,6 +1106,89 @@ class TestNewConversation:
         # (never a window referencing a terminated one), and old was NOT destroyed.
         assert provider._handle is old
         old.destroy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_a_backend_that_does_not_evict_before_creating_anything(self):
+        """The whole primitive rests on ``old.destroy()`` actually reclaiming the
+        previous session. A backend outside ``ACP_BACKENDS_SESSION_EVICTION`` has
+        not demonstrated a teardown that does, so warm reuse would add one resident
+        session per reset with nothing but an age ceiling to reap it. It must
+        refuse, and refuse BEFORE ``session/new``: creating first would leak the very
+        session the refusal exists to prevent.
+
+        The stand-in is the claude backend: a registered backend that is not a
+        member. (codex WAS the motivating case, until its teardown became the
+        evicting ``session/close`` and it joined the set -- which is exactly why the
+        gate reads the set and not a name.)"""
+        from kiro_crew.acp.client import AcpError
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKENDS_SESSION_EVICTION
+
+        assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_SESSION_EVICTION
+
+        old = _make_handle(session_id="old-session-1")
+        runtime, _ = self._runtime_with_new_session()
+        runtime.acp_backend = ACP_BACKEND_CLAUDE
+        provider = AcpSessionProvider(old, runtime)
+
+        with pytest.raises(AcpError, match="does not evict sessions"):
+            await provider.new_conversation()
+
+        # Nothing was created and nothing was torn down: the caller's hard-reset
+        # fallback runs against a provider still pointing at its live session.
+        runtime.create_session.assert_not_awaited()
+        old.destroy.assert_not_awaited()
+        assert provider._handle is old
+
+    @pytest.mark.asyncio
+    async def test_allows_codex_now_that_its_teardown_evicts(self):
+        """codex joined the eviction set when its teardown became ``session/close``;
+        pooled warm reuse is the path that gain was for."""
+        from kiro_crew.acp.types import ACP_BACKEND_CODEX
+
+        old = _make_handle(session_id="old-session-1")
+        runtime, new_handle = self._runtime_with_new_session()
+        runtime.acp_backend = ACP_BACKEND_CODEX
+        provider = AcpSessionProvider(old, runtime)
+
+        await provider.new_conversation()
+
+        assert provider._handle is new_handle
+        old.destroy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_allows_kas_which_evicts_on_teardown(self):
+        """Positive membership, not "is not codex": KAS is the other member of
+        ``ACP_BACKENDS_SESSION_EVICTION`` and must keep the cheap path."""
+        old = _make_handle(session_id="old-session-1")
+        runtime, new_handle = self._runtime_with_new_session()
+        runtime.acp_backend = "kas"
+        provider = AcpSessionProvider(old, runtime)
+
+        await provider.new_conversation()
+
+        assert provider._handle is new_handle
+        old.destroy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_kiro_keeps_the_cheap_path_and_its_id_is_the_empty_string(self):
+        """Kiro keeps warm reuse, and ``""`` is not a missing value to resolve:
+        ``ACP_BACKEND_KIRO`` IS ``""``, so a default runtime reads as a member of
+        the eviction set directly. Pinned because a reader meeting
+        ``acp_backend == ""`` naturally hears "unset" and adds a resolution step
+        the set does not need -- which is exactly the dead branch this replaced."""
+        from kiro_crew.acp.types import ACP_BACKEND_KIRO, ACP_BACKENDS_SESSION_EVICTION
+
+        assert ACP_BACKEND_KIRO == ""
+        assert ACP_BACKEND_KIRO in ACP_BACKENDS_SESSION_EVICTION
+
+        old = _make_handle(session_id="old-session-1")
+        runtime, new_handle = self._runtime_with_new_session()
+        assert runtime.acp_backend == ACP_BACKEND_KIRO
+        provider = AcpSessionProvider(old, runtime)
+
+        await provider.new_conversation()
+
+        assert provider._handle is new_handle
 
     @pytest.mark.asyncio
     async def test_success_survives_old_destroy_failure(self):
@@ -1194,7 +1331,7 @@ class TestLivePathModelEntitlement:
             {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
         ]
 
-        async def _refresh():
+        async def _refresh(*_a, **_kw):
             handle.available_models = fresh
             return fresh
 
@@ -1249,6 +1386,21 @@ class TestLivePathModelEntitlement:
 
         handle.refresh_available_models.assert_not_awaited()
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_refusal_heal_forces_a_fresh_probe(self):
+        """D1: an explicit pick is a user action, so its revalidation passes
+        force=True — it must not be refused on a no-evidence failure the picker
+        read path may have cached in the shared attempt-clock window."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+
+        with pytest.raises(AcpModelUnavailable):
+            await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_awaited_once()
+        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
 
 
 class TestAdvertisedModelIds:

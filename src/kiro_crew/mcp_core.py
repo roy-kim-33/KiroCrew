@@ -6,10 +6,10 @@ and calls tools via JSON-RPC over stdio (MCP protocol).
 Tools:
     spawn_run       — spawn a background subagent
     spawn_list      — list running/completed subagents
-    spawn_status    — retrieve full subagent output
+    spawn_status    — retrieve live status and partial/full subagent output
     resource_status — check host resource headroom before heavy work
     learn_add       — save a learned correction
-    learn_list      — list all lessons
+    learn_list      — list one window of lessons, with the total
     learn_remove    — remove lessons by substring
     task_run        — start the autonomous task runner
     vision_analyze  — describe an image (path or URL) via a vision subagent
@@ -18,22 +18,21 @@ Tools:
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
-import platform
 import re as _re
 import socket
-import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import list_agents
 from kiro_crew.autonudge import binding_key_for, structured_monitor_binding_key_for
 from kiro_crew.config.loader import (
@@ -49,27 +48,45 @@ from kiro_crew.history import _SEARCH_SCAN_WINDOW as SEARCH_SCAN_WINDOW
 from kiro_crew.history import ConversationLog, is_incognito_transcript, snippet_needles
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.embedder import create_embedder_from_config
-from kiro_crew.knowledge.retrieval import HybridRetriever
+from kiro_crew.knowledge.retrieval import HybridRetriever, vector_leg
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loopback_http import loopback_urlopen
-from kiro_crew.mcp_caller import current_caller
+from kiro_crew.mcp_caller import (
+    CallerContext,
+    current_caller,
+    resolve_own_identity,
+    set_current_caller,
+)
 from kiro_crew.mcp_shared import (
     call_tool_with_logging,
+    external_client_identity_note,
     internal_caller,
     run_mcp_stdio_loop,
+    spawned_without_gateway_identity,
 )
+from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.mcp_tools import build_tool_list, dispatch
 from kiro_crew.members import record_activity
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.port_resolution import port_is_gateway_owned, resolve_client_port_src
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
+    redact_local_paths,
 )
 from kiro_crew.sel import sel
-from kiro_crew.session_directive import refuse_if_markerless
+from kiro_crew.session_directive import (
+    CORE_MCP_SERVER,
+    DIRECTIVE_TOOLS,
+    clear_vouch,
+    refuse_if_markerless,
+)
+from kiro_crew.session_pid_sig import session_pid_mapping_path
+from kiro_crew.session_token_sig import session_key_from_env_token
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
     validate_tool_args,
@@ -90,6 +107,7 @@ _HANDLER_SURFACE = (
     sel,
     summarize_result,
     time,
+    vector_leg,
 )
 
 
@@ -355,10 +373,18 @@ def _secret_for_base(base: str) -> str:
     pre-restart secret is the desync that helper exists to close.
 
     The port comes from the base being dialled rather than a fresh resolution,
-    so the credential and the target cannot name different gateways.
+    so the credential and the target cannot name different gateways. The HOST is
+    taken from that same base, so the credential is resolved for the exact
+    listener this base addresses (``read_local_secret`` prefers the address-keyed
+    entry and fails closed): a port names a SET of listeners, and pairing the
+    read to the dialled host is what keeps the secret from reaching a co-resident
+    that merely holds the port.
     """
     try:
-        return read_local_secret(int(base.rsplit(":", 1)[-1]))
+        authority = base.split("//", 1)[-1].split("/", 1)[0]
+        host = authority.rsplit(":", 1)[0]
+        port = int(authority.rsplit(":", 1)[-1])
+        return read_local_secret(port, dial_host=host)
     except Exception:
         return ""
 
@@ -390,8 +416,10 @@ def _reverify_refused_target(refused_base: str) -> tuple[str, str] | None:
     * the port is not PROVEN to be held by this user's gateway. The source
       label alone cannot carry that proof: ``KIROCREW_BOUND_PORT`` is
       inherited process state naming the gateway that SPAWNED us, exported
-      once its site was listening (``dashboard.server._export_bound_port``),
-      and it ranks above the marker step — so ``bound``, not ``marker``, is
+      from the port that gateway owns — reserved (bound and listening, not yet
+      accepting) on the dashboard path, republished by
+      ``dashboard.server._export_bound_port`` once its
+      site serves, and it ranks above the marker step — so ``bound``, not ``marker``, is
       the source for every gateway-spawned process, and it is never
       ownership-checked. A refusal is affirmative evidence the previous owner
       is gone, and a retry that SLEEPS first is exactly the window in which
@@ -457,76 +485,13 @@ WAIT_STALENESS_PING_SECS = 60.0
 _SKILL_FETCH_MAX_CHARS = 32 * 1024
 
 
-def _compress_snapshot_to_outline(snapshot: str, max_lines: int = 100) -> str:
-    """Compress a full accessibility snapshot into a compact outline.
-
-    Keeps: headings, links, buttons, inputs, images with alt text, and
-    structural landmarks. Strips: empty containers, decorative elements,
-    redundant whitespace. Returns element refs so agent can interact
-    without re-reading the full snapshot.
-    """
-    if not snapshot:
-        return "Empty snapshot — page may not have loaded."
-
-    lines = snapshot.split("\n")
-    keep_patterns = _re.compile(
-        r"(heading|link|button|textbox|combobox|checkbox|radio|tab|menu"
-        r"|img|image|navigation|main|banner|contentinfo|search|alert"
-        r"|dialog|listitem|row|cell|ref=)"
-    )
-    outline: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped == "-":
-            continue
-        if keep_patterns.search(stripped.lower()):
-            indent = len(line) - len(line.lstrip())
-            compact_indent = "  " * min(indent // 2, 4)
-            outline.append(f"{compact_indent}{stripped}")
-            if len(outline) >= max_lines:
-                outline.append(f"... (truncated at {max_lines} lines)")
-                break
-
-    if not outline:
-        total = len([ln for ln in lines if ln.strip()])
-        return f"No interactive elements found in snapshot ({total} total lines). Try browser_snapshot with a more specific target."
-
-    return f"Page outline ({len(outline)} elements):\n" + "\n".join(outline)
-
-
-def _search_snapshot(snapshot: str, query: str, max_results: int = 50) -> str:
-    """Search a snapshot for lines matching a query pattern."""
-    if not snapshot:
-        return "Empty snapshot."
-    if not query:
-        return "Error: query is required"
-
-    try:
-        pattern = _re.compile(query, _re.IGNORECASE)
-    except _re.error:
-        pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
-
-    lines = snapshot.split("\n")
-    matches: list[str] = []
-    for i, line in enumerate(lines, 1):
-        if pattern.search(line):
-            matches.append(f"L{i}: {line.strip()}")
-            if len(matches) >= max_results:
-                break
-
-    if not matches:
-        return f"No matches for '{query}' in snapshot ({len(lines)} lines)."
-
-    return f"Found {len(matches)} matches:\n" + "\n".join(matches)
-
-
 def _list_tools() -> list[dict[str, Any]]:
     """Tool descriptors served for ``tools/list``.
 
     Declared per domain under :mod:`kiro_crew.mcp_tools`; this stays the
     entry point kiro-cli and in-process discovery both read.
     """
-    return build_tool_list()
+    return with_titles(CORE_MCP_SERVER, build_tool_list())
 
 
 def _internal_secret() -> str:
@@ -534,94 +499,16 @@ def _internal_secret() -> str:
 
     Thin wrapper over ``config.loader.read_local_secret``, which owns the
     per-listener-then-shared order. The port is passed rather than re-resolved
-    because ``_api_port`` already resolved and cached it for this process.
+    because ``_api_port`` already resolved and cached it for this process. The
+    dial host is the IPv4 loopback literal every ``_api_base`` in this module
+    addresses, so the credential is resolved for that listener and refuses when
+    the address-keyed entry is absent rather than falling back to the port-keyed
+    read.
     """
     try:
-        return read_local_secret(_api_port())
+        return read_local_secret(_api_port(), dial_host="127.0.0.1")
     except Exception:
         return ""
-
-
-def _ppid_via_libproc(pid: int) -> int:
-    """macOS parent-PID lookup via libproc's ``proc_pidinfo`` (stdlib ctypes).
-
-    macOS has no ``/proc``, and the app sandbox denies spawning ``ps``
-    (``Operation not permitted``). ``proc_pidinfo`` is an information syscall
-    (no ``exec``), so the sandbox allows it — the same primitive psutil uses,
-    but with zero third-party dependency. Returns 0 on any failure so the caller
-    can fall back.
-    """
-    import ctypes
-    import struct
-
-    proc_pidtbsdinfo = 3
-    # sizeof(struct proc_bsdinfo) is 232 on 64-bit Darwin; over-allocate.
-    buf_size = 256
-    try:
-        libproc = ctypes.CDLL("libproc.dylib", use_errno=True)
-        libproc.proc_pidinfo.restype = ctypes.c_int
-        libproc.proc_pidinfo.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        buf = ctypes.create_string_buffer(buf_size)
-        n = libproc.proc_pidinfo(pid, proc_pidtbsdinfo, 0, buf, buf_size)
-        # pbi_ppid is the 5th uint32 (offset 16); need at least that many bytes.
-        if n <= 16:
-            return 0
-        # struct proc_bsdinfo starts: pbi_flags, pbi_status, pbi_xstatus,
-        # pbi_pid, pbi_ppid (5 x uint32) — pbi_ppid is index 4.
-        return int(struct.unpack_from("<5I", buf.raw, 0)[4])
-    except Exception:
-        return 0
-
-
-def _get_ppid(pid: int) -> int:
-    """Get parent PID cross-platform. Returns 0 on failure.
-
-    Standard-library only — deliberately NO third-party dependency (e.g.
-    psutil), so the shipped app needs nothing extra bundled or code-signed and
-    works across OS versions out of the box.
-
-    - Linux: read ``/proc/<pid>/status`` (plain file read).
-    - macOS: ``proc_pidinfo`` via libproc (see ``_ppid_via_libproc``). The old
-      code shelled out to ``ps`` here, which the macOS app sandbox denies
-      (``Operation not permitted``) — that broke the ancestor PID-walk in
-      ``_resolve_session_key``, leaving spawned sub-agents unable to resolve
-      their parent session key (empty ``KIROCREW_SESSION_KEY``) and surfacing
-      spurious tool-approval cards on trusted sessions. libproc needs no
-      ``exec``, so it works under the sandbox.
-    - Windows: ``CreateToolhelp32Snapshot`` via
-      ``platform_compat.get_ppid``. Without this branch the walk fell through
-      to ``ps``, which does not exist on Windows, so every lookup returned 0
-      and ``_resolve_session_key`` could never resolve a key -- silently
-      breaking every session-keyed tool (``learn_add``, cron management,
-      callback delivery) with ``missing X-Session-Key``.
-    - Other/unknown platforms: fall back to ``ps`` (may be blocked, then 0).
-    """
-    system = platform.system()
-    try:
-        if system == "Windows":
-            ppid = platform_compat.get_ppid(pid)
-            return ppid if ppid > 0 else 0
-        if system == "Linux":
-            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-                if line.startswith("PPid:"):
-                    return int(line.split()[1])
-        elif system == "Darwin":
-            ppid = _ppid_via_libproc(pid)
-            if ppid:
-                return ppid
-        # Last-resort fallback (unknown platform, or a libproc/proc miss): ``ps``.
-        # May be sandbox-blocked, in which case this raises and we return 0.
-        out = subprocess.check_output(["ps", "-o", "ppid=", "-p", str(pid)], text=True, timeout=2)
-        return int(out.strip())
-    except Exception:
-        pass
-    return 0
 
 
 # ── Knowledge-search store/embedder cache ──
@@ -696,8 +583,55 @@ def _get_knowledge_search(db_path: Path, cfg_path: Path) -> tuple[Any, Any]:
         return store, embedder
 
 
+def _session_key_from_token() -> str:
+    """Resolve this session's key from its signed per-session TOKEN, or "".
+
+    The identity channel that needs no daemon, no broker stub and no config
+    switch. The token is minted per ACP ``session/new``
+    (:func:`kiro_crew.mcp_gateway.claim.mint_stub_session_token`) and rides THIS
+    session's own ``mcpServers`` elements in ``env``, so — unlike every
+    process-keyed source — a ``spawn_run`` subagent sharing its parent's kiro-cli
+    process carries a different name than its parent. The gateway publishes the
+    token -> session-key mapping to a MAC-signed file
+    (:func:`kiro_crew.session_token_sig.publish_session_token`) at ``session/new``
+    and again on every warm-pool ``rekey()``, and the MAC is what makes the file
+    trustworthy in a directory an agent can write.
+
+    The read itself belongs to
+    :func:`kiro_crew.session_token_sig.session_key_from_env_token`, the one reader
+    every resolver shares — this module's two, the client-side
+    ``mcp_caller.CallerContext.from_env`` and the managed-tool-policy lookup in
+    ``mcp_shared`` — so the token's position and its fail-closed behaviour cannot
+    drift between them. Read at the SAME position in each: after the
+    gateway-injected per-call caller context, and BEFORE the
+    ``KIROCREW_SESSION_KEY`` env var. That order is load-bearing rather than
+    arbitrary — a warm-pool process is re-keyed to a new session while the env its
+    MCP children were spawned with keeps naming the PREVIOUS one, so where the two
+    disagree the env var is the stale answer and the file is the current one.
+    Placing the token second (below the caller context) keeps the gateway's own
+    per-call injection authoritative wherever it exists, since that is stamped per
+    CALL and therefore cannot go stale at all.
+
+    Fails closed: an unset token, a missing mapping, or a MAC that does not verify
+    all return ``""`` and the caller falls through to the sources it had before.
+    Never raises — an identity source that can raise would turn a resolvable
+    session into a crashed tool call.
+    """
+    try:
+        return session_key_from_env_token()
+    except Exception:
+        # No logger here, and no bare stderr write: this module runs inside the
+        # kirocrew-core stdio MCP server, whose stray stdout/stderr would corrupt
+        # the JSON-RPC stream — the same constraint the governance-degrade branch
+        # below states, and the reason this module keeps no logger at all. The
+        # observable consequence of a failure is the refusal the caller already
+        # emits, which carries :func:`strict_identity_diagnosis`.
+        pass
+    return ""
+
+
 def _resolve_session_key() -> str:
-    """Return the real session key, falling back to PID file when env var is absent.
+    """Return this session's key, or ``""`` when nothing can name it.
 
     Source 0 is the gateway-injected per-call caller context (pooled
     topology): gatewayd strips client-forged ``kirocrew.caller`` blocks and
@@ -705,57 +639,42 @@ def _resolve_session_key() -> str:
     identity when present — env-var identity is wrong-by-construction in a
     shared backend (one process, many sessions).
 
-    Warm-pool kiro-cli processes have no KIROCREW_SESSION_KEY env var (the pool
-    spawns with an empty key so rekey() + PID file provide the correct mapping).
+    Everything below it is :func:`kiro_crew.mcp_caller.resolve_own_identity`,
+    the one client-side ladder every such resolver shares: the signed
+    per-session token, then ``KIROCREW_SESSION_KEY``, then the gateway-published
+    pid mapping by host pid and by ancestor walk. The protected member binding is
+    deliberately NOT consulted here — it gates a private memory store, and this
+    lenient resolver's consumers are attribution rather than authorization.
 
-    After rekey, the process tree may be: gateway -> kiro-cli (pool, has PID file)
-    -> kiro-cli-chat (forked child) -> MCP server.  os.getppid() returns the
-    immediate parent (kiro-cli-chat) which has no PID file.  Walk up ancestors
-    until we find a matching file or hit init.
+    Warm-pool kiro-cli processes have no ``KIROCREW_SESSION_KEY`` (the pool
+    spawns with an empty key so rekey() + pid mapping provide the mapping), and
+    a pid mapping answers for the PROCESS: on a runtime hosting several sessions
+    it names a co-tenant, so the ladder refuses there rather than returning the
+    wrong session.
     """
     ctx = current_caller()
     if ctx is not None and ctx.session_key:
         return ctx.session_key
-    sk = os.environ.get("KIROCREW_SESSION_KEY", "")
-    if sk:
-        return sk
-    try:
-        from kiro_crew.session_pid_sig import read_session_pid_txt
-
-        cfg_dir = config_dir()
-        # Sandbox launcher exports its own HOST pid (the pid the gateway keys
-        # session_pid files by) — direct lookup works even when this
-        # process's pid view diverges from the host's (PID-namespace
-        # sandboxing), where the ancestor walk below can never match.
-        # Reads go through session_pid_sig's hardened reader (symlink
-        # refusal, regular-file check, size bound) — same read discipline
-        # as the strict verifier, minus the signature requirement.
-        host_pid = os.environ.get("KIROCREW_HOST_PID", "")
-        if host_pid.isdigit():
-            key = read_session_pid_txt(host_pid, cfg_dir)
-            if key:
-                return key
-        pid = os.getppid()
-        seen: set[int] = set()
-        while pid > 1 and pid not in seen:
-            seen.add(pid)
-            key = read_session_pid_txt(pid, cfg_dir)
-            if key:
-                return key
-            pid = _get_ppid(pid)
-    except Exception:
-        pass
-    return ""
+    return resolve_own_identity(consult_protected_binding=False).session_key
 
 
 def _resolve_session_key_strict() -> str:
     """Resolve the session key, refusing PID-walked and unsigned identities.
 
     Like ``_resolve_session_key`` but drops the ``/proc`` ancestor walk.
-    Two identity sources are accepted:
+    Three identity sources are accepted:
 
-    1. The gateway-injected ``KIROCREW_SESSION_KEY`` env var.
-    2. The direct ``KIROCREW_HOST_PID`` -> ``session_pid_<pid>.txt``
+    1. The signed per-SESSION token (:func:`_session_key_from_token`). Minted per
+       ``session/new``, carried in the ``env`` of this session's own
+       ``mcpServers`` elements, and resolved through a MAC-signed mapping file the
+       gateway republishes on every ``rekey()``. It is the only source that is
+       both per-session (so a ``spawn_run`` subagent does not inherit its
+       parent's identity on a shared runtime) and switch-free (no gatewayd, no
+       broker stub, no config key) — which is why it is accepted ABOVE the env
+       var: where the two disagree, a warm-pool rekey has made the env stale and
+       the file is current.
+    2. The gateway-injected ``KIROCREW_SESSION_KEY`` env var.
+    3. The direct ``KIROCREW_HOST_PID`` -> ``session_pid_<pid>.txt``
        lookup, but ONLY when the HMAC sidecar written by the gateway
        verifies (:func:`kiro_crew.session_pid_sig.verify_session_pid`).
        PID-namespace sandboxing strips ``KIROCREW_SESSION_KEY`` from the
@@ -772,15 +691,18 @@ def _resolve_session_key_strict() -> str:
        fully identified.
 
     Returns ``""`` when only the ``/proc`` ancestor WALK would have
-    matched, or when the sidecar is missing/invalid. The walk stays
-    excluded: a subagent spawned via ``spawn_run`` lives under the
+    matched, when the sidecar is missing/invalid, or when the mapping
+    records that its pid hosts SEVERAL sessions — one key cannot name
+    them, so answering would attribute this caller to a co-tenant, and a
+    state-mutating tool would write another session's state. The walk
+    stays excluded: a subagent spawned via ``spawn_run`` lives under the
     parent slot's process tree, so walking ancestors from its MCP-core
     child silently resolves to the parent — which would let the
     subagent mutate state on the wrong slot. Read-only callers (audit,
     telemetry) keep the lenient resolver where misattribution is
     harmless.
 
-    Source 0 (accepted BEFORE both of the above): the gateway-injected
+    Source 0 (accepted BEFORE all three of the above): the gateway-injected
     per-call caller context. In the pooled topology gatewayd strips any
     client-forged ``kirocrew.caller`` block on every inbound frame and
     injects its own (built from the uid-gated claim-push at ``rekey()``),
@@ -794,6 +716,12 @@ def _resolve_session_key_strict() -> str:
     ctx = current_caller()
     if ctx is not None and ctx.session_key:
         return ctx.session_key
+    # The signed per-session token, ABOVE the env var: after a warm-pool rekey the
+    # env key names the previous session and the mapping file names the current
+    # one. See :func:`_session_key_from_token`.
+    from_token = _session_key_from_token()
+    if from_token:
+        return from_token
     sk = os.environ.get("KIROCREW_SESSION_KEY", "")
     if sk:
         return sk
@@ -813,7 +741,7 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
 
     Every strict refusal already says *what* was refused; none of them says why
     THIS install cannot answer "which session is calling", so the reader has no
-    next step. This inspects the same three sources
+    next step. This inspects the same sources
     :func:`_resolve_session_key_strict` accepts and names the missing channel.
 
     The distinction that matters to an operator: on the kiro backend a session's
@@ -831,30 +759,75 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
     """
     if _resolve_session_key_strict():
         return ""
-    if os.environ.get("KIROCREW_HOST_PID", "").isdigit():
+    from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+
+    if os.environ.get(STUB_SESSION_TOKEN_ENV, ""):
+        # The switch-free channel was WIRED — this session's MCP element carried
+        # a token — and the signed mapping is what failed. That is a trust-root
+        # or publication problem, never a routing one, so pointing the reader at
+        # ``stub_servers`` here would send them to configure a channel they
+        # already have. Named separately from the pid sidecar below because the
+        # two fail for different reasons and only one of them is fixed by the
+        # sandbox launcher being present.
+        return (
+            f" No identity channel: this session's MCP element carried a session "
+            f"token but its signed mapping did not verify. Check `kirocrew doctor` "
+            f"(SEL trust root) — {server} needs no routing when this channel works."
+        )
+    host_pid = os.environ.get("KIROCREW_HOST_PID", "")
+    if host_pid.isdigit():
         # The sandbox launcher declared a host pid, so the channel exists and
         # the sidecar is what failed — a signing/trust-root problem, not routing.
+        # Name the directory the verifier actually searched: when an agent spec
+        # pinned a foreign KIROCREW_HOME into this stub's environment,
+        # the path is the poisoned home, and without it the operator is sent to
+        # `kirocrew doctor` on the real gateway, which reports a healthy trust
+        # root and points nowhere.
+        suffix = ""
+        try:
+            mapping = session_pid_mapping_path(host_pid)
+            # Existence-independent on purpose: the mapping directory is
+            # same-uid agent-writable, so any wording that varies with what is
+            # at the path (present, absent, a planted symlink) becomes an
+            # existence oracle. Naming the searched path is the whole of the
+            # diagnostic; whether anything is there is one `ls` away.
+            suffix = f" (mapping searched: {mapping})"
+        except (OSError, RuntimeError, ValueError):
+            # A diagnostic must never replace the denial it decorates with a
+            # crash: Path.home() raises RuntimeError with no resolvable home,
+            # expanduser RuntimeError on "~unknown", resolution OSError, and
+            # garbage ValueError. On any of them, keep the generic wording.
+            suffix = ""
         return (
-            f" No identity channel: the signed pid mapping for this session did not "
-            f"verify. Check `kirocrew doctor` (trust root) — {server} does not need "
-            f"routing when this channel works."
+            f" No identity channel: the signed pid mapping for this session did "
+            f"not verify{suffix}. Check `kirocrew doctor` (trust root) — {server} "
+            f"does not need routing when this channel works."
         )
-    return (
-        f" No identity channel on this install: {server} is not in "
+    # Reaching here means no token on the element and no launcher pid, the same
+    # shape ``spawned_without_gateway_identity`` reads; the note is gated on it
+    # anyway so this branch and the tool-policy refusal agree by construction.
+    out = (
+        f" No identity channel on this install: {server}'s MCP element carries "
+        f"neither a session token nor a session key, {server} is not in "
         f"mcp_gateway.stub_servers, so the gateway injects no per-call caller, and "
         f"the kiro backend's AcpRuntime is session-unbound (it carries no session "
-        f"key in its environment by design). Route {server} from MCP Management "
-        f"(or add it to mcp_gateway.stub_servers and restart) to give this session "
-        f"a verifiable identity. `kirocrew doctor` reports the same check."
+        f"key in its environment by design). A session token on the element is the "
+        f"switch-free fix and needs no gateway; where this backend emits no element "
+        f"for {server} at all, route it from MCP Management (or add it to "
+        f"mcp_gateway.stub_servers and restart) to give this session a verifiable "
+        f"identity. `kirocrew doctor` reports the same check."
     )
+    if spawned_without_gateway_identity():
+        out += external_client_identity_note(server)
+    return out
 
 
 #: The REFLEXIVE tool surface: every module whose MCP tools embed "my session"
 #: in their semantics (ledger writes, monitor loops, session-scoped control,
-#: attributed channel sends, crew/app state, cron ownership). Each of these
-#: resolves the caller STRICTLY through :func:`require_strict_session_key` —
-#: never the lenient :func:`_resolve_session_key`, whose ``/proc`` ancestor
-#: walk hands a subagent its PARENT slot's identity. This is data, not lore:
+#: attributed channel sends, crew/app state, cron ownership). These operations
+#: resolve the caller STRICTLY through :func:`require_strict_session_key`, never
+#: the lenient resolver whose ``/proc`` ancestor walk can return a parent slot.
+#: The registry includes every module with a strict operation. This is data:
 #: ``test/test_identity_topology.py`` scans the source tree and fails when a
 #: module calls the strict resolver directly (bypassing the gate) or calls the
 #: gate without being registered here, so the NEXT reflexive tool cannot skip
@@ -862,20 +835,26 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
 REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
     {
         "mcp_computer.py",
+        "mcp_crew_log.py",
         "mcp_cron.py",
         "mcp_dashboard.py",
+        "mcp_debug.py",
+        "mcp_work.py",
+        "mcp_panel.py",
         "mcp_tools/apps.py",
         "mcp_tools/control.py",
+        "mcp_tools/learn.py",
         "mcp_tools/ledger.py",
+        "mcp_tools/logs.py",
         "mcp_tools/messaging.py",
+        "mcp_tools/sessions.py",
+        "mcp_tools/skills.py",
         "mcp_tools/workflows.py",
     }
 )
 
 
-def require_strict_session_key(
-    refusal: str, server: str = "kirocrew-core"
-) -> tuple[str, str]:
+def require_strict_session_key(refusal: str, server: str = "kirocrew-core") -> tuple[str, str]:
     """The ONE fail-closed identity gate every reflexive tool routes through.
 
     Returns ``(key, "")`` when the caller is strictly identified, and
@@ -884,7 +863,8 @@ def require_strict_session_key(
     operator learns why THIS install cannot answer "which session is calling".
 
     Resolution is :func:`_resolve_session_key_strict` — gateway-injected
-    caller context, ``KIROCREW_SESSION_KEY``, or the HMAC-verified host-pid
+    caller context, the HMAC-verified per-session token,
+    ``KIROCREW_SESSION_KEY``, or the HMAC-verified host-pid
     sidecar; never the lenient ``/proc`` ancestor walk, under which a subagent
     resolves to its PARENT slot and could read or mutate the parent's state.
 
@@ -938,6 +918,94 @@ def _deny_channel_agent_messaging(caller_session: str, tool_name: str) -> str | 
     return (
         f"Error: {tool_name} is not available to channel agents — "
         "communicate through channel posts instead."
+    )
+
+
+def _deny_channel_agent_dispatch(tool_name: str, args: dict[str, Any] | None = None) -> str | None:
+    """Return an ``Error:`` denial when a channel agent calls a dispatch verb.
+
+    The dispatch verbs are the ones that start work outside the caller's own
+    turn: they create a descendant agent, drive one that is already running, or
+    open a context something else can drive later. The full list, and the reason
+    each name is on it, live with ``CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS`` in
+    ``channel.py`` -- imported here rather than respelled, so the interactive
+    permission guard and this one cannot drift apart.
+
+    A name alone does not identify one of these calls when the tool is a
+    passthrough carrying a whole API surface, so a second set keyed on the
+    operation, ``CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS``, holds those: the
+    tool stays callable and only the operations that start work are refused.
+    That is why this takes the call's arguments as well as its name.
+
+    Why the refusal lands HERE, on the channel agent's own hop, rather than on
+    the descendant: a descendant's session key is ``subagent:<id>``, carrying no
+    trace of where its chain began, so a containment check keyed on a
+    ``channel:`` identity sees an ordinary sub-agent and allows the call. Marking
+    descendants instead would mean an unmarked descendant is indistinguishable
+    from a legitimate one, so a path that is missed allows silently. Refusing the
+    verb that creates the descendant uses the one identity that is verified at
+    this point, and a path that is missed refuses.
+
+    Identity comes from the STRICT resolver, never the lenient ancestor walk: a
+    channel agent is launched by the gateway with its session key injected, so
+    its key is always resolvable, while the lenient walk would let an
+    unattributable caller inherit a parent's identity.
+
+    Best-effort SEL audit mirrors channel.py's ``rejected_blocked_tool``
+    outcome; an audit failure never unblocks the deny.
+    """
+    # The name and operation tests run first because they are the tests with no
+    # observable cost. This gate sits on every kirocrew-core call, and each handler
+    # resolves its own caller: a resolve here as well means a verb this gate does
+    # not hold resolves identity twice, which a read verb's identity contract pins
+    # against at exactly one strict resolve. So a call that is not held leaves
+    # through the cheapest possible path, having touched nothing. The import is a
+    # ``sys.modules`` hit once the first call has paid it.
+    from kiro_crew.channel import (
+        CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS,
+        CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS,
+    )
+
+    denied = tool_name in CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS
+    # What the denial names. A whole tool when the name is held; the single
+    # operation when it is not, because naming the tool there would tell a caller
+    # its reads are gone when they are not.
+    subject = tool_name
+    if not denied:
+        operations = CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS.get(tool_name)
+        if not operations:
+            return None
+        call = args or {}
+        # Upper-cased so the deny is never spelled more narrowly than the
+        # operation it holds; the path is compared as given, because the tool's
+        # schema admits only an exact member of its own allowlist there.
+        operation = (str(call.get("method", "")).upper(), str(call.get("path", "")))
+        if operation not in operations:
+            return None
+        subject = f"{operation[0]} {operation[1]} on {tool_name}"
+    caller_session = require_strict_session_key("channel-agent containment")[0]
+    if not caller_session.startswith("channel:"):
+        return None
+    try:
+        # Resolved from ``kiro_crew.sel`` at call time, not through the
+        # module-level binding, so a substituted SEL factory is observed.
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key=caller_session,
+            source="mcp",
+            tool_name=tool_name,
+            tool_kind="kirocrew-core",
+            outcome="rejected_blocked_tool",
+        )
+    except Exception:
+        # File-backed SEL write; stdio-silent (no logger -- stderr would
+        # corrupt the JSON-RPC stream). The deny below still holds.
+        pass
+    return (
+        f"Error: {subject} is not available to channel agents -- a channel "
+        "agent may not start work that outlives its own turn. Do the work in "
+        "the turn and report it as a channel post."
     )
 
 
@@ -1068,7 +1136,9 @@ def _vet_browse_governance(caller_session: str) -> str | None:
         return None
 
 
-def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
+def _vet_channel_governance(
+    caller_session: str, transport: str, tool_name: str = "send_message"
+) -> str | None:
     """Return a denial reason if governance forbids messaging *via transport*.
 
     The ``channels`` scope (a ScopedMap) is the per-transport allowlist: which
@@ -1078,8 +1148,14 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
     generally but restrict it to specific transports (e.g. Slack only).  We
     query the ScopedMap ``members`` allowlist for *transport*.  ``posture`` (the
     per-transport identity ceiling, policy-only) is enforced at the transport's
-    own admission path, not here.  Same stdio-silent, fail-closed-CPP discipline
-    as :func:`_vet_messaging_governance`.
+    own admission path, not here.
+
+    ``tool_name`` attributes the SEL audit records (denial / degraded) to the
+    actual calling tool — the gate is shared by ``send_message`` and
+    ``update_message``, and the persisted audit trail must name the real caller.
+
+    Same stdio-silent, fail-closed-CPP discipline as
+    :func:`_vet_messaging_governance`.
     """
     from kiro_crew.platform.context import PlatformCompositionError
 
@@ -1095,9 +1171,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             log_warning=False,
         )
         if not getattr(decision, "permitted", True):
-            _audit_governance_deny(
-                caller_session, f"send_message:{transport}", "channels", decision
-            )
+            _audit_governance_deny(caller_session, f"{tool_name}:{transport}", "channels", decision)
             return f"messaging via transport {transport!r} blocked by governance policy"
         return None
     except PlatformCompositionError:
@@ -1108,7 +1182,7 @@ def _vet_channel_governance(caller_session: str, transport: str) -> str | None:
             from kiro_crew.platform.governance_profiles import audit_governance_degraded
 
             audit_governance_degraded(
-                f"send_message:{transport}",
+                f"{tool_name}:{transport}",
                 session_key=caller_session,
                 scope="channels",
                 app=_governance_app(),
@@ -1225,20 +1299,48 @@ def _session_key_header_error(sk: str) -> str | None:
 
 
 def _caller_header() -> dict[str, str]:
-    """``X-Internal-Caller`` for this process, when it has declared one.
+    """Component attribution for independently authenticated internal requests.
 
     MCP stdio servers declare their component name via
     ``mcp_shared.set_internal_caller`` (done centrally in
     ``run_mcp_stdio_loop``), and every loopback request from these helpers
     carries it so the gateway's audit log can attribute an internal write to
     the actual component instead of inferring "some internal caller" from the
-    secret's mere presence (#3503). Attribution only — the gateway
+    secret's mere presence. Attribution only — the gateway
     authenticates on ``X-Internal-Secret`` and validates this name against a
     known set before trusting it into an audit line. Processes that never
     declared an identity (CLI, tests) send no header rather than a guess.
+
     """
     name = internal_caller()
     return {"X-Internal-Caller": name} if name else {}
+
+
+def _session_token_header() -> dict[str, str]:
+    """Attach the signed per-session token to internal gateway requests.
+
+    The token is already injected into each MCP server's environment.  Sending
+    it alongside ``X-Session-Key`` lets the gateway bind a loopback TCP request
+    to the session that launched this MCP process; the gateway verifies the
+    signature and the key match.  It is a transport identity proof, not a
+    member-memory capability.
+
+    EVERY verb below attaches it, not only the writes: the gateway's
+    session-scoped reads authorize on the declared key the same way, so a read
+    that omitted it would be answered as an unnamed caller and a whole tool
+    surface would refuse on a policy it could not fetch.
+
+    A pooled backend is spawned from gatewayd's own environment, so the
+    per-session token is not in ``os.environ``; gatewayd forwards it inside the
+    per-call caller block for Kiro Crew's control-plane servers instead, and the
+    caller block wins because it is stamped per CALL and cannot go stale. The
+    header itself is spelled once, in :mod:`kiro_crew.session_token_sig`, beside
+    the verifier that reads it.
+    """
+    from kiro_crew.session_token_sig import session_token_header
+
+    ctx = current_caller()
+    return session_token_header(ctx.session_token if ctx is not None and ctx.from_gateway else "")
 
 
 def _transport_failure(message: str, mark: bool) -> dict:
@@ -1397,7 +1499,9 @@ def _send(
                 refusal = exc
             except Exception as exc:
                 return _transport_failure(str(exc), mark_transport_error)
-        return {"error": _refused_message(refused[0], refusal)}
+        # ``refused`` is the one failure that proves nothing reached a gateway,
+        # so a caller may fall back to a local path without risking a replay.
+        return {"error": _refused_message(refused[0], refusal), "refused": True}
 
     # ONE resolution for this attempt; both transports derive from it.
     target = _resolve_api_target()
@@ -1473,6 +1577,7 @@ def _post(
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
+        **_session_token_header(),
     }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
@@ -1531,9 +1636,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
                 # content, so only a short identifier-shaped value survives —
                 # anything else is dropped rather than echoed onward.
                 raw_code = parsed.get("code")
-                if isinstance(raw_code, str) and _re.fullmatch(
-                    r"[a-z0-9_.-]{1,64}", raw_code
-                ):
+                if isinstance(raw_code, str) and _re.fullmatch(r"[a-z0-9_.-]{1,64}", raw_code):
                     code = raw_code
         except Exception:
             pass
@@ -1556,6 +1659,23 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
             "the instance you meant) and retry; the gateway's security event log "
             "records both credential fingerprints for the mismatch."
         )
+    elif code == "caller_record_missing":
+        message = (
+            "this session's cron or subagent record no longer exists; start a new "
+            "session before retrying the tool."
+        )
+    elif code == "unix_peer_unverified":
+        message = (
+            "the gateway could not verify this Unix-socket caller as the same local "
+            "user. Restart the gateway and start a new session; if the error persists, "
+            "make sure the client and gateway run as the same OS user."
+        )
+    elif code == "peer_session_mismatch":
+        message = (
+            "this Unix-socket caller is bound to a different session than the "
+            "X-Session-Key it declared. Restart the affected session, or start a new "
+            "one, before retrying the tool."
+        )
     out: dict = {"error": message}
     if counted:
         out["counted"] = True
@@ -1564,7 +1684,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
     return out
 
 
-def _get(path: str, session_key: str | None = None) -> dict:
+def _get(path: str, session_key: str | None = None, *, timeout: float = 10) -> dict:
     """GET a loopback gateway path with the internal-secret handshake.
 
     ``session_key`` exists so a caller that has ALREADY verified its identity can
@@ -1576,15 +1696,24 @@ def _get(path: str, session_key: str | None = None) -> dict:
     whatever the lenient walk answers at request time, which need not be the same
     session. Passing the verified key makes the value that was checked the value
     that is used. It is still validated by ``_session_key_header_error``.
+
+    ``timeout`` defaults to the 10s a telemetry read needs. A route that does real
+    work behind the GET raises it — the Dev Fleet pod reads spawn a
+    ``python -m kiro_crew pod`` subprocess in the gateway, so they pay a cold
+    interpreter start that 10s cannot cover on a loaded host.
     """
-    headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
+    headers = {
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    return _send(path, headers=headers, timeout=10)
+    return _send(path, headers=headers, timeout=timeout)
 
 
 def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
@@ -1600,6 +1729,7 @@ def _patch(path: str, body: dict | None = None, *, session_key: str | None = Non
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
+        **_session_token_header(),
     }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
@@ -1628,6 +1758,7 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
+        **_session_token_header(),
     }
     sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
@@ -1638,10 +1769,19 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
     return _send(path, data=data, headers=headers, method="PUT")
 
 
-def _delete(path: str, body: dict | None = None) -> dict:
+def _delete(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
+    """DELETE a loopback gateway path with the internal-secret handshake.
+
+    ``session_key``: as in :func:`_patch`. A caller gated on
+    :func:`_resolve_session_key_strict` must send the key it verified.
+    """
     data = json.dumps(body or {}).encode() if body else None
-    headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
-    sk = _resolve_session_key()
+    headers = {
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+        **_session_token_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}
@@ -1782,7 +1922,7 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     schema = MCP_CORE_SCHEMAS.get(name)
     if schema:
         return validate_tool_args(args, schema)
-    return args  # tools without schemas (learn_list) pass through
+    return args  # tools without schemas pass through
 
 
 def _current_session_thread_ts() -> str | None:
@@ -1857,13 +1997,149 @@ def _classify_slack_identity() -> tuple[str, str | None]:
     return ("non_slack", None)
 
 
+#: The ``tools/call`` name and RAW (pre-validation) arguments of the call in
+#: flight, installed by :func:`_call_tool` and cleared on its exit. Read by
+#: ``mcp_tools.control._emit_directive`` to report the CALL to the gateway, which
+#: derives the directive from it (see :func:`derive_directive`). ContextVars so a
+#: pooled server handling concurrent calls never reports one call under another.
+_CURRENT_CALL_NAME: ContextVar[str] = ContextVar("kirocrew_current_call_name", default="")
+_CURRENT_CALL_RAW_ARGS: ContextVar[dict[str, Any]] = ContextVar(
+    "kirocrew_current_call_raw_args", default={}
+)
+
+
+def current_call_name() -> str:
+    """The ``tools/call`` name of the call in flight, or ``""``."""
+    return _CURRENT_CALL_NAME.get()
+
+
+def current_call_raw_args() -> dict[str, Any]:
+    """The RAW ``tools/call`` arguments of the call in flight (pre-validation)."""
+    return copy.deepcopy(_CURRENT_CALL_RAW_ARGS.get())
+
+
+#: When set, ``mcp_tools.control._emit_directive`` records its validated
+#: ``(kind, args)`` here INSTEAD of POSTing it. This is how the gateway derives a
+#: directive's payload itself: it re-runs the directive tool on the raw call
+#: arguments the MCP stub reported, so the applied payload is a function of the
+#: victim's own call and never of a caller-supplied body. ``None`` = normal mode.
+_DIRECTIVE_CAPTURE: ContextVar[list[tuple[str, dict[str, Any]]] | None] = ContextVar(
+    "kirocrew_directive_capture", default=None
+)
+
+
+def capture_directive(kind: str, args: dict[str, Any]) -> bool:
+    """Record ``(kind, args)`` into the active capture slot; True if captured."""
+    sink = _DIRECTIVE_CAPTURE.get()
+    if sink is None:
+        return False
+    sink.append((kind, dict(args)))
+    return True
+
+
+def directive_capture_active() -> bool:
+    """True while this call is a GATEWAY-SIDE replay under :func:`derive_directive`.
+
+    A directive tool's handler runs TWICE for one arming call: once in the MCP
+    server, where its return text answers the model, and once here, where
+    :func:`derive_directive` re-runs it only to intercept the directive it
+    publishes and DISCARDS the returned text (see :func:`_call_tool_body`).
+
+    The two runs differ in one way that matters for I/O: this one executes on the
+    gateway's OWN event loop, called synchronously from the aiohttp handler, so a
+    blocking loopback request back to this same gateway cannot be serviced while
+    it waits -- every session stalls until that request times out.
+
+    A handler that reads gateway state only to shape its REFUSAL TEXT must
+    therefore skip the read here: the text is discarded, and the turn boundary
+    re-decides authoritatively either way.
+    """
+    return _DIRECTIVE_CAPTURE.get() is not None
+
+
+def derive_directive(
+    tool: str, raw_args: dict[str, Any], session_key: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Re-run directive tool *tool* on *raw_args* AS *session_key* and return the
+    ``(kind, args)`` it would have published, or None if it published nothing
+    (refused, not a directive tool, or raised).
+
+    Runs in the GATEWAY process. *session_key* is the caller's ``X-Session-Key``
+    as the gateway verified it -- kernel-attested on the unix socket, bearer-token
+    ``internal_auth`` on TCP -- and is installed as the call's :class:`CallerContext` for the
+    duration -- source 0 of ``_resolve_session_key_strict`` -- so a handler that
+    refuses without a strict identity (``monitor_watch``, ``monitor_stop``,
+    ``monitor_update``) sees the same session the stub would have and derives
+    rather than short-circuiting. That is the identity gatewayd injects for a
+    pooled backend, arrived at by the same verification. Every write the handler
+    would perform is the POST, and capture mode intercepts exactly that.
+
+    The replay goes through :func:`_call_tool_body`, which in capture mode runs
+    validation and the handler DIRECTLY rather than through
+    ``call_tool_with_logging``: the stub already wrote the invocation's SEL audit
+    row when the model's call ran, and a second "completed" row for the same call
+    -- attributed to the same session, from the gateway process -- would double
+    every directive in the audit trail. Derivation is a read of what the call
+    means, not a second invocation, and leaves no record of its own.
+    """
+    if tool not in DIRECTIVE_TOOLS or not isinstance(raw_args, dict) or not session_key:
+        return None
+    sink: list[tuple[str, dict[str, Any]]] = []
+    token = _DIRECTIVE_CAPTURE.set(sink)
+    prior = current_caller()
+    set_current_caller(CallerContext(session_key=session_key, from_gateway=True))
+    try:
+        # Deep copy for the same reason _call_tool snapshots deeply: the handler
+        # may mutate nested objects, and the caller digests *raw_args* after.
+        _call_tool(tool, copy.deepcopy(raw_args))
+    except Exception:
+        return None
+    finally:
+        set_current_caller(prior)
+        _DIRECTIVE_CAPTURE.reset(token)
+    return sink[0] if len(sink) == 1 else None
+
+
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
+    # Call-in-flight record for control._emit_directive: the tool name and the
+    # RAW arguments (pre-validation), which is what the gateway is told so it can
+    # re-derive the directive itself. Cleared on exit so a direct handler call in
+    # the same thread later (a test, a nested helper) never reports a stale call.
+    _t_name = _CURRENT_CALL_NAME.set(name)
+    # DEEP copy: validation mutates nested argument objects in place
+    # (suggest_followup pops an empty ``branch`` off each item), and the
+    # gateway must digest what the model SENT -- the same bytes the consumer
+    # digests off the tool_call frame -- not what validation left behind.
+    _t_args = _CURRENT_CALL_RAW_ARGS.set(
+        copy.deepcopy(raw_args) if isinstance(raw_args, dict) else {}
+    )
+    try:
+        return _call_tool_body(name, raw_args)
+    finally:
+        _CURRENT_CALL_NAME.reset(_t_name)
+        _CURRENT_CALL_RAW_ARGS.reset(_t_args)
+
+
+def _call_tool_body(name: str, raw_args: dict[str, Any]) -> str:
+    if _DIRECTIVE_CAPTURE.get() is not None:
+        # Gateway-side derivation (derive_directive): the handler's only write is
+        # the directive it publishes, which capture_directive intercepts, and the
+        # returned text is discarded. No SEL row -- the stub logged the real
+        # invocation -- and no refusal tagging, since nothing reads the result.
+        # A validation error is a refusal here too: the handler never ran, the
+        # sink stays empty, and derive_directive answers None.
+        return _call_tool_inner(name, _validate_args(name, raw_args))
     # Tag a directive tool's marker-less result as a refusal at the OUTERMOST
     # return, which is the only point that sees every way such a tool can
     # decline — argument validation runs inside the wrapper below, ahead of the
-    # handler, so a schema rejection never reaches code that could tag itself
-    # (#8635). Without the tag the consumer reads a decline as a LOST directive
+    # handler, so a schema rejection never reaches code that could tag itself.
+    # Without the tag the consumer reads a decline as a LOST directive
     # marker and fires a WARNING meant for a transport regression.
+    #
+    # Clear the vouch FIRST: the gate honours a marker only if this dispatch
+    # produced it, so a directive emitted by the PREVIOUS call must not be able
+    # to authorize marker-shaped bytes in this one.
+    clear_vouch()
     return refuse_if_markerless(
         name,
         call_tool_with_logging(
@@ -2072,6 +2348,99 @@ def _format_anchor(anchor: dict) -> str:
     return f' [on: "{head}" [TRUNCATED: {omitted} chars omitted' f'{offset_info}] "{tail}"]'
 
 
+def _crew_memory_unavailable_reason(error: UnknownMemoryStore) -> str:
+    return redact_local_paths(redact(str(error)))[0][:1000]
+
+
+def _with_display_name(entry: dict[str, Any], key: str, agent: Any) -> dict[str, Any]:
+    """Add the crew's dashboard label to a routing entry when it has one.
+
+    The user names a crew by the label the dashboard shows; the model must
+    dispatch by the key. Without the label beside the key, a crew whose label
+    differs from its id cannot be matched to the user's words.
+    """
+    label = (getattr(agent, "display_name", "") or "").strip()
+    if label and label != key:
+        entry["display_name"] = label
+    return entry
+
+
+def _key_with_label(key: str, label: str | None) -> str:
+    """Render one ``available`` item: the key, then its label when it has one."""
+    return f"{key} ({label})" if label else key
+
+
+def _do_route_crew(task: str) -> str:
+    """Rank the crews whose triggers match *task* (the route_crew tool body).
+
+    The SCORED half of routing, next to ``select_crew``'s roster. Both exist
+    because they answer different questions: the roster asks the model to judge,
+    which is right when the task is prose and the crews are described in prose;
+    this ranks the same triggers mechanically, which is right when a caller wants
+    the same task to reach the same crew every time.
+
+    Shares ``trigger_match`` with the skills loader rather than scoring its own
+    way, so "this phrasing matches" cannot mean two things in one product. A
+    crew with no triggers is not a candidate — that is the operator's opt-out,
+    and it is the same rule the roster applies.
+
+    Reports rather than binds. Binding happens where a run is created
+    (``spawn_run(crew=...)``), because that is the only place the decision can be
+    honoured on both halves the caller cares about, memory and template.
+    """
+    if not task or not task.strip():
+        return json.dumps({"error": "task must be a non-empty string"}, ensure_ascii=False)
+    cfg = KiroCrewConfig.load()
+    default = cfg.default_agent
+    candidates = [(n, c.triggers) for n, c in cfg.agents.items() if n != default]
+    ranked = rank_triggered(task, candidates)
+    matches = []
+    unavailable = []
+    for name, score in ranked:
+        try:
+            binding = resolve_agent_bindings(cfg, name, validate_memory_files=False)
+        except UnknownMemoryStore as exc:
+            unavailable.append(
+                _with_display_name(
+                    {"crew": name, "reason": _crew_memory_unavailable_reason(exc)},
+                    name,
+                    cfg.agents[name],
+                )
+            )
+            continue
+        matches.append(
+            _with_display_name(
+                {
+                    "crew": name,
+                    "score": round(score, 3),
+                    "description": (cfg.agents[name].description or "").strip(),
+                    "memory_store": binding.memory_store_name,
+                },
+                name,
+                cfg.agents[name],
+            )
+        )
+    return json.dumps(
+        {
+            "task": task[:200],
+            "default_agent": default,
+            "matches": matches,
+            "unavailable": unavailable,
+            "guidance": (
+                "Ranked by trigger overlap, best first. If both matches and "
+                "unavailable are empty, no crew claims this task -- handle it "
+                "on the default crew rather than picking the least-bad match. "
+                "Unavailable crews matched but their memory binding was refused: "
+                "report that refusal; do not substitute Global memory for them. "
+                "To act on a healthy match, spawn with "
+                "crew=<name>: that is what gives the run that crew's memory and "
+                "template, and what keeps another crew's memory out of it."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def _do_select_crew(crew: str) -> str:
     """Orchestrator crew routing (the select_crew tool body).
 
@@ -2088,7 +2457,7 @@ def _do_select_crew(crew: str) -> str:
     default = cfg.default_agent
     if not crew:
         roster = [
-            {"name": n, "triggers": c.triggers}
+            _with_display_name({"name": n, "triggers": c.triggers}, n, c)
             for n, c in cfg.agents.items()
             if n != default and c.triggers.strip()
         ]
@@ -2100,18 +2469,32 @@ def _do_select_crew(crew: str) -> str:
                     "Select a crew ONLY when its triggers clearly and specifically "
                     "match the task with high confidence. If no crew is a strong "
                     "match (or the list is empty), do NOT route — use the default "
-                    "crew. Crews without triggers are intentionally omitted."
+                    "crew. Crews without triggers are intentionally omitted. "
+                    "The user may refer to a crew by its display_name; always "
+                    "pass its name to spawn_run(crew=...)."
                 ),
             },
             ensure_ascii=False,
         )
     if crew not in cfg.agents:
-        available = ", ".join(sorted(cfg.agents)) or "(none)"
+        available = (
+            ", ".join(
+                _key_with_label(k, _with_display_name({}, k, cfg.agents[k]).get("display_name"))
+                for k in sorted(cfg.agents)
+            )
+            or "(none)"
+        )
         return json.dumps(
             {"error": f"unknown crew '{crew}'", "available": available},
             ensure_ascii=False,
         )
-    b = resolve_agent_bindings(cfg, crew)
+    try:
+        b = resolve_agent_bindings(cfg, crew, validate_memory_files=False)
+    except UnknownMemoryStore as exc:
+        return json.dumps(
+            {"crew": crew, "error": _crew_memory_unavailable_reason(exc)},
+            ensure_ascii=False,
+        )
     # Routing-decision pointer. This is the one place a member's identity is
     # unambiguous on the delegation path: `spawn_run`'s `agent` is validated
     # against the installed TEMPLATES, so by the time a sub-agent starts the
@@ -2325,7 +2708,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     this module's plumbing (``_post``, the identity resolvers, the governance
     vets) as attributes of ``mcp_core``, so a test that rebinds one still
     intercepts.
+
+    Channel-agent containment sits here rather than in each handler because this
+    is the one place every kirocrew-core tool call passes through: a per-handler
+    check is a check the next dispatch verb's author has to remember, and the
+    boundary this holds is exactly the kind that fails by omission. The
+    interactive guard in ``channel.py`` rejects the same verbs at the
+    permission-request event, but an auto-approved call emits no such event --
+    under global YOLO or channel trust the request is approved with no human in
+    the loop -- so the boundary has to hold at MCP dispatch too.
     """
+    chan_err = _deny_channel_agent_dispatch(name, args)
+    if chan_err:
+        return chan_err
     return dispatch(name, args)
 
 
@@ -2357,9 +2752,8 @@ def run_mcp_core_server() -> None:
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
         # safe to share one backend across sessions. All four managed servers
-        # advertise today -- kirocrew-cron since #4622, kirocrew-computer and
-        # kirocrew-dashboard since #4659 -- and what advertising buys is the
-        # injected block, not co-tenancy: a backend that does NOT advertise is
+        # advertise, and what advertising buys is the injected block, not
+        # co-tenancy: a backend that does NOT advertise is
         # pooled all the same (nothing declines to pool one; see
         # ``rewriter.UNPOOLABLE_SERVERS``) and simply never receives an identity.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,

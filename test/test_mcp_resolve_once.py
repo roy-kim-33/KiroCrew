@@ -3,7 +3,7 @@
 The store's whole contract is that it can only ever REMOVE dependency resolution
 from a launch, never add a failure to one. So most of what is pinned here is the
 shape of a miss: a spec that is not an npm launcher, a record that is absent,
-malformed, stale, or points at a file that no longer exists must each read as
+malformed, stale, or points at a missing file must each read as
 "launch it the way you would have anyway" rather than as an error.
 
 No test spawns npm. ``install`` is exercised through a stubbed ``npm`` that
@@ -555,6 +555,22 @@ class TestInstall:
         assert _sandbox_calls[0]["mode"] == "standard"
         assert _sandbox_calls[0]["strip_python_env"] is True
 
+    async def test_install_stages_outside_the_sealed_store_then_publishes(self, tmp_path) -> None:
+        home = str(tmp_path / "home")
+        spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
+
+        rec = await R.install(home, spec, npm=_fake_npm(tmp_path, bin_field="cli.js"))
+
+        assert rec is not None
+        argv = _sandbox_calls[0]["argv"]
+        prefix = argv[argv.index("--prefix") + 1]
+        sealed_store = os.path.realpath(R.store_root(home))
+        assert os.path.commonpath((os.path.realpath(prefix), sealed_store)) != sealed_store
+        assert os.path.join("run", "mcp-resolve") in prefix
+        assert _sandbox_calls[0]["extra_writable_dirs"] == (prefix,)
+        assert not os.path.exists(prefix)
+        assert os.path.isfile(os.path.join(R.spec_dir(home, spec), rec.entrypoint))
+
     async def test_commits_a_record_pointing_at_the_bin(self, tmp_path) -> None:
         home = str(tmp_path / "home")
         spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
@@ -723,6 +739,26 @@ class TestInstall:
         # the two halves have to stay together.
         source = inspect.getsource(R.install)
         assert "start_new_session=True" in source
+
+    async def test_published_tree_does_not_share_staging_inodes(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        async def keep_staging(_path: str) -> None:
+            return None
+
+        monkeypatch.setattr(R, "_rmtree_off_loop", keep_staging)
+        home = str(tmp_path / "home")
+        spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
+        rec = await R.install(home, spec, npm=_fake_npm(tmp_path, bin_field="cli.js"))
+        assert rec is not None
+
+        published = os.path.join(R.spec_dir(home, spec), rec.entrypoint)
+        staged = os.path.join(R._staging_spec_dir(home, spec), rec.entrypoint)
+        assert os.stat(published).st_ino != os.stat(staged).st_ino
+        published_bytes = open(published, "rb").read()
+        with open(staged, "wb") as fh:
+            fh.write(b"staging changed after publish")
+        assert open(published, "rb").read() == published_bytes
 
     async def test_cancellation_reaps_the_tree_too(self, tmp_path, monkeypatch) -> None:
         # Broker shutdown cancels the prefetch task. Without a cancel handler the
@@ -950,7 +986,7 @@ class _ReapProbe:
     ``_drain_capped`` reader already cancelled, so the stdout pipe is undrained:
     a killed npm blocked writing into a full pipe -- or a lifecycle-script
     grandchild still holding it open -- makes a bare ``await proc.wait()`` hang
-    forever (#6005). The bounded reap must drain via ``communicate()`` and never
+    forever. The bounded reap must drain via ``communicate()`` and never
     touch ``wait()``.
     """
 
@@ -978,7 +1014,7 @@ class TestReapInstallTree:
     @pytest.mark.asyncio
     async def test_reaps_via_communicate_not_wait(self, monkeypatch) -> None:
         """The reap must go through the bounded, pipe-draining ``kill_and_reap``,
-        never a bare ``await proc.wait()`` that a full pipe can hang (#6005)."""
+        never a bare ``await proc.wait()`` that a full pipe can hang."""
         from kiro_crew import platform_compat
 
         proc = _ReapProbe()

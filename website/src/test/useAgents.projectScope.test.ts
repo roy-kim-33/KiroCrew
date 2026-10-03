@@ -26,26 +26,37 @@
  * without changing its *arguments*.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { renderHook, waitFor } from '@testing-library/react'
+import { renderHook as rtlRenderHook, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { createElement, type ReactNode } from 'react'
 import { useAgents } from '../hooks/useAgents'
 
 vi.mock('../api/client', () => ({
   api: {
-    kirocrewAgents: vi.fn(),
-    syncKirocrewAgents: vi.fn(),
+    agentCatalog: vi.fn(),
+    // useAgents reads dashboard.crewmates_in_agent_picker from the shared
+    // config query; an empty config keeps the default templates-only picker.
+    kirocrewConfig: vi.fn(() => Promise.resolve({})),
   },
 }))
 
+// useAgents reads the shared ['kirocrewConfig'] query, so every render needs a
+// QueryClient. Same call shape as RTL's renderHook.
+const renderHook = ((cb: never, opts?: Record<string, unknown>) => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children)
+  return rtlRenderHook(cb, { ...opts, wrapper })
+}) as typeof rtlRenderHook
+
 const { api } = await import('../api/client')
 const mockApi = api as unknown as {
-  kirocrewAgents: ReturnType<typeof vi.fn>
-  syncKirocrewAgents: ReturnType<typeof vi.fn>
+  agentCatalog: ReturnType<typeof vi.fn>
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockApi.syncKirocrewAgents.mockResolvedValue({})
-  mockApi.kirocrewAgents.mockResolvedValue({
+  mockApi.agentCatalog.mockResolvedValue({
     agents: [{ name: 'kirocrew', scope: 'global' }],
     default_agent: 'kirocrew',
   })
@@ -59,9 +70,9 @@ describe('useAgents project scoping', () => {
       ({ dir }: { dir?: string }) => useAgents(0, 'chat-1', dir),
       { initialProps: { dir: undefined as string | undefined } },
     )
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1))
 
-    mockApi.kirocrewAgents.mockResolvedValue({
+    mockApi.agentCatalog.mockResolvedValue({
       agents: [
         { name: 'kirocrew', scope: 'global' },
         { name: 'project-agent', scope: 'project' },
@@ -70,7 +81,7 @@ describe('useAgents project scoping', () => {
     })
     rerender({ dir: '/repo/service' })
 
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(2))
   })
 
   it('surfaces the project-scoped agents once the project is set', async () => {
@@ -80,7 +91,7 @@ describe('useAgents project scoping', () => {
     )
     await waitFor(() => expect(result.current.agents).toHaveLength(1))
 
-    mockApi.kirocrewAgents.mockResolvedValue({
+    mockApi.agentCatalog.mockResolvedValue({
       agents: [
         { name: 'kirocrew', scope: 'global' },
         { name: 'project-agent', scope: 'project' },
@@ -98,10 +109,10 @@ describe('useAgents project scoping', () => {
       ({ dir }: { dir: string }) => useAgents(0, 'chat-1', dir),
       { initialProps: { dir: '/repo/one' } },
     )
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1))
 
     rerender({ dir: '/repo/two' })
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(2))
   })
 
   it('still sends only the session key — the server derives project scope', async () => {
@@ -111,11 +122,11 @@ describe('useAgents project scoping', () => {
       ({ dir }: { dir: string }) => useAgents(0, 'chat-1', dir),
       { initialProps: { dir: '/repo/one' } },
     )
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1))
     rerender({ dir: '/repo/two' })
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(2))
 
-    for (const call of mockApi.kirocrewAgents.mock.calls) {
+    for (const call of mockApi.agentCatalog.mock.calls) {
       expect(call).toEqual(['chat-1'])
     }
   })
@@ -130,7 +141,7 @@ describe('useAgents project scoping', () => {
     )
     await waitFor(() => expect(result.current.agents).toHaveLength(1))
 
-    mockApi.kirocrewAgents.mockImplementationOnce(
+    mockApi.agentCatalog.mockImplementationOnce(
       () => new Promise(res => { resolveSecond = res }),
     )
     rerender({ dir: '/repo/two' })
@@ -149,7 +160,7 @@ describe('useAgents project scoping', () => {
     )
     await waitFor(() => expect(result.current.agents).toHaveLength(1))
 
-    mockApi.kirocrewAgents.mockImplementationOnce(() => new Promise(() => {}))
+    mockApi.agentCatalog.mockImplementationOnce(() => new Promise(() => {}))
     rerender({ trig: 1 })
 
     expect(result.current.agents).toHaveLength(1)
@@ -159,43 +170,19 @@ describe('useAgents project scoping', () => {
     // Surfaces with no slot context (Channels, Schedule) pass neither key nor
     // project; a re-render must not look like a scope change.
     const { rerender } = renderHook(() => useAgents(0))
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1))
 
     rerender()
-    expect(mockApi.kirocrewAgents).toHaveBeenCalledTimes(1)
+    expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1)
   })
-  it('waits for the one-time sync even when the scope changes while it is in flight', async () => {
-    // `/api/agents/sync` writes AIM-installed agents into config.json, and the
-    // global rows of `GET /api/agents` are read from that config. A fetch that
-    // overtakes the sync stores a pre-sync roster, which then sticks until the
-    // next scope change or a remount. Setting a project immediately after mount
-    // is this fix's primary path, so that window must be closed.
-    let resolveSync: (v: unknown) => void = () => {}
-    mockApi.syncKirocrewAgents.mockImplementationOnce(
-      () => new Promise(res => { resolveSync = res }),
-    )
-
-    const { rerender } = renderHook(
-      ({ dir }: { dir?: string }) => useAgents(0, 'chat-1', dir),
-      { initialProps: { dir: undefined as string | undefined } },
-    )
-
-    rerender({ dir: '/repo/service' })
-    expect(mockApi.kirocrewAgents).not.toHaveBeenCalled()
-
-    resolveSync({})
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalled())
-    // Once per mount, not once per scope.
-    expect(mockApi.syncKirocrewAgents).toHaveBeenCalledTimes(1)
-  })
-
-  it('still fetches when the one-time sync fails', async () => {
-    // A failed sync must not strand the roster: fall through and list whatever
-    // config is already on disk.
-    mockApi.syncKirocrewAgents.mockRejectedValueOnce(new Error('sync unavailable'))
-
-    renderHook(() => useAgents(0, 'chat-1', '/repo/one'))
-
-    await waitFor(() => expect(mockApi.kirocrewAgents).toHaveBeenCalledWith('chat-1'))
+  it('never issues the enrolling sync write: listing is a read', async () => {
+    // The hook used to POST `/api/agents/sync` before listing, and that write
+    // enrolled every discovered template as a crew member with its own memory.
+    // Reading the catalog must not grow the Crew Members roster as a side effect,
+    // so the client object is given NO sync method: reaching for one would throw.
+    const { result } = renderHook(() => useAgents(0, 'chat-1', '/repo/service'))
+    await waitFor(() => expect(result.current.agents).toHaveLength(1))
+    expect('syncKirocrewAgents' in mockApi).toBe(false)
+    expect(mockApi.agentCatalog).toHaveBeenCalledTimes(1)
   })
 })

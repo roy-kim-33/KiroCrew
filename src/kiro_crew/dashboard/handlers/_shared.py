@@ -2,24 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
-import importlib.util
+import functools
+import inspect
 import json
 import logging
 import os
-import sys
-import sysconfig
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from types import SimpleNamespace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    NamedTuple,
+    overload,
+)
 
 import aiohttp
 from aiohttp import web
 
-from kiro_crew import extras, platform_compat
+from kiro_crew import extras
 from kiro_crew.agent_discovery import (
     SKILL_URI_PREFIX,
     expand_skill_uri,
+    parsed_agent_specs,
     skill_resource_uris,
 )
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
@@ -27,21 +38,256 @@ from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
+    MEMBER_CHAT_PRINCIPAL_KEY,
     _b64url_decode,
     required_peer_key_unverified,
 )
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.messaging.privacy_mode import hydrate as _hydrate_conv_flags
 from kiro_crew.messaging.privacy_mode import is_incognito as is_thread_incognito
 from kiro_crew.messaging.privacy_mode import is_temporary as is_thread_temporary
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
-from kiro_crew.skills import skills_dir
+from kiro_crew.skills import _trusted_skill_roots, _with_canonical_globs, skills_dir
+from kiro_crew.terminal_safe import normalize_for_scanning, strip_control_characters
 
 if TYPE_CHECKING:
+    from kiro_crew.execution_context import ExecutionContext
     from kiro_crew.platform.interfaces import CapabilityManager
 
 logger = logging.getLogger(__name__)
+
+
+def _scrub_text(val: str) -> str:
+    """Redact ``val``, dropping control characters but keeping the content around them.
+
+    Invisible characters split a token, and both redactors decide by matching a pattern,
+    so a token split by one matches nothing and the field egresses carrying it. They do
+    not all deserve the same treatment on the way out, though, and that is the whole of
+    this function's shape.
+
+    A CONTROL character other than tab, newline and carriage return is terminal-escape
+    material rather than text a user wrote, so it always leaves: it drives a terminal that
+    renders the field verbatim, and no consumer is worse off without it. Those three are
+    content and stay, which is why a token split by one of them is still split afterwards.
+    Removing a control character can JOIN a token back together, which is why the redactors
+    run again afterwards rather than trusting the first verdict.
+
+    A FORMAT character is usually content. A soft hyphen inside a word, a joiner holding an
+    emoji together, a mark ordering a Latin digit before Arabic -- deleting those rewrites
+    what the user stored, on a path that runs for every row of every listing, and the
+    caller that compares this function's output with its input to decide whether a
+    document is editable then refuses every write to it. So a copy with the format
+    characters removed is scanned as EVIDENCE, and handed back only when it reveals a
+    credential the output still hides: that field holds a credential, so its exact bytes
+    are the thing that must not egress, and its own format characters go with them.
+
+    Scanning the text as stored first is not redundant with scanning that copy. Removing
+    an invisible character can destroy a boundary a pattern requires, so a token the
+    stored text matches can stop matching once the copy is joined up.
+    """
+    out, _ = redact_exfiltration_urls(val)
+    out, _ = redact_credentials(out)
+    stripped = strip_control_characters(out)
+    if stripped != out:
+        out, _ = redact_exfiltration_urls(stripped)
+        out, _ = redact_credentials(out)
+    normalised = normalize_for_scanning(out)
+    if normalised == out:
+        return out
+    scanned, _ = redact_exfiltration_urls(normalised)
+    scanned, _ = redact_credentials(scanned)
+    if scanned == normalised:
+        return out
+    return scanned
+
+
+#: Deepest JSON nesting this scrub walks. A stored memory payload is a handful of levels
+#: deep, so the cap costs real data nothing; what it buys is a bound on the descent below,
+#: which would otherwise recurse as deep as a hostile document asks it to.
+_MAX_JSON_SCRUB_DEPTH = 64
+
+#: Stands in for a JSON payload this chain cannot scan to the bottom. Serialised as a JSON
+#: string so the field a consumer parses still parses.
+_UNSCANNABLE_JSON = "[REDACTED: unscannable JSON payload]"
+
+
+class _UnscannableJSON(Exception):
+    """A JSON payload that cannot be scanned to the bottom, so it must not egress."""
+
+
+def _decode_unique(val: str) -> object:
+    """Decode a JSON document, refusing one whose object names are not unique.
+
+    ``json.loads`` keeps the LAST value for a repeated name and discards the rest, so a
+    credential sitting in an earlier duplicate is gone before the scan below ever sees it.
+    What survives decoding then looks exactly like a clean document, the comparison
+    downstream finds nothing changed, and the raw text egresses still carrying it. Reading
+    all of a document is what certifies it, so a repeated name makes it unscannable.
+    """
+
+    def unique(items: list[tuple[str, object]]) -> dict[str, object]:
+        out: dict[str, object] = {}
+        for key, value in items:
+            if key in out:
+                raise _UnscannableJSON
+            out[key] = value
+        return out
+
+    return json.loads(val, object_pairs_hook=unique)
+
+
+def _scrub_decoded(val: object, depth: int = 0) -> object:
+    """Scrub every string inside an already-decoded JSON value, shape preserved.
+
+    An object's NAMES are scrubbed alongside its values, by the same path. A name is text
+    the document carries and the field egresses, so a credential sitting in one leaves
+    untouched if only values are walked, and the name is the easier place to put it:
+    whoever writes structured memory chooses both halves of a pair. A name can also be a
+    document in its own right, so it takes the descent below rather than a text scrub
+    alone, and the two halves of a pair are defended identically.
+
+    A string is handed back to the transport scrub, because one decode does not reach the
+    bottom of every field. A memory record keeps its own value as a JSON document, so a
+    revision snapshot of that record is a document holding a document: the outer decode
+    yields a string whose escapes are still printable text, where no control character
+    exists to remove and no split credential matches. Descending again is what reaches it.
+
+    Scrubbing two different names can produce the same name, and a dict holds one value
+    per name. Keeping either silently drops the other's value, so this raises instead and
+    lets the caller withhold the whole document. Depth is bounded for the same reason it
+    is bounded anywhere: the walk below is recursive and the document is untrusted. The
+    count spans encoding levels as well as structural ones, so the descent above cannot
+    restart it and escape the bound.
+    """
+    if depth > _MAX_JSON_SCRUB_DEPTH:
+        raise _UnscannableJSON
+    if isinstance(val, str):
+        return _scrub_json_transport(_scrub_text(val), depth + 1, original=val)
+    if isinstance(val, list):
+        return [_scrub_decoded(item, depth + 1) for item in val]
+    if isinstance(val, dict):
+        cleaned: dict[object, object] = {}
+        for key, item in val.items():
+            name = (
+                _scrub_json_transport(_scrub_text(key), depth + 1, original=key)
+                if isinstance(key, str)
+                else key
+            )
+            if name in cleaned:
+                raise _UnscannableJSON
+            cleaned[name] = _scrub_decoded(item, depth + 1)
+        return cleaned
+    return val
+
+
+def _is_json_document(val: str) -> bool:
+    """Whether the text is a JSON document, judged before any scrub has touched it.
+
+    The scan below runs on scrubbed text, and a redactor's replacement can span JSON
+    structure: the credential-assignment patterns match across a name, its colon and its
+    value, so splicing one out leaves text that does not parse. Judging JSON-ness on that
+    text would call a real document prose and hand it back unscanned. This answers for the
+    stored bytes instead, so the two questions stay separate.
+
+    A decode that fails for any reason OTHER than malformed syntax still means the text is
+    JSON -- decoding merely could not finish -- so those count as a document here.
+    """
+    if val.lstrip()[:1] not in ("{", "[", '"'):
+        return False
+    try:
+        json.loads(val)
+    except json.JSONDecodeError:
+        return False
+    except (ValueError, RecursionError):
+        return True
+    return True
+
+
+def _scrubbed_document_or(val: str, original: str | None) -> str:
+    """Hand back scrubbed text that is not a document, or withhold one the scrub broke.
+
+    Reaching here means the text in hand does not parse. That is the safe case only when the
+    stored bytes did not parse either: then no JSON payload ever existed and the text scan
+    covered everything. When the stored bytes DID parse, the scrub's own replacement broke
+    the document, so its payload was never walked and handing the text back ships an
+    uncertified payload -- the hole this chain closes.
+    """
+    if original is not None and original != val and _is_json_document(original):
+        return json.dumps(_UNSCANNABLE_JSON)
+    return val
+
+
+def _scrub_json_transport(val: str, depth: int = 0, *, original: str | None = None) -> str:
+    """Scrub the PAYLOAD of a field that carries a JSON document, not just its text.
+
+    A JSON document is a transport encoding, and encoding hides the very characters the
+    scan looks for: a control character inside the payload is written as the six printable
+    characters ``\\u0001``, so the control pattern finds nothing to remove and the token it
+    splits stays split for both redactor passes. The field then egresses carrying the
+    credential, and whatever decodes the document -- a browser calling ``JSON.parse`` --
+    gets the control character back, where it renders as nothing and the credential reads
+    as whole. A memory row carries the same value twice, as text and as JSON, so scanning
+    only the text redacts one copy of a credential and ships the other.
+
+    Scrubbing therefore descends into the decoded value. The field is replaced only when
+    that changed something, so a document holding nothing sensitive is passed through
+    byte for byte rather than re-serialised into a different spelling of itself.
+
+    Only a document decoding to a string, list or dict is considered: a bare JSON number
+    or boolean carries no text to scan, and a plain prose field does not parse at all.
+
+    Two ways of failing are kept apart, because only one of them leaves a payload behind.
+    The dividing line is the PARSER's own verdict on the STORED bytes, not on the text in
+    hand: the scan runs on scrubbed text, and a credential-assignment pattern spans a name,
+    its colon and its value, so splicing one out can leave text that fails to parse even
+    though the stored document parses fine. Text the parser rejects AND that was never a
+    document
+    holds no JSON payload at all, so the text scrub already covered everything there was to
+    cover and the field passes through. Every other failure means a payload existed and
+    decoding could not finish -- nested past the cap, nested deeply enough to exhaust the
+    parser's own recursion, repeating an object name so decoding discards a member, holding
+    names that collide once scrubbed, tripping a limit of this interpreter that a consumer's
+    parser does not share such as the cap on converting a very long integer, or broken by
+    the scrub's own replacement. Such a document has a payload this chain cannot certify,
+    and shipping an uncertified payload is the hole being closed here, so the field is
+    withheld and a marker goes out instead.
+    """
+    if val.lstrip()[:1] not in ("{", "[", '"'):
+        return _scrubbed_document_or(val, original)
+    try:
+        decoded = _decode_unique(val)
+    except json.JSONDecodeError:
+        return _scrubbed_document_or(val, original)
+    except (_UnscannableJSON, ValueError, RecursionError):
+        return json.dumps(_UNSCANNABLE_JSON)
+    if not isinstance(decoded, (str, list, dict)):
+        return val
+    try:
+        cleaned = _scrub_decoded(decoded, depth)
+    except (_UnscannableJSON, RecursionError):
+        return json.dumps(_UNSCANNABLE_JSON)
+    if cleaned == decoded:
+        return val
+    return json.dumps(cleaned)
+
+
+@overload
+def _redact_memory_field(val: dict) -> dict: ...
+
+
+@overload
+def _redact_memory_field(val: list) -> list: ...
+
+
+@overload
+def _redact_memory_field(val: str) -> str: ...
+
+
+@overload
+def _redact_memory_field(val: object) -> object: ...
 
 
 def _redact_memory_field(val: object) -> object:
@@ -50,13 +296,46 @@ def _redact_memory_field(val: object) -> object:
     Lives here (not in ``memory.py``) so handlers that ``memory.py`` itself
     imports from -- e.g. ``cron.py`` -- can share the chain without an import
     cycle.
+
+    SHAPE-PRESERVING for a container, and the overloads above say so rather than
+    flattening every result to ``object``: a caller that hands this a dict and then
+    bounds or indexes the result would otherwise need a cast, which asserts the shape
+    instead of reading it off the function. A dict comes back a dict, a list a list
+    and a string a string.
+
+    NOT shape-preserving for bytes, which is why one type variable would be the wrong
+    tool here: binary is dropped to ``None`` rather than redacted, since it is not
+    text this chain can scan and returning it unread would put an unscanned blob on an
+    egress path. That case falls to the ``object`` overload.
+
+    The redactors run TWICE, once on the text as stored and once after invisible
+    characters are removed, because each pass catches what the other cannot.
+
+    Both redactors decide by matching a pattern. An invisible character embedded
+    mid-token splits the token so no pattern matches it, and the field would leave on
+    an egress path carrying credential material any consumer that drops those
+    characters can reassemble. Removing them first rejoins the token, which is what the
+    second pass sees.
+
+    The first pass is not redundant, because removing a character can also DESTROY a
+    match. A pattern guarded by a negative lookbehind for a non-word character is
+    satisfied by the invisible character itself, so joining a word character onto the
+    token defeats it -- a credential the text as stored would have given up survives
+    normalisation. Scanning the original first keeps that verdict.
+
+    Normalising between the two passes rather than after both is what makes the order
+    safe. Normalising after the last pass would reassemble the very token that pass had
+    just failed to match, and the field would egress the whole secret.
+
+    Tab, newline and carriage return are content and survive, so a token split by one of
+    those three stays split; see
+    :func:`kiro_crew.terminal_safe.normalize_for_scanning` for what is removed and why
+    no visible content is lost.
     """
     if isinstance(val, (bytes, memoryview)):
         return None
     if isinstance(val, str):
-        val, _ = redact_exfiltration_urls(val)
-        val, _ = redact_credentials(val)
-        return val
+        return _scrub_json_transport(_scrub_text(val), original=val)
     if isinstance(val, list):
         return [_redact_memory_field(item) for item in val]
     if isinstance(val, dict):
@@ -64,12 +343,78 @@ def _redact_memory_field(val: object) -> object:
     return val
 
 
+#: The session-search row fields carrying LLM-authored or peer-supplied prose,
+#: which every pass returning such a row must put through
+#: :func:`kiro_crew.security.redact` before egress.
+#:
+#: Three passes return these rows -- ``api_sessions_search``, and
+#: ``api_instances_search_sessions``' local-row and peer-row passes -- and each
+#: would otherwise hand-copy both the redaction chain AND this field list. The
+#: chain already has an owner (``security.redact`` composes the exfiltration-URL
+#: and credential passes in that order); this tuple gives the field list one too,
+#: so a caller cannot redact ``title`` and quietly forget ``snippet``. A missing
+#: field reads as correct at the call site, which is why the list is shared
+#: rather than restated.
+#:
+#: Order is irrelevant; membership is the contract.
+SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
+
+
 # Shared body cap for the small JSON-object endpoints that must bound the
 # request BEFORE decoding (the strict-internal notification routes). Kept
 # module-level and in one place so the security-relevant cap cannot drift
-# between the two call sites (issue #490). 64 KB is generous — payload fields
+# between the two call sites. 64 KB is generous — payload fields
 # have their own caps.
 _MAX_BODY_BYTES = 64 * 1024
+
+
+def _declares_json(content_type: str) -> bool:
+    """Is *content_type* a media type whose payload is a JSON document?
+
+    ``application/json`` and the ``+json`` structured-suffix family
+    (``application/merge-patch+json``, ``application/ld+json``) only. The suffix
+    family is in because the app SDK already lets a caller send one -- a scoped
+    API test pins ``application/merge-patch+json`` reaching the gateway -- so
+    refusing it would break a shape the product ships.
+
+    Everything else is out, including ``text/plain`` and an ABSENT header, which
+    aiohttp reports as ``application/octet-stream``. Absent and ``text/plain``
+    are the two spellings that matter: both are CORS *simple* request types, so a
+    cross-origin page sends them with no preflight, and a plain HTML form can
+    emit either. ``application/json`` is not simple, so requiring it means the
+    browser must ask permission before the body is ever delivered.
+    """
+    ct = content_type.strip().lower()
+    return ct == "application/json" or (ct.startswith("application/") and ct.endswith("+json"))
+
+
+def _json_content_type_error(request: web.Request) -> web.Response | None:
+    """415 unless a request that HAS a body declares a JSON content type.
+
+    Checked only when a body is actually present. An empty body carries no JSON
+    document to be misread, so gating it would change the status of a bodiless
+    POST (today a 400 ``invalid_json``, or ``{}`` under ``allow_absent``) while
+    removing no attack primitive.
+
+    415 rather than 400: the body may be perfectly well-formed JSON, and what is
+    refused is the media type the client declared for it.
+
+    Runs AFTER the capped path's Content-Length precheck, so a caller who
+    declared too many bytes still gets 413 rather than being told about its
+    header instead. Both refuse before anything is read, so the order is about
+    which fact the client is told, not about work done.
+    """
+    if not request.can_read_body:
+        return None
+    if _declares_json(request.content_type or ""):
+        return None
+    return web.json_response(
+        {
+            "error": "JSON body requires Content-Type: application/json",
+            "code": "unsupported_media_type",
+        },
+        status=415,
+    )
 
 
 async def read_bounded_json(
@@ -77,6 +422,7 @@ async def read_bounded_json(
     max_bytes: int | None = _MAX_BODY_BYTES,
     *,
     allow_absent: bool = False,
+    require_json_content_type: bool = True,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Read and parse a JSON *object* request body, capped at *max_bytes*.
 
@@ -85,25 +431,74 @@ async def read_bounded_json(
     endpoints routed through it: ``await request.json()`` happily returns a
     list, string, or number for a body that is valid JSON but not an object, and
     a handler that then calls ``.get()`` on the result turns a client mistake
-    into a 500 (issue #5587).
+    into a 500.
+
+    A request that HAS a body must also DECLARE a JSON content type, or it is
+    refused 415 ``unsupported_media_type`` before the body is read -- see
+    :func:`_json_content_type_error`. Parsing a ``text/plain`` or
+    content-type-less body as JSON is what lets a cross-origin page deliver a
+    JSON command to a local endpoint with no CORS preflight; requiring the
+    header puts the preflight back. In-tree callers are unaffected: every client
+    that sends a body already sets ``application/json`` (the frontend
+    ``post``/``put``/``patch``/``del`` helpers, ``mcp_core``, ``cron_script``,
+    ``cli_*``, ``pod.runtime``, ``remote_relay``), and the bodiless requests
+    (``app_lifecycle_client``, ``cron_trigger``) are not checked.
+
+    ONE caller opts OUT, and must: ``POST /api/messaging/teams``, where
+    Microsoft's Bot Framework Connector posts activities, passes
+    ``require_json_content_type=False``. Two reasons, and the second is the
+    load-bearing one:
+
+    * Refusing a media type there is a change to an EXTERNAL contract. The route
+      is the single entry in ``token_auth.CSRF_EXEMPT_EXACT_METHODS``, so the
+      Origin barrier does not stand in front of it, and a media-type refusal
+      would be the one refusal that could silently stop an external channel.
+    * The gate cannot be enforced there ANYWAY, and enforcing it costs the byte
+      cap. ``handlers/messaging.py`` forwards this helper's error only when it is
+      a 413, because a verdict derived from body CONTENT must not precede the JWT
+      check. A 415 is therefore dropped, the parsed body is never stashed, and
+      ``teams/client.py``'s fallback re-parses with a bare ``request.json()`` --
+      on a stream this helper returned from WITHOUT reading, so the re-parse is
+      bounded only by the app-wide ``client_max_size`` instead of
+      ``TEAMS_MAX_ACTIVITY_BYTES`` (64 KiB). Opting out keeps the capped read,
+      and with it the stash, so the body is parsed exactly once and never past
+      the cap.
+
+    Which generalizes to the rule any future caller must satisfy: because the
+    415 and the declared-oversize 413 return BEFORE a single byte is read, a
+    caller that does not return every error this helper hands back must pass
+    ``require_json_content_type=False``, or it inherits an unread stream that
+    nothing bounds. Every other caller in the tree returns the error
+    unconditionally (``chat_pins`` rewrites a 400's code and then returns it),
+    so the Teams route is the only opt-out.
+
+    Which also means: this gate is a SECOND barrier, not the first one. Every
+    other unsafe-method ``/api/`` route is already refused cross-origin by
+    ``csrf_middleware``, so on those routes the 415 removes no primitive that
+    was reachable -- it holds if a route is ever added to the CSRF-exempt list,
+    or the Origin barrier is ever mis-scoped, without waiting for that mistake
+    to be exploitable. Extending the refusal to the Teams route is a separate
+    decision about an external contract, not part of this one.
+
+    The other self-authenticating webhook, ``POST /api/hooks/agent``, reads
+    through ``handlers/hooks.py::_json_object`` and is untouched by this.
 
     NOT yet the dashboard's only such guard. Four siblings survive and diverge:
     ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
     codes, but raises ``HTTPBadRequest`` instead of returning the response),
     ``handlers/hooks.py::_json_object`` (``default_empty=True`` collapses a
-    MALFORMED body to defaults -- the defect this issue fixed in
-    ``api_memory_promote``), ``handlers/session_storage.py::_json_body``
+    MALFORMED body to defaults), ``handlers/session_storage.py::_json_body``
     (deliberately different: an empty body is legitimate there, and it
     documents why), and ``handlers/artifacts.py::_read_json_body`` (raises
     ``ArtifactValidationError``, carries its own cap). Folding or narrowing each
-    is tracked on issue #5587 alongside the remaining handler sweep -- claiming
-    one owner before that is done would be a claim the tree does not support.
+    is still outstanding -- claiming one owner before that is done would be a
+    claim the tree does not support.
 
     The cap is enforced BEFORE decoding: a Content-Length precheck rejects an
     oversized declared body, and the stream is then read incrementally so a
     chunked body (which carries no Content-Length) cannot buffer past
     ``max_bytes + one chunk`` on the event-loop thread. That bound is the point
-    of the helper for the strict-internal notification routes (issue #490).
+    of the helper for the strict-internal notification routes.
 
     ``max_bytes=None`` reads the body whole with no pre-decode ceiling, for the
     endpoints that have no principled byte limit today (a knowledge bundle
@@ -141,6 +536,16 @@ async def read_bounded_json(
     """
     if allow_absent and not request.can_read_body:
         return {}, None
+    # A DECLARED oversize keeps its 413, which is the actionable answer for a
+    # caller sending too much and was this helper's answer before the media-type
+    # gate existed. The gate runs next, still before a single byte is read.
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
+        return None, web.json_response(
+            {"error": "payload too large", "code": "payload_too_large"}, status=413
+        )
+    ct_error = _json_content_type_error(request) if require_json_content_type else None
+    if ct_error is not None:
+        return None, ct_error
     if max_bytes is None:
         try:
             body = await request.json()
@@ -149,10 +554,6 @@ async def read_bounded_json(
                 {"error": "invalid JSON", "code": "invalid_json"}, status=400
             )
     else:
-        if request.content_length and request.content_length > max_bytes:
-            return None, web.json_response(
-                {"error": "payload too large", "code": "payload_too_large"}, status=413
-            )
         chunks: list[bytes] = []
         received = 0
         async for chunk in request.content.iter_chunked(8192):
@@ -344,6 +745,564 @@ def _capability_manager() -> "CapabilityManager":
         lambda: current_context().capability_manager,
         fallback_factory=lambda: bind_capability_manager(DefaultCapabilityManager()),
         log_message="capability_manager lookup failed; treating as unavailable",
+    )
+
+
+def _session_memory_store(state: DashboardState, session_key: str) -> str:
+    """The NAMED silo *session_key* writes to, or ``""`` for the global store.
+
+    Reads the session's own recorded binding, which is the same source the
+    consolidator uses (``context.store_of_session``) — so a
+    durable write the AGENT makes lands in the silo its consolidations land in.
+    Without this a crew's ``learn_add`` wrote into the global lessons table that
+    every OTHER crew reads on every turn, while the crew's own context injected
+    only its silo's lessons: one crew steering every crew, and its own correction
+    never reaching its later turns.
+
+    Unavailable recorded identity raises; it never turns into a global write.
+
+    A thin adapter over ``context.store_of_session``, which is where the resolution
+    lives: the channel surfaces hold a ``ContextBuilder`` rather than a
+    ``DashboardState``, and two copies of "read the recorded binding" are how the
+    dashboard's answer and a channel's answer drift apart for one session.
+    """
+    from kiro_crew.context import store_of_session
+
+    return store_of_session(state.conversation_log, session_key)
+
+
+async def resolve_lesson_memory_store(
+    request: web.Request, state: DashboardState, operation: str
+) -> tuple[str, web.Response | None]:
+    """Authorize a lessons request before it uses a session's named store.
+
+    Lessons are an agent-facing API, so verified internal calls retain their
+    recorded binding. A browser or app token cannot borrow that authority by
+    supplying another session's X-Session-Key: a named store then requires the
+    dashboard owner. Only authentication middleware publishes internal_auth;
+    a request header claiming to carry an internal secret is not evidence.
+
+    No named binding preserves the existing global/workspace lessons contract.
+    """
+    from kiro_crew.memory_startup import MemoryStartupUnavailable
+
+    try:
+        if request.get("internal_auth") is True:
+            scope = await member_request_scope(request)
+            if not scope.verified:
+                raise ValueError("Execution identity is unavailable")
+            store = scope.store or ""
+        else:
+            store = await asyncio.to_thread(
+                _session_memory_store, state, request.headers.get("X-Session-Key", "")
+            )
+    except MemoryStartupUnavailable as exc:
+        return "", web.json_response(
+            {"error": _redact_memory_field(str(exc)), "code": "store_unavailable"}, status=503
+        )
+    except (ValueError, OSError):
+        startup_refusal = memory_startup_refusal()
+        if startup_refusal is not None:
+            return "", startup_refusal
+        return "", web.json_response(
+            {
+                "error": "The member's memory binding is unavailable; global memory was not used.",
+                "code": "store_unavailable",
+            },
+            status=503,
+        )
+    if store and request.get("internal_auth") is not True:
+        denial = await require_owner_dashboard_request(request, operation)
+        if denial is not None:
+            return "", denial
+    elif request.get("internal_auth") is True:
+        refusal = await require_private_memory_session(request, store, operation)
+        if refusal is not None:
+            return "", refusal
+    return store, memory_startup_refusal(store)
+
+
+async def _audit_private_memory_denial(operation: str, error: str) -> None:
+    """Record a denial without changing it or initializing SEL on the event loop."""
+
+    def _write() -> None:
+        from kiro_crew.sel import sel as _sel
+
+        _sel().log_api_access(
+            caller="internal",
+            operation=operation,
+            outcome="denied",
+            source="member_memory",
+            error=error,
+        )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception:
+        logger.debug("SEL audit for denied member operation %s failed", operation, exc_info=True)
+
+
+class MemberScope(NamedTuple):
+    """Authenticated transport attribution and the captured execution target."""
+
+    session: str | None
+    verified: bool
+    store: str | None
+    execution: ExecutionContext | None = None
+
+
+_MEMBER_SCOPE_KEY = "_member_scope"
+
+
+def _cron_execution_from_registry(
+    state: DashboardState | None, session: str
+) -> tuple[bool | None, "ExecutionContext | None"]:
+    """Resolve a code-cron's captured execution without opening its transcript.
+
+    Script crons use the gateway's internal HTTP API, but they do not create a
+    dashboard transcript before the script starts. Their stable ``cron:<id>``
+    key is therefore resolved from the scheduler's in-memory job record, whose
+    ``execution_context`` was captured when the job was admitted. This keeps
+    built-in script helpers on the same canonical route as message crons and
+    refuses a missing or malformed V2 record instead of falling back to Global.
+    Legacy V1 jobs retain their explicit store through ``resolve_cron_memory``.
+
+    ``True`` means a job was found, ``False`` means the configured registry has
+    no such job, and ``None`` means this request has no scheduler registry (for
+    example a reduced Slack-only surface). The first two outcomes are refused
+    or routed by the caller without falling back to a transcript or Global.
+    """
+    if state is None or not session.startswith("cron:"):
+        return None, None
+    parts = session.split(":")
+    job_id = parts[1] if len(parts) > 1 else ""
+    if not job_id:
+        return True, None
+    jobs = getattr(getattr(state, "crons", None), "_jobs", None)
+    if jobs is None:
+        return None, None
+    if not isinstance(jobs, (list, tuple, Mapping)):
+        # The scheduler registry is a concrete list in production. A surface
+        # that exposes only a placeholder object has no registry to consult;
+        # preserve the pre-V2 directive validation path.
+        return None, None
+    try:
+        candidates = jobs.values() if isinstance(jobs, Mapping) else jobs
+        job = next((item for item in candidates if getattr(item, "id", "") == job_id), None)
+    except Exception:  # noqa: BLE001 - identity resolution fails closed
+        return True, None
+    if job is None:
+        return False, None
+    try:
+        from kiro_crew.execution_context import execution_from_record
+
+        marker = object()
+        execution_record = getattr(job, "execution_context", marker)
+        if execution_record is marker:
+            # A reduced/legacy scheduler surface may expose only the caller
+            # ownership fields. It has no V2 routing authority; leave it to the
+            # existing transcript/global path rather than manufacturing one.
+            return None, None
+        if execution_record is not None:
+            execution = execution_from_record({"execution_context": execution_record})
+        else:
+            # A V2 schedule without its captured record is refused. Legacy V1
+            # records keep their old path; this helper must not reinterpret
+            # their display/store fields as a V2 identity.
+            member_id = getattr(job, "member_id", "")
+            memory_store = getattr(job, "memory_store", "")
+            from kiro_crew.memory_stores import memory_store_version
+
+            if not isinstance(member_id, str) or not isinstance(memory_store, str):
+                return None, None
+            if memory_store_version(memory_store) == 2 or (member_id and not memory_store):
+                return True, None
+            return None, None
+        return True, execution
+    except (AttributeError, OSError, ValueError):
+        return True, None
+
+
+async def member_request_scope(request: web.Request) -> MemberScope:
+    """Authenticate the caller and read its binding off the loop, at most once per request."""
+    cached = request.get(_MEMBER_SCOPE_KEY)
+    if isinstance(cached, MemberScope):
+        return cached
+    from kiro_crew.execution_context import read_session_execution
+    from kiro_crew.member_memory_auth import session_key_is_attested
+
+    def _resolve() -> MemberScope:
+        if request.get("internal_auth") is not True:
+            return MemberScope(None, False, None)
+        session = request.headers.get("X-Session-Key", "")
+        if not isinstance(session, str):
+            return MemberScope(None, False, None)
+        if not session:
+            return MemberScope(None, True, None)
+        if not session_key_is_attested(request, session):
+            # The header names an execution record this transport cannot vouch
+            # for. An unverified scope is the answer the callers already turn
+            # into their 409 ``member_identity_unavailable`` / 403 refusals, so
+            # the record is never read on a name the caller merely asserted.
+            return MemberScope(session, False, None)
+        try:
+            execution = read_session_execution(session)
+        except (OSError, ValueError):
+            if not session.startswith("cron:"):
+                return MemberScope(session, False, None)
+            execution = None
+        if session.startswith("cron:"):
+            found, cron_execution = _cron_execution_from_registry(request.app.get("state"), session)
+            if found is False or (found is True and cron_execution is None):
+                return MemberScope(session, False, None)
+            if found is True:
+                # The scheduler record is authoritative for a cron run. A
+                # stale transcript must never rebind an existing job after a
+                # retry, restart, or job edit.
+                execution = cron_execution
+        if execution is None:
+            return MemberScope(session, True, "")
+        return MemberScope(session, True, execution.store.legacy_name, execution)
+
+    scope = await asyncio.to_thread(_resolve)
+    try:
+        request[_MEMBER_SCOPE_KEY] = scope
+    except TypeError:  # a request double without item assignment: re-resolve next time
+        pass
+    return scope
+
+
+async def internal_memory_scope(
+    request: web.Request, operation: str, *, claimed_session: str | None = None
+) -> tuple[str | None, web.Response | None]:
+    """Capture routing from the authenticated request without opening memory."""
+    if request.get("internal_auth") is not True:
+        return None, None
+    scope = await member_request_scope(request)
+    if scope.verified and (claimed_session is None or claimed_session == scope.session):
+        return scope.store or None, None
+    await _audit_private_memory_denial(operation, "The execution identity is unavailable.")
+    return None, web.json_response(
+        {
+            "error": "The execution identity is unavailable; Global memory was not used.",
+            "code": "member_identity_unavailable",
+        },
+        status=409,
+    )
+
+
+async def private_chat_route_refusal(request: web.Request) -> web.Response | None:
+    """Keep member tools within their admitted chat controls."""
+    scope, refusal = await internal_memory_scope(request, "chat.control")
+    if refusal is not None:
+        # Let the ordinary internal-auth middleware produce its established
+        # caller_record_missing 403 for delegated work removed mid-run. Memory
+        # routing must not turn that host/app security decision into a 409.
+        session = request.headers.get("X-Session-Key", "")
+        if session.startswith(("cron:", "subagent:")):
+            from kiro_crew.dashboard.token_auth import caller_record_is_missing
+
+            state = request.app.get("state")
+            if state is not None and caller_record_is_missing(
+                session,
+                getattr(getattr(state, "crons", None), "_jobs", None),
+                getattr(getattr(state, "subagents", None), "_agents", None),
+            ):
+                return None
+    if refusal is not None or scope is None:
+        return refusal
+    # The follow-up card is an agent-facing callback on its current tab. Other
+    # chat controls belong to the owner; private work uses scoped spawn/history.
+    if request.method == "POST" and request.path.endswith("/followup"):
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        key = request.headers.get("X-Session-Key", "")
+        slot_name = request.match_info.get("slot", "")
+        state = request.app["state"]
+        slot = state._slots.get(slot_name)
+        if (
+            key.startswith("dashboard:")
+            and slot_name == key.removeprefix("dashboard:")
+            and slot is not None
+            and effective_session_key(slot) == key
+            and slot.memory_store == scope
+        ):
+            return None
+    # A crew member is admitted to the chat FOLDER and TAG routes it needs to
+    # organise its own worker sessions (session_create with folder=,
+    # chat_folder_file_self, chat_tag_assign, chat_session_pin), and to the
+    # read-only session LIST its folder tools use to resolve its own slot -- the
+    # surface session-control already opens to the same members. This is COARSE admission only: it lets
+    # the caller reach the handler, whose own per-resource fence
+    # (``chat_folders``/``chat_tags``' ``owner_app``/``folder_principal`` for the
+    # tree, ``member_owns_slot`` for filing/tagging and the session-list filter,
+    # ``_refuse_vocabulary_write`` for the shared tag list) is what decides which
+    # folder or session it may touch or see. Every OTHER ``/api/chat/*`` route
+    # keeps the owner-only refusal below.
+    if await _member_admitted_to_chat_folder_tag_route(request, scope):
+        return None
+    return await private_owner_surface_refusal(request, "chat.control")
+
+
+#: Methods a crew-member caller is admitted for on the chat folder/tag routes.
+#: The path is matched STRUCTURALLY by :func:`_admitted_chat_route_methods`
+#: against the exact registered patterns, never by a raw prefix, so a sibling
+#: literal that shares a prefix (``/api/chat/folders/reorder``,
+#: ``/api/chat/tag-columns/order``) is NOT admitted and keeps the owner-only
+#: refusal.
+#:
+#: The admitted VERBS are exactly the ones a member may actually do -- a verb
+#: whose handler has no member fence is not admitted here, so the gate can never
+#: forward a request the fence would have to refuse (or, worse, one no fence
+#: covers). Concretely: a member creates folders and renames/reparents its OWN
+#: (POST + PATCH on the tree), but does NOT delete folders (delete is refused for
+#: every agent principal); it READS the shared tag vocabulary (GET) but does NOT
+#: coin/rename/delete tags (``chat_tags.api_chat_tag_delete`` has no
+#: vocabulary fence at all, so admitting DELETE would let a member remove a
+#: shared tag); it files/tags only its own or created sessions, and a tag it
+#: assigns is still subject to the agent tag-grants policy
+#: (``chat_tags.agent_tag_change_refusal``): it may apply a tag the owner opened
+#: to agents (``add-only``/``add-remove``) or any rowless ordinary label, but a
+#: tag the owner reserved (a protected ``none`` row) is refused the same as for
+#: any other agent. The per-handler
+#: ownership fence (``owner_app``/``folder_principal`` for the tree,
+#: ``member_owns_slot`` for filing/tagging, ``_refuse_vocabulary_write`` for tag
+#: creation/rename) is still the authoritative gate; this set just refuses to
+#: forward anything outside a member's real capability.
+_MEMBER_CHAT_FOLDERS_METHODS = frozenset({"GET", "POST"})
+_MEMBER_CHAT_FOLDER_ID_METHODS = frozenset({"PATCH"})
+#: The reorder (sibling-position) leg of a folder move; its handler fences every
+#: row to the caller's own folder, so a member renumbers only what it owns.
+_MEMBER_CHAT_FOLDER_REORDER_METHODS = frozenset({"POST"})
+_MEMBER_CHAT_TAGS_METHODS = frozenset({"GET"})
+#: The board's column list is admitted READ-only, like the tag vocabulary: it
+#: names tags and live-state lanes, never a session. Its writes (POST, and the
+#: ``/{id}`` and ``/order`` routes, which are not matched at all) stay refused;
+#: ``_refuse_vocabulary_write`` in each write handler refuses a member too.
+_MEMBER_CHAT_TAG_COLUMNS_METHODS = frozenset({"GET"})
+_MEMBER_CHAT_SLOT_FOLDER_METHODS = frozenset({"PATCH"})
+_MEMBER_CHAT_SLOT_TAGS_METHODS = frozenset({"PUT"})
+#: Pinning a session (``chat_session_pin``); ``api_chat_slot_pin`` applies the
+#: same ``member_owns_slot`` fence as filing and tagging.
+_MEMBER_CHAT_SLOT_PIN_METHODS = frozenset({"PATCH"})
+#: The session LIST is admitted read-only: the folder/tag MCP tools
+#: (chat_folder_file_self / chat_folder_move_session / chat_folder_tree) read it
+#: to resolve the caller's own slot. ``api_chat_slots`` filters the response for
+#: a member to its own + created sessions (the same set the tree read shows), so
+#: admitting GET here does not widen what a member can enumerate.
+_MEMBER_CHAT_SLOTS_METHODS = frozenset({"GET"})
+
+
+def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
+    """The methods a member is admitted for on *path*, or ``None`` if not admitted.
+
+    Structural, path-shape matching that mirrors the routes registered in
+    ``routes/sessions.py`` / ``routes/chat.py`` EXACTLY. A trailing single
+    segment on ``/folders/`` is a folder id (``{id}``); the reserved literal
+    ``/api/chat/folders/reorder`` and every ``/api/chat/tag-*`` except the
+    read-only column list ``/api/chat/tag-columns`` are deliberately excluded.
+    ``/api/chat/tags/{id}`` is NOT admitted for any method -- a member
+    neither renames nor deletes shared tags -- so its DELETE (which has no
+    vocabulary fence) is refused at the gate. ``/api/chat/slots`` is the session
+    LIST only; a deeper ``/api/chat/slots/<slot>/...`` sub-resource other than
+    the fenced ``/folder``, ``/tags`` and ``/pin`` writes is NOT matched here.
+    """
+    if path in ("/api/chat/folders", "/api/chat/folders/"):
+        return _MEMBER_CHAT_FOLDERS_METHODS
+    if path in ("/api/chat/tags", "/api/chat/tags/"):
+        return _MEMBER_CHAT_TAGS_METHODS
+    if path in ("/api/chat/tag-columns", "/api/chat/tag-columns/"):
+        return _MEMBER_CHAT_TAG_COLUMNS_METHODS
+    if path in ("/api/chat/slots", "/api/chat/slots/"):
+        return _MEMBER_CHAT_SLOTS_METHODS
+    if path == "/api/chat/folders/reorder":
+        # The sibling-position half of a folder MOVE. Admitted so a member's
+        # combined reparent (PATCH /folders/{id}) + reorder does not commit only
+        # the reparent and leave positioning half-applied. The reorder handler
+        # fences every row to the caller's own folder (``folder_principal`` +
+        # ``_subtree_holds_foreign_folder``), so a member can renumber only its
+        # own folders.
+        return _MEMBER_CHAT_FOLDER_REORDER_METHODS
+    id_part = _single_id_segment(path, "/api/chat/folders/")
+    if id_part is not None and id_part not in ("reorder", "cleanup"):
+        return _MEMBER_CHAT_FOLDER_ID_METHODS
+    slot = _single_id_segment(path, "/api/chat/slots/", suffix="/folder")
+    if slot is not None:
+        return _MEMBER_CHAT_SLOT_FOLDER_METHODS
+    slot = _single_id_segment(path, "/api/chat/slots/", suffix="/tags")
+    if slot is not None:
+        return _MEMBER_CHAT_SLOT_TAGS_METHODS
+    slot = _single_id_segment(path, "/api/chat/slots/", suffix="/pin")
+    if slot is not None:
+        return _MEMBER_CHAT_SLOT_PIN_METHODS
+    return None
+
+
+def _single_id_segment(path: str, prefix: str, *, suffix: str = "") -> str | None:
+    """The single path segment between *prefix* and *suffix*, or ``None``.
+
+    Returns the segment only when *path* is exactly ``prefix<seg>suffix`` with a
+    non-empty ``seg`` that itself contains no ``/`` -- so a deeper path (a
+    sub-resource of ``{id}``/``{slot}``) does NOT match the one-segment route.
+    """
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix) :]
+    if suffix:
+        if not rest.endswith(suffix):
+            return None
+        rest = rest[: -len(suffix)]
+    if not rest or "/" in rest:
+        return None
+    return rest
+
+
+async def _member_admitted_to_chat_folder_tag_route(request: web.Request, scope: str) -> bool:
+    """Whether this verified-scope caller is a member reaching an admitted route.
+
+    ``scope`` is the store :func:`internal_memory_scope` already resolved and
+    VERIFIED for this request. Admission is the SHARED member predicate
+    (``session_control.member_admitted_to_scoped_surface``) the session-control
+    gate uses, restricted to the exact ``(method, path shape)`` pairs
+    :func:`_admitted_chat_route_methods` recognises. The config reads inside the
+    predicate are blocking, so the whole test runs off the loop in one hop and
+    fails closed.
+    """
+    allowed = _admitted_chat_route_methods(request.path)
+    if allowed is None or request.method not in allowed:
+        return False
+    from kiro_crew.dashboard import session_control as sc
+
+    session_key = request.headers.get("X-Session-Key", "").strip()
+
+    def _admit() -> bool:
+        return sc.member_admitted_to_scoped_surface(session_key, scope)
+
+    if not await asyncio.to_thread(_admit):
+        return False
+    # Carry the VERIFIED member principal onto the request so the handler's
+    # ownership fence (``chat_folders.folder_principal`` / ``member_owns_slot``)
+    # reads it WITHOUT a second, loop-blocking config read after the body-parse
+    # await -- the same "decide once on the verified scope, carry it" discipline
+    # the session-control gate applies with ``precomputed_ownership_fenced``.
+    try:
+        request[MEMBER_CHAT_PRINCIPAL_KEY] = f"member:{scope}" if scope else ""
+    except TypeError:  # a request double without item assignment
+        pass
+    return True
+
+
+async def member_scope_denied_refusal(operation: str) -> web.Response:
+    """The ``member_scope_denied`` 403, audited under *operation*.
+
+    Extracted so a caller that has ALREADY resolved a private scope (the
+    session-control gate, which then decides member callers separately) can emit
+    the exact same refusal and audit line as :func:`private_owner_surface_refusal`
+    WITHOUT re-running :func:`internal_memory_scope` a second time. One
+    implementation, so the two paths cannot drift on the wording or the audit.
+    """
+    await _audit_private_memory_denial(
+        operation, "Agent tools cannot use the owner's aggregate controls."
+    )
+    return web.json_response(
+        {
+            "error": "This operation requires the owner. Use the member's scoped tools instead.",
+            "code": "member_scope_denied",
+        },
+        status=403,
+    )
+
+
+async def private_owner_surface_refusal(
+    request: web.Request, operation: str
+) -> web.Response | None:
+    """Member tools retain the ordinary owner permission for aggregate controls."""
+    scope, refusal = await internal_memory_scope(request, operation)
+    if refusal is not None or scope is None:
+        return refusal
+    return await member_scope_denied_refusal(operation)
+
+
+#: A check that runs before a route handler; a response it returns is the answer.
+RouteGuard = Callable[[web.Request], Awaitable[web.Response | None]]
+
+
+def guarded_route(handler: Callable[..., Any], guard: RouteGuard) -> Callable[..., Any]:
+    """Run ``guard`` before ``handler``; its refusal, when it makes one, is the response."""
+
+    @functools.wraps(handler)
+    async def guarded(request: web.Request) -> web.StreamResponse:
+        refusal = await guard(request)
+        if refusal is not None:
+            return refusal
+        return await handler(request)
+
+    return guarded
+
+
+def owner_surface_guard(operation: str) -> RouteGuard:
+    """The owner check as a route guard, audited under ``operation``."""
+
+    async def guard(request: web.Request) -> web.Response | None:
+        return await private_owner_surface_refusal(request, operation)
+
+    return guard
+
+
+def owner_surface_route(handler: Callable[..., Any]) -> Callable[..., Any]:
+    """Check owner permissions before ``handler`` runs; the audit label is its name."""
+    return guarded_route(handler, owner_surface_guard(handler.__name__))
+
+
+def guard_owner_surface_routes(
+    namespace: dict[str, Any],
+    *,
+    member_scoped: frozenset[str],
+    resource_scoped: Mapping[str, RouteGuard] | None = None,
+    prefix: str = "api_",
+) -> None:
+    """Wrap every ``<prefix>*`` coroutine in a handler module's ``namespace`` as an owner surface.
+
+    Fail-closed: only the routes the module names in ``member_scoped`` (they
+    verify and scope their own caller) run unwrapped, and a route named in
+    ``resource_scoped`` runs behind that guard (the caller's access to the
+    route's own resource) instead of the owner check. A handler added later is
+    refused to private callers unless it is listed here on purpose. Call it
+    once, at the bottom of the module, so the re-exported names are the guarded
+    ones.
+    """
+    scoped = dict(resource_scoped or {})
+    missing = (member_scoped | scoped.keys()) - namespace.keys()
+    if missing:
+        raise RuntimeError(f"scoped routes are not defined: {sorted(missing)}")
+    for name, value in list(namespace.items()):
+        if (
+            name.startswith(prefix)
+            and inspect.iscoroutinefunction(value)
+            and name not in member_scoped
+        ):
+            guard = scoped.get(name)
+            namespace[name] = (
+                owner_surface_route(value) if guard is None else guarded_route(value, guard)
+            )
+
+
+async def require_private_memory_session(
+    request: web.Request, store: str, operation: str, *, session_key: str | None = None
+) -> web.Response | None:
+    """Require the selected target to match this call's captured execution."""
+    if request.get("internal_auth") is not True:
+        return await require_owner_dashboard_request(request, operation) if store else None
+    scope = await member_request_scope(request)
+    if scope.verified and (session_key is None or session_key == scope.session):
+        if (scope.store or "") == store:
+            return None
+    return web.json_response(
+        {
+            "error": "The request does not match its execution memory target; Global was not used.",
+            "code": "member_identity_unavailable",
+        },
+        status=409,
     )
 
 
@@ -798,13 +1757,14 @@ def _agent_loads_skill(agent_json: dict[str, Any], agent_path: Path, skill_md: P
     if not isinstance(resources, list):
         return False
     target = str(skill_md)
-    for res in resources:
-        if not isinstance(res, str):
-            continue
-        glob = _expand_resource_uri(res, agent_path)
-        if glob and fnmatch.fnmatch(target, glob):
-            return True
-    return False
+    globs = [
+        g
+        for res in resources
+        if isinstance(res, str)
+        for g in (_expand_resource_uri(res, agent_path),)
+        if g
+    ]
+    return any(fnmatch.fnmatch(target, g) for g in _with_canonical_globs(globs))
 
 
 def _expand_agent_globs(
@@ -818,6 +1778,9 @@ def _expand_agent_globs(
     all skills avoids re-running :func:`_expand_resource_uri` once per
     (skill, agent, resource), which on a large catalog is the dominant cost.
     Agents with no skill:// resources are dropped (they can match nothing).
+    Each glob is paired with its canonical spelling, as the loader's scope
+    match does, so a ``~`` mapping under a symlinked ``$HOME`` still matches
+    the resolved catalog path the loader injects.
     """
     expanded: list[tuple[str, list[str]]] = []
     for name, data, agent_path in parsed_agents:
@@ -832,7 +1795,7 @@ def _expand_agent_globs(
             if g
         ]
         if globs:
-            expanded.append((name, globs))
+            expanded.append((name, _with_canonical_globs(globs)))
     return expanded
 
 
@@ -846,41 +1809,31 @@ def _agents_loading_skill(
     ]
 
 
+# The parsed-agents snapshot lives in ``agent_discovery.parsed_agent_specs``
+# — one cache, one signature, one invalidation point shared with the
+# ``list_agents`` cache (the agent write paths clear both through
+# ``clear_list_agents_cache``). Skill rows themselves stay uncached: the
+# endpoint's documented freshness contract is about skills on disk, not
+# agent specs.
+
+
 def _load_parsed_agents() -> list[tuple[str, dict[str, Any], Path]]:
     """Read every agent JSON ONCE, returning ``(name, data, agent_path)``.
 
     Hoisted out of the per-skill loop so ``api_skills`` parses each agent
     file exactly once per request instead of once per skill — turning an
-    O(skills × agents) read/parse blowup into O(agents). Best-effort: macOS
-    AppleDouble sidecars ("._foo.json"), unreadable/invalid agents, and
-    sensitive-path symlinks are skipped (a symlink under ~/.kiro/agents/
-    could otherwise point at a credential file renamed ``*.json``).
+    O(skills × agents) read/parse blowup into O(agents). Resolved from the
+    :func:`kiro_crew.agent_discovery.parsed_agent_specs` snapshot, so a warm
+    request parses nothing and reads go through the one hardened reader
+    (sidecars, symlink loops, sensitive targets, oversized files, and
+    invalid JSON are skipped best-effort rather than 500ing the response).
+    Rows are shared with that cache: treat them as read-only.
     """
     parsed: list[tuple[str, dict[str, Any], Path]] = []
     for agents_dir in _agent_dirs():
-        try:
-            agent_files = sorted(agents_dir.glob("*.json"))
-        except OSError:
-            # An unreadable agents dir (e.g. PermissionError) must degrade to
-            # "no agents" rather than propagate and 500 the whole response.
-            continue
-        for agent_path in agent_files:
-            if agent_path.name.startswith("._"):
-                continue
-            try:
-                resolved = agent_path.resolve(strict=True)
-            except OSError:
-                continue
-            if is_sensitive_path(str(resolved)):
-                continue
-            try:
-                data = json.loads(resolved.read_text(encoding="utf-8"))
-            # ValueError covers both json.JSONDecodeError and
-            # UnicodeDecodeError (a non-UTF-8 file must not 500 the API).
-            except (OSError, ValueError):
-                continue
-            if not isinstance(data, dict):
-                continue
+        for data, agent_path in parsed_agent_specs(
+            agents_dir, operation="skills_loaded_by_agents", source="dashboard"
+        ):
             name = data.get("name") or agent_path.stem
             parsed.append((str(name), data, agent_path))
     return parsed
@@ -1044,6 +1997,95 @@ def _warn_skills_outside_roots(package_skills: list[dict[str, Any]]) -> None:
 SKILL_TREE_MAX_ENTRIES = 500
 SKILL_FILE_MAX_BYTES = 1_048_576  # 1 MiB
 
+# The ONE key prefix whose leaf skill directory may be a symlink pointing
+# anywhere. Editions install ``~/.kiro/skills/<name>`` as a link to their own
+# tree (AIM ``--local`` and friends), so refusing it there would 404 a shape
+# people actually run. Under every other prefix a leaf that resolves outside its
+# root is admitted only when it lands in an app skill provider root (see
+# :func:`_leaf_is_contained`), because an unconstrained leaf link is a
+# whole-filesystem read primitive: ``<project>/.kiro/skills/x -> /etc`` would
+# serve /etc through the tree and file endpoints. ``is_sensitive_path`` is no
+# backstop for that — it is a $HOME-anchored credential denylist, not a
+# containment check.
+LEAF_SYMLINK_PREFIX = "kiro-user/"
+
+
+def _path_at_or_under(path: Path, root: Path) -> bool:
+    """Whether *path* IS *root* or sits under it. Both must be resolved."""
+    return path == root or root in path.parents
+
+
+def _declared_app_skill_dirs(resolved: Path) -> list[Path]:
+    """The skill directories the app OWNING *resolved* declares, resolved.
+
+    ``apps.bridges._register_skills`` links ``app_root / p`` for each ``p`` in
+    that app's ``manifest.skills``, so this is the exact set of targets a skills
+    link can legitimately have. Read through ``bridges._registration_source``,
+    which for a shipped builtin is the immutable package copy rather than
+    mutable installed metadata. Empty — admitting nothing — when *resolved* names
+    no app, the app declares no skills, or its manifest cannot be read.
+    """
+    app_name = ""
+    for root in _trusted_skill_roots():
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        # ``<data home>/apps/<app>/…`` and the package's
+        # ``<kiro_crew>/apps/builtins/<app>/…``.
+        if parts[:2] == ("apps", "builtins") and len(parts) > 2:
+            app_name = parts[2]
+        elif parts:
+            app_name = parts[0]
+        if app_name:
+            break
+    if not app_name:
+        return []
+    try:
+        from kiro_crew.apps import bridges  # deferred: heavy import chain
+
+        manifest, app_root = bridges._registration_source(app_name)
+    except Exception:  # noqa: BLE001 — an unreadable app admits nothing
+        logger.debug("app skill sources unavailable for %r", app_name, exc_info=True)
+        return []
+    if manifest is None:
+        return []
+    out: list[Path] = []
+    for declared in getattr(manifest, "skills", []) or []:
+        try:
+            out.append((app_root / str(declared)).resolve(strict=True))
+        except (OSError, RuntimeError):
+            continue
+    return out
+
+
+def _leaf_is_contained(resolved: Path, root_resolved: Path, prefix_allows_link: bool) -> bool:
+    """Whether a RESOLVED skill directory may be served under its root.
+
+    Inside the root is always fine. Outside it, two sources are legitimate and
+    nothing else is:
+
+    * the prefix in :data:`LEAF_SYMLINK_PREFIX`, where an edition installs
+      ``~/.kiro/skills/<name>`` as a link into its own tree;
+    * a directory an app DECLARES as a skill — ``apps.bridges._register_skills``
+      links each one into the kirocrew skills root (namespaced AND flat) with the
+      target in the app's own tree, so those land outside the root by
+      construction.
+
+    The declared directories, NOT the app's root: an app tree also holds that
+    app's data, tokens and rendered configs, and ``<root>/x -> <app>/data`` must
+    not serve them. Taking the set from the manifest the bridge registers from is
+    what keeps the browse side from admitting more than the bridge links.
+    """
+    if _path_at_or_under(resolved, root_resolved):
+        return True
+    if prefix_allows_link:
+        return True
+    return any(
+        _path_at_or_under(resolved, declared) for declared in _declared_app_skill_dirs(resolved)
+    )
+
 
 def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "") -> Path | None:
     """Return the absolute skill directory for *name*, or None.
@@ -1058,13 +2100,17 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
     *session_key* scopes ``kiro-workspace/`` to the requesting chat slot's
     project. Without it, resolution falls back to the single project shared by
     every slot — and fails closed to ``None`` when open slots disagree, since
-    guessing could read the wrong checkout (#2457).
+    guessing could read the wrong checkout.
 
     The returned path is always under one of the allowed roots — paths
-    that try to escape via ``..`` or symlinks are rejected.
+    that try to escape via ``..`` or symlinks are rejected. The single
+    exception is a ``kiro-user/`` leaf symlink; see
+    :data:`LEAF_SYMLINK_PREFIX`.
     """
     if not name or ".." in name or name.startswith("/"):
         return None
+    # Only the edition-install prefix may resolve to a leaf outside its root.
+    allow_leaf_symlink = name.startswith(LEAF_SYMLINK_PREFIX)
     if name.startswith("kiro-user/"):
         rel = name[len("kiro-user/") :]
         root = Path.home() / ".kiro" / "skills"
@@ -1076,7 +2122,7 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
         # boundary that matters -- an unconsented project skill never reaching the
         # agent's context -- is enforced in SkillsLoader. Uses the permissive
         # resolver so the documented keyless single-project fallback and the
-        # #2457 two-project behaviour stay as they are.
+        # two-project behaviour stay as they are.
         proj = active_project_dir(state, session_key)
         if proj is None:
             return None
@@ -1104,6 +2150,16 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
         # point at a sensitive location that the unresolved check missed
         # (consistent with the kirocrew/kiro branches below).
         if is_sensitive_path(str(resolved)):
+            return None
+        # Leaf containment, as the shared block below applies it to every other
+        # prefix: the resolved skill directory must sit at or under one of the
+        # package roots it was searched in. This branch returns early, so the
+        # check belongs here too — an edition packager can plant
+        # ``<edition-root>/x -> /outside`` exactly like any other root, and
+        # ``package/`` carries no leaf-symlink allowance. An unresolvable root
+        # contains nothing, so a leaf found only through one fails closed.
+        package_roots = _resolved_set(_edition_package_roots(canonical))
+        if not any(_path_at_or_under(resolved, r) for r in package_roots):
             return None
         return resolved
     else:
@@ -1144,23 +2200,33 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
         return None
     try:
         resolved = candidate.resolve(strict=True)
-    except OSError:
+    except (OSError, RuntimeError):
+        # ``RuntimeError`` is what a symlink loop raises on some CPythons, and a
+        # standing loop is already filtered by ``is_dir()`` above — so what
+        # reaches here is a leaf that BECAME one after that check. Either way the
+        # skill is refused; this function answers a request and must not turn an
+        # unresolvable name into a 500.
         return None
     # Containment + symlink policy.  Skills can be nested under category
-    # directories (``utils/multi-badger`` → ``<root>/utils/multi-badger``),
-    # and a skill directory itself may be a symlink (an edition may install
-    # symlink ``~/.kiro/skills/<name>`` to ``~/.agents/skills/<name>``).  We
-    # therefore require the candidate's *parent* directory to resolve to a
-    # location at or under the trusted root — which permits the leaf to be a
-    # symlink while still rejecting a symlinked *intermediate* directory that
-    # would let ``a/b`` escape the tree.  The resolved target is then checked
-    # against the sensitive-path list as a final guard.
+    # directories (``utils/multi-badger`` → ``<root>/utils/multi-badger``), so
+    # the candidate's *parent* must resolve to a location at or under the
+    # trusted root — that is what rejects a symlinked *intermediate* directory
+    # which would let ``a/b`` escape the tree.
+    #
+    # The LEAF is held to the same rule, with the two documented exceptions in
+    # :func:`_leaf_is_contained` — the edition-install prefix, and an app skill
+    # provider root. Otherwise a parent-only check is an escape, so the resolved
+    # target itself must be inside the root. That target is finally checked
+    # against the sensitive-path list, which narrows the exceptions but does not
+    # bound them.
     try:
         parent_resolved = candidate.parent.resolve(strict=True)
         root_resolved = root.resolve(strict=True)
-    except OSError:
+    except (OSError, RuntimeError):
         return None
-    if parent_resolved != root_resolved and root_resolved not in parent_resolved.parents:
+    if not _path_at_or_under(parent_resolved, root_resolved):
+        return None
+    if not _leaf_is_contained(resolved, root_resolved, allow_leaf_symlink):
         return None
     if is_sensitive_path(str(resolved)):
         return None
@@ -1190,7 +2256,7 @@ def _skill_key_roots(state: DashboardState, session_key: str = "") -> list[tuple
     edition roots) are omitted. *session_key* scopes the ``kiro-workspace/``
     root to the requesting chat slot's project, exactly as
     :func:`_resolve_skill_root` does — the two MUST agree or an enumerated key
-    would not resolve (#2457).
+    would not resolve.
     """
     out: list[tuple[str, Path]] = [("kiro-user/", Path.home() / ".kiro" / "skills")]
     proj = active_project_dir(state, session_key)
@@ -1219,18 +2285,31 @@ def _collect_skills_under(
     prefix: str,
     out: dict[str, Path],
     depth: int,
+    allow_leaf_symlink: bool = False,
+    mtimes: dict[Path, int | None] | None = None,
 ) -> None:
     """Add every ``<dir>/SKILL.md`` at or under *directory* to *out*.
 
-    Containment mirrors :func:`_resolve_skill_root`: a candidate's *parent* must
-    resolve at or under the trusted root, which permits the skill directory
-    itself to be a symlink (an edition may install a skill by symlinking
-    ``~/.kiro/skills/<name>`` to elsewhere) while still rejecting a symlinked
-    *intermediate* directory that would let ``a/b`` escape the tree. Sensitive
-    paths are rejected before and after symlink resolution.
+    Containment mirrors :func:`_resolve_skill_root` through the same
+    :func:`_leaf_is_contained` predicate, because a key this walk offers must be
+    one that function accepts: a candidate's *parent* must resolve at or under
+    the trusted root, and so must the candidate itself unless the prefix is
+    :data:`LEAF_SYMLINK_PREFIX` or the target is an app skill provider root.
+    Without that agreement an escaping leaf would be enumerated as a phantom key
+    the resolver refuses, and its ``skill://`` URI would name a file outside the
+    root.
+    Sensitive paths are rejected before and after symlink resolution.
+
+    *mtimes*, when given, receives the modification time of every directory
+    this walk reads -- *directory* itself and each skill directory whose
+    ``SKILL.md`` it checks -- taken BEFORE the read, so a change that lands
+    between the stat and the read still shows as a change afterwards. It is
+    what :meth:`SkillCatalogSnapshot.changed` compares against.
     """
     if depth <= 0:
         return
+    if mtimes is not None:
+        mtimes[directory] = _dir_mtime_ns(directory)
     try:
         entries = sorted(directory.iterdir())
     except OSError:
@@ -1242,22 +2321,122 @@ def _collect_skills_under(
             continue
         try:
             parent_resolved = entry.parent.resolve(strict=True)
-        except OSError:
+            entry_resolved = entry.resolve(strict=True)
+        except (OSError, RuntimeError):
+            # A symlink loop raises RuntimeError on some CPythons and OSError on
+            # others, and this walk answers a request: an entry whose identity
+            # cannot be established is skipped like any other uncontainable one,
+            # never propagated as a 500 (matching :func:`_resolved_set`).
             continue
-        if parent_resolved != root_resolved and root_resolved not in parent_resolved.parents:
+        if not _path_at_or_under(parent_resolved, root_resolved):
             continue
+        if not _leaf_is_contained(entry_resolved, root_resolved, allow_leaf_symlink):
+            continue
+        if mtimes is not None:
+            mtimes[entry] = _dir_mtime_ns(entry)
         skill_md = entry / "SKILL.md"
         if skill_md.is_file():
             try:
                 target = skill_md.resolve(strict=True)
-            except OSError:
+            except (OSError, RuntimeError):
                 continue
             if is_sensitive_path(str(target)):
                 continue
             # First root wins, matching _skill_key_roots precedence.
             out.setdefault(prefix + entry.relative_to(root).as_posix(), skill_md)
         else:
-            _collect_skills_under(entry, root, root_resolved, prefix, out, depth - 1)
+            _collect_skills_under(
+                entry, root, root_resolved, prefix, out, depth - 1, allow_leaf_symlink, mtimes
+            )
+
+
+def _dir_mtime_ns(path: Path) -> int | None:
+    """``st_mtime_ns`` of *path*, or ``None`` when it cannot be stat'ed (absent)."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+# A directory's mtime comes from the kernel's coarse clock (a jiffy on Linux; a
+# whole second on some filesystems, two on FAT), so a change landing in the same
+# tick as the one a walk recorded leaves the mtime equal. A directory modified
+# this close to the walk is therefore treated as changed rather than trusted.
+_CATALOG_SETTLE_NS = 2_000_000_000
+
+
+class SkillCatalogSnapshot(NamedTuple):
+    """One walk of the skill roots: its keys, and what it read to build them.
+
+    ``entries`` is the catalog (see :func:`enumerate_skill_catalog`).
+    ``dir_mtimes`` is the modification time of every directory the walk read
+    (each root, absent ones as ``None``; each category directory it descended
+    into; each skill directory whose ``SKILL.md`` it checked), and
+    ``walked_at_ns`` the wall clock when the walk began.
+    """
+
+    entries: dict[str, Path]
+    dir_mtimes: dict[Path, int | None]
+    walked_at_ns: int
+
+    def changed(self) -> bool:
+        """Whether the skill roots may hold a different catalog now.
+
+        One ``stat`` per directory the walk read and no walk: ``True`` when any
+        of them has a different mtime (a skill directory created or removed, a
+        ``SKILL.md`` added to or taken from one, a root that appeared), or when
+        one was modified within :data:`_CATALOG_SETTLE_NS` of the walk, where an
+        equal mtime cannot prove nothing landed. ``False`` means the snapshot's
+        ``entries`` are still what a walk would return.
+        """
+        settled_before = self.walked_at_ns - _CATALOG_SETTLE_NS
+        for path, recorded in self.dir_mtimes.items():
+            current = _dir_mtime_ns(path)
+            if current != recorded:
+                return True
+            if current is not None and current >= settled_before:
+                return True
+        return False
+
+
+def walk_skill_catalog(state: DashboardState, session_key: str = "") -> SkillCatalogSnapshot:
+    """Walk the skill roots once; return the catalog with its staleness stamp.
+
+    The walk :func:`enumerate_skill_catalog` performs, plus the directory mtimes
+    :meth:`SkillCatalogSnapshot.changed` needs. A caller that must answer off a
+    catalog some time after it walked (the agent PATCH's receipt) keeps the
+    snapshot and re-walks only when the check says the roots moved. The check is
+    worth carrying because a walk is two orders of magnitude dearer than it: each
+    entry passes the sensitive-path check on top of its ``resolve`` calls, so a
+    200-skill tree walks in hundreds of milliseconds and re-checks in about one
+    (``test/skill_catalog_walk_bench.py`` measures both).
+    """
+    catalog: dict[str, Path] = {}
+    mtimes: dict[Path, int | None] = {}
+    walked_at_ns = time.time_ns()
+    for prefix, root in _skill_key_roots(state, session_key):
+        if is_sensitive_path(str(root)):
+            continue
+        if not root.is_dir():
+            # Recorded as absent so a root created later reads as a change.
+            mtimes[root] = None
+            continue
+        try:
+            root_resolved = root.resolve(strict=True)
+        except OSError:
+            mtimes[root] = None
+            continue
+        _collect_skills_under(
+            root,
+            root,
+            root_resolved,
+            prefix,
+            catalog,
+            _SKILL_NEST_DEPTH,
+            prefix == LEAF_SYMLINK_PREFIX,
+            mtimes,
+        )
+    return SkillCatalogSnapshot(catalog, mtimes, walked_at_ns)
 
 
 def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dict[str, Path]:
@@ -1280,17 +2459,10 @@ def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dic
     It is additionally the single source of truth for BOTH directions of the
     key <-> URI mapping, so they cannot disagree: a mapping written against a
     symlinked skill directory inverts back to the same key it was written from.
+
+    The walk itself is :func:`walk_skill_catalog`; this is its catalog alone.
     """
-    catalog: dict[str, Path] = {}
-    for prefix, root in _skill_key_roots(state, session_key):
-        if is_sensitive_path(str(root)) or not root.is_dir():
-            continue
-        try:
-            root_resolved = root.resolve(strict=True)
-        except OSError:
-            continue
-        _collect_skills_under(root, root, root_resolved, prefix, catalog, _SKILL_NEST_DEPTH)
-    return catalog
+    return walk_skill_catalog(state, session_key).entries
 
 
 def _skill_uri_for_path(skill_md: Path) -> str:
@@ -1371,7 +2543,11 @@ def skill_uri_for_key(
 
 
 def agent_skill_views(
-    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
+    data: dict[str, Any],
+    agent_path: Path,
+    state: DashboardState,
+    session_key: str = "",
+    catalog: dict[str, Path] | None = None,
 ) -> tuple[list[str], list[str]]:
     """``(catalog_keys, unmanaged_uris)`` for *data*, from ONE catalog walk.
 
@@ -1380,15 +2556,18 @@ def agent_skill_views(
     enumerated skill accounts for) which are shown read-only and preserved on
     every write. Both are order-preserving; keys are de-duplicated.
 
+    Pass *catalog* (from :func:`enumerate_skill_catalog`) to reuse a walk the
+    caller already did instead of enumerating the roots again.
+
     Filesystem-heavy (it enumerates the skill roots) — callers on the asyncio
     event loop MUST run this off the loop.
     """
-    catalog = enumerate_skill_catalog(state, session_key)
+    entries = catalog if catalog is not None else enumerate_skill_catalog(state, session_key)
     keys: list[str] = []
     unmanaged: list[str] = []
     seen: set[str] = set()
     for uri in skill_resource_uris(data):
-        key = skill_key_for_uri(uri, agent_path, state, catalog)
+        key = skill_key_for_uri(uri, agent_path, state, entries)
         if key is None:
             unmanaged.append(uri)
         elif key not in seen:
@@ -1398,15 +2577,20 @@ def agent_skill_views(
 
 
 def agent_skill_keys(
-    data: dict[str, Any], agent_path: Path, state: DashboardState, session_key: str = ""
+    data: dict[str, Any],
+    agent_path: Path,
+    state: DashboardState,
+    session_key: str = "",
+    catalog: dict[str, Path] | None = None,
 ) -> list[str]:
     """Catalog keys for the skills *data* maps, de-duplicated, order-preserving.
 
     Only catalog-resolvable entries are returned — this is the set the Agent
     Templates editor owns and can rewrite. Wildcard / hand-authored URIs are
     excluded here and reported separately by :func:`agent_unmanaged_skill_uris`.
+    Pass *catalog* to reuse one walk, as for :func:`agent_skill_views`.
     """
-    return agent_skill_views(data, agent_path, state, session_key)[0]
+    return agent_skill_views(data, agent_path, state, session_key, catalog)[0]
 
 
 def agent_unmanaged_skill_uris(
@@ -1427,12 +2611,21 @@ def apply_skill_mapping(
     state: DashboardState,
     keys: list[str],
     session_key: str = "",
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], SkillCatalogSnapshot]:
     """Rewrite *data*'s ``skill://`` resources to *keys*, in place.
 
-    Returns ``(applied_keys, unknown_keys)``. Nothing is written when
-    *unknown_keys* is non-empty — the caller rejects the whole request so a
-    typo'd key can never partially apply.
+    Returns ``(applied_keys, unknown_keys, applied_uris, snapshot)``. ``applied_uris[i]``
+    is the ``skill://`` resource written for ``applied_keys[i]``, in request order --
+    the one statement of which entries of the rewritten list are the managed ones,
+    resolved against the same catalog walk that validated the keys, so a caller
+    that must re-apply the request's order onto a later read of the spec never
+    has to guess it from the list's shape. ``snapshot`` is that walk itself, with
+    the stamp :meth:`SkillCatalogSnapshot.changed` reads, so the caller can resolve
+    what it finally writes (:func:`agent_skill_keys` takes ``snapshot.entries``)
+    against the snapshot the keys were validated with, and walk the roots a second
+    time only when they moved in between. Nothing is written when *unknown_keys*
+    is non-empty -- the caller rejects the whole request so a typo'd key can never
+    partially apply.
 
     Invariants:
 
@@ -1448,7 +2641,8 @@ def apply_skill_mapping(
     # One enumeration for the whole write: every key resolved and every existing
     # URI inverted against the SAME snapshot, so a concurrent skill add/remove
     # cannot make the two halves disagree mid-request.
-    catalog = enumerate_skill_catalog(state, session_key)
+    snapshot = walk_skill_catalog(state, session_key)
+    catalog = snapshot.entries
     for key in keys:
         if key in seen:
             continue
@@ -1460,7 +2654,7 @@ def apply_skill_mapping(
         applied.append(key)
         uris.append(uri)
     if unknown:
-        return applied, unknown
+        return applied, unknown, uris, snapshot
 
     resources = data.get("resources") or []
     if not isinstance(resources, list):
@@ -1480,7 +2674,7 @@ def apply_skill_mapping(
         # key is absent/empty), and an agent with nothing mapped should fall
         # back to those defaults — so drop the key instead of writing [].
         data.pop("resources", None)
-    return applied, unknown
+    return applied, unknown, uris, snapshot
 
 
 def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
@@ -1489,6 +2683,17 @@ def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
     Each entry: ``{path: relative-from-root, type: "file"|"dir", size: int}``.
     Sensitive paths are filtered out.  Symlinks are resolved; entries whose
     real path escapes *skill_root* are omitted.
+
+    *skill_root* is the root :func:`_resolve_skill_root` admitted, and this walk
+    addresses it by name — so a root REPLACED after that admission is enumerated
+    as whatever its name then denotes. Holding the root's identity across the
+    walk needs the traversal itself to run relative to a descriptor, which is a
+    second mechanism with its own platform fallback (no ``O_DIRECTORY`` on
+    Windows) and its own listing semantics. This function therefore carries the
+    same exposure as the rest of the by-name filesystem surface, and the
+    guarantee that bytes never leave the root lives where bytes are read:
+    :func:`read_skill_file` opens through a descriptor and holds its admission
+    root literally.
     """
     out: list[dict[str, Any]] = []
     for dirpath, dirnames, filenames in os.walk(skill_root, followlinks=False):
@@ -1529,6 +2734,23 @@ def read_skill_file(skill_root: Path, rel_path: str) -> tuple[str, str | None]:
 
     Returns ``(content, error)``.  ``error`` is non-empty when access is
     denied, the file is too big, or it doesn't exist.
+
+    *skill_root* must be a root a caller already admitted —
+    :func:`_resolve_skill_root` returns a resolved path, and that path is what
+    bounds the read. Resolving the root again HERE cannot serve as the bound: a
+    skill directory replaced between admission and this call resolves to the
+    replacement's target, so the bound would be computed from the swap.
+
+    The path checks below choose WHICH file to serve; the bytes then come from
+    ``hooks.safe_read_file_bytes_nolink`` with ``within_root``, so containment
+    is enforced on the descriptor actually opened rather than on a path resolved
+    earlier. Re-opening by name instead leaves a check-to-use window — an
+    ancestor directory swapped for a symlink after the check escapes the root —
+    and no hardlink guard at all, since ``resolve()`` does not follow a
+    hardlink, so a link to a file outside the root satisfies the containment
+    check above. The helper opens without following the final component, then
+    validates the opened inode: hardlinked (``st_nlink > 1``), non-regular, or
+    escaping paths are refused.
     """
     if not rel_path or ".." in rel_path.split("/") or rel_path.startswith("/"):
         return "", "invalid path"
@@ -1550,9 +2772,32 @@ def read_skill_file(skill_root: Path, rel_path: str) -> tuple[str, str | None]:
     if size > SKILL_FILE_MAX_BYTES:
         return "", f"file too large ({size} bytes; cap {SKILL_FILE_MAX_BYTES})"
     try:
-        return resolved.read_text(encoding="utf-8", errors="replace"), None
-    except OSError:
-        return "", "read failed"
+        data = safe_read_file_bytes_nolink(
+            str(target),
+            # The ADMITTED root, and kept literally: neither this function nor
+            # the helper may resolve it again. Both re-resolutions authorize a
+            # replacement — ``skill_resolved`` is computed after the admission,
+            # and the helper's own ``realpath`` runs later still — so an fd under
+            # the swapped target would satisfy containment against a root
+            # derived from the swap.
+            within_root=str(skill_root),
+            max_bytes=SKILL_FILE_MAX_BYTES,
+            within_root_is_canonical=True,
+        )
+    except FileTooLargeError:
+        # The file grew past the cap between the stat above and the read.
+        return "", f"file too large (cap {SKILL_FILE_MAX_BYTES})"
+    if data is None:
+        # One message for every descriptor-level refusal (escape, hardlink,
+        # non-regular, unreadable): the caller is a browse endpoint, and naming
+        # which guard fired would describe the filesystem to the client.
+        return "", "access denied"
+    # Universal newlines, because the descriptor read is a BINARY one and the
+    # contract this serves is text: a CRLF skill file has to render as the same
+    # content on every platform, and the viewer receiving \r\n on Windows alone
+    # is a difference nothing downstream asked for.
+    text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n"), None
 
 
 def _read_session_key(request: "Any") -> str:
@@ -1639,6 +2884,103 @@ def _caller_bounds(request: web.Request) -> tuple[dict[str, str], int]:
     return carried, ttl_ceiling
 
 
+def inherited_session_memory_mode(state: DashboardState, key: str) -> str | None:
+    """Read only restrictions captured by trusted child creation in this process."""
+    from kiro_crew.messaging.privacy_mode import strictest
+
+    modes = []
+    admitted = getattr(getattr(state, "context_builder", None), "_session_memory_modes", None)
+    if isinstance(admitted, dict) and key in admitted:
+        modes.append(admitted[key])
+    manager = getattr(state, "subagents", None)
+    if manager is not None:
+        for info in getattr(manager, "running", ()):
+            if (info.conversation_key or f"subagent:{info.id}") == key:
+                if not info._memory_mode_ready:
+                    return "temporary"
+                modes.append(info.memory_mode)
+    if any(mode not in VALID_MEMORY_MODES for mode in modes):
+        return "temporary"
+    return (strictest(modes) or "persistent") if modes else None
+
+
+def live_session_memory_mode(state: DashboardState, key: str) -> str | None:
+    """Snapshot gateway-owned policy without filesystem I/O or namespace grants."""
+    if key in ("", "dashboard:ui"):
+        return "persistent"
+    inherited = inherited_session_memory_mode(state, key)
+    if inherited is not None:
+        return inherited
+    # A headless key must not borrow an unrelated dashboard slot's suffix.
+    slot = (
+        state._slots.get(key.removeprefix("dashboard:")) if key.startswith("dashboard:") else None
+    )
+    from kiro_crew.validation import SLACK_THREAD_TS_RE
+
+    channel = is_channel_session_key(key) or bool(SLACK_THREAD_TS_RE.fullmatch(key))
+    if channel:
+        _hydrate_conv_flags(state.sessions, key)
+        if is_thread_temporary(key):
+            return "temporary"
+        if is_thread_incognito(key):
+            return "incognito"
+    request = SimpleNamespace(headers={"X-Session-Key": key})
+    if slot is not None or channel:
+        if _blocks_reads_session(state, request):
+            return "temporary"
+        if _is_restricted_session(state, request):
+            return "incognito"
+        return "persistent"
+    return None
+
+
+def require_live_session_memory_mode(state: DashboardState, key: str) -> str:
+    mode = live_session_memory_mode(state, key)
+    if not isinstance(mode, str) or mode not in VALID_MEMORY_MODES:
+        raise ValueError("The originating session's memory mode is unavailable")
+    return mode
+
+
+async def resolve_session_memory_mode(state: DashboardState, key: str) -> str:
+    """Resolve admission policy, retaining live snapshots across off-loop work."""
+    mode = live_session_memory_mode(state, key)
+    if mode is not None:
+        if mode not in VALID_MEMORY_MODES:
+            raise ValueError("The originating session's memory mode is invalid")
+        return mode
+    from kiro_crew.execution_context import read_session_execution
+
+    execution = await asyncio.to_thread(read_session_execution, key)
+    if execution is not None:
+        return execution.memory_mode
+    if key.startswith("subagent:"):
+        from kiro_crew.subagent_persistence import read_run_memory_mode
+
+        return await asyncio.to_thread(read_run_memory_mode, key.removeprefix("subagent:"))
+    if key.startswith(("wf:", "wf-pool:", "wf-unpooled:", "wf-worker:", "wf-author:", "wf-scope:")):
+        from kiro_crew.workflow_memory import WorkflowMemoryError, read_binding
+
+        try:
+            row = await asyncio.to_thread(read_binding, key.split(":", 2)[1], required=True)
+        except WorkflowMemoryError as exc:
+            raise ValueError("The originating session's memory mode is unavailable") from exc
+        mode = row.get("memory_mode") if row is not None else None
+    else:
+        from kiro_crew.subagent_persistence import read_session_memory_mode
+
+        mode = await asyncio.to_thread(read_session_memory_mode, key)
+        if mode is not None:
+            return mode
+        if key.startswith("taskrunner:"):
+            raise ValueError("The task runtime's protected memory mode is unavailable")
+        exists, mode = await asyncio.to_thread(_probe_persisted_session, key.split(":", 1)[-1])
+        if not exists:
+            mode = None
+    if not isinstance(mode, str) or mode not in VALID_MEMORY_MODES:
+        raise ValueError("The originating session's memory mode is unavailable")
+    return mode
+
+
 def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
     """Check if request comes from an ephemeral (incognito) or temporary (guest) session.
 
@@ -1650,6 +2992,9 @@ def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
         return False
     if sk == "dashboard:ui":
         return False
+    inherited = inherited_session_memory_mode(state, sk)
+    if inherited is not None and inherited != "persistent":
+        return True
     if sk in state._restricted_keys:
         return True
     slot_name = sk.split(":", 1)[-1] if ":" in sk else sk
@@ -1690,6 +3035,9 @@ def _blocks_reads_session(state: DashboardState, request: "Any") -> bool:
     sk = _read_session_key(request)
     if not sk or sk == "dashboard:ui":
         return False
+    inherited = inherited_session_memory_mode(state, sk)
+    if inherited is not None and inherited not in {"persistent", "incognito"}:
+        return True
     slot_name = sk.split(":", 1)[-1] if ":" in sk else sk
     slot = state._slots.get(slot_name)
     if slot and slot.blocks_reads:
@@ -1911,7 +3259,7 @@ async def require_owner_dashboard_request(
 
     # SEL is warmed at gateway startup (sel.warm_sel_singleton), so this
     # ``log_api_access`` only enqueues to the writer thread — no thread hop
-    # needed (#8608). Guarded because a FAILED warm leaves construction to
+    # needed. Guarded because a FAILED warm leaves construction to
     # retry here and possibly raise.
     caller = str(request.get("user") or "unknown")
     try:
@@ -1995,35 +3343,15 @@ def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
 def _pip_install_channel_available() -> bool:
     """True when ``<gateway python> -m pip install`` can plausibly succeed.
 
-    Three environments make that command a guaranteed dead end, and surfacing
-    it there recreates the press-and-nothing-changes failure this surface
-    exists to avoid:
-
-    - the desktop app's bundled interpreter (see
-      :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
-      pip install writes into the code-signed bundle — breaking launches and
-      updates — and is discarded on every app update;
-    - an interpreter without the ``pip`` module (uv tool installs, some
-      pipx layouts);
-    - a PEP 668 externally-managed interpreter (distro/brew pythons), where
-      pip refuses to install. Checked only outside a venv: inside one, pip
-      works and deliberately ignores the marker, so a venv returns True.
+    Thin wrapper over :func:`kiro_crew.extras.pip_install_channel_available`,
+    which owns the predicate because it also renders the command the predicate
+    governs -- `doctor` asks the same question about the same command, and two
+    copies of "can pip install here" would drift apart.
 
     Touches the filesystem (``find_spec``, then the marker file), so call it
     from a worker thread on an async path.
     """
-    if platform_compat.is_bundled_interpreter():
-        return False
-    if importlib.util.find_spec("pip") is None:
-        return False
-    # PEP 668 applies to the environment pip would install into. Inside a venv
-    # pip deliberately ignores the marker, and `sysconfig.get_path("stdlib")`
-    # resolves to the BASE interpreter's directory — where distro/brew pythons
-    # place it — so checking it from a venv would misfire on the recommended
-    # install layout (venv on a Debian/Ubuntu/Homebrew python).
-    if sys.prefix != sys.base_prefix:
-        return True
-    return not (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists()
+    return extras.pip_install_channel_available()
 
 
 def pip_extra_install_command(extra: str) -> str:
@@ -2040,3 +3368,307 @@ def pip_extra_install_command(extra: str) -> str:
     empty command as "no install channel" and show the unsupported notice.
     """
     return extras.pip_install_command(extra)
+
+
+#: Query parameter naming the memory store a request addresses. One spelling,
+#: read only by :func:`resolve_requested_memory_store`, because the whole
+#: security property below rests on "the parameter is present" and a second
+#: hand-typed spelling is how one route starts answering for a store the gate
+#: never saw.
+MEMORY_STORE_PARAM = "store"
+
+
+def memory_startup_refusal(
+    store: str = "default", *, allow_failed: bool = False
+) -> web.Response | None:
+    """Structured refusal shared by data routes; recovery controls stay usable."""
+    from kiro_crew.memory_startup import MemoryStartupUnavailable, require_memory_ready
+
+    try:
+        require_memory_ready(store, allow_failed=allow_failed)
+    except MemoryStartupUnavailable as exc:
+        return web.json_response(
+            {"error": _redact_memory_field(str(exc)), "code": "store_unavailable"}, status=503
+        )
+    return None
+
+
+async def resolve_requested_memory_store(
+    request: web.Request,
+    state: DashboardState,
+    operation: str,
+    *,
+    require_ready: bool = True,
+    allow_failed: bool = False,
+) -> tuple[str, web.Response | None]:
+    """Route internal tools through their captured execution; owners may select a store.
+
+    Browser requests without a store retain the Global default. An explicit
+    store parameter always requires the ordinary owner permission, including
+    when it names Global. Unknown selections never fall back to another store.
+    """
+    from kiro_crew.memory_stores import (
+        DEFAULT_MEMORY_STORE,
+        declared_store_names,
+        named_store_or_empty,
+    )
+
+    if MEMORY_STORE_PARAM not in request.query:
+        store = ""
+        if request.get("internal_auth") is True:
+            scope = await member_request_scope(request)
+            if not scope.verified:
+                return "", web.json_response(
+                    {
+                        "error": "The execution identity is unavailable; Global was not used.",
+                        "code": "member_identity_unavailable",
+                    },
+                    status=409,
+                )
+            store = scope.store or ""
+        refusal = (
+            memory_startup_refusal(store, allow_failed=allow_failed) if require_ready else None
+        )
+        return store, refusal
+
+    denial = await require_owner_dashboard_request(request, operation)
+    if denial is not None:
+        return "", denial
+
+    requested = request.query[MEMORY_STORE_PARAM].strip() or DEFAULT_MEMORY_STORE
+    if requested not in declared_store_names():
+        return "", web.json_response(
+            {
+                "error": f"no memory store named {requested!r} is declared",
+                "code": "unknown_memory_store",
+            },
+            status=404,
+        )
+    return named_store_or_empty(requested), (
+        memory_startup_refusal(requested, allow_failed=allow_failed) if require_ready else None
+    )
+
+
+#: Guards the per-store caches below. ONE lock rather than one per store: building
+#: a store happens once per store per gateway lifetime, so contention is
+#: irrelevant, while a per-store lock map needs its own lock to be built safely
+#: and buys nothing.
+_store_tier_lock = LoopBoundLock()
+
+
+async def markdown_memory_for_store(state: DashboardState, store: str):
+    """Return manual documents plus the selected store's learning history facade."""
+    from kiro_crew.memory_startup import require_memory_ready
+
+    require_memory_ready(store)
+    if not store:
+        return _get_memory(state)
+    from kiro_crew.memory_stores import require_memory_store
+
+    def validate_target() -> int:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        require_memory_ready(store)
+        config = KiroCrewConfig.load()
+        record = config.memory_stores.get(store)
+        version = getattr(record, "memory_version", 1)
+        require_memory_store(store, config=config, require_directory=version == 2)
+        return version
+
+    version = await asyncio.to_thread(validate_target)
+    vector = await vector_memory_for_store(state, store) if version == 2 else None
+    cache: dict[str, Any] = getattr(state, "_store_markdown", None) or {}
+    if store in cache:
+        return cache[store]
+    async with _store_tier_lock:
+        # Deletion may have committed while this request awaited the tier lock.
+        version = await asyncio.to_thread(validate_target)
+        vector = await vector_memory_for_store(state, store) if version == 2 else None
+        cache = getattr(state, "_store_markdown", None) or {}
+        if store in cache:
+            return cache[store]
+        from kiro_crew.memory import MemoryStore
+        from kiro_crew.memory_stores import memory_index_path_for, memory_store_dir_for
+
+        def build_memory():
+            import weakref
+
+            from kiro_crew.member_memory_backup import (
+                acquire_store_use_lock,
+                release_store_use_lock,
+            )
+            from kiro_crew.memory_stores import MEMORY_DB_FILE
+
+            workspace = memory_store_dir_for(store)
+            fd = acquire_store_use_lock(workspace / MEMORY_DB_FILE) if version == 1 else None
+            try:
+                mem = MemoryStore(
+                    workspace=workspace,
+                    index_db=memory_index_path_for(store),
+                    memory_version=version,
+                    vector_store=vector,
+                )
+                mem.init()
+                # Keep admission while either the cache or an in-flight request owns
+                # this object, including V1 Markdown-only stores with no vector tier.
+                if fd is not None:
+                    weakref.finalize(mem, release_store_use_lock, fd)
+                return mem
+            except BaseException:
+                release_store_use_lock(fd)
+                raise
+
+        mem = await asyncio.to_thread(build_memory)
+        cache[store] = mem
+        state._store_markdown = cache  # type: ignore[attr-defined]
+        return mem
+
+
+async def release_markdown_memory_store(state: DashboardState, store: str) -> None:
+    """Drop a deleted member's dashboard cache after any in-flight construction."""
+    async with _store_tier_lock:
+        cache = getattr(state, "_store_markdown", None)
+        memory = cache.pop(store, None) if cache is not None else None
+    if memory is not None:
+        memory.vector_store = None
+        memory._invalidate_history_cache()
+
+
+def _store_name(store: str) -> str:
+    """The store's NAME, given the request seam's spelling of it.
+
+    The seam spells the global store ``""`` (see
+    :func:`resolve_requested_memory_store`), while every resolver in
+    ``memory_stores`` and ``memory_backup`` takes a name and RAISES on an empty
+    one — ``validate_memory_store_name("")`` is a refusal. So the two spellings
+    are not interchangeable, and translating between them in one named place is
+    what keeps a route from handing ``""`` to a path resolver.
+    """
+    from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
+
+    return store or DEFAULT_MEMORY_STORE
+
+
+async def _audit(request: web.Request, operation: str, outcome: str, resources: str) -> None:
+    """Record a memory-store mutation in the security event log. Best-effort.
+
+    Off the loop because the FIRST ``sel()`` of a process CONSTRUCTS the log
+    (trust-dir creation, key validation, an owner-only DACL on Windows) and the
+    owner gate only pays that cost on a denial — so on a gateway whose first
+    admin request succeeds, this is the construction site.
+
+    Never changes the outcome: the mutation has already landed when this runs, and
+    losing the audit line is strictly better than turning a completed restore into
+    a 500 the operator would retry.
+    """
+    from kiro_crew.sel import sel  # deferred: sel imports config
+
+    caller = str(request.get("user") or "unknown")
+    try:
+        await asyncio.to_thread(
+            lambda: sel().log_api_access(
+                caller=caller,
+                operation=operation,
+                outcome=outcome,
+                source="dashboard",
+                resources=resources,
+            )
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for %s failed", operation, exc_info=True)
+
+
+async def _admin_store(
+    request: web.Request, operation: str, body: dict[str, Any] | None = None
+) -> tuple[str, web.Response | None]:
+    """The store this admin request addresses, or a refusal to return AS-IS.
+
+    Same two answers as :func:`resolve_requested_memory_store` — ``""`` for the
+    global store, a name for a silo — and the same 404 ``unknown_memory_store``
+    for a name nobody declared.
+
+    A POST names its store in the BODY rather than the query string, because that
+    is where the rest of its arguments are, so the body is consulted first and
+    the query resolver handles the absent case. The body key is
+    :data:`MEMORY_STORE_PARAM` deliberately: one spelling for both transports is
+    what keeps a route from starting to answer for a store under a second name
+    the seam never sees.
+
+    Only the DECLARED-name half of the seam is re-expressed here, never the gate:
+    every caller of this function has already taken
+    :func:`require_owner_dashboard_request` unconditionally, which is strictly
+    stronger than the presence gate the query resolver applies.
+
+    A value that is present but not a string REFUSES rather than falling through
+    to the caller's binding, and gets the same 404 an undeclared name gets. Both
+    halves matter: a mutation whose store field was mistyped must not silently
+    land on the default store, and distinguishing malformed from unknown would
+    report whether a given name is declared.
+    """
+    from kiro_crew.memory_stores import (
+        DEFAULT_MEMORY_STORE,
+        declared_store_names,
+        named_store_or_empty,
+    )
+
+    require_ready = operation not in {"memory.backups.list", "memory.restore.cancel"}
+    allow_failed = operation == "memory.restore"
+    if body is not None and MEMORY_STORE_PARAM in body:
+        raw = body[MEMORY_STORE_PARAM]
+        # ``""`` is never a declared name, so a non-string lands on the 404 below.
+        requested = (raw.strip() or DEFAULT_MEMORY_STORE) if isinstance(raw, str) else ""
+        if requested not in declared_store_names():
+            return "", web.json_response(
+                {
+                    "error": f"no memory store named {requested!r} is declared",
+                    "code": "unknown_memory_store",
+                },
+                status=404,
+            )
+        return named_store_or_empty(requested), (
+            memory_startup_refusal(requested, allow_failed=allow_failed) if require_ready else None
+        )
+    state: DashboardState = request.app["state"]
+    return await resolve_requested_memory_store(
+        request, state, operation, require_ready=require_ready, allow_failed=allow_failed
+    )
+
+
+def _store_unavailable(store: str) -> web.Response:
+    """The 503 every route returns for a store it cannot address.
+
+    One answer for both ways that happens — a vector tier that would not stand
+    up, and a name that does not resolve to its own file — because the caller's
+    remedy is the same and neither is a fact about the request.
+
+    Never a fall back to the global store: serving the operator's own memory
+    under a crew's name is invisible in the response, which is the one failure
+    the file boundary exists to prevent.
+    """
+    return web.json_response(
+        {
+            "error": f"the vector store for memory store {_store_name(store)!r} is unavailable",
+            "code": "store_unavailable",
+        },
+        status=503,
+    )
+
+
+async def vector_memory_for_store(state: DashboardState, store: str):
+    """The VECTOR tier for *store*, or ``None`` when a silo's cannot be stood up.
+
+    ``None`` is returned ONLY for a silo, and a caller must report it rather than
+    falling back to the global store: serving the operator's own memory under a
+    crew's name is the one failure the file boundary exists to prevent, and it is
+    invisible in the response.
+    """
+    from kiro_crew.memory_startup import require_memory_ready
+
+    require_memory_ready(store)
+    if not store:
+        from kiro_crew.dashboard.handlers.memory import _get_vector_store_async
+
+        return await _get_vector_store_async(state)
+    from kiro_crew.context import ContextBuilder
+
+    return await ContextBuilder.ensure_store(store)
