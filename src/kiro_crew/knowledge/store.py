@@ -6,19 +6,84 @@ import base64
 import json
 import logging
 import threading
-from collections import defaultdict
+import time
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-try:
-    import pysqlite3 as sqlite3
-except ImportError:
-    import sqlite3
-
 from kiro_crew.on_loop_db import STORE_STRICT_ENV, OnLoopDBGuard
 
-from .._sqlite_compat import fts5_cjk_match_groups, fts5_segment_for_index
+from .._sqlite_compat import fts5_cjk_match_groups, fts5_segment_for_index, sqlite3
+
+#: Test-only switch. ``False`` in production: every connection keeps SQLite's
+#: own thread-affinity guard (``check_same_thread=True``), so a caller that
+#: caches ``store.db`` and uses it from another thread is refused with
+#: ``ProgrammingError`` instead of racing the owner. ``test/conftest.py`` flips
+#: this to ``True`` once per session so ``_close_all_for_tests()`` can close the
+#: handles other (usually exited) threads opened -- the one operation the
+#: default guard refuses that a teardown needs, since an unclosed connection is
+#: a reference cycle on CPython 3.11+ and holds its descriptors until the
+#: cyclic collector runs. Only the ``test/`` testpath loads that conftest; the
+#: app test trees under ``src/kiro_crew/apps/builtins`` do not, so they never
+#: activate the flip themselves (a ``test/`` case run earlier in the same worker
+#: leaves it on). Nothing in production may set it.
+_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS = False
+
+
+class _ThreadAffineTestConnection(sqlite3.Connection):
+    """A test-mode connection that keeps the thread-affinity guard in Python.
+
+    Opened with ``check_same_thread=False`` so a teardown on another thread may
+    ``close()`` it, but every statement entry point the store uses --
+    ``cursor``, ``execute``, ``executemany``, ``executescript``, ``commit`` and
+    ``rollback`` -- refuses a thread that did not open it with the same
+    ``ProgrammingError`` SQLite raises in production, so the test suite still
+    catches a caller that caches ``store.db`` and uses it from a worker. The
+    connection-level paths the store never takes (``with conn:``, ``backup``,
+    ``iterdump``, ``blobopen``) and the methods of an already-created cursor are
+    NOT re-guarded. Only ever constructed under ``_ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS``.
+    """
+
+    _owner_ident: int = -1
+
+    def _check_owner(self) -> None:
+        current = threading.get_ident()
+        if current != self._owner_ident:
+            raise sqlite3.ProgrammingError(
+                "SQLite objects created in a thread can only be used in that same thread. "
+                f"The object was created in thread id {self._owner_ident} and this is "
+                f"thread id {current}."
+            )
+
+    def cursor(self, *args, **kwargs):  # type: ignore[override]
+        self._check_owner()
+        return super().cursor(*args, **kwargs)
+
+    def execute(self, *args, **kwargs):  # type: ignore[override]
+        self._check_owner()
+        return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):  # type: ignore[override]
+        self._check_owner()
+        return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):  # type: ignore[override]
+        self._check_owner()
+        return super().executescript(*args, **kwargs)
+
+    def commit(self):  # type: ignore[override]
+        self._check_owner()
+        return super().commit()
+
+    def rollback(self):  # type: ignore[override]
+        self._check_owner()
+        return super().rollback()
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +97,139 @@ logger = logging.getLogger(__name__)
 AUTO_ADDED_PROP = "auto_added"
 
 # Marker recording that a row Kiro Crew registered itself has been adopted by the
-# user, the feature that registered it no longer existing. Written by
+# user (the auto-registration feature that created such rows is gone). Written by
 # `retire_auto_registered_folder` when the scan funnel refuses such a row, and by the
 # confirm and resume endpoints when the user adopts one; its presence is what keeps a
 # later refusal from undoing that decision.
 AUTO_REGISTRATION_RETIRED_PROP = "auto_registration_retired"
+
+#: How long ``maintenance_window`` waits for in-flight ingestion to drain
+#: before giving the sweep up for this launch.
+MAINTENANCE_WAIT_SECS = 600.0
+
+
+class IngestionGate:
+    """Reader/writer gate between ingestion and store maintenance.
+
+    Ingestion writes a source in several autocommit steps -- the source row,
+    its ingestion job, its items, its entities and their mentions -- and the
+    orphan sweep's predicates read exactly those half-states as orphans: a
+    source without items, an entity without a mention. The sweep runs after the
+    listener is up, concurrently with requests, so the two need an ordering
+    that is not a clock: ``ingestion_in_flight()`` brackets one whole ingest
+    (many may hold it at once) and ``maintenance_window()`` waits until no
+    holder remains, then holds the sweep's turn, during which a NEW ingest
+    waits at its entry rather than starting under the sweep.
+
+    The wait is bounded. Ingestion that never drains inside ``timeout`` makes
+    the window yield ``False`` -- the caller skips its sweep and the next
+    launch retries -- rather than either side killing the other. While the
+    window is waiting, new ingestion is already held back, so a steady stream
+    of ingests cannot starve the sweep indefinitely; a single long ingest can,
+    and that is the bounded case.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._ingesting = 0
+        self._maintenance = False
+
+    @contextmanager
+    def ingestion_in_flight(self, *, admitted: bool = False) -> Iterator[None]:
+        """Hold the gate for one ingest.
+
+        *admitted* is for a hold handed on from a current holder to a task it
+        starts: the holder's own hold means no sweep is running, so the new
+        hold joins it without waiting for a maintenance window that may have
+        begun waiting in between -- waiting there would hold the parent's
+        release hostage to the window's timeout (the window waits for the
+        parent; the parent waits for this entry). An admitted hold still counts,
+        so the window keeps waiting for it like any other.
+        """
+        with self._cond:
+            while self._maintenance and not admitted:
+                self._cond.wait()
+            self._ingesting += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._ingesting -= 1
+                if self._ingesting == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS) -> Iterator[bool]:
+        """Yield ``True`` with the store quiescent, ``False`` if it never drained."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._maintenance:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._maintenance:
+                logger.warning(
+                    "Knowledge maintenance skipped: another maintenance window "
+                    "held for %.0fs", timeout)
+                yield False
+                return
+            self._maintenance = True
+            while self._ingesting > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cond.wait(remaining):
+                    break
+            if self._ingesting > 0:
+                self._maintenance = False
+                self._cond.notify_all()
+                logger.warning(
+                    "Knowledge maintenance skipped: %d ingestion(s) still in flight "
+                    "after %.0fs", self._ingesting, timeout)
+                yield False
+                return
+        try:
+            yield True
+        finally:
+            with self._cond:
+                self._maintenance = False
+                self._cond.notify_all()
+
+
+@dataclass(frozen=True)
+class SourceContentStats:
+    """One source's share of the admitted content.
+
+    ``source_id`` is None for the bucket holding items that belong to no source.
+    The store deliberately does not spell that bucket with the dashboard's
+    ``__none__`` wire sentinel: that string is a contract between the items API
+    and the SPA, and a third copy down here in the store would have to change
+    with them while nothing in SQLite needs it.
+    """
+
+    source_id: str | None
+    name: str
+    documents: int
+    items: int
+
+
+@dataclass(frozen=True)
+class ContentStats:
+    """Admitted knowledge content: totals plus the same numbers per source.
+
+    ``sources`` counts registered sources, so it excludes the sourceless bucket
+    that ``per_source`` may carry. Both totals reconcile against ``per_source``
+    exactly -- summing its ``items`` gives ``items`` and summing its
+    ``documents`` gives ``documents`` -- which is the property that makes these
+    numbers auditable, and the reason membership here is plain ownership
+    (``items.source_id``) rather than the ownership-OR-location rule
+    ``knowledge_list_sources`` uses to estimate what a scope would yield. Under
+    that rule an item surviving a cross-source dedup collapse counts for two
+    sources and the per-source numbers over-sum the totals.
+    """
+
+    sources: int
+    documents: int
+    items: int
+    per_source: tuple[SourceContentStats, ...]
 
 
 def is_auto_registered(props: dict) -> bool:
@@ -64,24 +257,41 @@ _WALKING_SOURCE_TYPES = ("local_folder", "obsidian_vault")
 
 # Every query in this module funnels through the ``db`` property, so one check
 # there covers every caller at any stack depth -- including the ones a lexical
-# ``async def`` scan cannot see, which is why this guard exists (#7078, the
-# interprocedural half of #3057).
+# ``async def`` scan cannot see, which is why this guard exists.
 #
 # Both narrowings below are temporary and exist for the same reason: this store
-# still has 85 recorded on-loop callers -- the whole of
-# ``.github/sync-io-in-async-baseline.txt``, all of it knowledge paths, owned by
-# the cleanup at #7019.
+# still has on-loop callers left -- the watcher's marked cancel-path finalize
+# (``# on-loop-io-ok`` in ``knowledge/watcher.py``; the lexical baseline in
+# ``.github/sync-io-in-async-baseline.txt`` is now empty, and a marker is an
+# exemption, not an offload) plus the interprocedural path below.
+#
+# ``dashboard/handlers/knowledge.py`` takes the store through a worker for every
+# take of its OWN, endpoints and background tasks alike. It is not the whole
+# story, so the claim is scoped deliberately: ``artifact_ingest.py``'s
+# ``ingest_artifact`` reads a job status through ``IngestionPipeline`` inline
+# from an async method, and ``reconcile_artifacts`` reaches it once per
+# artifact, so a caller still reaches the store on the loop ONE FRAME DOWN.
+# That path is interprocedural backlog, invisible to the lexical baseline, and
+# belongs with the offload of that read rather than with this file.
+#
+# Two takes stay inline, carried as ``# on-loop-io-ok`` markers, and the
+# lexical baseline is empty. The watcher's self-heal rebuild
+# finalizes its job row inline on its cancellation path, where an interrupted
+# ``to_thread`` could drop the write -- ``start_rebuild_job`` sweeps a stale
+# 'processing' row to 'abandoned', so the single-flight guard recovers either
+# way. And ``dashboard/state.py`` builds this store lazily, whose migrations run
+# under ``allow_on_loop()`` below.
 #
 # * ``strict_env=STORE_STRICT_ENV`` keeps this store off the SHARED
 #   ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch, which ``setup.py``'s ``test_e2e``
 #   and ``ci.yml`` already export into the e2e gateway for history's clean
-#   surface. On the shared flag, the on-loop ``/api/knowledge/stats`` and
-#   ``/api/knowledge/namespaces`` handlers would raise and 500 the e2e run.
+#   surface. On the shared flag, the watcher's finalize would raise inside the
+#   e2e gateway.
 # * ``dev_mode_arms_strict=False`` keeps a developer gateway from raising on that
 #   same backlog, which would report tracked work as a regression and push the
 #   developer to unset ``KIROCREW_DEV_MODE`` -- silencing history.py's guard too.
 #
-# When #7019 empties that baseline, delete both arguments and this store joins
+# When that baseline is empty, delete both arguments and this store joins
 # the shared switch.
 _ON_LOOP_DB_GUARD = OnLoopDBGuard(
     label="knowledge store",
@@ -165,6 +375,28 @@ def _validated_aliases(value: object) -> str:
     return text
 
 
+def _validated_embedding_sig(value: object) -> str | None:
+    """``items.embedding_sig``: an opaque signature string, or NULL.
+
+    Deliberately shape-only. The value's grammar belongs to its producer
+    (:func:`kiro_crew.knowledge.embedder.embed_signature`), and a signature this
+    store cannot recognise is safe in the only direction that matters: it fails
+    to equal the importing store's own signature, so ``_vector_search`` refuses
+    the vector instead of scoring it across spaces. What is NOT safe is a
+    non-string reaching the bind, which raises past the typed-error contract --
+    hence the guard here rather than at one HTTP path.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise KnowledgeBundleError("'items.embedding_sig' must be a non-empty string or null")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise KnowledgeBundleError("'items.embedding_sig' must be valid UTF-8 text") from None
+    return value
+
+
 def _without_sync_status(properties):
     """*properties* with any ``sync_status`` key removed.
 
@@ -202,6 +434,129 @@ def _without_sync_status(properties):
     if not isinstance(properties, dict) or "sync_status" not in properties:
         return properties
     return {k: v for k, v in properties.items() if k != "sync_status"}
+
+
+#: Tables whose row may be restored from a bundle. A state row is a claim that a LOCAL
+#: subsystem owns this document, and importing one makes that claim on the subsystem's
+#: behalf without its knowledge -- so wherever that subsystem REAPS BY ABSENCE, the row
+#: is not a stale marker but an order to delete the items the import just brought. Two
+#: of the three do reap, which is why only one is listed:
+#:
+#: * ``folder_file_state`` -- ``FolderWatcher._do_scan`` step 4 walks every state row and
+#:   deletes the ones whose path its walk did not yield, WITHOUT consulting ``status``.
+#:   What the walk yields depends on the MAPPED source's own live filters (extension
+#:   allowlist, ``min_file_bytes``, ``ignore_patterns``, ``confine_to_root``, and a root
+#:   ``.kiroignore`` re-read every sweep), so a receiving store that filters the same
+#:   folder more narrowly than the sender deletes the arriving documents.
+#: * ``artifact_item_state`` -- ``reconcile_artifacts`` runs on every
+#:   ``ArtifactKnowledgeSync.start``, takes ``known.keys() - live``, and removes each
+#:   provably absent slug's group. A bundle imported on a host whose artifact store does
+#:   not hold those slugs (any second machine, any restore) therefore loses them on the
+#:   next start. ``_known_kinds`` reads every row regardless of ``status``, so no status
+#:   value hides the row from that pass.
+#: * ``agent_item_state`` -- nothing reaps it. ``agent_source.remove_document`` runs only
+#:   when a caller explicitly deletes that document; there is no reconcile pass, no
+#:   inventory comparison, and no absence test anywhere on the agent path.
+#:
+#: A row left out costs its items their ownership, which is the state a bundle carrying
+#: no state tables already leaves them in, and the owning subsystem re-derives its row
+#: the next time it sees the document.
+_BUNDLE_STATE_RESTORED_TABLES = frozenset({"agent_item_state"})
+
+
+def _bundle_state_restores(table: str) -> bool:
+    """Whether a row of *table* may be restored onto this host."""
+    return table in _BUNDLE_STATE_RESTORED_TABLES
+
+
+def _bundle_state_text(field: str, value: object) -> str | None:
+    """A state row's text column, refused as a typed error if it cannot be bound.
+
+    ``isinstance(value, str)`` is not enough: a lone surrogate is a ``str`` that
+    SQLite cannot encode, and the ``UnicodeEncodeError`` it raises at bind time sits
+    outside every arm the import endpoint catches, so it surfaces as a 500 instead of
+    the malformed-bundle 400. Same gate the properties and signature columns use, for
+    the same reason -- these strings reach a bind too.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise KnowledgeBundleError(f"'{field}' must be a string or null")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise KnowledgeBundleError(f"'{field}' must be valid UTF-8 text") from None
+    return value
+
+
+# A group names a document's chunks, and each member is an item id: a uuid-shaped
+# string. Both halves are bounded because a cap on the COUNT bounds memory only when
+# every retained field is bounded too, and both refusals are visible -- a bundle
+# exceeding either is rejected by ``_bundle_group_bounds`` rather than trimmed here.
+_MAX_ITEM_GROUP_MEMBERS = 4096
+_MAX_ITEM_ID_CHARS = 128
+
+#: Conservative ceiling on bound parameters in one statement -- the same one
+#: :mod:`kiro_crew.vector_memory` keeps, for the same reason: sqlite's own limit is
+#: 32,766 on the bundled build but only 999 on a host still on a pre-3.32 library, and
+#: there is no cheap way to read it per runtime. Every ``IN`` list below whose length
+#: comes from a BUNDLE is chunked under it. A bundle names as many sources as it likes
+#: and one state row's group runs to ``_MAX_ITEM_GROUP_MEMBERS``, both past 999, and the
+#: failure is an ``OperationalError`` raised mid-transaction: the whole import rolls back
+#: and the endpoint answers 500 where it should have succeeded.
+_MAX_SQL_PARAMS = 400
+
+
+def _sql_param_chunks(
+    values: set[str] | list[str], reserve: int = 0
+) -> Iterator[tuple[str, ...]]:
+    """*values* in bind-sized tuples, one ``IN`` list each; empty input yields nothing.
+
+    *reserve* is how many binds that statement spends on its OWN fixed parameters -- a
+    ``WHERE source_id = ? AND id IN (...)`` reserves one -- so the whole statement, not
+    just the list, stays inside :data:`_MAX_SQL_PARAMS`.
+    """
+    width = max(1, _MAX_SQL_PARAMS - reserve)
+    ordered = list(values)
+    for start in range(0, len(ordered), width):
+        yield tuple(ordered[start:start + width])
+
+
+def _bundle_item_group(value: object) -> list[str]:
+    """A state row's ``item_ids`` as it arrives in a bundle, parsed to a list of ids.
+
+    A bundle is untrusted input, so anything that is not JSON text holding an array of
+    non-empty strings reads as no group at all, which drops the row rather than
+    committing ownership that cannot be checked. Duplicates collapse and order is
+    kept: the column stores the set of items one document owns, and a repeated id
+    would make the group's size disagree with the items behind it.
+
+    Only the TEXT shape is accepted, because that is the only shape any producer
+    emits: the column is TEXT holding JSON and an export ships it verbatim.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return []
+    try:
+        raw: object = json.loads(value)
+    except (ValueError, RecursionError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    group: list[str] = []
+    seen: set[str] = set()
+    for entry in raw:
+        # A set, because ``entry not in group`` on the growing list costs O(N^2) and
+        # this parser runs under BEGIN IMMEDIATE inside a worker thread: a bundle
+        # shipping one large unique array spins there holding the write lock.
+        if not isinstance(entry, str) or not entry or entry in seen:
+            continue
+        if len(entry) > _MAX_ITEM_ID_CHARS:
+            continue
+        group.append(entry)
+        seen.add(entry)
+        if len(group) >= _MAX_ITEM_GROUP_MEMBERS:
+            break
+    return group
 
 
 class _NodeView:
@@ -344,6 +699,33 @@ _DOC_STATE_KEY_COL: dict[str, str] = {
     "agent_item_state": "slug",
 }
 
+#: Public view of the per-document state tables a ``.knowledge`` bundle carries,
+#: mapped to the column that identifies one document inside each. Derived from the
+#: definition above so the dashboard's bundle validator and :meth:`import_bundle`
+#: read one list. A bundle that moves items WITHOUT these rows moves content the
+#: receiving store can never manage: nothing claims the items for de-duplication,
+#: the Sources UI has no per-document group label for them, and a later ingest of
+#: the same document adds a second copy instead of replacing the first.
+BUNDLE_STATE_KEY_COL: dict[str, str] = dict(_DOC_STATE_KEY_COL)
+
+#: Columns each state table carries through a bundle, beyond its source, its key
+#: and its item group. Everything else is either derived on import -- the live
+#: status, which the surviving group defines -- or local bookkeeping that does not
+#: travel: retry counters, error text, and the dedup winner a losing row points at
+#: all describe the EXPORTING store's own progress.
+_BUNDLE_STATE_CARRIED_COLS: dict[str, tuple[str, ...]] = {
+    "folder_file_state": ("content_hash", "text_hash", "last_seen"),
+    "artifact_item_state": ("content_hash", "updated_at", "name", "kind"),
+    "agent_item_state": ("content_hash", "updated_at", "name", "source_uri"),
+}
+
+#: Columns written to a fixed value instead of being carried.
+#:
+#: Carried columns that are NOT NULL in the schema. A bundle omitting one gets the
+#: import's own clock, so a row that otherwise qualifies is not refused over a
+#: missing timestamp.
+_BUNDLE_STATE_REQUIRED_COLS = frozenset({"last_seen", "updated_at"})
+
 # Which column on each state table holds a hash in the SAME DOMAIN as
 # ``items.content_hash``, for lookups that have to relate a state row to items.
 #
@@ -376,9 +758,17 @@ _OWNERSHIP_HASH_COL: dict[str, str] = {
 # ``text_hash`` and the row becomes correct for transformed documents too.
 
 
+#: Orphan sources deleted per writer transaction by :meth:`KnowledgeStore.reclaim_orphans`.
+_RECLAIM_CHUNK = 200
+
+
 class KnowledgeStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, read_only: bool = False):
         self._db_path = db_path
+        # A read-only store runs neither the schema DDL nor `_migrate()` and opens
+        # every connection with SQLite `mode=ro`, so a write is refused by the
+        # engine rather than by convention -- see `open_read_only`.
+        self._read_only = read_only
         # One connection PER THREAD. sqlite3 connections carry
         # thread affinity (check_same_thread=True by default), but callers
         # like HybridRetriever.search() run on worker threads via
@@ -389,6 +779,17 @@ class KnowledgeStore:
         # concurrent readers alongside a single writer, and busy_timeout
         # serializes rare cross-thread writes.
         self._thread_local = threading.local()
+        # Every connection this store has opened, on any thread, so `_close_all_for_tests()`
+        # can release them all. Without this a connection a worker thread opened had
+        # no close path at all: on CPython 3.11+ an unclosed `sqlite3.Connection`
+        # is a reference CYCLE (its statement cache is an `lru_cache` wrapping the
+        # connection itself), so dropping the store does not free the descriptor
+        # -- only the cyclic collector eventually does. `_generation` is bumped
+        # by `_close_all_for_tests()`; a thread whose cached connection predates it reopens
+        # lazily instead of touching a handle another thread closed.
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
+        self._generation = 0
         # The FTS index rebuild is deliberately NOT done here. This constructor
         # runs on the event-loop thread (see the note above), and a rebuild is
         # data-scaled, so doing it here would stall the gateway at boot for the
@@ -408,33 +809,98 @@ class KnowledgeStore:
         # known to be CJK-segmented, None while unknown. Never cached as False --
         # see `_fts_terms_segmented`.
         self._fts_segmented: bool | None = None
-        self.graph = SimpleDiGraph()
+        # The entity graph is materialised on first READ, not here -- see
+        # `ensure_graph_loaded`. `_graph` is the backing store for the `graph`
+        # property; nothing outside `_load_graph` and that property should touch
+        # it. RE-ENTRANT because both the first-touch accessor and `_load_graph`
+        # itself acquire it: the accessor holds it across the call so two readers
+        # cannot each start a scan, and `_load_graph` acquires it again so that
+        # EVERY rebuild -- including the six mutation-refresh call sites, which
+        # hold no lock of their own -- serializes against every other. A plain
+        # `Lock` would self-deadlock on that nesting.
+        self._graph = SimpleDiGraph()
+        self._graph_loaded = False
+        self._graph_lock = threading.RLock()
+        # Orders ingestion against the deferred orphan sweep -- see
+        # `IngestionGate`, `ingestion_in_flight` and `maintenance_window`.
+        self._ingestion_gate = IngestionGate()
         # This constructor runs on the event-loop thread by documented design
         # (see the thread-affinity note above). It is not an edge case:
         # `setup_knowledge_routes()` reads the gateway's lazy `knowledge_store`
         # property at route registration, which `start_dashboard` runs BEFORE
         # the socket binds, so construction happens on the loop on every
         # launch. The take is deliberate, so the on-loop guard -- which exists
-        # to police reader/writer query paths -- warned spuriously on every
-        # boot (#8231). Deliberate is not free, though: `_migrate()` runs an
-        # unconditional writer-locked orphan sweep and `_load_graph()`
-        # full-scans two tables, both data-scaled (only the FTS rebuild is
-        # deferred to the first off-loop reader). Moving that work off the
-        # boot path is #8329; suppressing the diagnostic for the sanctioned
-        # take is all this block does. The suppression ends with the block:
-        # the six non-constructor `_load_graph()` call sites and every query
-        # path stay fully guarded.
+        # to police reader/writer query paths -- would warn spuriously on every
+        # boot. Deliberate is not free, though, so neither data-scaled piece of
+        # construction sits on the boot path: `_load_graph()` is deferred to
+        # the first graph reader (`ensure_graph_loaded`), the same shape the
+        # FTS rebuild uses, and the writer-locked orphan sweep is
+        # `reclaim_orphans()`, kicked from a worker thread by `start_dashboard`
+        # once the listener is up. What remains here is the schema DDL and the
+        # per-column ALTERs, which are O(schema), not O(data).
+        # The suppression ends with the block: the six non-constructor
+        # `_load_graph()` call sites and every query path stay fully guarded.
+        if read_only:
+            return
         with _ON_LOOP_DB_GUARD.allow_on_loop():
             self._init_schema()
             self._migrate()
-            self._load_graph()
+
+    @classmethod
+    def open_read_only(cls, db_path: str) -> "KnowledgeStore":
+        """Open an EXISTING library for reading only: no DDL, no migration, no reap.
+
+        The constructor runs `_migrate()` on every open, and that sweep takes the
+        writer lock and deletes any itemless source row nothing references. That
+        is the right cost for a surface that goes on to write and the wrong one
+        for a verb documented as read-only -- `kirocrew knowledge stats` runs in
+        a fresh process, so it would re-run the sweep on every invocation. Here
+        the file is opened with SQLite `mode=ro`: nothing on this store can
+        write, because the engine refuses rather than a convention asking. The
+        trade is that a schema behind the code is reported, not repaired -- a
+        read that meets a missing table or column raises
+        `sqlite3.OperationalError`, and any migrating open (the gateway,
+        `kirocrew knowledge dedup --apply`) is the fix.
+        """
+        return cls(db_path, read_only=True)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Production keeps SQLite's thread-affinity guard and registers nothing:
+        # its connections are freed exactly as before (by refcount or the cyclic
+        # collector), so the registry pins no exited thread's handle. Under the
+        # test flag the native guard is relaxed -- which does NOT make the
+        # connection shared: `db` still hands every thread its own, and the
+        # `_ThreadAffineTestConnection` factory re-applies the guard in Python on
+        # every statement entry point the store uses (cursor/execute*/commit/
+        # rollback), leaving only `close()` cross-thread -- so `_close_all_for_tests()`,
+        # called from whichever thread tears the store down, can release the
+        # handles OTHER threads opened; the native check refuses that even for
+        # an exited thread.
+        test_mode = _ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS
+        connect_kwargs: dict = {"timeout": 30, "isolation_level": None}
+        if test_mode:
+            connect_kwargs.update(check_same_thread=False, factory=_ThreadAffineTestConnection)
+        if self._read_only:
+            # `as_uri()` percent-encodes the path, which is the escaping SQLite
+            # undoes when it parses a URI filename, so a path holding `?` or `#`
+            # cannot be read as the start of the query string. journal_mode is
+            # left alone: a read-only connection may not change it, and a WAL
+            # file is readable as-is.
+            uri = Path(self._db_path).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, **connect_kwargs)
+            if test_mode:
+                conn._owner_ident = threading.get_ident()
+        else:
+            conn = sqlite3.connect(self._db_path, **connect_kwargs)
+            if test_mode:
+                conn._owner_ident = threading.get_ident()
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
+        if test_mode:
+            with self._connections_lock:
+                self._connections.append(conn)
         return conn
 
     @property
@@ -442,9 +908,10 @@ class KnowledgeStore:
         """The calling thread's connection, created lazily on first use."""
         _ON_LOOP_DB_GUARD.check()
         conn = getattr(self._thread_local, "conn", None)
-        if conn is None:
+        if conn is None or getattr(self._thread_local, "gen", self._generation) != self._generation:
             conn = self._connect()
             self._thread_local.conn = conn
+            self._thread_local.gen = self._generation
         return conn
 
     def _init_schema(self):
@@ -596,7 +1063,10 @@ class KnowledgeStore:
             -- Same shape and role as artifact_item_state: it is what lets one
             -- aggregate source hold many independently-replaceable documents,
             -- and what gives de-duplication a per-document unit to act on
-            -- instead of the whole source.
+            -- instead of the whole source. source_uri is the document's own
+            -- REDACTED locator, kept so a search hit can cite the document it
+            -- came from rather than the aggregate's control uri (agent://);
+            -- NULL on rows written before the column existed.
             CREATE TABLE IF NOT EXISTS agent_item_state (
                 source_id TEXT NOT NULL REFERENCES sources(id),
                 slug TEXT NOT NULL,
@@ -606,6 +1076,7 @@ class KnowledgeStore:
                 name TEXT,
                 status TEXT DEFAULT 'active',
                 merged_into_source_id TEXT,
+                source_uri TEXT,
                 PRIMARY KEY (source_id, slug)
             );
 
@@ -649,14 +1120,21 @@ class KnowledgeStore:
         # source_locations predates being an identity table: pre-existing DBs have
         # neither the (item_id, source_id) uniqueness nor any index. De-duplicate
         # first so the unique index can be created, then add both lookup indexes.
-        self.db.execute("""
-            DELETE FROM source_locations WHERE id NOT IN (
-                SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
-            )
-        """)
-        self.db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
-            "ON source_locations(item_id, source_id)")
+        # The de-dup is a full GROUP BY over the table, so it is gated on the
+        # unique index NOT existing yet: once the index is in place duplicates
+        # are impossible, and the scan would run on every open for nothing.
+        has_unique = self.db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'index' "
+            "AND name = 'idx_source_locations_item_source'").fetchone()
+        if has_unique is None:
+            self.db.execute("""
+                DELETE FROM source_locations WHERE id NOT IN (
+                    SELECT MIN(id) FROM source_locations GROUP BY item_id, source_id
+                )
+            """)
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_locations_item_source "
+                "ON source_locations(item_id, source_id)")
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_source_locations_item_id "
             "ON source_locations(item_id)")
@@ -718,9 +1196,8 @@ class KnowledgeStore:
         #
         # Nothing in-tree can write that escaped form any more (`json.dumps`
         # never escapes ASCII, and `_without_sync_status` re-serializes on every
-        # insert and update), but `import_bundle` used to store a bundle's
-        # properties text verbatim, so a row imported before this change can
-        # still hold one.
+        # insert and update), but a row imported by an early `import_bundle` --
+        # which stored properties text verbatim -- can still hold one.
         blob_copies = self.db.execute(
             "SELECT id, properties, sync_status FROM sources").fetchall()
         for row in blob_copies:
@@ -811,6 +1288,72 @@ class KnowledgeStore:
         if "merged_into_source_id" not in agent_cols:
             self.db.execute(
                 "ALTER TABLE agent_item_state ADD COLUMN merged_into_source_id TEXT")
+        # The document's own REDACTED locator, attached to agent-source search
+        # hits so a citation names where the document came from instead of the
+        # aggregate's control uri. Legacy rows carry NULL, which citation
+        # enrichment treats as "unknown" and falls back to agent://; the next
+        # add of that document backfills it.
+        if "source_uri" not in agent_cols:
+            self.db.execute(
+                "ALTER TABLE agent_item_state ADD COLUMN source_uri TEXT")
+        # The orphan sweep is NOT here any more -- see `reclaim_orphans`. The
+        # constructor runs on the event loop before the socket binds, and the
+        # sweep is data-scaled and writer-locked, so on a large store it
+        # stalled boot long enough for runtime timeouts to kill the gateway.
+        # `start_dashboard` kicks it from a worker thread once the listener is
+        # up (`_kick_knowledge_orphan_reclaim`).
+
+    def ingestion_in_flight(self, *, admitted: bool = False):
+        """Bracket one whole ingest so the deferred sweep never sees it half-written.
+
+        Held from the source row through the last mention commit; entering
+        waits while :meth:`maintenance_window` holds the sweep's turn.
+        """
+        return self._ingestion_gate.ingestion_in_flight(admitted=admitted)
+
+    def maintenance_window(self, timeout: float = MAINTENANCE_WAIT_SECS):
+        """Wait for ingestion to drain, then hold new ingestion off for the body.
+
+        Yields ``True`` once the store is quiescent; ``False`` -- logged -- when
+        ingestion does not drain within ``timeout``, in which case the caller
+        skips its sweep. See :class:`IngestionGate`.
+        """
+        return self._ingestion_gate.maintenance_window(timeout)
+
+    def reclaim_orphans(self) -> None:
+        """Delete orphan sources, entities and stale relations -- off the boot path.
+
+        Formerly the tail of :meth:`_migrate`, so it ran inside ``__init__`` on
+        the event-loop thread on every launch, before the socket bound. The
+        body is data-scaled (every predicate is a full scan over ``sources``,
+        ``items`` and the state tables) and takes SQLite's writer lock, so a
+        large knowledge store stalled the gateway for long enough to trip the
+        runtime's boot timeouts. ``start_dashboard`` now runs this from a
+        worker thread AFTER the listener is accepting, via
+        ``_kick_knowledge_orphan_reclaim``; the store is readable throughout
+        (WAL readers do not wait on the writer).
+
+        Running after the listener is up means a request can be ingesting
+        concurrently: :meth:`add_source` commits the source row on its own, and
+        the rows that protect it from the orphan predicate (its ingestion job,
+        its items, its entities' mentions) are written by the caller's pipeline
+        some time later. A sweep observing that half state would delete a
+        source the user just added. The deferred worker therefore runs this
+        inside :meth:`maintenance_window`, which waits for every
+        :meth:`ingestion_in_flight` holder to finish and holds new ingestion
+        off for the duration; this method itself sweeps every row it finds.
+
+        A caller that looks up an existing source and ingests into it later
+        holds ``pipeline.ingestion_in_flight()`` across the whole span, so the
+        sweep waits for it rather than racing it.
+
+        Thread-safe by the same rules as every other write path: the calling
+        thread gets its own connection through :attr:`db`, and the sweep runs
+        as a series of short ``BEGIN IMMEDIATE`` transactions (see the body). Because it may now run after a reader
+        has materialised the graph, it refreshes the in-memory graph when one is
+        loaded -- the constructor-time sweep never had to, since it always ran
+        before the first load.
+        """
         # Clean orphan sources (no items), entities (no mentions/relations), and stale relations
         #
         # Folder sources are EXCLUDED: a watched folder with zero discovered
@@ -818,31 +1361,73 @@ class KnowledgeStore:
         # user-set state -- notably a paused empty folder would be dropped on
         # restart and then re-created as active by auto-discovery, silently
         # un-pausing it. The row is user-registered configuration, not derived
-        # data, so only its items are reclaimable.
+        # data, so only its items are reclaimable. The agent-document and
+        # artifact aggregate sources are containers of the same kind: each is
+        # created empty ('active', no items, no state rows) the moment its
+        # feature first needs it and filled by a later write, so an empty one
+        # is a feature waiting for its first document, not garbage.
+        orphan_pred = (
+            "id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
+            "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip', 'agent', 'artifact') "
+            "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
+            # Only a source whose ingest has run to an end state is reclaimable.
+            # Every other status is a claim on the row: 'pending' (the column
+            # default a fresh add_source row carries until its background ingest
+            # writes its gate holder and job row), 'pending_confirmation',
+            # 'syncing', 'active' (a producible initial status for a source a
+            # feature fills later) and 'paused' (user-set) all mean somebody
+            # still intends to write under it. The allowlist is written by the
+            # row's own INSERT or by the ingest that finished, so there is no
+            # window in which a live source reads as an orphan.
+            "AND COALESCE(sync_status, '') IN ('synced', 'error', 'missing') "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
+            "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
+            # A source can hold documents it does not OWN: after a duplicate
+            # collapse it is a location of the surviving copy. Reaping it here
+            # would delete the very rows that record co-ownership, on every
+            # gateway start, and the document would stop being reachable from it.
+            "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
+        )
+        # The candidate list is read outside any transaction, and the deletes run
+        # in chunks of short BEGIN IMMEDIATE transactions that re-check the
+        # predicate under the lock. A knowledge write issued on the event loop
+        # while the sweep runs waits for at most one chunk instead of the whole
+        # data-scaled sweep, so the post-bind sweep cannot stall the loop for
+        # the duration the pre-bind one did.
+        orphan_ids = [
+            row[0] for row in self.db.execute(f"SELECT id FROM sources WHERE {orphan_pred}").fetchall()
+        ]
+        for offset in range(0, len(orphan_ids), _RECLAIM_CHUNK):
+            chunk = orphan_ids[offset : offset + _RECLAIM_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            still_orphan = f"SELECT id FROM sources WHERE id IN ({marks}) AND {orphan_pred}"
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({still_orphan})", chunk)
+                self.db.execute(f"DELETE FROM sources WHERE id IN ({still_orphan})", chunk)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            orphan_sources_q = (
-                "SELECT id FROM sources WHERE id NOT IN (SELECT DISTINCT source_id FROM items WHERE source_id IS NOT NULL) "
-                "AND source_type NOT IN ('local_folder', 'obsidian_vault', 'quip') "
-                "AND id NOT IN (SELECT source_id FROM ingestion_jobs WHERE status IN ('pending', 'processing')) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM folder_file_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM artifact_item_state) "
-                "AND id NOT IN (SELECT DISTINCT source_id FROM agent_item_state) "
-                # A source can hold documents it does not OWN: after a duplicate
-                # collapse it is a location of the surviving copy. Reaping it here
-                # would delete the very rows that record co-ownership, on every
-                # gateway start, and the document would stop being reachable from it.
-                "AND id NOT IN (SELECT DISTINCT source_id FROM source_locations)"
-            )
-            self.db.execute(f"DELETE FROM source_locations WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM ingestion_jobs WHERE source_id IN ({orphan_sources_q})")
-            self.db.execute(f"DELETE FROM sources WHERE id IN ({orphan_sources_q})")
             self.db.execute("DELETE FROM entity_relations WHERE source_id NOT IN (SELECT id FROM entities) OR target_id NOT IN (SELECT id FROM entities)")
             self._prune_orphan_entities()
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        # Only a graph somebody already materialised can be holding the entities
+        # just dropped; an unloaded one is built fresh by its first reader. The
+        # flag is read under ``_graph_lock`` so a first load racing this sweep
+        # cannot slip between the check and the refresh: a load that holds the
+        # lock finishes first and then reads as loaded (so it is refreshed), and
+        # a load that arrives later reads the tables after the prune committed.
+        with self._graph_lock:
+            if self._graph_loaded:
+                self._load_graph()
 
     def _prune_orphan_entities(self) -> None:
         """Delete entities nothing references any more -- no mention, no relation.
@@ -885,13 +1470,115 @@ class KnowledgeStore:
         row = self.db.execute(sql + " LIMIT 1", tuple(params)).fetchone()
         return dict(row) if row else None
 
+    @property
+    def graph(self) -> SimpleDiGraph:
+        """The entity graph, materialised on first access.
+
+        A backstop, not the intended entry point. Every reader that can run on
+        the event loop should call :meth:`ensure_graph_loaded` from a worker
+        thread first; this property exists so that a caller nobody found is
+        served a CORRECT graph -- and flagged by the on-loop guard if it is on
+        the loop -- rather than a silently empty one. An empty graph returned to
+        a reader is indistinguishable from "this entity has no neighbours",
+        which is the failure mode worth paying a stall to avoid.
+        """
+        self.ensure_graph_loaded()
+        return self._graph
+
+    def ensure_graph_loaded(self) -> None:
+        """Materialise the entity graph if no reader has done so yet.
+
+        Called by each graph reader before it touches :attr:`graph` --
+        ``get_entity_graph`` and ``get_full_graph`` in the dashboard handlers --
+        from a worker thread via ``asyncio.to_thread``. Deliberately NOT called
+        from ``__init__``, for the reason ``ensure_fts_index_current`` gives
+        about itself: the constructor runs on the event-loop thread and this
+        work is proportional to ``entities`` + ``entity_relations``, so doing it
+        there stalls the gateway before the socket binds.
+
+        **The offload is load-bearing, not hygiene.** Both handlers are
+        ``async def`` and read the graph on the loop, where the loop-stall
+        watchdog IS armed (it is started after the bind). Reaching this lazily
+        from the loop would move a data-scaled read out of the pre-bind window,
+        where nothing is armed and nothing is served, into the one window where
+        a stall can hard-exit the gateway. ``allow_on_loop()`` is not an option
+        here either -- its own contract restricts it to constructor-shaped setup
+        paths and directs production code to offload.
+
+        Steady state is a single boolean check. The first caller takes the lock
+        and does the work; concurrent readers wait rather than each starting
+        their own scan. The lock is re-entrant and :meth:`_load_graph` takes it
+        again, so a mutation refresh cannot interleave with this load -- see that
+        method for why serializing every rebuild is the property that matters.
+        """
+        if self._graph_loaded:
+            return
+        with self._graph_lock:
+            if self._graph_loaded:
+                return
+            self._load_graph()
+
     def _load_graph(self):
-        self.graph.clear()
-        for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
-            self.graph.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
-        for row in self.db.execute("SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"):
-            self.graph.add_edge(row["source_id"], row["target_id"],
-                                id=row["id"], relation_type=row["relation_type"], weight=row["weight"])
+        """Rebuild the in-memory graph from the tables, atomically.
+
+        Takes ``_graph_lock`` around the WHOLE rebuild, not just the first one.
+        Holding it only at the first-touch call site was not enough: the six
+        mutation-refresh sites acquire no lock of their own, so a first graph GET
+        racing a source DELETE put two threads through the rebuild at once, and
+        the loser's rows survived into a graph whose ``_graph_loaded`` was then
+        set True -- a flag asserting "loaded" over data that is wrong, which is
+        worse than an unloaded graph because it never gets rescanned.
+
+        Serializing the whole rebuild also fixes WHICH snapshot wins: the SELECTs
+        below run after acquisition, so the rebuild that acquires last reads the
+        freshest committed state rather than replaying rows it captured earlier.
+
+        **Build a fresh graph, then publish it with one reference assignment.**
+        Clearing the live ``self._graph`` and re-adding row
+        by row would be stale-publish-safe under serialization but leave the object a
+        reader could be iterating momentarily empty: a reader holding
+        ``self._graph`` between the ``clear()`` and the last insert would see a torn
+        (empty or truncated) graph, and a multi-step reader that re-read
+        ``self.graph`` across its own steps -- degree ranking, then per-node
+        attribute reads -- could miss a node that ``clear()`` had just removed.
+        Building into a NEW ``SimpleDiGraph`` and swapping the reference
+        under the lock closes that window: the old object is never mutated, so a
+        reader holding it sees a complete, consistent OLD graph until it drops the
+        reference, and the next read sees the complete NEW one. The multi-step
+        readers pin one reference for the duration of their read (see
+        ``get_entity_subgraph`` / ``get_neighbors`` and the graph handlers) so a
+        swap mid-read cannot mix old and new nodes.
+
+        The lock is only ever taken here and in :meth:`ensure_graph_loaded`, and
+        this method never takes SQLite's writer lock -- it is read-only, and all
+        six refresh sites call it after their own COMMIT -- so there is no
+        ordering against ``BEGIN IMMEDIATE`` to invert. (That is the hazard the
+        ``_fts_lock`` comment warns about, and it does not apply here: the FTS
+        rebuild acquires its lock and THEN a writer lock.)
+        """
+        with self._graph_lock:
+            rebuilt = SimpleDiGraph()
+            for row in self.db.execute("SELECT id, name, entity_type FROM entities"):
+                rebuilt.add_node(row["id"], name=row["name"], entity_type=row["entity_type"])
+            for row in self.db.execute(
+                "SELECT id, source_id, target_id, relation_type, weight FROM entity_relations"
+            ):
+                rebuilt.add_edge(
+                    row["source_id"],
+                    row["target_id"],
+                    id=row["id"],
+                    relation_type=row["relation_type"],
+                    weight=row["weight"],
+                )
+            # Single-reference publish. A reader that captured the previous
+            # ``self._graph`` keeps iterating that complete object; readers after
+            # this point see ``rebuilt``. Neither ever observes a half-built graph.
+            self._graph = rebuilt
+            # Truthful bookkeeping for the refresh call sites too: after any
+            # rebuild the graph IS materialised, so a later first-touch must not
+            # scan again. Set inside the lock, so no reader can observe the flag
+            # True over a half-rebuilt graph.
+            self._graph_loaded = True
 
     def add_item(self, title, content, item_type, source_id=None, chunk_index=0,
                  summary=None, tags=None, embedding=None, namespace="default",
@@ -935,17 +1622,25 @@ class KnowledgeStore:
         safe = {k: v for k, v in fields.items() if k in self._ITEM_COLUMNS}
         if not safe:
             return
-        # Read old FTS values BEFORE the update
-        fts_fields = {"title", "content", "tags"} & set(fields)
-        old_row = None
-        if fts_fields:
-            old_row = self.db.execute(
-                "SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)
-            ).fetchone()
         cols = ", ".join(f"{k} = ?" for k in safe)
         vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in safe.values()]
+        fts_fields = {"title", "content", "tags"} & set(fields)
+        # The write lock comes first, BEFORE the old-row read, because the FTS
+        # delete is built from what that read returns. Two concurrent PATCHes of
+        # one item would otherwise both read the same old title, and the loser
+        # would unindex terms the winner had already replaced -- leaving the item
+        # searchable under a superseded title, with nothing that repairs it
+        # (``ensure_fts_index_current`` re-indexes on a term-representation
+        # version bump, never on content staleness). Holding the lock across the
+        # read costs one indexed lookup by id, and it is the shape
+        # ``merge_source_properties`` documents for the same reason.
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            old_row = None
+            if fts_fields:
+                old_row = self.db.execute(
+                    "SELECT rowid, title, content, tags FROM items WHERE id = ?", (item_id,)
+                ).fetchone()
             self.db.execute(f"UPDATE items SET {cols} WHERE id = ?", (*vals, item_id))  # noqa: S608
             # Sync FTS: delete with OLD values, insert with NEW values
             if old_row:
@@ -994,7 +1689,7 @@ class KnowledgeStore:
         Matched on ``content_hash`` because that is what identifies the document
         independently of which source holds it. Appends rather than replaces, so a
         multi-item group (a chunked file) is not truncated to one, and clears any
-        deferral marker: a row that owns an item is no longer deferring to anyone.
+        deferral marker: a row that owns an item is not deferring to anyone.
 
         A hash is only an identifier while it picks out ONE row. Two distinct
         documents in one source may legitimately hold identical text, and writing the
@@ -1037,14 +1732,14 @@ class KnowledgeStore:
                 (json.dumps(ids), healthy, st["rowid"]))
 
     def detach_source_location_by_hash(self, source_id: str, content_hash: str) -> int:
-        """Drop this source's CLAIM on a document it no longer has a copy of.
+        """Drop this source's CLAIM on a document it has no copy of.
 
         The counterpart to :meth:`_adopt_reassigned_item`. A source that lost a dedup
         holds no items for that document -- its state row is 'deduped' with an empty
         group -- yet it IS still a location of the winner's items, which is what keeps
         the document reachable if the winner goes away. When the losing copy is
         genuinely removed (its file deleted from that folder), the claim has to go too,
-        or the source stays a candidate to inherit a document it no longer has and the
+        or the source stays a candidate to inherit a document it does not have and the
         content resurfaces there as searchable text with no file behind it.
 
         Identified by ``content_hash`` because that is the only handle such a row has:
@@ -1085,7 +1780,7 @@ class KnowledgeStore:
     def release_stale_claim(self, source_id: str, prev_hash: str | None,
                             new_hash: str, prev_item_ids: list[str],
                             prev_text_hash: str | None = None) -> int:
-        """Release a claim made for content this source no longer has.
+        """Release a claim made for content this source does not have.
 
         A source that lost a dedup owns no items but IS a location of the winner's,
         and that claim is specific to the content it was made for. When the source's
@@ -1233,10 +1928,8 @@ class KnowledgeStore:
     def delete_source_cascade(self, source_id):
         """Delete a source and all its items in a single transaction (batch SQL).
 
-        No tombstone is written. One used to be, so a recurring discovery sweep could
-        not re-create the auto source a user had just deleted; with both discovery
-        loops removed nothing re-creates a source behind the user, so recording the
-        deletion would be a write nothing reads. The ``dismissed_auto_sources`` table
+        No tombstone is written. Nothing re-creates a source behind the user, so
+        recording the deletion would be a write nothing reads. The ``dismissed_auto_sources`` table
         is left in place unused rather than dropped, so no schema migration rides
         along with a feature removal.
         """
@@ -1450,6 +2143,100 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             self.db.execute("ROLLBACK")
             raise
 
+    def merge_source_properties(self, source_id: str, *, set_keys: dict | None = None,
+                                remove_keys: tuple[str, ...] = (),
+                                sync_status: str | None = None,
+                                last_synced: str | None = None) -> dict | None:
+        """Apply a key delta to one source's ``properties``, in ONE write-locked take.
+
+        Returns the properties as persisted, or None when the row is gone.
+
+        The delta is fixed up front; a caller whose new blob depends on what the
+        row reads (a counter increment) uses :meth:`revise_source_properties`,
+        which this is the fixed-delta form of. The transaction shape and its
+        reasons are documented there.
+        """
+        def revise(props: dict) -> str | None:
+            for key in remove_keys:
+                props.pop(key, None)
+            props.update(set_keys or {})
+            return sync_status
+
+        return self.revise_source_properties(source_id, revise, last_synced=last_synced)
+
+    def revise_source_properties(self, source_id: str,
+                                 revise: Callable[[dict], str | None], *,
+                                 last_synced: str | None = None) -> dict | None:
+        """Rewrite one source's ``properties`` from its CURRENT blob, in ONE
+        write-locked take.
+
+        *revise* is called with the row's parsed properties under the write lock
+        and mutates them in place; it returns the ``sync_status`` to stamp on
+        the COLUMN, or None to leave the column alone. *last_synced*, when
+        given, lands in the same statement. Returns the properties as
+        persisted, or None when the row is gone.
+
+        ``properties`` is a whole-column rewrite, so a read-modify-write split
+        across two statements loses a concurrent writer's change: whoever writes
+        last replaces the other's blob wholesale. Every same-row writer that
+        derives its blob from a read -- the dashboard's pause/resume, the
+        watcher's scan stamps, the sync scheduler's outcome counter and the
+        ingest finalize's content-hash stamp -- comes through here, so the
+        database serializes them against each other: the write lock is taken
+        BEFORE the read (``BEGIN IMMEDIATE``, the shape
+        :meth:`retire_auto_registered_folder` uses), so no other writer can land
+        between this read and this write, and the UPDATE is guarded with the
+        blob it read (``WHERE properties = ?``, the shape
+        :meth:`_retire_one_in_txn` uses). Under the lock that guard cannot fail,
+        which is the point: it states the invariant in SQL, so a future caller
+        that drops the transaction gets a no-op rather than a silent overwrite.
+        A writer that works from a snapshot it took earlier and rewrites the
+        whole blob would resurrect that snapshot over everything committed since
+        -- which is why the finalize stamps a delta here instead.
+
+        A failed ``BEGIN IMMEDIATE`` is NOT swallowed here, unlike in
+        :meth:`retire_auto_registered_folder`: that sweep gets another pass, a
+        request does not, so a lock timeout has to reach the caller instead of
+        being reported as a missing row.
+
+        ``sync_status`` is written to the COLUMN and stripped from the blob by
+        ``_without_sync_status``, for the reason that helper documents.
+
+        Synchronous and takes the write lock, so an event-loop caller hands it to
+        ``asyncio.to_thread``.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute(
+                "SELECT properties FROM sources WHERE id = ?", (source_id,)).fetchone()
+            if row is None:
+                self.db.execute("COMMIT")
+                return None
+            try:
+                props = json.loads(row["properties"] or "{}")
+            except (ValueError, TypeError, RecursionError):
+                props = {}
+            if not isinstance(props, dict):
+                props = {}
+            sync_status = revise(props)
+            text = _without_sync_status(json.dumps(props))
+            sets = ["properties = ?", "updated_at = ?"]
+            params: list = [text, datetime.now().isoformat()]
+            if sync_status is not None:
+                sets.append("sync_status = ?")
+                params.append(sync_status)
+            if last_synced is not None:
+                sets.append("last_synced = ?")
+                params.append(last_synced)
+            cur = self.db.execute(
+                f"UPDATE sources SET {', '.join(sets)} WHERE id = ? AND properties = ?",  # noqa: S608
+                (*params, source_id, row["properties"]))
+            self.db.execute("COMMIT")
+            return props if cur.rowcount > 0 else None
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+
     def _migrate_fts_index(self) -> None:
         """Re-index ``items_fts`` when its stored term representation is stale.
 
@@ -1619,8 +2406,18 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "INSERT INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (eid, name, entity_type, description, json.dumps(aliases or []), now, now))
-        self.graph.add_node(eid, name=name, entity_type=entity_type)
-        self.db.commit()
+        # Hold ``_graph_lock`` across BOTH the commit and the in-memory add, as one
+        # critical section. ``_load_graph`` -- which every delete / merge /
+        # import path runs after its own COMMIT -- takes this same lock for its whole
+        # rebuild-and-swap, so serializing commit+add here means a concurrent rebuild
+        # can never land BETWEEN this commit and this add. Without that, a source
+        # deletion that removes this entity's rows could rebuild and swap in the
+        # window, and this late add would re-inject the deleted entity into the
+        # published graph when SQLite has already dropped it. Whichever of the two paths
+        # acquires last leaves the in-memory graph agreeing with the committed rows.
+        with self._graph_lock:
+            self.db.commit()
+            self._graph.add_node(eid, name=name, entity_type=entity_type)
         return eid
 
     def find_entity(self, name):
@@ -1660,8 +2457,13 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "INSERT INTO entity_relations (id, source_id, target_id, relation_type, description, weight, source_item_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (rid, source_id, target_id, relation_type, description, weight, source_item_id, now))
-        self.graph.add_edge(source_id, target_id, id=rid, relation_type=relation_type, weight=weight)
-        self.db.commit()
+        # Hold ``_graph_lock`` across commit + add, one critical section -- see
+        # add_entity. This closes the delete-then-restore race: a source deletion
+        # whose rebuild+swap would otherwise land between this commit and this add
+        # cannot interleave, so this edge is never re-injected after its row is gone.
+        with self._graph_lock:
+            self.db.commit()
+            self._graph.add_edge(source_id, target_id, id=rid, relation_type=relation_type, weight=weight)
         return rid
 
     def add_mention(self, item_id, entity_id, context=None):
@@ -1821,15 +2623,21 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                         (new_source_id, item_id))
 
     def get_neighbors(self, entity_id, depth=1) -> list:
+        # Pin one graph reference for the whole traversal. ``_load_graph``
+        # publishes a rebuilt graph by swapping ``self._graph``, so
+        # re-reading ``self.graph`` at each step could mix an old and a new graph
+        # across the successor/predecessor walk and the per-node attribute reads.
+        # Capturing it once means this read sees a single consistent snapshot.
+        graph = self.graph
         visited = set()
         frontier = {entity_id}
         for _ in range(depth):
             next_frontier = set()
             for nid in frontier:
-                for neighbor in self.graph.successors(nid):
+                for neighbor in graph.successors(nid):
                     if neighbor not in visited and neighbor != entity_id:
                         next_frontier.add(neighbor)
-                for neighbor in self.graph.predecessors(nid):
+                for neighbor in graph.predecessors(nid):
                     if neighbor not in visited and neighbor != entity_id:
                         next_frontier.add(neighbor)
             visited |= frontier
@@ -1838,32 +2646,120 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
         visited.discard(entity_id)
         result = []
         for nid in visited:
-            data = self.graph.nodes.get(nid, {})
+            data = graph.nodes.get(nid, {})
             result.append({"id": nid, "name": data.get("name"), "entity_type": data.get("entity_type")})
         return result
 
-    def get_entity_subgraph(self, entity_id, depth=2) -> dict:
+    def get_entity_subgraph(self, entity_id, depth=2) -> dict | None:
+        """The D3-shaped subgraph around ``entity_id``, or ``None`` if absent.
+
+        Pins ONE graph reference for the whole read and does the existence check
+        against it, so the check and the traversal see the same snapshot -- a
+        rebuild swapping in a fresh graph between them cannot let an entity pass
+        the check on the old graph and be walked on the new one, returning a
+        degenerate ``name: None`` subgraph instead of ``None``. The
+        ``get_entity_graph`` handler relies on this ``None`` to answer 404.
+        """
+        graph = self.graph
+        if not graph.has_node(entity_id):
+            return None
         visited = set()
         frontier = {entity_id}
         for _ in range(depth):
             next_frontier = set()
             for nid in frontier:
-                for neighbor in self.graph.successors(nid):
+                for neighbor in graph.successors(nid):
                     next_frontier.add(neighbor)
-                for neighbor in self.graph.predecessors(nid):
+                for neighbor in graph.predecessors(nid):
                     next_frontier.add(neighbor)
             visited |= frontier
             frontier = next_frontier - visited
         visited |= frontier
         nodes = []
         for nid in visited:
-            data = self.graph.nodes.get(nid, {})
+            data = graph.nodes.get(nid, {})
             nodes.append({"id": nid, "name": data.get("name"), "type": data.get("entity_type")})
         edges = []
-        for u, v, data in self.graph.edges(data=True):
+        for u, v, data in graph.edges(data=True):
             if u in visited and v in visited:
                 edges.append({"source": u, "target": v, "type": data.get("relation_type"), "weight": data.get("weight")})
         return {"nodes": nodes, "edges": edges}
+
+    def aggregate_stats(self) -> ContentStats:
+        """Admitted content, totalled and broken down by source.
+
+        Distinct from ``get_stats``, which reports raw table cardinality for the
+        dashboard overview: this counts ACTIVE items only, because a superseded
+        or deduped copy is not content the library will serve, and it resolves
+        the two units a reader conflates otherwise. An ``items`` row IS a chunk
+        -- the unit ``knowledge_list_sources`` and ``/source-counts`` already
+        call an item -- and every chunk of one document carries that document's
+        whole-text ``content_hash``, so ``(source_id, content_hash)`` is the
+        document identity, the same one ``dedup`` groups on. An item written
+        without a content hash is therefore counted in ``items`` and belongs to
+        no document.
+
+        Read-only: no write, no repair, no rebuild. A caller that finds the
+        numbers wrong has a diagnosis, not a fix.
+        """
+        totals = self.db.execute(
+            "SELECT COUNT(*) AS items, "
+            "COUNT(DISTINCT CASE WHEN content_hash IS NOT NULL AND content_hash != '' "
+            "  THEN COALESCE(source_id, '') || char(31) || content_hash END) AS documents "
+            "FROM items WHERE status = 'active'"
+        ).fetchone()
+        # char(31) is a unit separator: concatenating the two keys raw would let
+        # a source id ending in a hash prefix collide with its neighbour.
+        by_source = {
+            row["sid"]: row
+            for row in self.db.execute(
+                "SELECT COALESCE(source_id, '') AS sid, COUNT(*) AS items, "
+                "COUNT(DISTINCT CASE WHEN content_hash IS NOT NULL AND content_hash != '' "
+                "  THEN content_hash END) AS documents "
+                "FROM items WHERE status = 'active' GROUP BY sid"
+            ).fetchall()
+        }
+        per_source: list[SourceContentStats] = []
+        source_rows = self.db.execute("SELECT id, name FROM sources ORDER BY name").fetchall()
+        for src in source_rows:
+            counted = by_source.get(src["id"])
+            per_source.append(
+                SourceContentStats(
+                    source_id=src["id"],
+                    name=src["name"],
+                    documents=int(counted["documents"]) if counted else 0,
+                    items=int(counted["items"]) if counted else 0,
+                )
+            )
+        # Every registered source is listed even at zero, so a source that
+        # ingested nothing is visible rather than absent. The sourceless bucket
+        # is the opposite: it is not a registered row, so it appears only when it
+        # holds something. It holds every active item no registered source owns:
+        # the NULL-source rows, and any row whose source_id names a source that no
+        # longer exists. `items.source_id REFERENCES sources(id)` keeps the second
+        # kind out of anything this store writes, but a database written before
+        # the foreign key was enforced can still hold one, and a row counted in
+        # `items` that appeared on no line would break the reconciliation this
+        # breakdown promises. A document is identified by (source_id,
+        # content_hash), so summing the per-source_id document counts is exact.
+        registered = {src["id"] for src in source_rows}
+        unowned = [row for sid, row in by_source.items() if sid not in registered]
+        unowned_items = sum(int(row["items"]) for row in unowned)
+        if unowned_items > 0:
+            per_source.append(
+                SourceContentStats(
+                    source_id=None,
+                    name="(no source)",
+                    documents=sum(int(row["documents"]) for row in unowned),
+                    items=unowned_items,
+                )
+            )
+        return ContentStats(
+            sources=len(source_rows),
+            documents=int(totals["documents"]) if totals else 0,
+            items=int(totals["items"]) if totals else 0,
+            per_source=tuple(per_source),
+        )
 
     def get_stats(self) -> dict:
         return {
@@ -1947,6 +2843,35 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             relations = [dict(r) for r in self.db.execute("SELECT * FROM entity_relations")]
             source_locations = [dict(r) for r in self.db.execute("SELECT * FROM source_locations")]
             mentions = [dict(r) for r in self.db.execute("SELECT * FROM mentions")]
+        # Ownership a bundle cannot back is worse than shipping none: the accepting pass
+        # keeps only the ids the import wrote, so an id this export does not carry is
+        # named on every restore in the account of what arrived owned by nothing, and the
+        # group it reaches the other side in is one id short of what the row claims.
+        # Deleting one chunk of a document leaves exactly that shape -- no delete path
+        # prunes a state row's group, by design -- so the routine case would report
+        # content as unowned that nothing is actually missing. Pruned to the items
+        # actually carried, and to the ones filed under the row's own source, which is
+        # the same pair the accepting pass checks.
+        exported_owner: dict[str, object] = {
+            row["id"]: row.get("source_id") for row in items
+            if isinstance(row, dict) and isinstance(row.get("id"), str)}
+        state_tables: dict[str, list[dict]] = {}
+        for table in BUNDLE_STATE_KEY_COL:
+            rows = [dict(r) for r in self.db.execute(
+                f"SELECT * FROM {table}")]  # noqa: S608 -- table from a module constant
+            kept: list[dict] = []
+            for row in rows:
+                group = [item for item in _bundle_item_group(row.get("item_ids"))
+                         if exported_owner.get(item) == row.get("source_id")]
+                if not group:
+                    continue
+                row["item_ids"] = json.dumps(group)
+                kept.append(row)
+            # A namespace-scoped export needs no separate filter: ``exported_owner`` holds
+            # only the items this export carries, so a row belonging wholly to another
+            # namespace prunes to nothing and is dropped here -- and with it that
+            # namespace's ``file_path``, document name and content hashes.
+            state_tables[table] = kept
         return {
             "items": items,
             "entities": [dict(r) for r in self.db.execute("SELECT * FROM entities")],
@@ -1954,15 +2879,64 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
             "sources": [dict(r) for r in self.db.execute("SELECT * FROM sources")],
             "source_locations": source_locations,
             "mentions": mentions,
+            # Ownership travels with the content. These rows are what make an
+            # imported item manageable at all.
+            **state_tables,
         }
 
     def import_bundle(self, bundle: dict) -> dict:
         items_imported = 0
         entities_created = 0
         relations_rebuilt = 0
+        state_rows_imported = 0
         now = datetime.now().isoformat()
+        # A bundle names its sources by the ids the EXPORTING store minted, and
+        # ``sources.uri`` carries the UNIQUE constraint, so the same logical source
+        # -- the artifact aggregate at ``artifact://``, a folder watched on two
+        # machines -- holds a different id on either side. Every row that points at
+        # a source is rewritten through this map, which makes the rule one sentence:
+        # a bundle source's uri always ends up present in this store, and everything
+        # that pointed at that source points at whichever local row owns that uri.
+        #
+        # Without it a bundle whose uri is already here inserts no source row (the
+        # unique index refuses it) and then every item in the bundle references a
+        # source id this store does not have, so the foreign key refuses the write
+        # and the entire import rolls back.
+        source_id_map: dict[str, str] = {}
+
+        def _source_fk(raw: object, field: str) -> object:
+            """*raw* rewritten to its local source id, refused if it resolves nowhere.
+
+            ``source_id_map`` is built from the bundle's own ``sources`` entries, so a
+            reference absent from it names a source the bundle does not carry. With no
+            uri to match on, the only handle left is an id -- and an id is local to
+            whichever store minted it, so resolving one against this store's rows files
+            the bundle's content under whatever local source happens to share it. The
+            DECLARED path already refuses exactly that: when a bundle source's uri is
+            absent here but its id is held by a different uri, the uri arrives under a
+            freshly minted id rather than being filed under the unrelated row. An
+            undeclared reference cannot be repaired that way, because nothing in the
+            bundle names the source its content belongs to, so it is refused as the
+            typed rejection the import endpoint turns into its malformed-bundle 400.
+
+            This is also what makes the plain ``INSERT`` in the sources loop defence in
+            depth rather than a hope: were it ever to fail and leave a uri unmapped, its
+            items are refused here instead of landing under an unrelated source.
+
+            A NULL reference is not a reference. An item filed under no source at all is
+            legitimate and arrives exactly as it came.
+            """
+            if raw is None:
+                return None
+            mapped = source_id_map.get(raw) if isinstance(raw, str) else None
+            if mapped is None:
+                raise KnowledgeBundleError(
+                    f"'{field}' names a source this bundle does not carry")
+            return mapped
+
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            claimed_uris: dict[str, str] = {}
             for src in bundle.get("sources", []):
                 # Restore the status from the COLUMN, which ``export_all`` ships
                 # (it serializes SELECT * FROM sources). Reading the blob copy
@@ -1982,6 +2956,68 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 # such a key on the next open without ever promoting it, so this
                 # is the boundary holding, not a second line of defence.
                 props_text = _validated_properties(src.get("properties"))
+                # Both identity columns become DICTIONARY KEYS while the bundle's
+                # source ids are rewritten, so a list or dict here raises an
+                # unhashable-type TypeError rather than the typed rejection the
+                # import endpoint turns into a 400. They are also the only handles a
+                # source row has, so an empty one names nothing. Enforced at the
+                # writer, like the properties and aliases columns, so a caller that
+                # is not the dashboard endpoint is safe by construction.
+                claimed_id = src.get("id")
+                claimed_uri = src.get("uri")
+                for label, value in (("id", claimed_id), ("uri", claimed_uri)):
+                    if not isinstance(value, str) or not value:
+                        raise KnowledgeBundleError(
+                            f"'sources.{label}' must be a non-empty string")
+                    # A lone surrogate is a ``str`` SQLite cannot encode, and the
+                    # ``UnicodeEncodeError`` it raises at bind time sits outside every
+                    # arm the import endpoint catches, so it surfaces as a 500 rather
+                    # than the malformed-bundle 400. These two reach a bind like every
+                    # other bundle string, so they take the same gate.
+                    try:
+                        value.encode("utf-8")
+                    except UnicodeEncodeError:
+                        raise KnowledgeBundleError(
+                            f"'sources.{label}' must be valid UTF-8 text") from None
+                # ``name`` and ``source_type`` are the schema's other NOT NULL columns on
+                # this table. An explicit JSON null in either is a constraint violation
+                # at insert time, and a suppressed insert is far worse than a loud one:
+                # the row never lands, so the uri stays absent, nothing maps this
+                # bundle's source id -- and the id lookup that backs the map up then
+                # resolves the UNRELATED local source whose id happens to match, filing
+                # this bundle's documents under it and granting ownership over them,
+                # silently. That is the collision the branch below already detects and
+                # routes around, arriving through the fallback instead.
+                for label in ("name", "source_type"):
+                    value = src.get(label)
+                    if not isinstance(value, str):
+                        raise KnowledgeBundleError(f"'sources.{label}' must be a string")
+                    try:
+                        value.encode("utf-8")
+                    except UnicodeEncodeError:
+                        raise KnowledgeBundleError(
+                            f"'sources.{label}' must be valid UTF-8 text") from None
+                # ``created_at`` is the last NOT NULL column a bundle supplies (a missing
+                # key falls back to the import clock, but an explicit null does not, and
+                # ``updated_at`` is always written from the clock). Validated here so no
+                # bundle-supplied null can reach the constraint at all, which is what
+                # keeps the answer a typed rejection rather than a driver error.
+                claimed_created = src.get("created_at", now)
+                if not isinstance(claimed_created, str) or not claimed_created:
+                    raise KnowledgeBundleError(
+                        "'sources.created_at' must be a non-empty string when present")
+                try:
+                    claimed_created.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise KnowledgeBundleError(
+                        "'sources.created_at' must be valid UTF-8 text") from None
+                # One id may name only one uri. ``sources.id`` is a PRIMARY KEY, so no
+                # export produces two entries sharing one; accepting them would let the
+                # later entry overwrite the earlier one's place in the map and file the
+                # bundle's items under a source that was never named for them.
+                if claimed_uris.setdefault(claimed_id, claimed_uri) != claimed_uri:
+                    raise KnowledgeBundleError(
+                        "'sources' repeats an id under two different uris")
                 restored = src.get("sync_status")
                 if not isinstance(restored, str) or not restored:
                     restored = json.loads(props_text or "{}").get("sync_status")
@@ -1999,29 +3035,92 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 if (src.get("source_type") in _WALKING_SOURCE_TYPES
                         and restored != "paused"):
                     restored = "pending_confirmation"
-                self.db.execute(
-                    "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, "
-                    "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (src["id"], src["name"], src["source_type"], src["uri"],
-                     _without_sync_status(props_text),
-                     self._initial_status_or_default(restored),
-                     src.get("created_at", now), now))
+                # Resolve by uri first, because the uri is the source's identity
+                # across stores while the id is local to whichever store minted it.
+                local = self.db.execute(
+                    "SELECT id FROM sources WHERE uri = ?", (src["uri"],)).fetchone()
+                if local is None:
+                    target_id = src["id"]
+                    if self.db.execute("SELECT 1 FROM sources WHERE id = ?",
+                                       (target_id,)).fetchone():
+                        # The uri is absent but its id is already taken by a source
+                        # holding a DIFFERENT uri. Reusing that id would file this
+                        # bundle's documents under an unrelated source and skipping
+                        # would drop them, so the uri arrives under an id of its own.
+                        target_id = str(uuid4())
+                    # Plain INSERT, not ``INSERT OR IGNORE``: this branch has already
+                    # established that the uri is absent and that the id it will use is
+                    # free, so no constraint can fire here for a legitimate row, and the
+                    # validations above leave no bundle-supplied null able to reach one.
+                    # It stays plain as defence in depth, because a SUPPRESSED failure
+                    # here is the worst outcome available: the row never lands, the uri
+                    # stays absent, nothing maps this bundle's source, and the map's id
+                    # fallback then files the documents under whatever unrelated local
+                    # source shares the id -- silently, and with ownership granted over
+                    # them. A driver error is not this module's typed rejection (the
+                    # store's SQLite driver raises a class the endpoint's arms do not
+                    # name), so it surfaces as a server error; that is a worse ANSWER
+                    # than a 400 and a far better OUTCOME than silent misfiling.
+                    self.db.execute(
+                        "INSERT INTO sources (id, name, source_type, uri, properties, "
+                        "sync_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (target_id, src["name"], src["source_type"], src["uri"],
+                         _without_sync_status(props_text),
+                         self._initial_status_or_default(restored),
+                         src.get("created_at", now), now))
+                    local = self.db.execute(
+                        "SELECT id FROM sources WHERE uri = ?", (src["uri"],)).fetchone()
+                if local is not None:
+                    source_id_map[claimed_id] = local["id"]
+            # Decided BEFORE the items go in, because an item that arrives and then
+            # finds no row to own it is the very defect this ownership round-trip
+            # exists to remove.
+            self._bundle_membership_ids(bundle)
+            self._bundle_group_bounds(bundle)
+            blocked_items, withheld_account = self._bundle_blocked_items(
+                bundle, source_id_map)
+            # The ids this import actually INSERTED. Ownership is granted over these
+            # alone: an id the bundle ships that already exists here was skipped by
+            # ``INSERT OR IGNORE``, so the row in the store is local content, and
+            # letting an imported state row name it would hand a foreign document the
+            # authority to replace or delete it.
+            inserted_items: set[str] = set()
+            inserted_entities: set[str] = set()
+            bundle_entity_refs: set[str] = set()
+            live_entity_refs: set[str] = set()
             for item in bundle.get("items", []):
+                if item.get("id") in blocked_items:
+                    continue
                 raw_emb = item.get("embedding")
                 if isinstance(raw_emb, str) and raw_emb:
                     try:
                         raw_emb = base64.b64decode(raw_emb)
                     except Exception:
                         raw_emb = None
+                # ``embedding_sig`` travels WITH the blob. It is the only thing
+                # that says which vector space the imported vector belongs to,
+                # and ``HybridRetriever._vector_search`` pins it -- so dropping
+                # it lands every imported item at NULL, which the vector leg
+                # reads as unproven provenance and refuses. The vectors are in
+                # the bundle and would simply never be scored again until a full
+                # re-embed. A foreign-space signature is exactly as welcome: it
+                # will not match the importing store's own signature, so those
+                # vectors are refused on purpose rather than by accident.
                 cursor = self.db.execute(
-                    "INSERT OR IGNORE INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO items (id, title, content, item_type, source_id, chunk_index, namespace, summary, tags, embedding, embedding_sig, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (item["id"], item["title"], item["content"], item["item_type"],
-                     item.get("source_id"), item.get("chunk_index", 0), item.get("namespace", "default"), item.get("summary"),
-                     item.get("tags", "[]"), raw_emb, item.get("status", "active"),
+                     # Through the map: the exporting store's source id is not this
+                     # store's, and an item left pointing at the bundle's id is
+                     # refused by the foreign key, which loses the whole import.
+                     _source_fk(item.get("source_id"), "items.source_id"),
+                     item.get("chunk_index", 0), item.get("namespace", "default"), item.get("summary"),
+                     item.get("tags", "[]"), raw_emb, _validated_embedding_sig(item.get("embedding_sig")),
+                     item.get("status", "active"),
                      item.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     items_imported += 1
+                    inserted_items.add(item["id"])
                     row = self.db.execute("SELECT rowid FROM items WHERE id = ?", (item["id"],)).fetchone()
                     if row:
                         self._fts_index(row[0], item["title"], item["content"],
@@ -2035,7 +3134,20 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                      ent.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     entities_created += 1
+                    inserted_entities.add(ent["id"])
+            # Every row below points at an item by foreign key, so one naming an item
+            # this import withheld has nothing to attach to. Skipping such a row keeps
+            # the rest of an otherwise valid bundle: leaving it in makes the constraint
+            # refuse the write and the whole import is lost over a document this store
+            # already has its own copy of.
             for rel in bundle.get("relations", []):
+                for endpoint in (rel.get("source_id"), rel.get("target_id")):
+                    if isinstance(endpoint, str):
+                        bundle_entity_refs.add(endpoint)
+                        if rel.get("source_item_id") not in blocked_items:
+                            live_entity_refs.add(endpoint)
+                if rel.get("source_item_id") in blocked_items:
+                    continue
                 cursor = self.db.execute(
                     "INSERT OR IGNORE INTO entity_relations (id, source_id, target_id, relation_type, description, weight, source_item_id, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2045,27 +3157,658 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 if cursor.rowcount > 0:
                     relations_rebuilt += 1
             for loc in bundle.get("source_locations", []):
+                if loc.get("item_id") in blocked_items:
+                    continue
                 self.db.execute(
                     "INSERT OR IGNORE INTO source_locations (id, item_id, source_id, chunk_range, section_title, anchor, created_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (loc["id"], loc["item_id"], loc["source_id"], loc.get("chunk_range"),
+                    (loc["id"], loc["item_id"],
+                     _source_fk(loc["source_id"], "source_locations.source_id"),
+                     loc.get("chunk_range"),
                      loc.get("section_title"), loc.get("anchor"), loc.get("created_at", now)))
             for m in bundle.get("mentions", []):
+                entity_ref = m.get("entity_id")
+                if isinstance(entity_ref, str):
+                    bundle_entity_refs.add(entity_ref)
+                    if m.get("item_id") not in blocked_items:
+                        live_entity_refs.add(entity_ref)
+                if m.get("item_id") in blocked_items:
+                    continue
                 self.db.execute(
                     "INSERT OR IGNORE INTO mentions (item_id, entity_id, context, created_at) "
                     "VALUES (?, ?, ?, ?)",
                     (m["item_id"], m["entity_id"], m.get("context"), m.get("created_at", now)))
+            state_rows_imported, dropped_state_rows = self._import_bundle_state(
+                bundle, source_id_map, inserted_items, now)
+            withheld_account.extend(dropped_state_rows)
+            # An entity is only reachable through a mention or a relation, and both skip
+            # a withheld item -- so an entity the bundle referenced ONLY from rows that
+            # named withheld items arrives referenced by nothing, becomes a graph node no
+            # document supports, and inflates ``entities_created`` past what is
+            # reachable. Scoped three ways: to the entities this import inserted, to ones
+            # the bundle actually referenced (a bundle carrying a standalone entity and no
+            # mentions means that entity deliberately, and hand-built bundles do it), and
+            # to ones nothing in the store references now (a pre-existing local mention
+            # still counts).
+            stranded = inserted_entities & (bundle_entity_refs - live_entity_refs)
+            for entity_id in sorted(stranded):
+                still_referenced = self.db.execute(
+                    "SELECT 1 FROM mentions WHERE entity_id = ? UNION ALL "
+                    "SELECT 1 FROM entity_relations WHERE source_id = ? OR target_id = ? "
+                    "LIMIT 1",
+                    (entity_id, entity_id, entity_id)).fetchone()
+                if still_referenced:
+                    continue
+                self.db.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+                entities_created -= 1
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
         self._load_graph()
-        return {"items_imported": items_imported, "entities_created": entities_created, "relations_rebuilt": relations_rebuilt}
+        return {"items_imported": items_imported, "entities_created": entities_created,
+                "relations_rebuilt": relations_rebuilt,
+                "ownership_rows_imported": state_rows_imported,
+                # Withheld items are the one silent outcome here: a document this store
+                # already holds under the same key contributes nothing and lowers
+                # ``items_imported`` with no way for the caller to tell why.
+                "items_withheld": len(blocked_items),
+                # Every id held back is accounted for here by reason and by the document
+                # or id it belongs to, so a caller can say WHICH content did not arrive
+                # instead of only how much.
+                "withheld": withheld_account}
+
+    def _bundle_group_bounds(self, bundle: dict) -> None:
+        """Refuse a bundle whose ownership group exceeds a named bound.
+
+        ``_bundle_item_group`` stops at ``_MAX_ITEM_GROUP_MEMBERS`` and drops an entry
+        longer than ``_MAX_ITEM_ID_CHARS``. Trimming alone would under-claim in silence:
+        the accepting pass would read a shorter group than the bundle states and hand the
+        missing chunks to no one. So the bundle is REFUSED here instead, which the import
+        endpoint answers as a typed 400 naming the field, and a bundle that reaches the
+        parser is already inside both bounds.
+        """
+        for table in _DOC_STATE_KEY_COL:
+            rows = bundle.get(table, [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("item_ids")
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                try:
+                    parsed: object = json.loads(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                if len(parsed) > _MAX_ITEM_GROUP_MEMBERS:
+                    raise KnowledgeBundleError(
+                        f"{table}.item_ids names {len(parsed)} items, over the "
+                        f"{_MAX_ITEM_GROUP_MEMBERS} bound")
+                for entry in parsed:
+                    if isinstance(entry, str) and len(entry) > _MAX_ITEM_ID_CHARS:
+                        raise KnowledgeBundleError(
+                            f"{table}.item_ids holds a {len(entry)}-character id, over "
+                            f"the {_MAX_ITEM_ID_CHARS} bound")
+
+    def _bundle_membership_ids(self, bundle: dict) -> None:
+        """Refuse a bundle whose row identifiers cannot be hashed or matched.
+
+        Each of these is tested against a ``set[str]`` of withheld items, and set
+        membership hashes the key unconditionally -- so a JSON array or object here
+        raises ``TypeError``, which sits outside every arm the import endpoint catches
+        and answers 500 where the typed 400 belongs. A number is accepted by the hash
+        and is worse than a crash: it matches nothing, so a withheld item's dependent
+        row is written as though the item had arrived. ``None`` is legitimate, because a
+        relation need not name a source item and an absent key reads the same way.
+
+        The same gate guards ``sources.id`` and ``sources.uri`` one loop earlier, for
+        the same reason and with the same answer. ``entities.id`` is here for both
+        halves of it: the entity insert binds it AND the created set holds it.
+        """
+        for field, rows, col in (
+                ("items.id", bundle.get("items", []), "id"),
+                ("entities.id", bundle.get("entities", []), "id"),
+                ("relations.source_item_id",
+                 bundle.get("relations", []), "source_item_id"),
+                ("source_locations.item_id",
+                 bundle.get("source_locations", []), "item_id"),
+                ("mentions.item_id", bundle.get("mentions", []), "item_id")):
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get(col)
+                if value is not None and not isinstance(value, str):
+                    raise KnowledgeBundleError(
+                        f"'{field}' must be a string when present")
+        # One id may name only one item. ``item_source`` is keyed on it, so a repeat
+        # silently overwrites the earlier row's mapped source -- and because the
+        # withheld set holds the ID rather than the row, a collision resolved against
+        # the surviving mapping then skips BOTH rows while the import reports success.
+        # ``items.id`` is a PRIMARY KEY, so only one of the two could ever land through
+        # ``INSERT OR IGNORE`` in any case. The same refusal guards ``sources.id`` for
+        # this same overwrite, a few lines above.
+        seen_item_ids: set[str] = set()
+        items = bundle.get("items", [])
+        if isinstance(items, list):
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                value = row.get("id")
+                if isinstance(value, str):
+                    if value in seen_item_ids:
+                        raise KnowledgeBundleError("'items' repeats an id")
+                    seen_item_ids.add(value)
+
+    def _bundle_blocked_items(
+        self, bundle: dict, source_id_map: dict[str, str]
+    ) -> tuple[set[str], list[dict[str, str]]]:
+        """Item ids a bundle may not bring in, because this store already holds the
+        document that would own them.
+
+        Two documents cannot share one ``(source, key)``: that pair IS a document's
+        identity within a source. When a live local row already holds the pair -- the
+        same folder watched on two machines, the same artifact slug on both -- the
+        bundle's copy is not a document here, and importing its items anyway would
+        leave them permanently unowned: nothing claims them for de-duplication, the
+        Sources UI shows no group for them, and the text answers searches alongside
+        the local copy after every later edit of it.
+
+        Only that reason blocks an item, because only that reason says the content
+        does not belong here. Every other refusal in :meth:`_import_bundle_state`
+        rejects a ROW as an untrustworthy statement about items that are themselves
+        legitimate -- an unparsable group, one whose ids another row already owns, one
+        the bundle files under a different source -- and those items arrive unowned
+        exactly as they do from a bundle with no state tables at all. An over-claiming
+        group is not among them: the ids the import wrote are owned and the rest are
+        merely named in the account, so nothing it brought is left unowned.
+
+        A row whose group overlaps another bundle row's group blocks nothing, and
+        neither does an id whose own bundle item is filed under a DIFFERENT source.
+        The bundle does not agree about who owns such an item, so treating one row's
+        collision as a verdict on it would drop another document's valid content --
+        the store's own writer can produce that shape, when a reassigned item leaves
+        one row naming an item its new owner's row never names. Those ids arrive
+        unowned instead, like every other item a malformed ownership row describes.
+        """
+        # Where each item the bundle ships will actually be filed. An id the colliding
+        # row names but the bundle files elsewhere is not this document's to withhold.
+        item_source: dict[str, str | None] = {}
+        for item in bundle.get("items", []):
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                raw = item.get("source_id")
+                mapped = (source_id_map.get(raw) if isinstance(raw, str) else None)
+                item_source[item["id"]] = mapped
+        groups: list[set[str]] = []
+        colliding: list[tuple[str, str, str, set[str], set[str]]] = []
+        for table in _DOC_STATE_KEY_COL:
+            # Every table, including the ones whose rows are never restored, because
+            # withholding is not reserving items for a claim someone goes on to make.
+            # It is the answer to "this store already holds that document": a folder
+            # file at the same path, or the same artifact slug, IS that document here,
+            # so importing its items again leaves identical text answering searches
+            # beside the local copy with nothing owning it and no pass that removes it.
+            # Arriving unowned is the acceptable outcome for a document this store
+            # LACKS; for one it already holds, not arriving is.
+            key_col = _DOC_STATE_KEY_COL[table]
+            for row in bundle.get(table, []):
+                if not isinstance(row, dict):
+                    continue
+                raw_source = row.get("source_id")
+                if not isinstance(raw_source, str):
+                    continue
+                target_source = source_id_map.get(raw_source)
+                # Validated here because this is the FIRST bind a state key reaches.
+                key = _bundle_state_text(f"{table}.{key_col}", row.get(key_col))
+                if target_source is None or not key:
+                    continue
+                group = set(_bundle_item_group(row.get("item_ids")))
+                if not group:
+                    continue
+                groups.append(group)
+                held = self.db.execute(
+                    f"SELECT item_ids FROM {table} "  # noqa: S608
+                    f"WHERE source_id = ? AND {key_col} = ?",
+                    (target_source, key)).fetchone()
+                if held is not None and self._state_row_owns_items(
+                        held["item_ids"], target_source):
+                    colliding.append((
+                        table, target_source, key, group,
+                        set(_bundle_item_group(held["item_ids"]))))
+        seen: Counter[str] = Counter()
+        for group in groups:
+            seen.update(group)
+        shared = {item_id for item_id, count in seen.items() if count > 1}
+        blocked: set[str] = set()
+        withheld: list[dict[str, str]] = []
+        for table, target_source, key, group, local_group in colliding:
+            # A collision is only a DIFFERENT document holding the key. When the local
+            # row's own group overlaps the bundle's, this is that same document coming
+            # back, and withholding its group destroys exactly what the bundle is for:
+            # a per-chunk delete leaves the group naming the deleted id while a
+            # surviving sibling keeps the row live, so the whole group -- the deleted
+            # chunk included -- would be held back, silently, with no exit but deleting
+            # the rest of the document first. Its live ids are skipped by ``INSERT OR
+            # IGNORE`` and its absent ids arrive, to be merged into that row's group by
+            # the accepting pass.
+            if group & local_group:
+                continue
+            document = {item_id for item_id in group
+                        if item_id not in shared
+                        and item_source.get(item_id) == target_source}
+            if not document:
+                continue
+            blocked |= document
+            withheld.append({"reason": "document_key_held_locally", "table": table,
+                             "source_id": target_source, "key": key,
+                             "items": str(len(document))})
+        # An id a local row claims must not be handed to an import, with one exception
+        # for the document the bundle is restoring; see :meth:`_contested_claims`. An id
+        # that already exists here is outside it either way: ``INSERT OR IGNORE`` leaves
+        # the local row alone and the inserted-items rule already refuses to hand it to
+        # an imported claim.
+        contested = self._contested_claims(bundle, source_id_map, set(item_source))
+        _present, absent = self._items_exist(contested)
+        for item_id in sorted(absent - blocked):
+            withheld.append({"reason": "item_id_claimed_by_another_document",
+                             "item_id": item_id})
+        return blocked | absent, withheld
+
+    def _contested_claims(
+        self, bundle: dict, source_id_map: dict[str, str], shipped: set[str]
+    ) -> set[str]:
+        """Shipped ids a local row claims that this import must not create.
+
+        The rule and its one exception: an id a local row claims must not be handed to an
+        import, UNLESS the claiming row is a document this bundle is restoring. Both
+        halves are load-bearing and they fail in opposite directions. The exception is
+        keyed on the bundle's own row at the SAME ``(table, source, key)``, which is what
+        makes it "this document meeting itself" rather than a blanket amnesty -- so it
+        covers every table the bundle states, not only the one whose rows get written. A
+        folder file or artifact slug this host still holds owns its chunk correctly, and
+        no pass re-derives one withheld here: the scan reaps only a row whose path the
+        walk missed and skips a ``done`` row whose mtime and hash did not change.
+
+        Without the rule, a stale group belonging to an UNRELATED document captures the
+        item: the claim is read before the item loop, so the id does not exist yet, the
+        insert creates it, the claim goes live over content it never owned, and the
+        bundle's own row is skipped as claimed -- leaving the item held only by that row,
+        so deleting that unrelated document destroys imported content.
+
+        Without the exception, restoring a document meets its own row. ``_delete_item_
+        cascade`` removes an item and leaves the doc-state group naming it, which is the
+        documented normal shape, so re-importing an export would meet the deleter's own
+        row and withhold the very item the bundle is the only copy of. That holds whether
+        the row owns anything live or not: a per-chunk delete leaves a surviving sibling,
+        and the row is then live AND the document being restored at once. The accepting
+        pass repoints or merges that row, so withholding there contradicts it instead of
+        guarding it.
+        """
+        restored_groups: dict[tuple[str, str, str], set[str]] = {}
+        stated: set[str] = set()
+        for table, key_col in _DOC_STATE_KEY_COL.items():
+            rows = bundle.get(table, [])
+            if not isinstance(rows, list) or not rows:
+                continue
+            stated.add(table)
+            # Collected for EVERY table the bundle states, including the ones no restore
+            # writes. The exemption is keyed on the bundle's own row at this same
+            # ``(table, source, key)``, so what it forgives is this document meeting
+            # itself -- and that is just as true of a folder file or an artifact slug this
+            # host still has. `_delete_item_cascade` never prunes a group, by design, so a
+            # per-chunk delete leaves the row naming the chunk while the file or slug is
+            # still here; withholding the id there loses it for good, because the folder
+            # scan reaps only a row whose path the walk MISSED and skips a `done` row
+            # whose mtime and hash are unchanged, so nothing re-ingests the chunk.
+            # The opposite risk is real but needs a race this cannot see from the
+            # database: a row whose document is GONE here and not yet reconciled away
+            # still holds the key, and exempting its claim lets the import make it live
+            # over content the next reap then deletes. Telling the two apart needs the
+            # owning subsystem's view of whether the document still exists, which is not
+            # reachable inside this transaction -- so the ordinary case wins and the race
+            # is left to the reap it belongs to.
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                raw = row.get("source_id")
+                target = source_id_map.get(raw) if isinstance(raw, str) else None
+                key = row.get(key_col)
+                group = set(_bundle_item_group(row.get("item_ids")))
+                if target and isinstance(key, str) and key and group:
+                    restored_groups.setdefault((table, target, key), set()).update(group)
+        contested: set[str] = set()
+        sources = set(source_id_map.values())
+        if not sources or not shipped:
+            return contested
+        for table, key_col in _DOC_STATE_KEY_COL.items():
+            # A bundle that ships no row for a table states no ownership through it, so
+            # its items cannot be judged against that table's local claims at all. The
+            # single-item export endpoint and every pre-existing bundle file are exactly
+            # that shape, and judging them here withholds the item a delete removed with
+            # no exit: no exemption can exist when nothing was shipped to exempt it.
+            if table not in stated:
+                continue
+            # Chunked: the source count is untrusted bundle input, so one ``IN`` list over
+            # all of them can pass the bind ceiling and abort the import (:data:`_MAX_SQL_PARAMS`).
+            for params in _sql_param_chunks(sources):
+                placeholders = ", ".join("?" * len(params))
+                for row in self.db.execute(
+                        f"SELECT source_id, {key_col} AS row_key, item_ids "  # noqa: S608
+                        f"FROM {table} WHERE source_id IN ({placeholders})", params):
+                    overlap = set(_bundle_item_group(row["item_ids"])) & shipped
+                    if not overlap:
+                        continue
+                    # Exempt the IDS the bundle's own row for this key names, not the key.
+                    # A marker row carries the key with an EMPTY group -- a full export
+                    # ships those verbatim -- so keying the exemption on the pair alone
+                    # lets such a row vouch for ids it never claimed, handing them to
+                    # whatever unrelated local row holds a stale claim on them.
+                    contested |= overlap - restored_groups.get(
+                        (table, row["source_id"], row["row_key"]), set())
+        return contested
+
+    def _items_exist(self, item_ids: set[str]) -> tuple[set[str], set[str]]:
+        """(*item_ids* this store holds, the rest), read in bounded chunks.
+
+        Chunked because the caller's set is bundle-sized rather than group-sized, and a
+        single ``IN`` list long enough to cover it can exceed SQLite's parameter limit.
+        """
+        present: set[str] = set()
+        for chunk in _sql_param_chunks(item_ids):
+            placeholders = ", ".join("?" * len(chunk))
+            present.update(
+                row["id"] for row in self.db.execute(
+                    f"SELECT id FROM items WHERE id IN ({placeholders})",  # noqa: S608
+                    chunk))
+        return present, item_ids - present
+
+    def _import_bundle_state(
+        self, bundle: dict, source_id_map: dict[str, str],
+        inserted_items: set[str], now: str
+    ) -> tuple[int, list[dict[str, str]]]:
+        """Restore per-document ownership rows for the items this bundle brought.
+
+        Runs INSIDE :meth:`import_bundle`'s transaction and AFTER the item loop,
+        because the test a row has to pass is which items the import actually wrote.
+
+        A row owns the items THIS import inserted for it, and nothing else. Ownership
+        means "these items, all of them", so an id the bundle ships that ALREADY
+        existed here is left out: ``INSERT OR IGNORE`` skipped it, the row in the store
+        is local content, and naming it would hand a foreign document the authority to
+        replace or delete something this store owns. Unowned local content -- residue
+        from an interrupted ingest -- is the case that makes that load-bearing rather
+        than theoretical.
+
+        What the import DID write is a different statement, and refusing it is what
+        strands content. A second bundle for a document already here brings exactly
+        that shape: the first restore put part of the group down, so the second's row
+        names ids it did not insert alongside ids it did. Dropping the whole row leaves
+        the new chunks searchable and owned by nothing -- ``agent_item_state`` is the
+        one table a bundle restores and no pass reaps it, so the document's own delete
+        takes the ids its row names and walks past the rest. The arriving ids therefore
+        join the live local row's group WHEN that row's own group overlaps the bundle's,
+        which is what says the two are one document coming back. This pass tests that
+        itself rather than inheriting it from the blocking pass, which cannot supply it:
+        an id two bundle rows both name is shared, so it is never blocked, and it arrives
+        with a DISJOINT live row sitting on its key. Merging there would file it under an
+        unrelated local document whose own delete would then destroy it, so such a row is
+        skipped and its items arrive unowned, reported as ``ownership_row_key_held_locally``.
+        A merge extends that row's group and touches nothing else, because its hash,
+        name and status describe this store's copy and the bundle can be older than it.
+
+        A row with nothing left to own is dropped rather than repaired, and its items
+        arrive unowned: an empty group is a de-duplication claim or a scan marker,
+        both of which describe the exporting store's progress and are re-derived
+        here by the next ingest of that document.
+
+        The status written is the table's own live value rather than the bundle's:
+        the surviving group is what makes a row live, and the vocabularies differ
+        per table (see :data:`_DOC_STATE_TABLES`).
+
+        A local row for the same document keeps its identity while it OWNS live items,
+        and only its group grows. One with an empty or stale group is holding a marker,
+        not ownership, so the imported row takes its place and its claim on another
+        source's items is released with it.
+
+        Returns the number of rows restored.
+        """
+        # Ids already spoken for, so no item ends up in two groups. One item in two
+        # groups is content-destroying rather than untidy: the next document-level
+        # delete hands ``delete_items_batch`` an item whose only other holder is a
+        # state row it does not consult, finds nothing else holding it, and removes
+        # it -- leaving the second row naming deleted content. The module already
+        # refuses this shape elsewhere, in ``_adopt_reassigned_item`` and
+        # ``detach_source_location_by_hash``, rather than putting one item in two
+        # groups. Seeded from the local rows of the sources this bundle touches, then
+        # grown as rows are accepted, so overlap WITHIN one bundle is caught too.
+        claimed_ids = self._claimed_item_ids(set(source_id_map.values()))
+        restored = 0
+        dropped: list[dict[str, str]] = []
+        for table, live_status in _DOC_STATE_TABLES:
+            if not _bundle_state_restores(table):
+                continue
+            key_col = _DOC_STATE_KEY_COL[table]
+            carried = _BUNDLE_STATE_CARRIED_COLS[table]
+            for row in bundle.get(table, []):
+                if not isinstance(row, dict):
+                    continue
+                raw_source = row.get("source_id")
+                # A non-string source id would be an unhashable dictionary key.
+                target_source = (source_id_map.get(raw_source)
+                                 if isinstance(raw_source, str) else None)
+                key = _bundle_state_text(f"{table}.{key_col}", row.get(key_col))
+                if target_source is None or not key:
+                    continue
+                group = _bundle_item_group(row.get("item_ids"))
+                if not group:
+                    continue
+                existing = self.db.execute(
+                    f"SELECT {_OWNERSHIP_HASH_COL[table]} AS owned_hash, item_ids "  # noqa: S608
+                    f"FROM {table} WHERE source_id = ? AND {key_col} = ?",
+                    (target_source, key)).fetchone()
+                local_group = (_bundle_item_group(existing["item_ids"])
+                               if existing is not None else [])
+                live = existing is not None and self._state_row_owns_items(
+                    existing["item_ids"], target_source)
+                if live and not set(local_group) & set(group):
+                    # A live local row sharing NO id with the bundle's group is a
+                    # DIFFERENT document holding this key, and the blocking pass does not
+                    # keep the two apart on its own: an id two bundle rows both name is
+                    # shared, so it is never blocked, and it reaches here with that
+                    # disjoint row in place. Merging would put the arriving id into this
+                    # store's unrelated document, whose own delete then takes content the
+                    # import brought -- with no pass that reaps the row or reports it.
+                    # Skip the row instead: its items arrive unowned, the outcome every
+                    # other untrustworthy ownership row already gets, and the account
+                    # names the key that held them back.
+                    stranded = sorted(set(group) & inserted_items)
+                    if stranded:
+                        dropped.append({"reason": "ownership_row_key_held_locally",
+                                        "table": table, "source_id": target_source,
+                                        "key": key, "items": ",".join(stranded)})
+                    continue
+                # A live local row whose group OVERLAPS the bundle's is THIS document
+                # already here, so its group is the base the arriving ids join and its
+                # own ids are already owned rather than missing.
+                merging = live
+                base = local_group if merging else []
+                # What this import actually wrote for this row, and what the row names
+                # that nothing here hands it. Ownership covers the first; the second is
+                # local content or absent content, and claiming either would let a
+                # foreign document replace or delete something this store owns.
+                arriving = [item for item in group
+                            if item in inserted_items and item not in base]
+                absent = sorted(set(group) - inserted_items - set(base))
+                if absent:
+                    # An export this store writes prunes the group to what it carries, so
+                    # this is a bundle built elsewhere, or a second bundle whose ids a
+                    # previous restore already put here under another document. Those ids
+                    # stay out of the group -- partial ownership would name items another
+                    # document holds -- and the caller is told which document and which
+                    # ids, because their content is here unowned and nothing else says so.
+                    dropped.append({"reason": "ownership_row_names_absent_items",
+                                    "table": table, "source_id": target_source,
+                                    "key": key, "items": ",".join(absent)})
+                if not arriving:
+                    # Nothing this import wrote, so there is no ownership to record: the
+                    # row would either restate the base or claim local content.
+                    continue
+                # An id another document already owns is never taken, and the base is not
+                # "another document" -- it is the row being extended.
+                if set(arriving) & (claimed_ids - set(base)):
+                    continue
+                # The ids were inserted by this import, so they exist -- but under the
+                # source the ITEM named, which is not necessarily the one this row names.
+                # A row may only own items filed under itself, and one id filed elsewhere
+                # makes the whole row an untrustworthy statement about ownership rather
+                # than a partial one: this store's own export cannot produce that shape.
+                # Chunked because the group runs to ``_MAX_ITEM_GROUP_MEMBERS``, past the
+                # bind ceiling on a pre-3.32 host (:data:`_MAX_SQL_PARAMS`).
+                held: set[str] = set()
+                for chunk in _sql_param_chunks(arriving, reserve=1):
+                    placeholders = ", ".join("?" * len(chunk))
+                    held.update(
+                        r["id"] for r in self.db.execute(
+                            "SELECT id FROM items WHERE source_id = ? "  # noqa: S608
+                            f"AND id IN ({placeholders})",
+                            (target_source, *chunk)).fetchall())
+                if held != set(arriving):
+                    continue
+                if merging:
+                    # Extend the live row's group and touch nothing else. Its hash, name
+                    # and status describe THIS store's copy of the document, and a bundle
+                    # reaching this branch can be older than that copy -- repointing the
+                    # identity columns at it would leave the row describing a revision
+                    # this store does not hold.
+                    self.db.execute(
+                        f"UPDATE {table} SET item_ids = ? "  # noqa: S608
+                        f"WHERE source_id = ? AND {key_col} = ?",
+                        (json.dumps([*base, *arriving]), target_source, key))
+                    claimed_ids.update(arriving)
+                    restored += 1
+                    continue
+                if existing is not None:
+                    # An empty or stale group is not ownership. It is a de-duplication
+                    # marker or a scan marker, and nothing else will ever name the items
+                    # this bundle brought, so the imported row takes the key. The
+                    # marker's claim on another source's items goes with it: leaving the
+                    # claim behind under a hash no row names any more means a later
+                    # deletion of the holder reassigns an item here and finds nothing to
+                    # adopt it into.
+                    self.detach_source_location_by_hash(
+                        target_source, existing["owned_hash"] or "")
+                columns = ("source_id", key_col, "item_ids", "status", *carried)
+                values: list[Any] = [
+                    target_source, key, json.dumps(arriving), live_status]
+                for col in carried:
+                    value = row.get(col)
+                    if col in _BUNDLE_STATE_REQUIRED_COLS and not isinstance(value, str):
+                        value = now
+                    values.append(_bundle_state_text(f"{table}.{col}", value))
+                self.db.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "  # noqa: S608
+                    f"VALUES ({', '.join('?' * len(columns))})",
+                    values)
+                claimed_ids.update(group)
+                restored += 1
+        return restored, dropped
+
+    def _claimed_item_ids(self, source_ids: set[str]) -> set[str]:
+        """Every item id an existing state row of *source_ids* already owns.
+
+        Scoped to the sources a bundle resolves to, because ownership is per-source
+        and that keeps the read bounded on a large library.
+        """
+        claimed: set[str] = set()
+        if not source_ids:
+            return claimed
+        for table in _DOC_STATE_KEY_COL:
+            # Chunked: the caller's set is one entry per source the BUNDLE resolves to,
+            # which nothing caps (:data:`_MAX_SQL_PARAMS`).
+            for params in _sql_param_chunks(source_ids):
+                placeholders = ", ".join("?" * len(params))
+                for row in self.db.execute(
+                        f"SELECT item_ids FROM {table} "  # noqa: S608
+                        f"WHERE source_id IN ({placeholders})", params):
+                    claimed.update(_bundle_item_group(row["item_ids"]))
+        return claimed
+
+    def _state_row_owns_items(self, raw: object, source_id: str) -> bool:
+        """Whether a state row of *source_id* still names an item filed under it.
+
+        An empty group is not ownership: a document that lost a de-duplication keeps a
+        marker row with no group, and every pending or failed scan row carries one too.
+        A group naming only items that have since been deleted is the same thing with
+        more history behind it.
+
+        Existence alone is not ownership either, which is why *source_id* is matched.
+        ``_adopt_reassigned_item`` leaves a stale claim by design when a content hash is
+        ambiguous, so a row can name items that ``delete_source_cascade`` reassigned to
+        a different source. Those items are live and the row describing them is not this
+        one, so reading the claim as ownership withholds the document a bundle carries
+        and loses its content silently -- which is the same rule the accepting pass
+        applies to the group a bundle ships.
+        """
+        group = _bundle_item_group(raw)
+        if not group:
+            return False
+        # Chunked: the group runs to ``_MAX_ITEM_GROUP_MEMBERS``, past the bind ceiling on
+        # a pre-3.32 host (:data:`_MAX_SQL_PARAMS`). One live id anywhere is ownership, so
+        # the first chunk that finds one answers.
+        for chunk in _sql_param_chunks(group, reserve=1):
+            placeholders = ", ".join("?" * len(chunk))
+            if self.db.execute(
+                    f"SELECT 1 FROM items WHERE source_id = ? "  # noqa: S608
+                    f"AND id IN ({placeholders}) LIMIT 1",
+                    (source_id, *chunk)).fetchone() is not None:
+                return True
+        return False
 
     def close(self):
-        """Close the calling thread's connection (other threads' connections
-        are released when their thread or the store is garbage-collected)."""
+        """Close the CALLING thread's connection; other threads' stay live.
+
+        Per-thread by contract (see `test_knowledge_cross_thread`): a worker
+        mid-query must never have its handle closed from under it. In production
+        the process exit is what closes the other threads' handles; a test
+        teardown uses `_close_all_for_tests()` instead.
+        """
         conn = getattr(self._thread_local, "conn", None)
         if conn is not None:
+            with self._connections_lock:
+                self._connections = [c for c in self._connections if c is not conn]
             conn.close()
             self._thread_local.conn = None
+
+    def _close_all_for_tests(self):
+        """Close EVERY connection this store opened, on any thread.
+
+        A test seam, and nothing in production may call it: production has no
+        moment at which every thread is provably idle short of process exit,
+        and closing a handle from under a worker mid-query is undefined. A test
+        teardown has that moment, and needs the close because connections that
+        pool threads and exited threads opened have no other close path, and an
+        unclosed one holds its descriptors until the cyclic collector runs
+        (a `sqlite3.Connection` is a self-cycle on CPython 3.11+). Idempotent, and not final:
+        the store stays usable, each thread reopening lazily on its next `db`
+        take -- the generation bump is what tells a thread its cached handle was
+        closed from elsewhere. Callers must ensure no thread is mid-query.
+        """
+        if not _ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS:
+            raise RuntimeError(
+                "KnowledgeStore._close_all_for_tests is a test seam: set "
+                "kiro_crew.knowledge.store._ALLOW_CROSS_THREAD_CLOSE_FOR_TESTS before any "
+                "store is built (test/conftest.py does, for the test/ testpath only; the app "
+                "test trees under src/kiro_crew/apps/builtins do not activate the flip "
+                "themselves); production closes by exiting"
+            )
+        with self._connections_lock:
+            conns, self._connections = self._connections, []
+            self._generation += 1
+        for conn in conns:
+            conn.close()
+        self._thread_local.conn = None

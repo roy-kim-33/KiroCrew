@@ -40,6 +40,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -105,9 +106,28 @@ _OPENSSL_TIMEOUT_SECS = 30
 _VENV_CREATE_TIMEOUT_SECS = 120
 #: pip resolves and downloads the full dependency set into a tree that has
 #: never seen it — the same bound dep_sync uses for a cold reinstall, doubled
-#: because a shadow build also compiles any sdist fallbacks from scratch.
+#: for a slow index on a cold cache, and for the compile fallback a host can
+#: opt back into below.
 _PIP_INSTALL_TIMEOUT_SECS = 900
 _PROBE_TIMEOUT_SECS = 60
+#: Dependencies are installed from prebuilt wheels only (the same policy as
+#: cli.sh's `PIP_BINARY_ONLY`). Without it pip builds any dependency that has
+#: no wheel for this host from its sdist, which needs a C toolchain the gateway
+#: host was never required to have; with it, such a host fails fast with pip's
+#: "No matching distribution found" naming the dependency.
+_PIP_BINARY_ONLY = "--only-binary=:all:"
+#: cli.sh's opt-in for a host that has the toolchain and wants the compile
+#: fallback back; read from this (gateway) process's environment, so a service
+#: unit has to carry it for an update to honour it.
+_ALLOW_SOURCE_BUILDS_ENV = "KIROCREW_ALLOW_SOURCE_BUILDS"
+
+
+def _pip_binary_policy() -> list[str]:
+    """The pip flags that keep dependency resolution binary-only (see above)."""
+    if os.environ.get(_ALLOW_SOURCE_BUILDS_ENV, "0") == "1":
+        return []
+    return [_PIP_BINARY_ONLY]
+
 
 # Signed-but-optional, mirroring cli.sh: a breaking release adds a fleet
 # floor (`min_version`). The signature still covers it (it stays in the
@@ -235,12 +255,131 @@ def running_from_managed_venv(layout: ManagedVenvLayout | None = None) -> bool:
     something else, and building a sibling tree beside a data home they do not
     use would be litter at best. POSIX-only by construction: cli.sh is a POSIX
     installer, so on Windows there is no managed venv to detect.
+
+    Identity comes from the interpreter's ``bin/`` directory, not the file:
+    ``python -m venv`` symlinks ``bin/python3`` to the base interpreter, so
+    resolving that file leaves the venv before the layout can recognize it.
     """
     if not IS_POSIX:
         return False
     if layout is None:
         layout = managed_venv_layout()
-    return layout.is_managed_tree(Path(sys.executable))
+    return layout.is_managed_tree(Path(sys.executable).parent)
+
+
+#: Name of the metadata file pipx writes at the root of every environment it
+#: manages (``$PIPX_HOME/venvs/<env>/pipx_metadata.json``). pipx owns it,
+#: rewrites it atomically after each operation, and reads it to drive its own
+#: ``upgrade``/``reinstall``/``uninstall`` — so its presence beside the running
+#: interpreter is an authoritative, version-stable "this venv is pipx's" signal
+#: that needs no path-guessing against ``$PIPX_HOME``.
+_PIPX_METADATA_NAME = "pipx_metadata.json"
+
+
+def running_from_pipx() -> bool:
+    """Is THIS process served by a pipx-managed environment?
+
+    Distinguishes the one non-managed shape whose installer re-run is
+    legitimate — ``cli.sh`` installs into a pipx venv when pipx is present, and
+    a re-run upgrades that same pipx venv in place — from a user's own plain
+    ``pip install`` into a venv they manage, where a re-run would build a
+    SECOND copy beside the one actually serving the user.
+
+    Identity is the metadata file pipx keeps at the environment root. A pipx
+    venv's root is ``sys.prefix`` for a process launched from it (the console
+    script runs the venv's own interpreter), so the marker sits one directory
+    up from ``bin/``. Reading ``sys.prefix`` rather than resolving
+    ``sys.executable`` keeps the answer stable across the ``bin/python3 ->``
+    base-interpreter symlink that ``python -m venv`` writes.
+    """
+    try:
+        return (Path(sys.prefix) / _PIPX_METADATA_NAME).is_file()
+    except OSError:
+        return False
+
+
+def _legacy_nested_venv() -> Path:
+    """The venv an earlier ``cli.sh`` created INSIDE the data home.
+
+    Mirrors cli.sh's ``_OLD_VENV`` (``<data home>/venv``) exactly. The current
+    installer retires it: a re-run that lands a working tree beside the data
+    home repoints the stable link and the launcher at that tree, then
+    ``rm -rf``s this one. The gateway's own wheel auto-update drives that
+    re-run, so the deletion can happen underneath the running process.
+    """
+    return data_home() / "venv"
+
+
+def _respawn_tree_is_managed(layout: ManagedVenvLayout) -> bool:
+    """Is the tree serving THIS process one a restart may re-route?
+
+    Identity is read from the interpreter's ``bin/`` directory, not from the
+    interpreter file: ``python -m venv`` writes ``bin/python3`` as a symlink
+    to the base interpreter, so resolving the file lands outside every venv
+    and would answer "not managed" for every real install. The directory
+    resolves through the layout's own links (stable link -> versioned tree)
+    and stops there.
+
+    Two identities qualify. A tree of this layout (legacy or versioned), and
+    the retired in-data-home venv — our own environment from an earlier
+    installer, which the same cli.sh re-run that lands the new tree deletes
+    from under the running gateway; without the stable link that process has
+    no interpreter left to exec. This is the respawn identity only: the
+    dispatch predicate for the shadow-build path is
+    :func:`running_from_managed_venv`, which keeps its own rule.
+    """
+    bin_dir = Path(sys.executable).parent
+    if layout.is_managed_tree(bin_dir):
+        return True
+    try:
+        resolved = bin_dir.resolve()
+        nested = _legacy_nested_venv().resolve()
+    except OSError:
+        return False
+    return resolved == nested or resolved.is_relative_to(nested)
+
+
+def _interpreter_in(tree: Path) -> str | None:
+    """The usable interpreter inside *tree*'s ``bin/``, or ``None``.
+
+    Prefers this process's own interpreter name so a restart keeps the version
+    it was launched under, and falls back to ``python3``, which every venv
+    ships.
+    """
+    for name in (os.path.basename(sys.executable), "python3"):
+        candidate = tree / "bin" / name
+        try:
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _respawn_fallback(layout: ManagedVenvLayout) -> str:
+    """The answer when the stable link cannot carry the restart.
+
+    ``sys.executable`` whenever it still exists — a broken, absent, or
+    outside-the-layout link must never take the restart path away from a
+    process whose own interpreter is fine.
+
+    When it does NOT exist, the cached path names nothing and the exec would
+    raise ENOENT. That is reachable: the installer re-run that retires the
+    in-data-home venv deletes it on the NEW tree's own import check, which is
+    independent of the stable-link repoint — the repoint is skipped when a real
+    directory sits at the stable name, and its failure is non-fatal. So the
+    nested venv is gone while the link is unusable. The legacy fixed tree is
+    the interpreter that re-run just built and import-verified, and this engine
+    never prunes it, so it is the honest last resort. Validated the same way as
+    the stable link's: inside the layout, present, executable.
+    """
+    if os.path.exists(sys.executable):
+        return sys.executable
+    if layout.is_managed_tree(layout.legacy):
+        candidate = _interpreter_in(layout.legacy)
+        if candidate is not None:
+            return candidate
+    return sys.executable
 
 
 def respawn_executable() -> str:
@@ -256,12 +395,21 @@ def respawn_executable() -> str:
 
     Falls back to ``sys.executable`` whenever the stable link does not exist
     or does not carry a usable interpreter, so a broken or absent link can
-    never take the restart path away.
+    never take the restart path away — except when ``sys.executable`` itself is
+    already gone, where :func:`_respawn_fallback` reaches the legacy tree
+    instead of handing back a path that does not exist.
+
+    One more shape routes here: a process still served by the retired
+    in-data-home venv (:func:`_legacy_nested_venv`). The installer re-run that
+    migrates it deletes that venv after repointing the stable link, so
+    ``sys.executable`` is gone and the stable link is the only interpreter
+    left; before that re-run there is no stable link and the fallback keeps
+    the restart on the nested venv, unchanged.
     """
     if not IS_POSIX:
         return sys.executable
     layout = managed_venv_layout()
-    if not running_from_managed_venv(layout):
+    if not _respawn_tree_is_managed(layout):
         return sys.executable
     # The link's TARGET must resolve inside this layout's own trees before it
     # is trusted with an exec: a stable link repointed outside the managed
@@ -271,16 +419,11 @@ def respawn_executable() -> str:
     # own tree included), which is the RFC's accepted local-code-execution gap
     # and is not widened by the link.
     if not layout.is_managed_tree(layout.stable_link):
-        return sys.executable
-    candidate = layout.stable_link / "bin" / os.path.basename(sys.executable)
-    if not candidate.exists():
-        candidate = layout.stable_link / "bin" / "python3"
-    try:
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    except OSError:
-        pass
-    return sys.executable
+        return _respawn_fallback(layout)
+    candidate = _interpreter_in(layout.stable_link)
+    if candidate is not None:
+        return candidate
+    return _respawn_fallback(layout)
 
 
 # ── Manifest fetch and verification ─────────────────────────────────────────
@@ -387,55 +530,170 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _verify_signature(canonical: bytes, signature: bytes, workdir: Path) -> None:
-    """Verify *signature* over *canonical* against the pinned trust root.
-
-    Delegates the RSA math to the ``openssl`` binary — the same verifier
-    cli.sh uses, resolved through :func:`trusted_system_bin` so a planted
-    PATH shim cannot stand in for it. The pinned key's fingerprint is
-    self-checked first (SHA-256 of its SubjectPublicKeyInfo DER must equal
-    :data:`CLI_MANIFEST_KEY_ID`), so an accidental edit to either constant
-    fails closed before any signature is considered.
-    """
+def _openssl_bin() -> str:
     openssl = trusted_system_bin("openssl")
     if openssl is None:
         raise WheelUpdateError(
             "openssl is required to verify the signed manifest and was not "
             "found in a trusted system directory"
         )
-    pem = workdir / "cli-manifest-public.pem"
-    try:
-        pem.write_bytes(base64.b64decode(CLI_MANIFEST_PUBLIC_KEY_B64, validate=True))
-    except (ValueError, OSError) as exc:
-        raise WheelUpdateError("embedded manifest public key is malformed") from exc
+    return openssl
 
-    der = workdir / "cli-manifest-public.der"
+
+def _check_key_fingerprint(openssl: str) -> bytes:
+    """Return the embedded public key PEM after self-checking its fingerprint.
+
+    The PEM goes to ``openssl pkey`` on STDIN and the DER comes back on STDOUT —
+    no file is written, so there is no name for a concurrent same-uid process to
+    pre-plant as a symlink and have the gateway follow. The DER's SHA-256 must
+    equal :data:`CLI_MANIFEST_KEY_ID`, so an accidental edit to either constant
+    fails closed before any signature is considered.
+    """
+    try:
+        pem = base64.b64decode(CLI_MANIFEST_PUBLIC_KEY_B64, validate=True)
+    except ValueError as exc:
+        raise WheelUpdateError("embedded manifest public key is malformed") from exc
     try:
         proc = subprocess.run(
-            [openssl, "pkey", "-pubin", "-in", str(pem), "-outform", "DER", "-out", str(der)],
+            [openssl, "pkey", "-pubin", "-outform", "DER"],
+            input=pem,
             capture_output=True,
             timeout=_OPENSSL_TIMEOUT_SECS,
-            # Explicit paths carry every output, but the child's CWD is pinned
-            # to the step's own workdir anyway so nothing an openssl build
-            # chooses to drop (an .rnd seed file, a debug artifact) can land in
-            # the gateway's working directory.
-            cwd=str(workdir),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise WheelUpdateError(f"openssl could not read the pinned key: {exc}") from exc
     if proc.returncode != 0:
         raise WheelUpdateError("embedded manifest public key is invalid")
-    fingerprint = "sha256:" + hashlib.sha256(der.read_bytes()).hexdigest()
+    fingerprint = "sha256:" + hashlib.sha256(proc.stdout).hexdigest()
     if fingerprint != CLI_MANIFEST_KEY_ID:
         raise WheelUpdateError("embedded manifest public key fingerprint mismatch")
+    return pem
 
-    payload = workdir / "signed-payload.json"
-    sig = workdir / "manifest-signature.bin"
-    payload.write_bytes(canonical)
-    sig.write_bytes(signature)
+
+def _verify_signature(canonical: bytes, signature: bytes, workdir: Path) -> None:
+    """Verify *signature* over *canonical* against the pinned trust root.
+
+    Delegates the RSA math to the ``openssl`` binary — the same verifier
+    cli.sh uses, resolved through :func:`trusted_system_bin` so a planted
+    PATH shim cannot stand in for it. The pinned key's fingerprint is
+    self-checked first.
+
+    No verification INPUT is ever written to a predictable, shared, or
+    agent-reachable path. The gateway runs OUTSIDE the sandbox, so writing the
+    PEM/signature/payload to a named file in an agent-writable directory (the
+    SEL ``trust`` keystone is sandbox read-write) would let a concurrent
+    same-uid agent pre-plant that name as a symlink to an operator file and have
+    this process clobber it through the write. So on POSIX the key and signature
+    are handed to openssl over anonymous pipe FDs (``/dev/fd/N``) the gateway
+    created, and the payload over stdin — no file exists to plant against.
+    ``workdir`` is used only as a Windows fallback (no ``/dev/fd`` there), and
+    then every file is opened ``O_CREAT|O_EXCL|O_NOFOLLOW`` so a pre-planted
+    symlink is refused rather than followed.
+    """
+    openssl = _openssl_bin()
+    _check_key_fingerprint(openssl)
+    pem = base64.b64decode(CLI_MANIFEST_PUBLIC_KEY_B64, validate=True)
+
+    devfd = IS_POSIX and os.path.isdir("/dev/fd")
+    if devfd:
+        _verify_over_fds(openssl, pem, signature, canonical)
+    else:
+        _verify_over_nofollow_files(openssl, pem, signature, canonical, workdir)
+
+
+def _verify_over_fds(openssl: str, pem: bytes, signature: bytes, canonical: bytes) -> None:
+    """POSIX path: key + signature over anonymous pipe FDs, payload over stdin.
+
+    Nothing is written to any directory, so there is no attacker-plantable name.
+    """
+    key_r, key_w = os.pipe()
+    sig_r, sig_w = os.pipe()
+    try:
+        # Write both inputs fully before the child reads them. They are small
+        # (a 2048-bit key, a 256-byte signature), well under a pipe's buffer, so
+        # a single write cannot block against a reader that has not started.
+        os.write(key_w, pem)
+        os.write(sig_w, signature)
+    finally:
+        os.close(key_w)
+        os.close(sig_w)
     try:
         proc = subprocess.run(
-            [openssl, "dgst", "-sha256", "-verify", str(pem), "-signature", str(sig), str(payload)],
+            [
+                openssl,
+                "dgst",
+                "-sha256",
+                "-verify",
+                f"/dev/fd/{key_r}",
+                "-signature",
+                f"/dev/fd/{sig_r}",
+                "/dev/stdin",
+            ],
+            input=canonical,
+            capture_output=True,
+            timeout=_OPENSSL_TIMEOUT_SECS,
+            pass_fds=(key_r, sig_r),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WheelUpdateError(f"openssl signature verification failed: {exc}") from exc
+    finally:
+        for fd in (key_r, sig_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if proc.returncode != 0:
+        raise WheelUpdateError("manifest signature verification failed — refusing to install")
+
+
+def _create_exclusive_nofollow(path: Path, data: bytes) -> None:
+    """Write *data* to *path*, refusing to follow or clobber anything there.
+
+    ``O_CREAT|O_EXCL`` fails if the name already exists (a pre-planted file or
+    symlink), and ``O_NOFOLLOW`` refuses a symlink at the final component — so
+    the gateway never follows an agent-planted link out of the staging dir.
+
+    ``O_BINARY`` (Windows only; 0 elsewhere) keeps the write byte-exact: in text
+    mode Windows translates the canonical payload's trailing ``\n`` to ``\r\n``,
+    which changes the signed bytes and makes verification fail closed.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _verify_over_nofollow_files(
+    openssl: str, pem: bytes, signature: bytes, canonical: bytes, workdir: Path
+) -> None:
+    """Fallback (no ``/dev/fd``, e.g. Windows): stage in *workdir*, but create
+    every file ``O_CREAT|O_EXCL|O_NOFOLLOW`` so a pre-planted symlink or file is
+    refused rather than followed, and read none of them back by name after."""
+    pem_path = workdir / "cli-manifest-public.pem"
+    payload_path = workdir / "signed-payload.json"
+    sig_path = workdir / "manifest-signature.bin"
+    try:
+        _create_exclusive_nofollow(pem_path, pem)
+        _create_exclusive_nofollow(payload_path, canonical)
+        _create_exclusive_nofollow(sig_path, signature)
+    except OSError as exc:
+        raise WheelUpdateError(f"could not stage verification inputs: {exc}") from exc
+    try:
+        proc = subprocess.run(
+            [
+                openssl,
+                "dgst",
+                "-sha256",
+                "-verify",
+                str(pem_path),
+                "-signature",
+                str(sig_path),
+                str(payload_path),
+            ],
             capture_output=True,
             timeout=_OPENSSL_TIMEOUT_SECS,
             cwd=str(workdir),
@@ -549,8 +807,12 @@ def download_verified_wheel(payload: dict[str, str], dest_dir: Path) -> Path:
 
 
 def _run(argv: list[str], timeout: float, step: str, cwd: str | None = None) -> None:
+    # Every build child writes into the shadow tree, so all of them run under
+    # the owner-only build umask (see _BUILD_UMASK below).
     try:
-        proc = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=cwd)
+        proc = subprocess.run(
+            argv, capture_output=True, timeout=timeout, cwd=cwd, umask=_BUILD_UMASK
+        )
     except subprocess.TimeoutExpired as exc:
         raise WheelUpdateError(f"{step} timed out after {timeout:.0f}s") from exc
     except OSError as exc:
@@ -560,6 +822,18 @@ def _run(argv: list[str], timeout: float, step: str, cwd: str | None = None) -> 
         raise WheelUpdateError(
             f"{step} exited {proc.returncode}" + (f": {detail[-2000:]}" if detail else "")
         )
+
+
+#: Owner-only umask for the venv/pip build children (POSIX; -1 = leave unchanged).
+#: ``kirocrew service install`` refuses to attach the AppArmor unprivileged-userns
+#: profile to a launcher that is group- or world-writable (service/apparmor.py), and
+#: ``python -m venv``/pip create ``bin/`` under the process umask — so a permissive
+#: umask (``002``, common on shared dev hosts) would otherwise birth the tree ``0775``
+#: and the profile install would refuse, recurring on every update. ``subprocess``
+#: applies ``umask`` in the child between fork and exec (thread-safe, unlike a
+#: ``preexec_fn`` in this threaded gateway), so bin/ and the launcher are born
+#: owner-only with no window and the profile attaches.
+_BUILD_UMASK = 0o077 if IS_POSIX else -1
 
 
 #: Ownership sentinel: written into a shadow directory the moment this engine
@@ -649,14 +923,23 @@ def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | No
     # Claim ownership BEFORE any build step: the sentinel is what a future
     # retry's reuse guard keys on, so it must exist from the first moment a
     # partial tree can. `python -m venv` tolerates a non-empty directory.
+    #
+    # The root is created OWNER-ONLY (mode=0o700). It is mkdir'd here in the gateway
+    # process under that process's own umask, so a permissive umask (002) would
+    # otherwise leave it group-writable. mkdir(mode=0o700) passes any umask unchanged
+    # (umask only masks group/other bits, and 0o700 sets none), so the root is born
+    # owner-only. Owner-only is safe: the service runs the launcher as this same
+    # user, and no other account needs to traverse the tree.
     try:
-        shadow_dir.mkdir(parents=True, exist_ok=True)
+        shadow_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         (shadow_dir / _SHADOW_SENTINEL).write_text(
             "created by kiro_crew.platform.wheel_engine; removed after verification\n",
             encoding="utf-8",
         )
     except OSError as exc:
         raise WheelUpdateError(f"could not claim the shadow directory: {exc}") from exc
+    # _run applies the owner-only build umask (see _BUILD_UMASK), so bin/kirocrew
+    # and its dirs are born non-group-writable and the AppArmor profile can attach.
     _run(
         [sys.executable, "-m", "venv", str(shadow_dir)],
         _VENV_CREATE_TIMEOUT_SECS,
@@ -672,14 +955,81 @@ def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | No
             capture_output=True,
             timeout=_VENV_CREATE_TIMEOUT_SECS,
             cwd=str(shadow_dir),
+            umask=_BUILD_UMASK,
         )
     except (OSError, subprocess.SubprocessError):
         pass
-    _run(
-        [str(shadow_python), "-m", "pip", "install", "--quiet", str(wheel_path)],
-        _PIP_INSTALL_TIMEOUT_SECS,
-        "pip install into the shadow venv",
-        cwd=str(shadow_dir),
+    # Binary-only, exactly as cli.sh installs: a dependency with no wheel for
+    # this host fails the update up front instead of being compiled from its
+    # sdist in the shadow tree (the gateway host is not required to have a C
+    # toolchain, and a half-built tree is what the sentinel cleanup exists for).
+    policy = _pip_binary_policy()
+    try:
+        _run(
+            [str(shadow_python), "-m", "pip", "install", "--quiet"] + policy + [str(wheel_path)],
+            _PIP_INSTALL_TIMEOUT_SECS,
+            "pip install into the shadow venv",
+            cwd=str(shadow_dir),
+        )
+    except WheelUpdateError as exc:
+        # Same classification cli.sh's _report_pip_failure applies: under the
+        # binary-only policy, pip's "No matching distribution found" means no
+        # release it may install has a wheel for this host, so the refusal
+        # names the platform, the usual cause and the way out (and the index
+        # as the other cause) rather than leaving the operator with pip's raw
+        # text alone.
+        missing = _no_wheel_packages(str(exc)) if policy else []
+        if not missing:
+            raise
+        raise WheelUpdateError(_no_wheel_message(missing) + f" (pip said: {exc})") from exc
+
+
+_NO_WHEEL_RE = re.compile(r"No matching distribution found for ([^\s]+)")
+
+
+def _no_wheel_packages(pip_text: str) -> list[str]:
+    """The requirements pip could not satisfy from wheels, in pip's own order.
+
+    Deliberately not gated on pip's ``(from versions: ...)`` list: pip builds
+    that list from the candidates that survived its link filter, so a package
+    whose every wheel targets a newer libc or another arch reads ``none`` --
+    the same text as an index that does not carry the package -- and a numeric
+    list only means versions outside the required range have a wheel here.
+    The message therefore states the usual cause and names the index as the
+    other one rather than reading a verdict into the list. cli.sh's
+    ``_report_pip_failure`` draws the same line.
+    """
+    seen: list[str] = []
+    for name in _NO_WHEEL_RE.findall(pip_text):
+        if name not in seen:
+            seen.append(name)
+    return seen[:5]
+
+
+def _no_wheel_message(missing: list[str]) -> str:
+    """The operator-facing refusal when no wheel of ``missing`` may be installed here.
+
+    Mirrors cli.sh's message so an install and its later update describe the
+    same platform floor and the same two causes; adds the one fact that is
+    specific to the update path: the opt-in is read from the gateway process's
+    environment, so a host that installed with it has to carry it in the
+    service unit for updates to honour it.
+    """
+    host = f"{platform.system()} {platform.machine()}"
+    if platform.system() == "Linux":
+        libc = platform.libc_ver()
+        if libc[0]:
+            host += f", {libc[0]} {libc[1]}"
+    return (
+        f"pip found no prebuilt wheel of {', '.join(missing)} it may install on this host "
+        f"({host}). Kiro Crew installs prebuilt wheels only and never compiles a dependency. "
+        "Usually this means the host is older than the wheels' floor: the current dependency "
+        "set needs a newer Linux (Amazon Linux 2023, RHEL/Rocky 8+, Ubuntu 22.04+, Debian "
+        "12+) on x86_64/aarch64, or macOS. It can also mean the package index could not be "
+        "reached or does not carry these releases; pip's own words follow. To compile on "
+        f"this host instead, install a C/C++ toolchain and the -dev headers, then set "
+        f"{_ALLOW_SOURCE_BUILDS_ENV}=1 in the environment the gateway runs under "
+        "(the service unit for a service install) and run `kirocrew update` again"
     )
 
 

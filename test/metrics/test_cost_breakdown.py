@@ -210,9 +210,9 @@ class TestConversations:
         assert c["growth_pct_per_turn"] is not None
 
     def test_every_session_is_reported_not_a_ranked_slice(self, store):
-        # This used to be a top-8 cut, which hid most of a user's sessions behind
-        # a count they could not reach. The list is now the whole population; the
-        # remaining cap is a payload backstop far above any real account.
+        # Every session is reported, not a ranked slice that hides sessions behind
+        # a count the user cannot reach. The cap is a payload backstop far above
+        # any real account.
         store([_row(slot=f"chat-{i}-1", credits=float(i)) for i in range(1, 15)])
         d = usage_mod.cost_breakdown(7)
         assert d["conversation_count"] == 14
@@ -343,11 +343,13 @@ class TestNonFiniteCredits:
 
     def test_a_clean_record_is_written_quietly(self, tmp_path, monkeypatch, caplog):
         # The warning has to mean something when it appears, so the ordinary
-        # path must not emit one.
+        # path must not emit one. Ordinary means attributed: a billed row with
+        # no model is its own failure and is reported by the write site.
         monkeypatch.setattr(usage_mod, "_token_usage_dir", lambda: tmp_path)
         with caplog.at_level(logging.WARNING, logger=usage_mod.__name__):
             usage_mod._write_token_record(
-                {"_type": "tokens", "credits": 12.5}, datetime.now(timezone.utc)
+                {"_type": "tokens", "model": "claude-opus-5", "credits": 12.5},
+                datetime.now(timezone.utc),
             )
         assert caplog.records == []
 

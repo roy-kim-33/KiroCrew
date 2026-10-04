@@ -64,7 +64,7 @@ def _no_cycle_background_tasks(monkeypatch):
     session summary): both hop to executor threads (config load, transcript
     flush) that would outlive the test and can re-create the per-test dir
     after teardown."""
-    monkeypatch.setattr(cr, "maybe_refresh_title", AsyncMock())
+    monkeypatch.setattr(cr, "title_then_refresh", AsyncMock())
     monkeypatch.setattr(cr, "generate_session_summary", AsyncMock())
 
 
@@ -157,7 +157,10 @@ async def test_synthesis_dispatch_emits_finalize_before_its_row(tmp_path, monkey
     slot = state.get_or_create_slot("chat-1")
     slot._titled = True
     slot._pending_synthesis = True
-    state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+    state.subagents = MagicMock(
+        running_agents_for=MagicMock(return_value=[]),
+        queued_count_for_async=AsyncMock(return_value=0),
+    )
     state._slots[slot.key] = slot
 
     def _fake_spawn(_state, _slot, coro):
@@ -217,7 +220,7 @@ async def test_empty_queue_boundary_emits_no_finalize(tmp_path, monkeypatch):
     started = await cr._start_next_queued_turn(state, slot)
     assert started is False
 
-    cr._finish_queue_cycle(state, slot)
+    await cr._finish_queue_cycle(state, slot)
     await asyncio.sleep(0)
 
     kinds = [t for t, _ in frames]

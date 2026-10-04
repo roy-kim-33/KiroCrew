@@ -1,6 +1,9 @@
-import { describe, it, expect } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+
+import { api } from '../../api/client'
 
 import SettingsSearch from './SettingsSearch'
 
@@ -27,17 +30,29 @@ function ParamsProbe() {
 }
 
 function setup(initialEntry = '/settings?tab=chat&channel=slack') {
-  return render(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <SettingsSearch />
-      <ParamsProbe />
-    </MemoryRouter>,
+  // A QueryClient because the search reads `['dashboardConfig']` to learn whether a
+  // governance-gated entry may be offered at all. The cases below are about ranking
+  // and activation and query nothing governed, so an unresolved read is fine here;
+  // `settingsSearchGovernance.test.ts` owns the offered/withheld behaviour.
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <SettingsSearch />
+        <ParamsProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
   )
+  return client
 }
 
 const input = () => screen.getByRole('combobox')
 
 describe('SettingsSearch', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('shows matching rows for a query against a stable registry entry', () => {
     setup()
     fireEvent.change(input(), { target: { value: 'zoom' } })
@@ -50,7 +65,7 @@ describe('SettingsSearch', () => {
     setup('/settings?tab=chat&channel=slack')
     fireEvent.change(input(), { target: { value: 'zoom' } })
     fireEvent.mouseDown(screen.getByText('Zoom Level'))
-    expect(screen.getByTestId('pathname').textContent).toBe('/settings/display')
+    expect(screen.getByTestId('pathname').textContent).toBe('/settings/display/zoom')
     const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
     expect(params.get('highlight')).toBe('display.zoom-level')
     // The stale legacy params from the previous URL must not ride along.
@@ -113,5 +128,45 @@ describe('SettingsSearch', () => {
     const after = screen.getAllByRole('option')
     expect(after[0]).toHaveAttribute('aria-selected', 'false')
     expect(after[1]).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('still offers the governed entry when the ceiling read FAILED', async () => {
+    // This component resolves the governance answer itself
+    // (`!isSuccess || data?.decisions_enabled === true`), so the case belongs here
+    // rather than against a restatement of that expression. A failed read is not a
+    // denial: the Decisions card this row navigates to renders the read-failed notice,
+    // so withholding the row would report the setting as absent on a host that merely
+    // could not check.
+    vi.spyOn(api, 'dashboardConfig').mockRejectedValue(new Error('offline'))
+    setup()
+    fireEvent.change(input(), { target: { value: 'Decisions' } })
+    await waitFor(() => {
+      expect(
+        screen.getAllByRole('option').some(o => /Decisions/i.test(o.textContent ?? '')),
+      ).toBe(true)
+    })
+  })
+
+  it('withholds Feature Tips once the tips read says the instance config is off', async () => {
+    // With tips off the Chat rail can drop its Discovery group, and the sub-nav
+    // self-heals `sub=discovery` to the first group -- the hit would land nowhere.
+    vi.spyOn(api, 'tipsStatus').mockResolvedValue({ enabled_config: false, opted_out: false, cadence_hours: 24 })
+    setup()
+    fireEvent.change(input(), { target: { value: 'Feature Tips' } })
+    await waitFor(() => {
+      expect(api.tipsStatus).toHaveBeenCalled()
+      expect(screen.queryByText('Feature Tips')).not.toBeInTheDocument()
+    })
+  })
+
+  it('still offers Feature Tips while the tips read is pending or has failed', async () => {
+    vi.spyOn(api, 'tipsStatus').mockRejectedValue(new Error('offline'))
+    const client = setup()
+    fireEvent.change(input(), { target: { value: 'Feature Tips' } })
+    // Pending: offered on first paint.
+    expect(screen.getByText('Feature Tips')).toBeInTheDocument()
+    // Failed: a read that did not succeed is not a denial.
+    await waitFor(() => expect(client.getQueryState(['tipsStatus'])?.status).toBe('error'))
+    expect(screen.getByText('Feature Tips')).toBeInTheDocument()
   })
 })

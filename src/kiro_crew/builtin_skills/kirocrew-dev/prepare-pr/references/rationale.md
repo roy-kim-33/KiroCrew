@@ -18,19 +18,25 @@ A failed server check re-enters Phase 1 rather than patching in place because ba
 movement between rounds is the common case on a repo carrying 175+ open PRs. Patching
 in place produces a fix validated against a base that no longer exists.
 
-## Why 10 iterations is a backstop and 3 is the real limit
+## Why retrospective and runtime bounds are separate
 
-The escalation triggers fire at ~3 rounds. That makes 10 unreachable in any healthy
-run: a loop that reaches 10 has already missed a trigger. It is retained purely as a
-runaway guard, and `SKILL.md` says so, because a cap presented as a target invites
-using it.
+A recurring span needs a retrospective because a stable failing-check count cannot
+show whether each repair adds another mechanism that attracts the next finding.
+The retrospective rechecks the whole diff against the original intent; it is not
+a mandatory stop at the third round. Local review passes, monitor cycles and wall
+clock measure different costs. The current bounds and escalation rules live only
+in `SKILL.md`; none is a target, and only the user may extend an exhausted budget.
 
-**Same-span recurrence needed its own trigger** because the count-based rule cannot
-see it. When each round closes exactly the finding it was given and receives one new
-blocker in the *same* `file:function` span, the failing-check count stays pinned at
-1 — it never rises and never falls, so "3 iterations with no drop" never fires. This
-is the most expensive round pattern measured on this repo, and in every instance the
-correct structural fix had already been written down mid-flight and then deferred.
+## Why the retrospective decides and continues
+
+In practice the loop stopped at every `--rounds` exit 30: the parent collected the
+retrospective, posted the remove / replace / keep verdicts as a menu, and waited.
+That turned an every-third-round review into a mandatory user gate, which is the
+opposite of what the loop is for. The verdicts are almost always decidable from the
+PR body's frozen goal and the defect the mechanism was added for, so the skill names
+the pick order and a default, and lists the only four situations where a human
+supplies something the agent cannot. Recurrence is the trigger for the review, not
+a reason to hand the PR back.
 
 ## Why the two Phase 0 gates come before opening
 
@@ -48,6 +54,257 @@ them and the gate reads as passing.
 Operating on a stale `origin/<base>` ref was the root cause of the 2026-07-31
 clobber, where a force-push replayed 114 duplicate commits. The fetch therefore fails
 closed rather than proceeding on the cached ref.
+
+## Why push_guard builds the commits, and never from the shared index
+
+A soft reset onto the base plus `git commit` commits whatever the index holds,
+and in a shared checkout the index is shared state: another session's
+`git checkout -q origin/main -- .` once left a stale tree staged there. Squashed
+that way, the commit sat exactly where a good squash sits, so every structural
+check passed (ancestry, ahead count, patch-id replay, `HEAD~1 == origin/<base>`)
+and the post-squash guard printed `SAFE TO PUSH (single commit on base)` for a
+commit that changed 5607 files and reverted 1480 upstream commits. A plain
+`git commit` after staging one file sweeps in every pre-staged path the same way.
+
+A content heuristic over the diff was built first (count the paths put back to
+an older base blob) and dropped. Measured on this repository's history, it let
+most trees one PR stale through. It could not see a reverted hunk inside a file
+the PR also edits. It refused re-lands, bulk deletions, low-similarity moves and
+codemod undos. Its limits were calibrated on one repository, while the guard runs
+on any. The real root cause is a shared checkout, so the fix is to stop each step
+from reading shared state:
+
+- **Nothing staged that you did not name.** Every mode except `--check-index`
+  refuses (41) while the index holds a path HEAD lacks. For `--commit` and
+  `--amend` that means a path that is not literally one of the names; a
+  directory does not name the entries under it. Names are compared as real
+  paths, so a symlinked prefix names the same file; an empty name (an unset
+  shell variable would otherwise name the whole tree) and a path outside the
+  repository, or on another drive, are usage errors (64).
+- **A commit by name is built in a private index.** It is seeded from HEAD;
+  each named path's worktree copy is added (`-f` only for a file, never for a
+  directory, so a named directory never sweeps in its ignored files), except
+  that a staged change the worktree cannot show (`git rm --cached`,
+  `update-index --chmod`, a gitlink whose submodule is not checked out) is
+  kept. `git commit` then commits that index, hooks and signing included,
+  with the message from `-m` or from `-F <file>` (which keeps prose off the
+  command line a shell fence reads). The shared index changes only after the
+  commit lands, only for the committed paths, and only where no one staged
+  anything since the run read it, so a rejecting hook leaves nothing staged
+  and a concurrent `git add` is kept. The commit landed when git exits 0 AND
+  HEAD is what was built: its parents, its author, and its tree outside the
+  named paths (a hook may reformat those, never add others). A commit that is
+  not is taken back with a compare-and-swap when the shape is unambiguous: it
+  sits where it was built, or git parented it on a commit that landed in
+  between. A failure that moved HEAD anyway is named as such, never as
+  "nothing was committed".
+- **The squash commit is built from a tree, with no index.** `--squash` runs
+  the history checks first and pins HEAD and the fully qualified
+  `refs/remotes/origin/<base>` once, so a commit or fetch during the replay
+  scan cannot slip in. `commit-tree` makes the commit object from HEAD's tree
+  on that base, signed with `-S` when `commit.gpgSign` asks. The message is
+  handled as bytes: cleaned like `git commit -F`, passed through the
+  prepare-commit-msg and commit-msg hooks (`git hook run`, with an index of the
+  squash's tree and `GIT_EDITOR=:`), cleaned again as `commit.cleanup` says, and
+  refused if that leaves it empty. A git older than 2.36 cannot run hooks by
+  name, so it refuses when such a hook exists instead of skipping it.
+  Pre-commit hooks do not run, because they ran when the squashed commits were
+  made. The branch ref (named once, never HEAD) then moves exactly once, by
+  compare-and-swap from the vetted tip, and the outcome is read back from the
+  ref. An interrupt or kill at any moment, SIGKILL included, leaves the branch
+  at its old tip or at the finished squash, never at the base. That property
+  is what makes a kill safe.
+  `commit-tree` also reads no MERGE_HEAD or CHERRY_PICK_HEAD, so a merge
+  another session starts mid-squash neither leaks in nor is used up.
+  Alternative rejected for the squash: `git commit` against a private index
+  (it parks the branch on the base while hooks run, and consumes another
+  session's state). A commit by name has neither problem: its branch never
+  leaves HEAD.
+- **A rebase stop is checked before it is continued.** `git rebase --continue`
+  commits from the shared index, so the skill runs `--check-index` first. At a
+  stop, the replayed commit's own paths are expected, including where the
+  other side renamed them (`STATUS: CLEAN`); anything else staged is listed
+  (41), with remedies that only unstage or abort, never one that discards the
+  replayed change. A stop on unresolved conflicts names them. An operation
+  counts as in progress the way `git status` decides it: its state directory,
+  or a pseudo-ref `git commit` would consume; a sequencer-only stop is named
+  from its todo list (a revert is a revert). A stale `REBASE_HEAD` left by a
+  finished rebase does not count. Every mode checks this before anything else,
+  so a squash at a stop names the stop, not a detached HEAD.
+- **Every SAFE mode reads the build record.** The record lives in the common
+  git dir, so every worktree of the repository shares it. It holds one file
+  per commit the guard made, named by the commit's sha and listing the paths
+  it committed. A commit by name is recorded only once it has landed, so one
+  a hook rejected records nothing. The squash is recorded just before its one
+  compare-and-swap move, so an interrupt after the move still leaves it
+  recorded; a squash whose move failed is on no branch, so its record vouches
+  for nothing. No two writers share a file, and no entry evicts
+  another; entries older than 180 days are pruned. Every mode that can say
+  SAFE refuses while HEAD changes, against the base, a path nothing accounts
+  for. That is what a squash or commit made by hand from a stale index looks
+  like. A path is accounted for in four ways:
+  - it is recorded for one of the branch's own commits;
+  - it is recorded for a past tip in the branch's reflog, which is what a
+    re-sync rebase, a conflict resolution or a squash rewrote, followed
+    through any rename the base made since. `--amend` reads the base as last
+    fetched for this, so it accounts for a path exactly as the push check
+    does;
+  - it is published: a commit on the pushed branch (`origin/<branch>`) whose
+    author is not this checkout's identity changes it, and HEAD holds
+    exactly that copy, as with a maintainer's commit already on the pull
+    request. The pushed branch counts only when HEAD or one of the branch's
+    reflog tips reaches it, so a stale remote ref left by an earlier branch of
+    the same name counts for nothing;
+  - it is named after `--`, which is the agent vouching for it after reading
+    its diff. In the default mode and `--require-single-on-base` that vouch
+    is read-only, for that run alone, so an author's commit plus a follow-up
+    pushes with both commits and authors intact. `--squash` and `--amend`
+    commit what is named (an amend, its worktree copy) and record it, and
+    their refusals say so.
+
+  Keying by commit, with the reflog for rewritten tips, means a deleted and
+  re-created branch, a name reset with `git switch -C`, `checkout -B`,
+  `branch -f` or a `git reset` of the checked-out branch (the reflog is read
+  back only to that reset), or a detached HEAD
+  in another worktree, inherits nothing: none has those tips. A worktree
+  carried from HEAD (`git worktree add -b`)
+  carries them. The record proves who committed a path, not what a later hand
+  edit put in it. A stale hunk inside a path the branch committed through the
+  guard is the residual below.
+- **A listed path is named back as printed.** Refusals print each path as
+  `:(top,literal)<path>`, which git and the guard both read as that path from
+  the top, from any directory. The guard reads such a name as written, never
+  through a parent that is now a symlink, and refuses one with a `..`
+  component. Each refusal also writes a NUL-separated list file, which
+  `--paths-from-file` reads, for a name no terminal can show.
+
+Every probe child runs with no terminal prompt (`GIT_TERMINAL_PROMPT=0`,
+`GCM_INTERACTIVE=never`), no stdin and `LC_ALL=C`. `GIT_ASKPASS` is left alone:
+it is also how a non-interactive credential source is wired. Output goes to
+files, not pipes, so a hook's background child cannot hold a finished step open.
+Children that run user code (the message hooks, `commit-tree`'s signing, `git
+commit`) keep the caller's locale, prompts, stdin and stderr, so a passphrase
+prompt can be answered and git's messages show as they happen. Every child
+drops the variables that relocate the repository, keeps the caller's
+`GIT_CONFIG_*` (identity, hooks path, signing), and runs with
+`GIT_NO_REPLACE_OBJECTS=1` and a `GIT_GRAFT_FILE` that cannot exist (a name
+under the null device), so neither a replace ref nor a legacy `info/grafts` line
+can hide trunk commits from the count. A graft file git can open, even an empty
+one, makes every child print git's "info/grafts is deprecated" advice, hooks'
+own git calls included. Every
+child stays in the guard's process group: whoever stops that group (a harness
+timeout, a closed terminal, SIGKILL) stops the child too. A child that outlives
+its bound gets SIGTERM, then SIGKILL after a grace period (on Windows, `taskkill
+/T`, then `/T /F`). SIGINT, SIGTERM and SIGHUP stop the current child before the
+guard reports, except that a signal the caller ignores (`nohup`) stays ignored,
+for the guard and its children. The base fetch runs with `--progress` and is stopped only when
+its output has not grown for `FETCH_STALL_S`: a killed fetch keeps nothing it
+received, so a total bound would fail a slow link on every retry. Its refusal
+names the one unbounded manual `git fetch` that gets past a link that stalls.
+Each 41 writes its own list file, so a remedy reads exactly the list it
+printed, and it lists every path whose worktree copy may hold edits (`(*)`);
+the command that clears the list is offered only when none is marked.
+
+Residuals, on the record:
+
+- An exact re-land of a reverted change is still refused by the replay check.
+  That check predates this design.
+- A conflict resolved wrongly, for example `rebase -X theirs` dropping an
+  upstream line, is the branch's own content. So is a stale copy of a file the
+  replayed commit also touches, staged at a rebase stop, and a stale hunk
+  committed by hand into a path the record already holds. No history or index
+  invariant can tell any of them from an intended edit; the review lanes are
+  the check.
+- Vouching for a path by name is the agent's word. The refusal counts and
+  lists the paths and tells it to read each diff first, and never to name one
+  that is not its own; no shipped remedy lists a whole diff to vouch with.
+- A path counts as published only on `origin/<branch>`. A fork's pull request
+  pushed to another remote has no published paths, so a co-author's commit
+  there is read and named. A commit of yours that was pushed without the guard
+  is not published either, so it is read and named. A stale copy pushed by
+  another author still counts as published, and pushing it again changes
+  nothing on the pull request.
+- The rewritten tips come from the branch's reflog. Where reflogs are off, or
+  a rebased-away tip's entry has expired (30 days by default), the guard's own
+  paths are refused and named again: the failure is a refusal, never a pass.
+- A grandchild that left the guard's group and ignores SIGTERM can outlive a
+  stopped child. On Windows the tree kill reaches it.
+- `preflight.py` refuses a git resolved inside the worktree, and a batch
+  launcher fed metacharacters. push_guard's runner does not yet; moving those
+  guards into push_guard (preflight already imports it) is a follow-up.
+- The replay scan runs one `diff-tree` and one `patch-id` per commit, each with
+  its own bound. Batching them, and one overall deadline, are follow-ups, as
+  are `diff_signals.py` and `green_age.py` still resolving short base names.
+
+## Why a green expires, and why the check is client-side
+
+A pull request's green is a verdict about `refs/pull/<N>/merge` at the moment the
+run was triggered. Nothing re-derives it when the base moves, so a head that
+passed and then waited for review can merge against a base its tests never saw.
+Measured: a PR ran CI once at 15:39, waited about ten hours, and merged at 01:32
+with no re-run; two PRs merged in between had added tests that the merged change
+makes fail. The red surfaced two hours later on an unrelated PR, because this
+repo's `main` CI is routinely cancel-evicted by the next merge — three
+consecutive main runs read `cancelled` — so there is no per-commit verdict on
+`main` to catch it either.
+
+Two obvious server-side fixes were rejected by the constraint that matters here:
+merge velocity. The median merge gap is about 1.4 minutes and CI takes about 19,
+so a merge queue or strict up-to-date protection would serialise the repository
+behind its own CI. `green_age.py` is the soft version of the same idea. It runs
+client-side during the review wait, and it costs a rebase only on a PR whose
+files actually collide with what the base gained — not on every PR, and not at
+merge time.
+
+That is also why the exit code is consumed by the skill and by nothing else.
+`pr_status.py` prints the line and carries the summary in `advisory.green_age`,
+but never feeds it to `decide()`: a client-side heuristic in front of a required
+check would be a merge gate the maintainers declined, and a probe that cannot
+measure (exit 2) must not be able to turn a readable PR red.
+
+`babysit`'s `BEHIND` trigger does not cover this. `mergeStateStatus` reports
+`BEHIND` only under strict up-to-date protection, which is off here
+(`strict_required_status_checks_policy: false`), so on this repo that trigger is
+dead and the exit-30 signal is what replaces it.
+
+### What this does not close
+
+The re-sync half only reaches a PR the loop is actively driving. A PR a human
+merges by hand gets the `green age:` line `pr_status.py` prints and nothing else,
+so the incident class is narrowed rather than closed: a merger who does not read
+that line can still merge an expired green. Closing it outright needs a
+server-side signal, which is the thing the merge-velocity constraint refuses.
+
+Exit 2 is deliberately neither of the other two. A base that cannot be read is not
+a fresh green and not a stale one, so it satisfies no criterion and blocks none;
+after three consecutive 2s the loop reports the reason and hands the PR over rather
+than polling forever on an environment it cannot fix.
+
+## Why the Backwards compatibility section is not a required one
+
+The same observed incident has a writer-side half, and it is the half that actually
+broke. The PR that waited ten hours TIGHTENED a contract: it made a ledger entry's
+`data` validate against a registry, so a payload that main accepted before now
+raises. That is a `Breaking:` change, and the writers it broke are exactly the ones
+the two PRs merging in between added -- `test/test_ledger_kinds.py`,
+`test/test_ledger_retention.py` and `test/test_remove_slot_for_history_key.py` all
+hand-write payloads without the new required fields. A writer sweep taken when that
+PR opened would have found none of them, because none of them existed yet. So the
+rule is not symmetry with the tests-side check: it is the same expiry, on the same
+merge, read from the callers instead of the tests -- which is why a tightening diff
+owes a `Breaking:` line plus a writer sweep re-run on fresh `origin/main` right
+before the last push, with that sha written into the body. `green_age.py` asks that
+question of the tests; the sweep asks it of the callers.
+
+The section is deliberately absent from `REQUIRED_SECTIONS` in
+`.github/scripts/pr-description-check.sh`, the list PR Hygiene and
+`fork-pr-description.yml` both check. That list is matched against the body of
+every open PR on each `edited`/`synchronize`, so adding a heading to it would fail
+every body written before this change -- a red that says nothing about the diff.
+The rule reaches the author through the template's own prompt and through
+prepare-pr's Phase 1.5 instead, where it costs an existing PR nothing. The frozen
+goal sections pay that cost on purpose: a PR with no goal is exactly what the
+gate exists to stop, so its red does say something about the PR.
 
 ## Why force-with-lease must be SHA-pinned
 
@@ -142,6 +399,44 @@ on the GPT comment, and one-rationale-per-finding keeps a reused reason from sil
 claiming findings it was never checked against. A rationale reused across several
 findings is the blanket line from "Common mistakes" with a marker on top of it.
 
+## Why review repairs are delegated by reviewer family
+
+The routing table in `SKILL.md` records a maintainer-requested execution policy
+for this repository's own PRs. It does not rest on a defect found in an earlier
+parent self-fix, and it does not claim a delegated repair is better than a parent
+repair. The acceptance condition is: each CI AI finding is repaired by a
+model-pinned subagent from the same family as the lane that raised it, preferring
+the stronger available member of that family, with disclosed lower-tier fallback,
+while the parent keeps verification, consolidation and publication. The intent is
+a repair that starts from the finding, the owning spec and the assigned files
+rather than the parent's round history (a subagent can still inherit context, so
+this is intent, not a guarantee), read by the family that wrote the finding, and
+checked by the parent as a separate step.
+
+The listing selects availability, the table states preference: the backend/account
+model listing says what exists, and an entry there is neither entitlement nor proof
+of service, which is why the skill still requires exact IDs and reports an
+unverified served model as such. "No pinnable spawn facility means a blocker" is
+part of the requested policy: the parent reports the blocker and hands off rather
+than presenting its own fix as delegated. The names live once, in the `SKILL.md`
+table; `docs/ci/ci-and-reviews.md` points at it, and
+`test/test_review_repair_routing_skill.py` pins the row order deliberately, so a
+generation change is one table edit plus the test that records the policy.
+
+## Why both body checks are gates
+
+`--check-body` gates completeness (exit 20) and length (exit 21) at once, and
+the two pull in opposite directions on purpose. The accounting check is the leak
+detector, not the prose: a long walkthrough hides a stray file better than a
+short body does, because the reviewer trusts it and skips the diff. The length
+check used to be a WARN, on the theory that a rename or a shared-helper migration
+needs the words and a hard cap cuts true facts. In practice the WARN was never
+read: the hard check rewarded listing, the soft one was ignored, and bodies grew
+round by round into per-file recitals nobody could read. With the ledger
+guaranteed complete, a cap cannot cut a true fact -- only a restated one. The
+code is the evidence; the body says what changed and why. Short prose, complete
+ledger -- paths, tables and pictures never count against the limit.
+
 ## Why the PR body must come from the template file
 
 The maintainer's auto-approval bot greps for the template's exact heading strings.
@@ -150,17 +445,50 @@ The maintainer's auto-approval bot greps for the template's exact heading string
 because the repo's file is the single source of truth and the skill always runs
 inside a checkout.
 
-## Why screenshots live in `temp-screenshots/`
+## Why screenshots are attachments, not commits
 
 `docs/` and `src/kiro_crew/**` ship in the wheel, the sdist, and the desktop DMG, so
-review images placed there ride into a shipped artifact. `temp-screenshots/` is
-outside every packaged path and is pruned periodically — long enough for the PR to be
-reviewed.
+review images placed there ride into a shipped artifact; a dedicated directory keeps
+them out of the package but still puts megabytes of pixels into every clone, forever.
+An attachment puts nothing in the repository at all: `gh pr create|edit --attach`
+uploads the file with the caller's own token and rewrites the body's local path to
+`https://github.com/user-attachments/assets/<uuid>`.
 
-SHA-pinned URLs are required because branch-pinned URLs break when the branch is
-deleted on merge, and external image hosts leak content and are camo-blocked for
-private repos. The pinned blob stays reachable through the historical commit even
-after cleanup removes the file from `main`'s tip.
+That URL is tied to no commit and no branch. A raw-blob URL has to be pinned to a SHA
+to survive branch deletion on merge, and then every squash, amend or force-push moves
+the SHA out from under it, so the body needs a re-pin pass after each round and the
+first missed pass leaves a broken image. The attachment URL survives all of those
+without anyone touching the body, so the loop never re-pins. External image hosts
+are the other alternative and are worse on both counts: they leak content, and GitHub
+Camo blocks them on private repos.
+
+The review lanes read the same URL the author wrote: the UX lane's blind read
+downloads the `user-attachments` links from the PR body, and the screenshot-evidence
+gate accepts them as visual evidence. Dragging a file into the description in the web
+UI produces an identical URL, so a human reviewer and the lanes see one convention.
+
+**The one scoped exception: a contributor with no write access on the repository.**
+`gh --attach` uploads through an endpoint that answers read permission with a 404
+(cli/cli#14302), so a fork contributor has no CLI path to an attachment at all; the
+web-UI drag is their only one. For them, and only them, committing the media under
+`temp-screenshots/<topic>/` (`git add -f`, past the ignore rule) and referencing the
+repository-relative path from the body is admissible evidence:
+`.github/scripts/pr-committed-evidence.sh` reads the blobs out of the object store for
+the fork lanes, and the screenshot-evidence gate accepts a still-linked committed
+path. The exception does not weaken the rule for anyone who CAN attach: every reason
+above still holds for them, and the cost below is one they would pay for nothing.
+
+**What the exception costs, and which part is irreversible.** When the PR merges,
+the committed file becomes a tracked file on `main` and a blob in history. The tracked
+file is the reversible half: the merging maintainer removes it in a follow-up
+`chore(evidence): drop the committed review media of #<n>` PR, so review media never
+accumulates on the tip again (the sweep that emptied the tree took out 1,739 files
+and 286 MB). The blob is the irreversible half: a deletion commit leaves it in every
+clone's pack, and only a history rewrite removes it, which that sweep deliberately
+deferred. The cost is accepted because it is bounded — fork PRs are the minority, the
+evidence script refuses a file over its size ceiling, and the guidance asks for two or
+three shots — and because it never lands silently: the files are in the diff the
+maintainer squash-merges. The merge-time steps are in `docs/ci/ci-and-reviews.md`.
 
 ## Why the closing-keyword check reads the API back
 
@@ -181,12 +509,18 @@ that issue plans against stale information.
 
 `statusCheckRollup` needs Checks read access, which a fine-grained PAT structurally
 cannot grant, and GitHub resolves each `gh ... --json` request atomically. Both
-scripts therefore fetch the rollup in its own `gh pr view` call. On failure they
-print `NOTICE: CI check status UNAVAILABLE ...` and continue with an empty rollup
-rather than aborting. The rollup read re-fetches `headRefOid` and is discarded
-(`NOTICE: CI check status DISCARDED ...`) when a concurrent push moved the head
-between the two reads, so one head's metadata is never paired with another head's
-checks.
+scripts therefore fetch the rollup in its own call. That call is a GraphQL read of the
+head commit's rollup rather than `gh pr view --json statusCheckRollup`: the rows `gh`
+returns name the workflow by its display label and nothing else about the run, while
+`collapse_superseded` keys on the run itself -- its id, its triggering event, its
+workflow definition's id and its own conclusion -- which only the check suite exposes.
+On failure the scripts print `NOTICE: CI check status UNAVAILABLE ...` and continue
+with an empty rollup rather than aborting. Every page of the read re-fetches
+`headRefOid` and names the commit the rollup hangs off, and the whole read is
+discarded (`NOTICE: CI check status DISCARDED ...`) when either disagrees with the
+core read's head, so one head's metadata is never paired with another head's checks.
+A board past the read's page cap is reported UNAVAILABLE rather than in part, since a
+partial read could keep a displaced row whose successor was never fetched.
 
 Both states are deliberately distinct from a genuine "no checks yet":
 `pr_status.py` still fails closed at exit 20 but with a `CI status unreadable ...`
@@ -216,22 +550,17 @@ runs over 25 hours with 23 approval blocks, zero pushes, and a healthy-looking
 registry. Heartbeat runs under a strict name allowlist (`HEARTBEAT_SAFE_TOOLS`) with
 no shell and no `git push`, so it cannot amend a commit at all.
 
-`pr_watch` is exempted only for a pure-watch stretch because it reads no comment
+`monitor_watch` is exempted only for a pure-watch stretch because it reads no comment
 bodies. A round is complete when every check finished **and** every bot posted, and
-`pr_watch` cannot see the second half of that condition.
+a provider-typed watch cannot see the second half of that condition. There is no
+script-cron watcher to exempt: a cron holding a copy of the retired driver is
+refused on every tick and auto-paused.
 
 ## Why arming cannot be confirmed from the reply
 
-Arming happens when the turn's *result* is processed, so a successful
-`monitor_start` can only ever come back as *requested* — the tool says so itself. A
-synchronous refusal is visible before the turn ends and is real. The residual case —
-the applier refusing after the turn ends — is unobservable from inside the turn by
-construction and shows up as a cycle that never arrives.
-
-Treating a bare *requested* as an arming failure fires the `wait` fallback on every
-arm and reinstates the very timeout the `monitor_start` branch exists to remove,
-which is why `SKILL.md` states the two branches as one rule with an explicit default.
-
-`max_cycles` counts cycles, not rounds. One 20–40 minute round costs several
-5-minute cycles, so the default expires after roughly the first two or three rounds
-and deactivates the loop silently, well short of the 10-iteration backstop.
+Arming is applied after the tool returns, so an acknowledgement alone does not
+prove a loop exists. A synchronous refusal is definitive; other results need the
+state check prescribed in `SKILL.md`. That check and its bounded fallback prevent
+both silent abandonment and duplicate poll drivers. Monitor cycles are not server
+rounds, so a wall-clock bound must accompany the cycle budget. The execution
+procedure owns those budgets rather than a second copy here.

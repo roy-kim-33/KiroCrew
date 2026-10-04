@@ -273,7 +273,7 @@ def _apply_recorded_answers(
     ``locked``, whatever the state file says about it -- including a pending
     re-emission of the same id. Decisions the agent has dropped from its state
     file are NOT resurrected: there is no card to lock, and synthesising one
-    would put a title on screen that no longer exists anywhere.
+    would put a title on screen that appears nowhere in that state.
     """
     if not recorded or not isinstance(spec_state, dict):
         return spec_state
@@ -379,7 +379,7 @@ def _claim_decision_locked(
                 return _CLAIM_ALIAS_CONFLICT, ""
             # The directory must still verify as ITSELF before anything is recorded
             # under its key. This is the half that keeps the alias-by-spelling hole
-            # closed now that _decision_key no longer resolves: an entry whose spec_dir
+            # closed given that _decision_key does not resolve: an entry whose spec_dir
             # disagrees with realpath is either a directory swapped after indexing or a
             # hand-written index entry spelling one directory two ways, and either way
             # recording under it would mint a second record for documents that already
@@ -504,6 +504,49 @@ async def _pending_decisions(spec_dir: str) -> list[dict[str, str]]:
     return await asyncio.to_thread(_pending_decisions_locked, spec_dir)
 
 
+def _outbox_entry(
+    entries: dict[str, dict[str, str]], decision_id: str, fingerprint: str, delivery_id: str
+) -> tuple[str, dict[str, str]] | None:
+    """The outbox row one delivery owns: its decision, its question and its delivery id.
+
+    An HTTP claim mints a fresh delivery id, so a delivery settles only the row it
+    created; matching the decision id and question fingerprint as well keeps a
+    replay from settling a row recorded for a different question.
+    """
+    return next(
+        (
+            (storage_key, entry)
+            for storage_key, entry in entries.items()
+            if entry.get("decision_id") == decision_id
+            and entry.get("fingerprint") == fingerprint
+            and entry.get("delivery_id") == delivery_id
+        ),
+        None,
+    )
+
+
+def _store_outbox_entry(
+    store: dict, spec_dir: str, storage_key: str, entry: dict[str, str], failure: str
+) -> bool:
+    """Write one transitioned row back under its directory's record and persist it.
+
+    BLOCKING -- call with ``_DECISIONS_LOCK`` held on a worker thread. False when the
+    directory's record has no answers mapping to hold the row, or when the write
+    fails; *failure* is the log message, formatted with the directory.
+    """
+    container = store.get(_decision_key(spec_dir))
+    answers = container.get("answers") if isinstance(container, dict) else None
+    if not isinstance(answers, dict):
+        return False
+    answers[storage_key] = entry
+    try:
+        _save_decisions(store)
+    except OSError:
+        logger.warning(failure, spec_dir, exc_info=True)
+        return False
+    return True
+
+
 def _mark_decision_relayed_locked(
     spec_dir: str, decision_id: str, fingerprint: str, delivery_id: str
 ) -> bool:
@@ -512,16 +555,8 @@ def _mark_decision_relayed_locked(
         store, usable = _read_decisions()
         if not usable:
             return False
-        entries = _decision_entries(store, spec_dir)
-        matched = next(
-            (
-                (storage_key, entry)
-                for storage_key, entry in entries.items()
-                if entry.get("decision_id") == decision_id
-                and entry.get("fingerprint") == fingerprint
-                and entry.get("delivery_id") == delivery_id
-            ),
-            None,
+        matched = _outbox_entry(
+            _decision_entries(store, spec_dir), decision_id, fingerprint, delivery_id
         )
         if matched is None:
             return False
@@ -529,19 +564,9 @@ def _mark_decision_relayed_locked(
         if entry.get("status") in ("relayed", "final"):
             return True
         entry["status"] = "relayed"
-        container = store.get(_decision_key(spec_dir))
-        answers = container.get("answers") if isinstance(container, dict) else None
-        if not isinstance(answers, dict):
-            return False
-        answers[storage_key] = entry
-        try:
-            _save_decisions(store)
-        except OSError:
-            logger.warning(
-                "could not mark decision delivery relayed for %s", spec_dir, exc_info=True
-            )
-            return False
-        return True
+        return _store_outbox_entry(
+            store, spec_dir, storage_key, entry, "could not mark decision delivery relayed for %s"
+        )
 
 
 async def _mark_decision_relayed(
@@ -565,16 +590,8 @@ def _restore_decision_pending_locked(
         store, usable = _read_decisions()
         if not usable:
             return False
-        entries = _decision_entries(store, spec_dir)
-        matched = next(
-            (
-                (storage_key, entry)
-                for storage_key, entry in entries.items()
-                if entry.get("decision_id") == decision_id
-                and entry.get("fingerprint") == fingerprint
-                and entry.get("delivery_id") == delivery_id
-            ),
-            None,
+        matched = _outbox_entry(
+            _decision_entries(store, spec_dir), decision_id, fingerprint, delivery_id
         )
         if matched is None:
             return False
@@ -584,17 +601,9 @@ def _restore_decision_pending_locked(
         if entry.get("status") != "relayed":
             return False
         entry["status"] = "pending"
-        container = store.get(_decision_key(spec_dir))
-        answers = container.get("answers") if isinstance(container, dict) else None
-        if not isinstance(answers, dict):
-            return False
-        answers[storage_key] = entry
-        try:
-            _save_decisions(store)
-        except OSError:
-            logger.warning("could not restore undelivered decision for %s", spec_dir, exc_info=True)
-            return False
-        return True
+        return _store_outbox_entry(
+            store, spec_dir, storage_key, entry, "could not restore undelivered decision for %s"
+        )
 
 
 async def _restore_decision_pending(
@@ -618,16 +627,8 @@ def _finalize_decision_locked(
         store, usable = _read_decisions()
         if not usable:
             return False
-        entries = _decision_entries(store, spec_dir)
-        matched = next(
-            (
-                (storage_key, entry)
-                for storage_key, entry in entries.items()
-                if entry.get("decision_id") == decision_id
-                and entry.get("fingerprint") == fingerprint
-                and entry.get("delivery_id") == delivery_id
-            ),
-            None,
+        matched = _outbox_entry(
+            _decision_entries(store, spec_dir), decision_id, fingerprint, delivery_id
         )
         if matched is None:
             return False
@@ -635,19 +636,9 @@ def _finalize_decision_locked(
         if entry.get("status") == "final":
             return True
         entry["status"] = "final"
-        container = store.get(_decision_key(spec_dir))
-        if not isinstance(container, dict):
-            return False
-        answers = container.get("answers")
-        if not isinstance(answers, dict):
-            return False
-        answers[storage_key] = entry
-        try:
-            _save_decisions(store)
-        except OSError:
-            logger.warning("could not finalize decision delivery for %s", spec_dir, exc_info=True)
-            return False
-        return True
+        return _store_outbox_entry(
+            store, spec_dir, storage_key, entry, "could not finalize decision delivery for %s"
+        )
 
 
 async def _finalize_decision(

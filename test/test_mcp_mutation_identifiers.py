@@ -1,6 +1,6 @@
 """The MCP mutation endpoints must type-check their identifiers.
 
-``toggle``, ``toggle-tool`` and ``remove`` used to call ``.strip()`` directly
+``toggle``, ``toggle-tool`` and ``remove`` must not call ``.strip()`` directly
 on ``name`` / ``server`` / ``tool``, so a truthy non-string from a malformed
 client (an array, an object, a number) surfaced as HTTP 500 — AttributeError —
 before any validation ran. Worse, the 500 could happen while the handler
@@ -8,7 +8,7 @@ already held the config lock or after persistence seams had been reached on
 sibling paths. These tests pin the contract: a wrong field TYPE is a
 deterministic 400 with a stable machine-readable code, and NO mutation seam
 (lock, mcp.json write) is touched; missing/blank identifiers keep the exact
-pre-existing required-field responses (#5621).
+pre-existing required-field responses.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 from body_stream_helpers import BodyStreamPayload
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.dashboard.handlers import mcp as h
 
@@ -31,9 +32,17 @@ def _req(body: object) -> web.Request:
         "POST",
         "/api/mcp/toggle",
         app=app,
-        headers={"Content-Length": str(len(raw))},
+        headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
         payload=BodyStreamPayload(raw),
     )
+    # The route is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``): the predicate reads
+    # the claims the token-auth middleware publishes plus ``state.owner_id``, and
+    # ``owner_id == ""`` with the signed local bootstrap subject ``local-app`` is
+    # the standalone-local owner shape.
+    app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
     return req
 
 

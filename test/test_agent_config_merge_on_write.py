@@ -1,4 +1,4 @@
-"""Merge-on-write semantics for the agent-config PUT (#6664).
+"""Merge-on-write semantics for the agent-config PUT.
 
 ``PUT /api/agent/config`` persists a whole-file snapshot the client read earlier,
 and ``apps/bridges.py::_register_mcp_servers`` writes app MCP bridges into that
@@ -66,6 +66,8 @@ async def _put(
     apps_root_is_file: bool = False,
     apps_dir_unreadable: bool = False,
     apps_child_unstattable: bool = False,
+    app_root_shape: str | None = None,
+    apps_child_vanishes: bool = False,
     managed: tuple[str, ...] = (),
     managed_specs: dict[str, dict] | None = None,
     extra_managed: dict[str, dict] | None = None,
@@ -139,6 +141,25 @@ async def _put(
         if apps_root_is_file:
             break
         _app_root = _apps_root / _app
+        if app_root_shape == "broken_symlink":
+            # The app ROOT itself is a DANGLING link: ``lstat`` succeeds (the link
+            # is there, so the name is occupied and this app's manifest is
+            # unreachable rather than absent), ``stat`` raises FileNotFoundError.
+            _app_root.symlink_to(_apps_root / "no-such-app-root")
+            continue
+        if app_root_shape == "link_to_file":
+            # The app ROOT is a link whose target EXISTS but is a plain FILE, so
+            # both ``lstat`` and ``stat`` succeed and only ``S_ISDIR`` is False.
+            # The dangling-link screen cannot see this shape: nothing raises.
+            _target = _apps_root / "not-a-directory.txt"
+            _target.write_text("not an app root", encoding="utf-8")
+            _app_root.symlink_to(_target)
+            continue
+        if app_root_shape == "plain_file":
+            # A plain FILE standing where the app root belongs: nothing raises and
+            # nothing is link-ish, which is the shape that must stay a skip.
+            _app_root.write_text("not an app root", encoding="utf-8")
+            continue
         _app_root.mkdir(exist_ok=True)
         if installed_absent:
             continue  # a directory under apps/ carrying no installed.json
@@ -200,6 +221,18 @@ async def _put(
                     yield _UnstattableChild(child)
 
         _handler_apps_root = _RootWithUnstattableChild(_apps_root)
+    if apps_child_vanishes:
+        # The OVERSHOOT GUARD for the child screen: a name the listing returns and
+        # that is GONE by the time the screen looks at it. An uninstall completing
+        # between ``iterdir`` and the ``lstat`` leaves exactly this, so it must stay
+        # a skip -- the one shape that separates "nothing is there" from the
+        # dangling link above, which occupies the name and must refuse.
+        class _RootWithVanishedChild(type(_apps_root)):  # type: ignore[misc]
+            def iterdir(self):
+                yield from super().iterdir()
+                yield self / "uninstalled-mid-walk"
+
+        _handler_apps_root = _RootWithVanishedChild(_apps_root)
 
     _managed_map: dict[str, dict] = {n: {} for n in managed}
     if managed_specs:
@@ -254,7 +287,7 @@ async def _put(
 
 @pytest.mark.asyncio
 async def test_app_bridge_registered_during_the_lock_wait_survives_the_put(tmp_path):
-    """The race the GPT round-6 finding reported, closed.
+    """An app bridge registered during the lock wait survives the PUT.
 
     The transaction lock is a cross-process flock whose wait is unbounded, so an
     app enable queued ahead of this PUT commits its ``mcpServers`` entry strictly
@@ -357,7 +390,7 @@ async def test_direct_client_entry_deletes_on_a_sequential_add_then_remove(tmp_p
 
     Pre-fix the preserve test was "no scope declares it", and the installed spec
     is not a scope, so this entry was re-inserted on every deletion attempt --
-    permanently undeletable, breaking #6664's own requirement 2 for the most
+    permanently undeletable, breaking the merge rule's own requirement 2 for the most
     ordinary kind of client entry. Preservation now requires POSITIVE evidence of
     app or host ownership, which a direct entry has none of.
     """
@@ -447,16 +480,15 @@ async def test_entry_of_unknown_ownership_is_deleted(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_scope_declaration_does_not_defeat_proven_ownership(tmp_path):
-    """ROUND 6: a scope declaration must not delete a bridge the app really owns.
+    """A scope declaration must not delete a bridge the app really owns.
 
-    The scope census used to subtract every declared name from the candidates
-    BEFORE ownership was tested, as a precedence rule inherited from the
-    prefix-matching era. Once ownership became the EXACT set of manifest-declared
-    names, that subtraction could only ever remove a name that IS provably owned:
-    app ``demo`` genuinely registers ``demo:notes``, so a user who also declares
-    ``demo:notes`` in their own mcp.json made every stale PUT delete the live
-    bridge -- the exact clobber #6664 exists to prevent, reachable through a
-    collision the user cannot see.
+    A scope census that subtracts every declared name from the candidates BEFORE
+    ownership is tested can only ever remove a name that IS provably owned, since
+    ownership is the EXACT set of manifest-declared names: app ``demo`` genuinely
+    registers ``demo:notes``, so a user who also declares ``demo:notes`` in their
+    own mcp.json would make every stale PUT delete the live bridge -- the exact
+    clobber the merge rule exists to prevent, reachable through a collision the
+    user cannot see.
 
     The census seam stays injected here on purpose: re-introducing any
     scope-based exclusion ahead of the ownership test trips this test.
@@ -542,7 +574,7 @@ async def test_host_managed_entry_is_preserved(tmp_path):
 
 @pytest.mark.asyncio
 async def test_an_opt_in_managed_server_omitted_from_the_snapshot_is_deleted(tmp_path):
-    """ROUND 7: an opt-in grant must be REVOCABLE through this editor.
+    """An opt-in grant must be REVOCABLE through this editor.
 
     ``kirocrew-dashboard`` carries ``opt_in``, which makes it an assignable set
     rather than an always-on capability: ``build_agent_config`` never emits it and
@@ -569,7 +601,7 @@ async def test_an_opt_in_managed_server_omitted_from_the_snapshot_is_deleted(tmp
 
 @pytest.mark.asyncio
 async def test_a_gate_closed_managed_server_omitted_from_the_snapshot_is_deleted(tmp_path):
-    """ROUND 7: a CLOSED ``spec_gate`` means the rebuild would not re-add it.
+    """A CLOSED ``spec_gate`` means the rebuild would not re-add it.
 
     ``kirocrew-computer``'s gate is consulted at emission time, and both spec
     writers ``pop`` the entry while it is closed -- emitting it is what makes
@@ -708,7 +740,7 @@ async def test_a_malformed_host_spec_does_not_fail_the_put(tmp_path):
 
 @pytest.mark.asyncio
 async def test_client_entry_under_an_installed_apps_namespace_is_deleted(tmp_path):
-    """ROUND 2: squatting an installed app's namespace must not confer ownership.
+    """Squatting an installed app's namespace must not confer ownership.
 
     App ``demo`` is installed and declares only ``notes``. The client adds
     ``demo:custom`` through this editor -- a name the app never registered -- and
@@ -736,7 +768,7 @@ async def test_a_declared_app_server_is_still_preserved(tmp_path):
     """The overshoot guard: a name the app genuinely declares still survives.
 
     Tightening ownership to exact names must not stop protecting real bridges --
-    that is the defect #6664 exists to fix.
+    that is the defect the merge rule exists to fix.
     """
     response, written = await _put(
         tmp_path,
@@ -787,7 +819,7 @@ async def test_unreadable_app_manifest_fails_the_put_and_writes_nothing(tmp_path
 
 @pytest.mark.asyncio
 async def test_corrupt_installed_metadata_fails_the_put_and_writes_nothing(tmp_path):
-    """ROUND 3: a malformed ``installed.json`` must refuse, not silently skip.
+    """A malformed ``installed.json`` must refuse, not silently skip.
 
     ``manager._read_installed`` returns None for BOTH a missing file and a parse
     failure, so a bare ``is None: continue`` dropped a CORRUPT app out of the
@@ -844,7 +876,7 @@ async def test_absent_installed_metadata_is_still_skipped(tmp_path):
 
 @pytest.mark.asyncio
 async def test_disabled_app_bridge_is_deleted(tmp_path):
-    """ROUND 4: a DISABLED app's stale bridge must be cleanable, not protected.
+    """A DISABLED app's stale bridge must be cleanable, not protected.
 
     A disabled app is still installed, so an installed-only ownership test keeps
     its declared names app-owned. That protects the exact entry the disable
@@ -945,7 +977,7 @@ async def _assert_refused_and_intact(tmp_path, **kwargs):
 @requires_symlinks
 @pytest.mark.asyncio
 async def test_installed_metadata_as_a_broken_symlink_fails_the_put(tmp_path):
-    """ROUND 5: a DANGLING installed.json symlink is unreadable, not absent.
+    """A DANGLING installed.json symlink is unreadable, not absent.
 
     ``Path.is_file()`` follows the link, finds nothing, and answers False -- the
     same False it gives for genuine absence -- so the app read as not installed
@@ -978,19 +1010,189 @@ async def test_apps_root_as_a_regular_file_fails_the_put(tmp_path):
 
 @pytest.mark.asyncio
 async def test_an_unstattable_apps_root_child_fails_the_put(tmp_path):
-    """ROUND 6: a child the listing returns but cannot stat is unreadable.
+    """A child the listing returns but cannot stat is unreadable.
 
     The enumeration screened its children with ``Path.is_dir()``, which routes
     the fault through pathlib's ``_ignore_error`` and answers a plain False for
     ENOENT, ENOTDIR, EBADF and ELOOP alike -- the same False it gives for a
     regular file. So a child that is a symlink LOOP was skipped as "not an app",
     and the absent bridge of the app living under that name was deleted: the
-    cannot-read-becomes-not-owned defect one level inside the shapes round 5's
-    screen already covers, and the same loop shape that screen refuses for
+    cannot-read-becomes-not-owned defect one level inside the shapes the
+    dangling-symlink screen already covers, and the same loop shape that screen refuses for
     ``installed.json``. Only a resolved stat may exclude a child, and only by
     PROVING it is not a directory.
     """
     await _assert_refused_and_intact(tmp_path, apps_child_unstattable=True)
+
+
+@requires_symlinks
+@pytest.mark.asyncio
+async def test_a_dangling_app_root_link_fails_the_put(tmp_path):
+    """A DANGLING app-root link OCCUPIES the name, so it is unreadable, not absent.
+
+    The child screen reached its skip through a single ``child.stat()``, which
+    FOLLOWS the link -- so it answered ``FileNotFoundError`` both for a name
+    nothing occupies and for a name a dangling link still occupies, and skipped
+    both as "not an app". The second is the opposite answer: something is standing
+    where the app root belongs, its manifest is unreachable, and what it declares
+    is therefore UNKNOWN rather than empty. Empty is what deletes its live
+    bridges, which is the cannot-read-becomes-not-owned defect this whole function
+    exists to refuse -- and it already refuses exactly this shape one position out,
+    for ``installed.json``, via ``_require_present_shape``.
+    """
+    await _assert_refused_and_intact(tmp_path, app_root_shape="broken_symlink")
+
+
+@pytest.mark.asyncio
+async def test_an_apps_root_child_that_vanished_after_the_listing_still_skips(tmp_path):
+    """The overshoot guard: a name that is genuinely GONE stays a skip.
+
+    Distinguishing the dangling link above must not turn the ordinary uninstall
+    race into a 500. An uninstall completing between ``iterdir`` and the screen
+    leaves a listed name with nothing at it, ``lstat`` raises
+    ``FileNotFoundError`` for the entry ITSELF, and that is the one proof of
+    absence. Needs no symlink privilege, so it carries this row on every platform
+    the dangling-link test may skip on.
+
+    ``mcpServers`` is submitted EMPTY on purpose: a submitted entry always wins, so
+    resubmitting ``demo:notes`` would decide the verdict without ever consulting
+    the walk and the row would pass however the screen behaved.
+    """
+    response, written = await _put(
+        tmp_path,
+        on_disk={"name": "kirocrew", "mcpServers": {"demo:notes": {"command": "notes-mcp"}}},
+        submitted={"name": "kirocrew", "mcpServers": {}},
+        apps={"demo": ("notes",)},
+        apps_child_vanishes=True,
+    )
+
+    assert response.status == 200, "a vanished name must not turn a routine PUT into a 500"
+    assert "demo:notes" in written["mcpServers"], "the live bridge was deleted"
+
+
+@requires_symlinks
+def test_both_app_root_walks_agree_a_dangling_link_is_not_absence(tmp_path):
+    """ONE tree, BOTH readers: neither walk may call a dangling app root absent.
+
+    Two modules decide independently whether an entry in the apps root stands for
+    an installed app, and they feed different decisions -- ``apps.manager``'s read
+    gates whether an ``mcpServers`` GRANT may be pruned, this walk gates whether an
+    app's BRIDGES may be deleted. Nothing else makes them agree, so this row is
+    what fails when they stop agreeing.
+
+    They cannot share one function: this side must RAISE (its contract is
+    fail-loud, and a name it cannot read is not a name it may report as unowned),
+    while the manager side returns a listing plus a completeness bool. What they
+    must share is the RULE, so this pins the rule on a single on-disk tree --
+    a dangling link at ``apps/demo`` -- and asserts each reader's own spelling of
+    "not absence". A later edit to either module's screens fails here instead of
+    silently moving one answer.
+    """
+    from kiro_crew.apps.manager import list_apps_with_skips
+    from kiro_crew.dashboard.handlers.agents import (
+        AppOwnershipUnreadable,
+        _app_declared_server_names,
+    )
+
+    apps_root = tmp_path / "apps"
+    apps_root.mkdir()
+    (apps_root / "demo").symlink_to(apps_root / "no-such-app-root")
+
+    with patch("kiro_crew.apps.manager.apps_dir", return_value=apps_root):
+        listing = list_apps_with_skips()
+    assert listing.apps == [], "a dangling root carries no readable record"
+    assert listing.complete is False, (
+        "the manager counts a link-ish entry as an app the listing DROPPED, so an "
+        "app missing from `apps` there carries no information"
+    )
+
+    with (
+        patch("kiro_crew.dashboard.handlers.agents.apps_dir", return_value=apps_root),
+        pytest.raises(AppOwnershipUnreadable) as caught,
+    ):
+        _app_declared_server_names()
+    assert "demo" in str(caught.value), "the refusal must name the entry it could not read"
+
+
+@requires_symlinks
+@pytest.mark.asyncio
+async def test_an_app_root_link_to_a_file_fails_the_put(tmp_path):
+    """A link-ish app root whose target RESOLVES to a file is still not absence.
+
+    The sibling the dangling-link screen cannot reach. Here ``lstat`` succeeds AND
+    ``stat`` succeeds -- the target is a real file -- so nothing raises and the only
+    thing that is False is ``S_ISDIR``. A screen that skips every non-directory
+    therefore reports the name as free, while ``apps.manager`` reads the same entry
+    through ``entry.is_symlink() or is_link_or_junction(entry)`` and counts it as an
+    app the listing DROPPED. That split is the same cannot-read-becomes-not-owned
+    defect one shape over, so the link-ish half must refuse.
+    """
+    await _assert_refused_and_intact(tmp_path, app_root_shape="link_to_file")
+
+
+@pytest.mark.asyncio
+async def test_a_plain_file_where_an_app_root_belongs_still_skips(tmp_path):
+    """The overshoot guard: refusing link-ish non-directories must spare plain ones.
+
+    ``_entry_stands_for_a_dropped_app`` deliberately does NOT count a plain file,
+    because a file BESIDE the app directories is an ordinary member of a healthy
+    apps root. So the new screen must split on link-ness, not on "is not a
+    directory" -- refusing every non-directory would turn any stray file in the
+    apps root into a 500 and disagree with the manager in the other direction.
+
+    ``mcpServers`` is submitted EMPTY on purpose: a submitted entry always wins, so
+    resubmitting ``demo:notes`` would decide the verdict without ever consulting the
+    walk and the row would pass however the screen behaved.
+    """
+    response, written = await _put(
+        tmp_path,
+        on_disk={"name": "kirocrew", "mcpServers": {"demo:notes": {"command": "notes-mcp"}}},
+        submitted={"name": "kirocrew", "mcpServers": {}},
+        apps={"demo": ("notes",)},
+        app_root_shape="plain_file",
+    )
+
+    assert response.status == 200, "a plain file in the apps root must not cause a 500"
+    assert (
+        written["mcpServers"] == {}
+    ), "a plain file stands for no app, so the grant is genuinely unowned here"
+
+
+@requires_symlinks
+def test_both_app_root_walks_agree_a_link_to_a_file_is_not_absence(tmp_path):
+    """ONE tree, BOTH readers, for the shape where nothing raises.
+
+    The agreement row above pins a tree where ``stat`` RAISES, so it cannot fail if
+    a reader starts deciding link-ness by whether the resolution threw. This tree
+    resolves cleanly and differs from a real app root only in ``S_ISDIR``, which is
+    what makes it the discriminating case: each reader has to reach "not absence"
+    from the entry's own link-ness rather than from a raised error.
+    """
+    from kiro_crew.apps.manager import list_apps_with_skips
+    from kiro_crew.dashboard.handlers.agents import (
+        AppOwnershipUnreadable,
+        _app_declared_server_names,
+    )
+
+    apps_root = tmp_path / "apps"
+    apps_root.mkdir()
+    target = apps_root / "not-a-directory.txt"
+    target.write_text("not an app root", encoding="utf-8")
+    (apps_root / "demo").symlink_to(target)
+
+    with patch("kiro_crew.apps.manager.apps_dir", return_value=apps_root):
+        listing = list_apps_with_skips()
+    assert listing.apps == [], "a link to a file carries no readable record"
+    assert (
+        listing.complete is False
+    ), "the manager counts a link-ish non-directory as an app the listing DROPPED"
+
+    with (
+        patch("kiro_crew.dashboard.handlers.agents.apps_dir", return_value=apps_root),
+        pytest.raises(AppOwnershipUnreadable) as caught,
+    ):
+        _app_declared_server_names()
+    assert "demo" in str(caught.value), "the refusal must name the entry it could not read"
 
 
 @pytest.mark.asyncio
@@ -1142,7 +1344,7 @@ async def test_preserved_entries_go_through_the_governance_filter(tmp_path, monk
     )
 
 
-# ── (d) the stale-snapshot axis: entries PRESENT in the submission (#7089) ─────
+# ── (d) the stale-snapshot axis: entries PRESENT in the submission ─────
 #
 # The mirror of section (b). There the submission OMITS a name and the question is
 # whether to KEEP it; here the submission CONTAINS a namespaced name absent from
@@ -1166,7 +1368,7 @@ async def test_a_stale_snapshot_cannot_resurrect_an_uninstalled_apps_bridge(tmp_
     so nothing on disk or under apps/ mentions it. Pre-fix the snapshot was
     persisted verbatim and the bridge came back live, with nothing logged; and it
     stayed back, because ``reconcile_enabled_app_resources`` only re-registers
-    ENABLED apps and there is no longer an app here at all.
+    ENABLED apps and there is no app here at all.
 
     The user's own plain entry in the same submission is untouched, which is what
     makes this specifically the app-namespace axis rather than a blanket refusal.
@@ -1371,7 +1573,7 @@ async def test_a_readable_spec_with_no_servers_still_drops_a_namespaced_addition
 
 @pytest.mark.asyncio
 async def test_a_spec_with_no_mcpservers_key_still_drops_a_namespaced_addition(tmp_path):
-    """A KEYLESS spec is ``{}``, not "unknown" -- the GPT round-1 finding on #7465.
+    """A KEYLESS spec is ``{}``, not "unknown".
 
     Reading a missing ``mcpServers`` key as unreadable hands this rule a reason to
     stand down and lets the resurrection straight through. The state is reachable
@@ -1442,7 +1644,7 @@ async def test_an_unreadable_spec_still_persists_a_namespaced_entry(tmp_path):
     )
 
 
-# ── (g) the region's axis matrix, and the one cell still open (#7470) ──────────
+# ── (g) the region's axis matrix, and the one cell still open ──────────
 
 
 @pytest.mark.asyncio
@@ -1450,24 +1652,23 @@ async def test_the_app_namespace_region_decides_every_axis_it_claims_to(tmp_path
     """Every axis of the app-namespace region in ONE table, so a missing one shows.
 
     THE FAILURE THIS EXISTS TO CATCH is a rule set that reads as complete and is
-    not. #6975 shipped the ABSENT axis; the PRESENT axis was not missing from that
-    review's conclusions so much as never enumerated, and it survived review to
-    become #7089 months later. A per-axis test cannot prevent that on its own --
-    each one passes in isolation -- so the axes are gathered here, and a region
-    whose behaviour changes on any axis has to come through this table.
+    not: one axis can ship while its mirror axis is never enumerated, passing
+    review only because nothing named it. A per-axis test cannot prevent that on
+    its own -- each one passes in isolation -- so the axes are gathered here, and
+    a region whose behaviour changes on any axis has to come through this table.
 
     The three cells and who decides each:
 
     * EXISTENCE, name ABSENT from the submission -> ON DISK decides
-      (``_merge_unowned_servers``, #6664): an owned bridge is kept.
+      (``_merge_unowned_servers``): an owned bridge is kept.
     * EXISTENCE, name PRESENT in the submission with no row on disk -> ON DISK
-      decides (``_drop_unbacked_app_entries``, #7089): the addition is dropped.
+      decides (``_drop_unbacked_app_entries``): the addition is dropped.
     * CONTENT, name on BOTH sides -> the SUBMISSION decides. **This cell is
-      OPEN** (#7470): a stale editor snapshot reverts a definition the platform
+      OPEN**: a stale editor snapshot reverts a definition the platform
       had already corrected. It is asserted here as it BEHAVES, not as it should,
-      because reversing it reverses the editor-snapshot-wins contract kept in
-      #5899 and re-affirmed for #6664 -- a maintainer ruling, not a review-time
-      call. When that ruling lands, this is the assertion that changes.
+      because reversing it reverses the editor-snapshot-wins contract -- a
+      maintainer ruling, not a review-time call. When that ruling lands, this is
+      the assertion that changes.
     """
     submitted_only = {"name": "kirocrew", "mcpServers": {"demo:ghost": {"command": "ghost"}}}
     matrix = [

@@ -4,16 +4,16 @@ Inside an unprivileged user namespace the kernel treats a mount's nosuid / nodev
 noexec bits as locked (``MNT_LOCK_*``) and rejects with EPERM any remount whose
 flag set would clear them. The bind created by the ``READONLY_DIRS`` loop inherits
 those bits — locks included — from its source mount, so a remount carrying only
-``MS_RDONLY`` was refused on hosts whose ``/tmp`` (or ``/home``) is mounted
+``MS_RDONLY`` is refused on hosts whose ``/tmp`` (or ``/home``) is mounted
 ``nosuid,nodev``: the systemd ``tmp.mount`` default on Amazon Linux 2023, Fedora
-and RHEL. ``_mount_or_die`` fails closed, so every sandboxed spawn aborted there
-(issue #8386). The fix: ``_locked_mount_flags`` reads the new bind's effective
+and RHEL. ``_mount_or_die`` fails closed, so a plain ``MS_RDONLY`` remount would
+abort every sandboxed spawn there. ``_locked_mount_flags`` reads the new bind's effective
 flags via ``statvfs`` and the sealing remount ORs them back in — re-asserting a
 bit already in force can only keep restrictions, never widen access.
 
 Three layers here, mirroring the other sandbox launcher tests (the sources under
 test are extracted from the GENERATED script, so none of these can pass against
-code the launcher no longer contains):
+code the launcher does not contain):
 
 - unit: the helper's ``f_flag`` → ``MS_*`` mapping, ``statvfs`` patched;
 - integration: the seal loop's remount call receives the helper's bits OR'd in,
@@ -46,9 +46,22 @@ from types import SimpleNamespace
 
 import pytest
 
+import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.sandbox import _build_launcher_script
 
 _LINUX_ONLY = pytest.mark.skipif(sys.platform != "linux", reason="Linux namespace launcher only")
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    The flag helper lifted out of the launcher does not depend on that answer, and a
+    real ssh spawned from the test process is a host dependency this module is not
+    about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
+
 
 #: Flag values the launcher defines for itself; mirrored so extracted code can run.
 _MS_RDONLY = 1
@@ -58,7 +71,7 @@ _MS_NOEXEC = 8
 _MS_REMOUNT = 32
 _MS_BIND = 4096
 
-_HELPER_START = "def _locked_mount_flags("
+_HELPER_START = "_O_PATH = getattr"
 _HELPER_END = "REAL_UID = "
 
 
@@ -178,14 +191,25 @@ class TestSealRemountCarriesTheLockedBits:
 
         target = tmp_path / "sealed"
         target.mkdir()
+        sealed_ino = target.stat().st_ino
         events: list[tuple] = []
+
+        def _resolved(path) -> int:
+            """The inode *path* reaches, resolved while its descriptor is open.
+
+            The loop hands ``mount`` a descriptor path pinning the object it
+            classified, so the spelling is a live fd number and says nothing on
+            its own. What the assertion needs is the OBJECT, which is what both
+            the bind and the sealing remount must reach.
+            """
+            return os.stat(path).st_ino
 
         def _record_mount(source, target_, flags, what):
             assert source == target_, "a ceiling is bound over ITSELF"
-            events.append(("mount", os.fsdecode(target_), flags))
+            events.append(("mount", _resolved(target_), flags))
 
         def _fake_statvfs(target_):
-            events.append(("statvfs", os.fsdecode(target_)))
+            events.append(("statvfs", _resolved(target_)))
             return SimpleNamespace(f_flag=os.ST_NOSUID | os.ST_NODEV)
 
         monkeypatch.setattr(os, "statvfs", _fake_statvfs)
@@ -193,7 +217,9 @@ class TestSealRemountCarriesTheLockedBits:
             str(region_file),
             init_globals={
                 "os": os,
+                "sys": sys,
                 "READONLY_DIRS": [str(target)],
+                "REQUIRED_MASK_TARGETS": frozenset(),
                 "_mount_or_die": _record_mount,
                 "_MS_BIND": _MS_BIND,
                 "_MS_REMOUNT": _MS_REMOUNT,
@@ -205,11 +231,11 @@ class TestSealRemountCarriesTheLockedBits:
         )
 
         assert events == [
-            ("mount", str(target), _MS_BIND),
-            ("statvfs", str(target)),
+            ("mount", sealed_ino, _MS_BIND),
+            ("statvfs", sealed_ino),
             (
                 "mount",
-                str(target),
+                sealed_ino,
                 _MS_REMOUNT | _MS_BIND | _MS_RDONLY | _MS_NOSUID | _MS_NODEV,
             ),
         ]
@@ -279,7 +305,7 @@ def _inner_script() -> str:
     The control comes first and is what gives the test its power: bind the
     control dir over itself, then attempt the PRE-FIX remount (``MS_RDONLY``
     alone). On a locked mount the kernel must refuse it with EPERM — the exact
-    #8386 failure. If it succeeds the environment does not lock flags and the
+    locked-flag failure. If it succeeds the environment does not lock flags and the
     test skips (44) rather than passing vacuously. Only then does the fixed
     path run against the sealed dir; the seal must land and a write must be
     refused with EROFS.
@@ -303,6 +329,7 @@ def _inner_script() -> str:
             sys.exit(46)
         sealed = os.path.join(mnt, b"sealed")
         READONLY_DIRS = [os.fsdecode(sealed)]
+        REQUIRED_MASK_TARGETS = frozenset()
         """)
     epilogue = textwrap.dedent("""\
         try:
@@ -327,7 +354,7 @@ class TestSealHoldsOnALockedNosuidNodevMountRealKernel:
         """The regression on a real kernel, with its own power proven in-band.
 
         The inner stage first shows the pre-fix remount is refused with EPERM
-        (so the locked-flag condition #8386 reported genuinely holds in this
+        (so the locked-flag condition genuinely holds in this
         environment), then runs the shipped seal path and asserts it succeeds
         and the sealed dir refuses a write with EROFS. Pre-fix code fails here
         at the seal step with the launcher's own ``sandbox: BLOCKED`` refusal.

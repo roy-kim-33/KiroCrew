@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 /** Props the stubbed transcript last received, for asserting what ChatPage passes. */
 const lastAssistantProps: { sessions?: ReadonlyMap<string, string> } = {}
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -110,7 +110,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -141,8 +142,9 @@ const SLOT_A = { key: 'chat-1', title: 'one', messages: 1, running: false, mode:
 const SLOT_B = { key: 'chat-2', title: 'two', messages: 1, running: false, mode: '', created: '', last_ts: '' }
 /** A surface ChatPage does not render, so it must never reach the chip roster. */
 const SLOT_DC = { key: 'chat-99-1700000000', title: 'dc-run', messages: 1, running: false, mode: 'design-critique', created: '', last_ts: '' }
-/** `crew` IS a chat surface, so it pins the filter against over-narrowing. */
-const SLOT_CREW = { key: 'chat-77-1700000001', title: 'crew run', messages: 1, running: false, mode: 'crew', created: '', last_ts: '' }
+/** A legacy Autopilot slot (retired `orchestrator` mode) still renders as an
+ *  ordinary chat, so it pins the filter against over-narrowing. */
+const SLOT_LEGACY_AUTOPILOT = { key: 'chat-77-1700000001', title: 'legacy run', messages: 1, running: false, mode: 'orchestrator', created: '', last_ts: '' }
 
 const renderChatPage = (connected: boolean, extraSlots: typeof SLOT_A[] = []) => {
   const allSlots = [SLOT_A, SLOT_B, ...extraSlots]
@@ -276,32 +278,43 @@ describe('chip roster carries only surfaces ChatPage can show', () => {
     expect(lastAssistantProps.sessions?.has(SLOT_DC.key)).toBe(false)
   })
 
-  it('keeps a crew session, so the filter is not simply narrowed to the default', async () => {
+  it('keeps a legacy Autopilot slot, so the filter is not simply narrowed to the default', async () => {
     // Positive control: excluding every non-empty surface would pass the test
-    // above while silently dropping two surfaces the chat view does show.
-    const { store } = renderChatPage(true, [SLOT_CREW])
+    // above while silently dropping a legacy Autopilot slot the chat view does show.
+    const { store } = renderChatPage(true, [SLOT_LEGACY_AUTOPILOT])
     seedMessage(store)
     await screen.findByTestId('chip')
 
-    expect(lastAssistantProps.sessions?.has(SLOT_CREW.key)).toBe(true)
+    expect(lastAssistantProps.sessions?.has(SLOT_LEGACY_AUTOPILOT.key)).toBe(true)
   })
 })
 
 describe('one session-entry path', () => {
   // A SOURCE guard: the two callees were behaviourally identical, so only the
   // structure can distinguish the collapsed form from the duplicated one.
-  const source = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
+  const pageSource = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
+  const sessionSource = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageSessionController.ts'), 'utf-8')
+  // The page's owners (pages/chat/page/) are scanned too, so neither absence
+  // below can be escaped by moving code out of ChatPage.tsx.
+  const ownerSources = readdirSync(join(__dirname, '..', 'pages', 'chat', 'page'))
+    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+    .map(f => readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', f), 'utf-8'))
 
   it('routes the in-message chip through the shared switch callee', () => {
-    expect(source).toContain('onSessionOpen={selectSessionTab}')
+    expect(pageSource).toContain('onSessionOpen={selectSessionTab}')
   })
 
   it('keeps no second spelling of the session-open guard', () => {
     // The duplicate would diverge the first time either side gained a side effect.
-    expect(source).not.toContain('handleSessionOpen')
+    expect(pageSource).not.toContain('handleSessionOpen')
+    expect(sessionSource).not.toContain('handleSessionOpen')
+    for (const src of ownerSources) expect(src).not.toContain('handleSessionOpen')
   })
 
   it('declares the shared callee exactly once', () => {
-    expect(source.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
+    // The callee is owned by the session controller; the page only receives it.
+    expect(sessionSource.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
+    expect(pageSource).not.toContain('const selectSessionTab = useCallback')
+    for (const src of ownerSources) expect(src).not.toContain('const selectSessionTab = useCallback')
   })
 })

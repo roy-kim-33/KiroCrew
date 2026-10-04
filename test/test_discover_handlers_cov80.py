@@ -115,7 +115,7 @@ def sel_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 @pytest.fixture()
 def state(skills_root: Path) -> MagicMock:
-    st = MagicMock(context_builder=None)
+    st = MagicMock(context_builder=None, owner_id="")
     st._standalone_skills = SkillsLoader(skills_path=skills_root, install_builtins=False)
     return st
 
@@ -139,6 +139,10 @@ def _mk(
     app = web.Application()
     app["state"] = state
     req = make_mocked_request(method, path, app=app)
+    # The owner (no owner configured, signed local subject): install is owner-gated,
+    # and these tests are about what lies behind the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     if internal_auth:
         req["internal_auth"] = True
     if body is not ...:
@@ -159,17 +163,19 @@ def _body(response: web.StreamResponse) -> Any:
 # --- registry singleton ------------------------------------------------------
 
 
-def test_build_registry_registers_skillsh() -> None:
+def test_build_registry_registers_the_builtin_providers() -> None:
     reg = h._build_registry()
-    assert reg.provider_names == ["skillsh"]
+    # Registration order is the catalog order the Discover panel fans out in.
+    assert reg.provider_names == ["skillsh", "github"]
     assert reg.get("skillsh") is not None
+    assert reg.get("github") is not None
 
 
 def test_get_registry_is_lazily_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(h, "_registry", None)
     first = h._get_registry()
     assert first is h._get_registry()
-    assert first.provider_names == ["skillsh"]
+    assert first.provider_names == ["skillsh", "github"]
 
 
 def test_slugify_of_empty_string_is_empty() -> None:
@@ -239,6 +245,24 @@ async def test_search_drops_non_string_tags_and_audits_the_search(
     kwargs = sel_mock.log_tool_invocation.call_args.kwargs
     assert kwargs["tool_name"] == "discover_skills"
     assert kwargs["metadata"]["result_count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_search_reports_provider_errors_in_response_and_audit(
+    state: MagicMock, registry: ProviderRegistry, sel_mock: MagicMock
+) -> None:
+    provider = _BundleProvider()
+    provider.search = AsyncMock(side_effect=RuntimeError("provider down"))  # type: ignore[method-assign]
+    registry.register(provider)
+
+    payload = _body(
+        await h.api_skills_discover(_mk("GET", "/api/skills/-/discover?q=cov", state=state))
+    )
+
+    assert payload["results"] == []
+    assert payload["provider_outcomes"] == [{"name": "covprov", "status": "error"}]
+    kwargs = sel_mock.log_tool_invocation.call_args.kwargs
+    assert kwargs["metadata"]["failed_provider_count"] == "1"
 
 
 # --- POST /api/skills/-/discover/install ------------------------------------

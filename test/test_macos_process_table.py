@@ -31,6 +31,10 @@ def _force_posix_ps_branch(monkeypatch):
     monkeypatch.setattr(rt.sys, "platform", "darwin")
     monkeypatch.setattr(rt.platform_compat, "IS_WINDOWS", False)
     monkeypatch.setattr(rt.platform_compat, "trusted_system_bin", lambda name: f"/bin/{name}")
+    # These pin the ps snapshot's contract, so every pid is measured by its ps
+    # RSS. On a real Mac the footprint reader would otherwise answer for any
+    # same-uid pid the fake table happens to name.
+    monkeypatch.setattr(rt.platform_compat, "proc_phys_footprint_bytes_for_pid", lambda pid: None)
     rt._reset_ps_table_cache()
     yield
     rt._reset_ps_table_cache()
@@ -138,7 +142,10 @@ def test_linux_branch_spawns_nothing(monkeypatch):
     bug, and routing it through ps would import the problem."""
     monkeypatch.setattr(rt.sys, "platform", "linux")
     calls = _counting_ps(monkeypatch)
-    monkeypatch.setattr(rt, "_iter_descendant_pids", lambda pid: [pid])
+    # Accepts the depth bound the real signature carries: the Linux branch passes
+    # it through, so a one-argument fake raises TypeError instead of exercising
+    # the branch this test is about.
+    monkeypatch.setattr(rt, "_iter_descendant_pids", lambda pid, max_depth=None: [pid])
     monkeypatch.setattr(rt, "_get_rss_mb", lambda pid: 5.0)
 
     assert rt._get_rss_tree_mb(100) == 5.0

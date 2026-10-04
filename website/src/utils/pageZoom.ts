@@ -10,14 +10,14 @@
  *
  *  Cancelling the gesture events does NOT suppress touch or pointer events, so a
  *  surface that owns its own pinch keeps working — the image viewer scales its own
- *  transform off two pointers (see Lightbox in `MarkdownRenderer.tsx`) and is
+ *  transform off two pointers (see `components/markdown/Lightbox.tsx`) and is
  *  unaffected by anything here.
  *
  *  Scoped to coarse pointers. Desktop Safari raises the same events for a trackpad
  *  pinch, where zooming a page is a convention this has no business taking away.
  *
  *  For the policy and the accessibility trade behind it, see the page-zoom section of
- *  `website/docs/page-layout.md` — the authoritative copy.
+ *  `website/docs/narrow-viewport.md` — the authoritative copy.
  */
 
 /** Safari's non-standard gesture event. `scale` is the pinch factor since the

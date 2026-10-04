@@ -19,88 +19,6 @@ export interface InlineComment {
   startOffset?: number
 }
 
-/** Popover that appears when user selects text and clicks "Comment". */
-function CommentPopover({ x, y, onSubmit, onCancel, containerRef, scrollRef }: {
-  x: number; y: number; onSubmit: (text: string) => void; onCancel: () => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>
-}) {
-  const [text, setText] = useState('')
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-  const popoverRef = useRef<HTMLDivElement>(null)
-  const ime = useImeGuard()
-  const onCancelRef = useRef(onCancel)
-  useEffect(() => { onCancelRef.current = onCancel }, [onCancel])
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => inputRef.current?.focus())
-    return () => cancelAnimationFrame(frame)
-  }, [])
-  // Dismiss on scroll — coordinates are stale after scrolling
-  useEffect(() => {
-    const target = scrollRef?.current ?? containerRef?.current ?? window
-    const handler = () => onCancelRef.current()
-    target.addEventListener('scroll', handler, { passive: true })
-    return () => target.removeEventListener('scroll', handler)
-  }, [scrollRef, containerRef])
-  // Dismiss on click outside
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
-        onCancelRef.current()
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-  const autoGrow = useCallback((el: HTMLTextAreaElement) => { el.style.height = 'auto'; const maxH = 160; el.style.height = Math.min(el.scrollHeight, maxH) + 'px'; el.style.overflowY = el.scrollHeight > maxH ? 'auto' : 'hidden' }, [])
-
-  // When containerRef is provided, position absolute relative to that container
-  const container = containerRef?.current
-  const rect = container?.getBoundingClientRect()
-  const useAbsolute = !!(container && rect)
-  const posX = useAbsolute ? x - rect.left + container.scrollLeft : x
-  const posY = useAbsolute ? y - rect.top + container.scrollTop : y
-  const maxW = useAbsolute ? rect.width : window.innerWidth
-  // Flip check uses viewport-relative position (y - rect.top) so it works regardless of scroll
-  const viewportY = useAbsolute ? y - rect!.top : y
-  const viewportH = useAbsolute ? rect!.height : window.innerHeight
-  const flipped = viewportY + 8 + 200 > viewportH
-
-  return (
-    <div
-      ref={popoverRef}
-      className={`${useAbsolute ? 'absolute' : 'fixed'} z-50 bg-card border border-border rounded-lg shadow-lg p-3 animate-scale-in`}
-      style={{ left: Math.min(posX, maxW - 320), top: flipped ? Math.max(0, posY - 60) : posY + 8, width: 300 }}
-    >
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-text">{i18nT('components.commentOverlay.add_comment')}</span>
-        <button
-          aria-label={i18nT('components.commentOverlay.close')}
-          className="p-0.5 rounded text-muted hover:text-text cursor-pointer bg-transparent border-none transition-colors"
-          onClick={onCancel}
-        ><X size={14} /></button>
-      </div>
-      <div className="relative">
-        <textarea
-          ref={inputRef}
-          aria-label={i18nT('components.commentOverlay.add_a_comment')}
-          placeholder={i18nT('components.commentOverlay.write_a_comment')}
-          value={text}
-          rows={1}
-          onChange={e => { setText(e.target.value); autoGrow(e.target) }}
-          {...ime.bindComposition()}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && text.trim()) { if (ime.claimEnter(e)) { e.stopPropagation(); onSubmit(text.trim()) } } if (e.key === 'Escape') { ime.reset(); e.preventDefault(); e.stopPropagation(); onCancel() } }}
-          className="bg-bg-elevated border border-border rounded-md pl-3 pr-8 py-2 text-text text-sm font-body outline-none w-full transition-colors focus-ring resize-none leading-[21px] overflow-hidden"
-        />
-        <button
-          aria-label={i18nT('components.commentOverlay.add_comment')}
-          disabled={!text.trim()}
-          className="absolute right-2 top-2 p-0.5 rounded text-muted hover:text-accent cursor-pointer bg-transparent border-none transition-colors disabled:opacity-30 disabled:cursor-default"
-          onClick={() => text.trim() && onSubmit(text.trim())}
-        ><MessageSquarePlus size={14} /></button>
-      </div>
-    </div>
-  )
-}
-
 /** Single comment row with inline edit support. */
 function CommentRow({ comment, onEdit, onRemove }: {
   comment: InlineComment; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void
@@ -137,7 +55,7 @@ function CommentRow({ comment, onEdit, onRemove }: {
               if (e.key === 'Enter' && draft.trim()) { if (ime.claimEnter(e)) commitEdit() }
               if (e.key === 'Escape') { ime.reset(); cancelledRef.current = true; setDraft(comment.text); setEditing(false) }
             }}
-            className="bg-bg border border-border rounded px-1.5 py-0.5 text-text text-[13px] w-full outline-none focus-ring" />
+            className="bg-bg border border-border rounded px-1.5 py-0.5 text-text text-[13px] w-full outline-hidden focus-ring" />
         ) : (
           <div
             role="button"
@@ -206,7 +124,7 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
           value={extraPrompt}
           onChange={e => setExtraPrompt(e.target.value)}
           rows={2}
-          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
         />
       )}
     </div>
@@ -321,5 +239,5 @@ export function formatArtifactCommentsMessage(
   return lines.join('\n')
 }
 
-export { CommentPopover, CommentList }
+export { CommentList }
 export type { InlineComment as Comment }

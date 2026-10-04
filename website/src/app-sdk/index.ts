@@ -10,42 +10,35 @@
  * and the import map will resolve it to the host's vendored copy.
  */
 import {
-  createContext,
-  useContext,
   useEffect,
   useRef,
   useCallback,
   type ReactNode,
 } from 'react'
-import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
+// The identity layer this module composes with its own scoped-API layer. Kept in
+// a separate file so a surface that needs identity WITHOUT a sandbox — every
+// builtin page — can mount it on its own, and so it stays off this barrel (see
+// the note at the bottom of this file on what the barrel publishes).
+import { AppIdentityProvider, useAppIdentity, type AppOrigin } from './identity'
+// The cache boundary, kept in its own module for the same reason as the two
+// layers above: an app's own query client is decided by origin, and that rule is
+// worth reading and testing on its own. Off this barrel — publishing a way to
+// name a cache client is the opposite of what it does.
+import { AppQueryClientProvider } from './appQueryClient'
+// The scoped-API layer, kept in its own module so it is NOT published on this
+// barrel -- see the header of ./scopedApi for why.
+import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo } from './scopedApi'
+// Re-exported as TYPES: the barrel<->vendor-stub parity gate counts value
+// exports, and a type vanishes at runtime, so an app author keeps these names
+// without the stub needing an entry it could not provide.
+export type { AppApi, AppApiError, AppInfo, AppPermissions } from './scopedApi'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export interface AppApi {
-  /** GET request scoped to declared permissions. */
-  get<T = unknown>(path: string, init?: RequestInit): Promise<T>
-  /** POST request scoped to declared permissions. */
-  post<T = unknown>(path: string, body?: unknown): Promise<T>
-  /** PUT request scoped to declared permissions. */
-  put<T = unknown>(path: string, body?: unknown): Promise<T>
-  /** PATCH request scoped to declared permissions. */
-  patch<T = unknown>(path: string, body?: unknown): Promise<T>
-  /** DELETE request scoped to declared permissions. */
-  del<T = unknown>(path: string): Promise<T>
-}
 
-export interface AppPermissions {
-  api: string[]
-  events: string[]
-}
 
-export interface AppInfo {
-  name: string
-  version: string
-  permissions: AppPermissions
-}
 
 export interface AppTheme {
   mode: 'dark' | 'light'
@@ -56,22 +49,6 @@ export interface AppTheme {
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
-
-interface AppSdkContextValue {
-  api: AppApi
-  info: AppInfo
-  subscribe: (event: string, cb: (data: unknown) => void) => () => void
-  navigate: (path: string) => void
-  notify: (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => void
-}
-
-const AppSdkContext = createContext<AppSdkContextValue | null>(null)
-
-function useCtx(): AppSdkContextValue {
-  const ctx = useContext(AppSdkContext)
-  if (!ctx) throw new Error('useAppApi() must be used inside <AppApiProvider>')
-  return ctx
-}
 
 // ---------------------------------------------------------------------------
 // Hooks (public API for app authors)
@@ -104,7 +81,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Chat content
   'chat_chunk', 'chat_thinking', 'chat_status', 'chat_message', 'chat_done',
   'chat_segment', 'chat_append', 'chat_message_update', 'chat_variant_switch',
-  'chat.side_result', 'heartbeat', 'context_usage',
+  'chat.side_result', 'chat.thread_reply', 'heartbeat', 'context_usage',
   // Tool / queue
   'tool_call', 'tool_result',
   'queue_push', 'queue_cancel', 'queue_edit', 'queue_pop', 'queue_reorder',
@@ -120,6 +97,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
   'subagent_stalled', 'subagent_retrying', 'subagent_recovering',
+  'subagent_waiting', 'subagent_resumed',
   'subagent_injection_failed',
   // Slack-gateway driven, slot-scoped
   'autonudge_state', 'batch_finished', 'spawn_batch_started',
@@ -135,6 +113,7 @@ const WS_SUBAGENT_EVENTS = new Set([
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
   'subagent_stalled', 'subagent_retrying', 'subagent_recovering',
+  'subagent_waiting', 'subagent_resumed',
   'subagent_injection_failed',
 ])
 
@@ -146,11 +125,17 @@ const WS_GLOBAL_EVENT_TO_SCOPE: Record<string, string> = {
   notifications_clear: 'notification',
   notification_channel_settings: 'notification',
   sessions_restarting: 'sessions',
+  // Bare {ts} refresh signal: the session-health verdict moved. Carries no slot,
+  // session key or counts, so it rides the same `sessions` declaration.
+  session_health_changed: 'sessions',
   yolo_expired: 'yolo',
   artifact_update: 'artifacts',
   'skills.pending_changed': 'skills',
   // Declared by its own literal name (already the correct per-event shape).
   workflow_run_event: 'workflow_run_event',
+  // Same scope name the gateway declares in ws_event_scope.py, so an app author
+  // gets the real permission to ask for instead of an "unknown event" hint.
+  panel_published: 'panels',
   log: 'log',
   browser_event: 'browser',
   // NOTE: `slots` is deliberately absent — the list re-push is always
@@ -343,11 +328,15 @@ export function useNavBadge(): (count: number) => void {
 export interface ChatLaunchOptions {
   /** Agent name to use for the session. */
   agent?: string
-  /** Initial message to send to the agent. */
+  /** Initial message, sent automatically unless autoSend is false. */
   message?: string
+  /** Existing dashboard slot key. Omit to start a new session. */
+  slotKey?: string
+  /** False seeds a draft only; the user must press Send. Defaults to true. */
+  autoSend?: boolean
 }
 
-/** Launch intent written to a global slot for ChatPage to consume on mount. */
+/** Launch intent written to a global slot for the routed chat to claim. */
 interface ChatLaunchIntent extends ChatLaunchOptions {
   ts: number
 }
@@ -356,8 +345,8 @@ interface ChatLaunchIntent extends ChatLaunchOptions {
  * Launch a chat session in the host dashboard.
  *
  * Writes launch intent to a lightweight global slot, then navigates to
- * /chat. ChatPage consumes the intent on mount — no timing issues,
- * no Redux coupling, no API calls. Same decoupled pattern as useNavBadge.
+ * /chat. The routed chat claims it on cold entry or hot navigation and owns
+ * session activation, draft creation and sending; apps need no Redux coupling.
  */
 export function useChatLauncher(): {
   openChat: (opts?: ChatLaunchOptions) => void
@@ -368,9 +357,13 @@ export function useChatLauncher(): {
     ;(window as Window & { __mc_chat_launch?: ChatLaunchIntent }).__mc_chat_launch = {
       agent: opts.agent,
       message: opts.message,
+      slotKey: opts.slotKey,
+      autoSend: opts.autoSend,
       ts: Date.now(),
     }
-    navigate('/chat')
+    navigate(opts.slotKey
+      ? `/chat?sid=${encodeURIComponent(opts.slotKey)}`
+      : opts.autoSend === false ? '/chat?new=1' : '/chat')
   }, [navigate])
 
   return { openChat }
@@ -384,108 +377,85 @@ export function useChatLauncher(): {
 // adding it to the top-level imports (apps get React from import map)
 import React from 'react'
 
-function createScopedApi(allowedPaths: string[], appName: string): AppApi {
-  const check = (path: string): string => {
-    // Reject absolute and protocol-relative URLs to prevent SSRF. Backslashes
-    // are rejected too: the URL parser treats `\` like `/`, so `/\evil.com` or
-    // `\\evil.com` would otherwise be parsed as a protocol-relative authority.
-    if (/^(?:https?:)?[/\\]{2}/i.test(path) || path.includes('\\')) {
-      throw new Error(`[app-sdk] Absolute URLs are not allowed: ${path}`)
-    }
-    // Normalize BEFORE the allowlist check so `..` traversal cannot escape the
-    // declared scope (e.g. `/api/apps/x/../../secret` → `/api/secret`).
-    const parsed = new URL(path, 'http://localhost')
-    const normalized = parsed.pathname
-    const allowed = allowedPaths.some(p => normalized === p || normalized.startsWith(p.endsWith('/') ? p : p + '/'))
-    if (!allowed) {
-      throw new Error(`[app-sdk] App "${appName}" not permitted to access ${normalized}. Declared: [${allowedPaths.join(', ')}]`)
-    }
-    return normalized + parsed.search
-  }
-
-  const jsonFetch = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-    const safePath = check(path)
-    const res = await fetch(safePath, init)
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText)
-      // A stale pre-owner session denial raises the dashboard's re-auth prompt
-      // (installed by api/client); in a document without it — the vendored
-      // iframe copy of this SDK — detection is a no-op and the throw below is
-      // unchanged either way.
-      noteStaleOwnerResponse(res.status, text)
-      throw new Error(`API ${res.status}: ${text}`)
-    }
-    // An empty-body response is not JSON — res.json() would throw a SyntaxError
-    // (e.g. a 204 No Content on DELETE, or a 200 with an empty body and no
-    // Content-Length header). Read the body as text and only parse when it is
-    // non-empty, so any empty body returns undefined regardless of status or
-    // whether a Content-Length: 0 header was sent.
-    if (res.status === 204 || res.status === 205) {
-      return undefined as T
-    }
-    const text = await res.text()
-    if (text.trim() === '') {
-      return undefined as T
-    }
-    return JSON.parse(text) as T
-  }
-
-  return {
-    get: (path, init) => jsonFetch(path, { ...init, method: 'GET' }),
-    post: (path, body) => jsonFetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: body != null ? JSON.stringify(body) : undefined,
-    }),
-    put: (path, body) => jsonFetch(path, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: body != null ? JSON.stringify(body) : undefined,
-    }),
-    patch: (path, body) => jsonFetch(path, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: body != null ? JSON.stringify(body) : undefined,
-    }),
-    del: (path) => jsonFetch(path, { method: 'DELETE' }),
-  }
-}
-
+/**
+ * Identity + scoped API in one, for a surface that has neither: an installed app
+ * mounted by `AppHost`.
+ *
+ * Prop contract unchanged, so every existing caller keeps working; `origin` is
+ * new and defaults to `'external'` because that is what an installed app is.
+ *
+ * It publishes identity only when there is NONE in context. A builtin page's
+ * identity is minted by the host and carries `origin: 'builtin'`; shadowing it
+ * with this provider's `'external'` default would silently revoke that page's
+ * host namespace — a capability disappearing with no error, which is the exact
+ * failure the identity layer exists to prevent.
+ */
 export function AppApiProvider({
   appName,
   appVersion = '0.0.0',
   allowedApiPaths,
   allowedEvents,
+  active = true,
   subscribeFn,
   navigateFn,
   notifyFn,
+  sessionKey,
+  origin = 'external',
   children,
 }: {
   appName: string
   appVersion?: string
   allowedApiPaths: string[]
-  allowedEvents: string[]
-  subscribeFn: (event: string, cb: (data: unknown) => void) => () => void
   navigateFn: (path: string) => void
-  notifyFn: (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => void
+  /** Optional since the scoped layer defaults them; see AppScopedApiProvider. */
+  allowedEvents?: string[]
+  subscribeFn?: (event: string, cb: (data: unknown) => void) => () => void
+  notifyFn?: (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => void
+  /** Whether the app's host surface is currently visible; forwarded to the
+   *  scoped layer, which publishes it as `info.active`. */
+  active?: boolean
+  /**
+   * Session the hosted surface is scoped to, sent as `X-Session-Key` on every
+   * scoped request.
+   *
+   * Chat surfaces pass their actual session; routed dashboard app pages pass
+   * `dashboard:ui`, matching the core API client. The host value overrides any
+   * caller-supplied header. Other hosts may omit the binding, but then callers
+   * cannot supply their own X-Session-Key. Hosts of restricted sessions must
+   * provide the real key so the backend's restricted-session guard can run.
+   */
+  sessionKey?: string
+  origin?: AppOrigin
   children: ReactNode
 }) {
-  const apiKey = JSON.stringify(allowedApiPaths)
-  const eventsKey = JSON.stringify(allowedEvents)
-  const value = React.useMemo<AppSdkContextValue>(() => ({
-    api: createScopedApi(allowedApiPaths, appName),
-    info: {
-      name: appName,
-      version: appVersion,
-      permissions: { api: allowedApiPaths, events: allowedEvents },
-    },
-    subscribe: subscribeFn,
-    navigate: navigateFn,
-    notify: notifyFn,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [appName, appVersion, apiKey, eventsKey, subscribeFn, navigateFn, notifyFn])
-
-  return React.createElement(AppSdkContext.Provider, { value }, children)
+  const existing = useAppIdentity()
+  const scoped = React.createElement(AppScopedApiProvider, {
+    appName,
+    appVersion,
+    allowedApiPaths,
+    allowedEvents,
+    active,
+    subscribeFn,
+    navigateFn,
+    notifyFn,
+    sessionKey,
+    children,
+  })
+  if (existing) return scoped
+  // Identity outside, cache client inside: the client to hand over is decided by
+  // the origin this provider is publishing, and an app's subtree must sit below
+  // both. An app that already carries a host-published identity took the branch
+  // above and is therefore already inside the client that identity chose.
+  return React.createElement(AppIdentityProvider, {
+    appId: appName,
+    origin,
+    children: React.createElement(AppQueryClientProvider, {
+      appId: appName,
+      origin,
+      sessionKey,
+      children: scoped,
+    }),
+  })
 }
 
 export { useChatSession } from './useChatSession'
@@ -511,3 +481,9 @@ export type { MessageRenderer, MessageRenderContext } from './messageRenderers'
 // stub to third-party apps and freeze the contract before its richest consumer —
 // the main composer, with configurable send keys and per-slot persisted drafts —
 // has exercised it. Publishing later is additive; un-publishing is a break.
+
+// Shared interaction and locale contracts; apps reuse the host implementations.
+export { useImeGuard } from '../hooks/useImeGuard'
+export { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+export { activeLocale, fmtNumber, fmtDate, fmtTime, fmtDateTime, fmtRelative, compareText } from '../i18n/format'
+export type { NumberOptions, DateStyleOptions, RelativeStyle } from '../i18n/format'

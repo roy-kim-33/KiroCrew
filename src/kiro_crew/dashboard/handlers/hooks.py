@@ -9,16 +9,27 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 import aiohttp
 from aiohttp import web
 
 from kiro_crew import webhooks
-from kiro_crew.agent import _VALID_HOOK_EVENTS, _shipped_defaults, kiro_agents_dir_path
+from kiro_crew.agent import (
+    _VALID_HOOK_EVENTS,
+    _shipped_defaults,
+    agents_spec_lock,
+    kiro_agents_dir_path,
+)
 from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.execution_context import ExecutionContext, clear_session_execution
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import sanitize_string
 
@@ -28,6 +39,7 @@ logger = logging.getLogger(__name__)
 def _sel():
     """Late-binding _sel() for test monkeypatch compatibility."""
     import kiro_crew.dashboard.handlers as _pkg  # noqa: F811
+
     return _pkg.sel()
 
 
@@ -50,19 +62,20 @@ def _get_hook_store(state: DashboardState):
 def _store_failure_guard(handler):
     """Map a webhook/script-hook store failure to 503 instead of a 500.
 
-    Every store this module touches can now REFUSE rather than silently report an
+    Every store this module touches can REFUSE rather than silently report an
     empty file: reads raise ``WebhookStoreUnreadable`` when the file exists but
     cannot be parsed, and the shared ``hooks.json`` write refuses rather than
     erasing the webhook contexts stored alongside the script hooks. Writes can also
     fail outright on a full or read-only disk (``OSError``).
 
-    Those refusals were being caught one handler at a time, a round of review each.
-    Applying one wrapper to every store-touching handler closes the class: a
-    handler that already returns a more specific 503 still does (its own guard runs
-    first), and anything that would otherwise escape as an unhandled 500 — which
+    One wrapper on every store-touching handler closes the class rather than
+    catching those refusals a handler at a time: a handler that already returns a
+    more specific 503 still does (its own guard runs first), and anything that
+    would otherwise escape as an unhandled 500 — which
     reads to the operator as a gateway fault rather than "your store needs
     repair" — becomes the shared, machine-readable response.
     """
+
     @functools.wraps(handler)
     async def _guarded(request: web.Request) -> web.Response:
         try:
@@ -103,11 +116,11 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     # ``kirocrew.json`` lives in the user-writable, tool-shared agents dir, so
     # the read goes through the hardened agents-dir reader (size cap, symlink
     # and sensitive-target screens, explicit UTF-8, non-object rejection).
-    # ``None`` covers every case the old ``except (OSError, JSONDecodeError)``
-    # caught — plus the ones it missed, e.g. non-UTF-8 bytes, which previously
-    # escaped as an unhandled 500 — and degrades the same way: no user hooks.
+    # ``None`` covers every unreadable case, including the ones an
+    # ``except (OSError, JSONDecodeError)`` misses (e.g. non-UTF-8 bytes, which
+    # would escape as an unhandled 500), and degrades one way: no user hooks.
     # Off-loop: the reader stats + reads up to the size cap, and this handler
-    # runs on the gateway event loop (review-adopted, no-blocking-call rule).
+    # runs on the gateway event loop (no-blocking-call rule).
     # The labels are passed explicitly: they name the SEL denial event's
     # operation and interface channel, and without them a refusal here is
     # recorded under the reader's ``list_agents`` defaults -- attributing a
@@ -147,11 +160,13 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
                 # Context-aware redact(): runs the exfil-URL + credential passes
                 # and applies a loaded companion's extra regexes (so an internal
                 # token in a hook command is scrubbed on this egress surface too).
-                tagged.append({
-                    "command": redact(e.get("command") or ""),
-                    "matcher": redact(e.get("matcher") or ""),
-                    "source": "bundled" if key in bundled_keys else "user",
-                })
+                tagged.append(
+                    {
+                        "command": redact(e.get("command") or ""),
+                        "matcher": redact(e.get("matcher") or ""),
+                        "source": "bundled" if key in bundled_keys else "user",
+                    }
+                )
         if tagged:
             result[event] = tagged
     return web.json_response({"hooks": result})
@@ -184,6 +199,15 @@ async def _mutate_hook_store(operation, *args):
 @_store_failure_guard
 async def api_hooks_create(request: web.Request) -> web.Response:
     """POST /api/hooks — create a new script hook."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "hooks.create")
+    if denied is not None:
+        return denied
     from kiro_crew.validation import (  # noqa: F811
         HOOK_CREATE_SCHEMA,
         ValidationError,
@@ -207,7 +231,7 @@ async def api_hooks_create(request: web.Request) -> web.Response:
     except _StoreUnavailable:
         return _store_unavailable_response()
     except ValueError as exc:
-        # store.create now enforces the same invariants as store.update via the
+        # store.create enforces the same invariants as store.update via the
         # shared validator, so it can raise ValueError. The HOOK_CREATE_SCHEMA
         # check above normally rejects bad input first, but catch it here too so
         # any schema/validator drift surfaces as a 400 (like the update handler)
@@ -226,6 +250,15 @@ async def api_hooks_create(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_hook_detail(request: web.Request) -> web.Response:
     """PUT/DELETE /api/hooks/{hook_id}."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "hooks.update")
+    if denied is not None:
+        return denied
     from kiro_crew.validation import (  # noqa: F811
         HOOK_UPDATE_SCHEMA,
         ValidationError,
@@ -284,6 +317,15 @@ async def api_hook_detail(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_hook_toggle(request: web.Request) -> web.Response:
     """POST /api/hooks/{hook_id}/toggle — enable/disable."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "hooks.toggle")
+    if denied is not None:
+        return denied
 
     store = _get_hook_store(request.app["state"])
     hook_id = request.match_info["hook_id"]
@@ -306,9 +348,22 @@ async def api_hook_toggle(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_hook_test(request: web.Request) -> web.Response:
     """POST /api/hooks/{hook_id}/test — execute hook and return output."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "hooks.test")
+    if denied is not None:
+        return denied
     # circular import: kiro_crew.hooks pulls dashboard state at module load, so
     # this handler defers the import to call time (matches _get_hook_store above).
-    from kiro_crew.hooks import HOOK_EVENT_STOP, run_script_hook  # noqa: F811
+    from kiro_crew.hooks import (  # noqa: F811
+        HOOK_EVENT_STOP,
+        HOOK_EVENT_USER_PROMPT_SUBMIT,
+        run_script_hook,
+    )
     from kiro_crew.platform import redact_via_context
 
     store = _get_hook_store(request.app["state"])
@@ -323,12 +378,23 @@ async def api_hook_test(request: web.Request) -> web.Response:
     context = sanitize_string(raw_context)
     if len(context) > 10000:  # Max context length for hook test
         context = context[:10000]
-    # Mirror ScriptHookStore.fire()'s Stop payload so a Stop hook reading the
-    # stdin ``assistant_text`` key (the full segment; the env var is capped at
-    # 500 in run_script_hook) is testable through this endpoint too. Other
-    # events keep the default payload (run_script_hook builds it when None).
+    # Mirror ScriptHookStore.fire()'s per-event stdin payload so the FULL
+    # context reaches the hook here exactly as it does on a live fire. The env
+    # var KIROCREW_HOOK_CONTEXT is capped at 500 chars in run_script_hook for
+    # every event (ARG_MAX safety), so an event whose context travels on stdin
+    # (UserPromptSubmit -> ``prompt``, Stop -> ``assistant_text``) must carry it
+    # here too, or a >500-char test context is truncated on both paths and the
+    # hook receives incomplete input. Events fire() sends context only via the
+    # env var keep the default payload (run_script_hook builds it when None),
+    # matching production.
     hook_event = None
-    if hook.event == HOOK_EVENT_STOP:
+    if hook.event == HOOK_EVENT_USER_PROMPT_SUBMIT:
+        hook_event = {
+            "hook_event_name": hook.event,
+            "cwd": os.getcwd(),
+            "prompt": context,
+        }
+    elif hook.event == HOOK_EVENT_STOP:
         hook_event = {
             "hook_event_name": hook.event,
             "cwd": os.getcwd(),
@@ -493,6 +559,27 @@ def _load_hook_context(hook_id: str) -> str:
     return injectable
 
 
+def _load_hook_execution(session_key: str) -> ExecutionContext:
+    """Capture a registration's identity without consulting current member labels."""
+    from kiro_crew.execution_context import capture_session_execution, execution_from_record
+
+    path = _hook_store_path()
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Hook registration is malformed")
+        row = raw.get(session_key.removeprefix(_HOOK_SESSION_PREFIX))
+        if isinstance(row, dict) and "execution_context" in row:
+            execution = execution_from_record(row)
+        else:
+            execution = capture_session_execution(session_key)
+    else:
+        execution = capture_session_execution(session_key)
+    if execution.memory_mode != "persistent":
+        raise ValueError("Hook registration is disabled for this session mode")
+    return execution
+
+
 def _verify_hook_token(request: web.Request) -> str | None:
     """Return the id of the webhook token authenticating *request*, else None.
 
@@ -512,9 +599,7 @@ def _verify_hook_token(request: web.Request) -> str | None:
     )
 
 
-def _verify_hook_signature(
-    request: web.Request, token_id: str, raw_body: bytes
-) -> str | None:
+def _verify_hook_signature(request: web.Request, token_id: str, raw_body: bytes) -> str | None:
     """Verify the request signature for *token_id*. ``None`` means accepted.
 
     Any other return value is the ``SIG_ERR_*`` string naming the cause, used
@@ -557,9 +642,35 @@ def _installed_agent_names() -> set[str]:
     return {agent.name for agent in list_agents()}
 
 
-async def _json_object(
-    request: web.Request, *, default_empty: bool = False
-) -> dict | None:
+_T = TypeVar("_T")
+
+
+class _DestinationAgentGone(Exception):
+    """The pinned agent was installed at the pre-check but not at commit time."""
+
+
+def _commit_pinned_token(agent: str, commit: Callable[[], _T]) -> _T:
+    """Thread-side: re-verify *agent* and run *commit* under the agents spec lock.
+
+    The template delete guard counts webhook pins and unlinks the spec file
+    while holding ``agents_spec_lock``; a token that pins an agent must therefore
+    be COMMITTED under that same lock, or it can validate against a file the
+    delete is about to remove and land pointing at nothing. Lock order matches
+    the delete's (spec lock, then the token store's own file lock), so the two
+    writers serialize instead of deadlocking. The loop-side pre-check stays for
+    the fast, friendly 400; this is the one that decides.
+    """
+    agents_dir = kiro_agents_dir_path()
+    # The lockfile lives beside the specs; the pinned agent's own file is in
+    # this directory, so creating it is never a surprise.
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    with agents_spec_lock(agents_dir):
+        if agent not in _installed_agent_names():
+            raise _DestinationAgentGone(agent)
+        return commit()
+
+
+async def _json_object(request: web.Request, *, default_empty: bool = False) -> dict | None:
     """Parse a JSON **object** body. ``None`` means answer 400.
 
     ``await request.json()`` happily returns a list, string or number for a body
@@ -615,7 +726,7 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     try:
         switch_on = await asyncio.to_thread(webhooks.token_store().is_switch_on)
     except webhooks.WebhookStoreUnreadable:
-        # The store exists but cannot be parsed. Reads now fail closed rather
+        # The store exists but cannot be parsed. Reads fail closed rather
         # than reporting an empty store, so answer with the same 503 shape an
         # operator-disabled endpoint uses instead of letting the exception
         # become an unhandled 500. Deliberately not recorded to the run store:
@@ -629,7 +740,8 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             error="webhook store unreadable",
         )
         return web.json_response(
-            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"}, status=503
+            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
+            status=503,
         )
     if not switch_on:
         _sel().log_api_access(
@@ -661,7 +773,9 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             source="webhook",
             error="auth failures throttled",
         )
-        return web.json_response({"error": "too many failed attempts", "code": "auth_throttled"}, status=429)
+        return web.json_response(
+            {"error": "too many failed attempts", "code": "auth_throttled"}, status=429
+        )
 
     # Identify the bearer before reading a body. This route bypasses dashboard
     # auth, so an unknown caller must not be able to allocate even the bounded
@@ -683,7 +797,8 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             error="webhook store unreadable",
         )
         return web.json_response(
-            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"}, status=503
+            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
+            status=503,
         )
     if not token_id:
         throttled = webhooks.record_auth_failure(source)
@@ -710,9 +825,7 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     source_entry: dict[str, object] | None = None
     if token_id != webhooks.LEGACY_TOKEN_ID:
         try:
-            source_entry = await asyncio.to_thread(
-                webhooks.token_store().entry_for, token_id
-            )
+            source_entry = await asyncio.to_thread(webhooks.token_store().entry_for, token_id)
         except webhooks.WebhookStoreUnreadable:
             return web.json_response(
                 {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
@@ -729,9 +842,7 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
                 resources=f"token:{token_id}",
                 error="webhook source revoked during admission",
             )
-            return web.json_response(
-                {"error": "unauthorized", "code": "unauthorized"}, status=401
-            )
+            return web.json_response({"error": "unauthorized", "code": "unauthorized"}, status=401)
         if source_entry.get("enabled", True) is False:
             _sel().log_api_access(
                 caller=source,
@@ -762,17 +873,21 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
         raw_body = await _read_hook_body(request)
     except _HookBodyTooLarge:
         return web.json_response(
-            {"error": f"request body exceeds {_HOOK_BODY_MAX_BYTES} bytes", "code": "body_too_large"}, status=413
+            {
+                "error": f"request body exceeds {_HOOK_BODY_MAX_BYTES} bytes",
+                "code": "body_too_large",
+            },
+            status=413,
         )
     except Exception:
-        return web.json_response({"error": "could not read request body", "code": "body_unreadable"}, status=400)
+        return web.json_response(
+            {"error": "could not read request body", "code": "body_unreadable"}, status=400
+        )
 
     # A valid bearer proves who; the signature proves the body and defeats
     # replay. Failures feed the SAME per-source throttle as a bad bearer — a
     # signature-guessing flood is the same abuse shape as a token-guessing one.
-    sig_error = await asyncio.to_thread(
-        _verify_hook_signature, request, token_id, raw_body
-    )
+    sig_error = await asyncio.to_thread(_verify_hook_signature, request, token_id, raw_body)
     if sig_error:
         throttled = webhooks.record_auth_failure(source)
         _sel().log_api_access(
@@ -819,23 +934,34 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     # mistake into a 500. Same for sessionKey and its .startswith() below.
     raw_message = body.get("message", "")
     if not isinstance(raw_message, str):
-        return web.json_response({"error": "message must be a string", "code": "message_not_a_string"}, status=400)
+        return web.json_response(
+            {"error": "message must be a string", "code": "message_not_a_string"}, status=400
+        )
     message = raw_message.strip()
     if not message:
-        return web.json_response({"error": "message required", "code": "message_required"}, status=400)
+        return web.json_response(
+            {"error": "message required", "code": "message_required"}, status=400
+        )
     if len(message) > _HOOK_MESSAGE_MAX_LEN:
         return web.json_response(
-            {"error": f"message exceeds {_HOOK_MESSAGE_MAX_LEN} chars", "code": "message_too_long"}, status=400
+            {"error": f"message exceeds {_HOOK_MESSAGE_MAX_LEN} chars", "code": "message_too_long"},
+            status=400,
         )
 
     session_key = body.get("sessionKey", "")
     if not isinstance(session_key, str):
-        return web.json_response({"error": "sessionKey must be a string", "code": "session_key_not_a_string"}, status=400)
+        return web.json_response(
+            {"error": "sessionKey must be a string", "code": "session_key_not_a_string"}, status=400
+        )
     if not session_key:
         session_key = f"hook:default:{int(time.time())}"
     if not session_key.startswith(_HOOK_SESSION_PREFIX):
         return web.json_response(
-            {"error": f"sessionKey must start with '{_HOOK_SESSION_PREFIX}'", "code": "session_key_prefix_invalid"}, status=400
+            {
+                "error": f"sessionKey must start with '{_HOOK_SESSION_PREFIX}'",
+                "code": "session_key_prefix_invalid",
+            },
+            status=400,
         )
 
     name = body.get("name", "Webhook")
@@ -845,10 +971,14 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
         # non-string raises there, the notification and Slack DM never run, and
         # the ephemeral session is already reset — the turn's output is gone
         # while the run history says it was delivered.
-        return web.json_response({"error": "name must be a string", "code": "name_not_a_string"}, status=400)
+        return web.json_response(
+            {"error": "name must be a string", "code": "name_not_a_string"}, status=400
+        )
     requested_agent = body.get("agent", "") or None
     if requested_agent is not None and not isinstance(requested_agent, str):
-        return web.json_response({"error": "agent must be a string", "code": "agent_not_a_string"}, status=400)
+        return web.json_response(
+            {"error": "agent must be a string", "code": "agent_not_a_string"}, status=400
+        )
     deliver = body.get("deliver", True)
     try:
         timeout_secs = max(
@@ -856,7 +986,10 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             min(int(body.get("timeoutSeconds", _HOOK_TIMEOUT_DEFAULT)), _HOOK_TIMEOUT_MAX),
         )
     except (ValueError, TypeError):
-        return web.json_response({"error": "timeoutSeconds must be an integer", "code": "timeout_not_an_integer"}, status=400)
+        return web.json_response(
+            {"error": "timeoutSeconds must be an integer", "code": "timeout_not_an_integer"},
+            status=400,
+        )
 
     mapped_agent = str(source_entry.get("agent") or "") if source_entry else ""
     if mapped_agent and requested_agent and requested_agent != mapped_agent:
@@ -974,12 +1107,23 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             detail=f"Rejected: {_HOOK_MAX_CONCURRENT} concurrent runs already in flight",
         )
         return web.json_response(
-            {"error": f"hook capacity reached ({_HOOK_MAX_CONCURRENT})", "code": "capacity_reached"},
+            {
+                "error": f"hook capacity reached ({_HOOK_MAX_CONCURRENT})",
+                "code": "capacity_reached",
+            },
             status=429,
         )
 
     permit_acquired = False
     try:
+        try:
+            execution = await asyncio.to_thread(_load_hook_execution, session_key)
+        except (OSError, ValueError):
+            _hook_inflight_sessions.discard(session_key)
+            return web.json_response(
+                {"error": "hook execution identity is unavailable", "code": "memory_unavailable"},
+                status=503,
+            )
         # With a positive count acquire completes synchronously; the key was
         # already claimed above even if a test double or future implementation
         # makes this await yield.
@@ -1002,6 +1146,7 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
                 deliver,
                 timeout_secs,
                 token_id=token_id,
+                execution_context=execution,
             )
         )
     except BaseException:
@@ -1017,21 +1162,103 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     return web.json_response({"status": "accepted", "sessionKey": session_key})
 
 
+# The permission-request event kind, spelled locally: the agent-sdk-boundary
+# gate forbids ADDING an ACP/providers import edge in application code, and
+# kiro_crew.agent_sdk does not re-export the event vocabulary yet, so naming
+# the wire constant here would grow exactly the edge the gate ratchets down.
+# The spelling is pinned against the source of truth by the regression tests,
+# which compare it to the real event object's kind.
+_EVENT_PERMISSION_REQUEST_KIND = "permission_request"
+
+
 async def _run_hook_inner(
-    state: DashboardState, session_key: str, message: str, agent: str | None
+    state: DashboardState,
+    session_key: str,
+    message: str,
+    agent: str | None,
+    *,
+    execution_context: ExecutionContext | None = None,
 ) -> str:
     """Inner agent turn — called within timeout wrapper."""
+    from dataclasses import replace
+
+    from kiro_crew import name_grant
+    from kiro_crew.context import _neutralize_structural_markers, session_store_for_turn
+    from kiro_crew.execution_context import bind_session_execution, read_session_execution
+    from kiro_crew.hooks import (  # noqa: F811  # circular import
+        TOOL_AUTO_APPROVE,
+        TOOL_DENY,
+        hook_gate_kwargs,
+        identity_grant_covers_child,
+    )
     from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK  # noqa: F811
 
+    execution: ExecutionContext = (
+        execution_context
+        if execution_context is not None
+        else await asyncio.to_thread(_load_hook_execution, session_key)
+    )
+    if execution.memory_mode != "persistent":
+        raise ValueError("Hook execution is disabled for this session mode")
+
+    def bind_captured() -> None:
+        prior = read_session_execution(session_key)
+        if prior is not None and (
+            prior.member_id != execution.member_id
+            or prior.store != execution.store
+            or prior.memory_mode != "persistent"
+        ):
+            raise ValueError("Hook session no longer matches its registered execution")
+        # Publish the captured identity WITHOUT vouching. A vouched entry is only
+        # ever read for the CALLER slot of `create_session`'s own-store admission,
+        # and a hook session can never be that caller: its key is a `hook:` synthetic
+        # (see `_HOOK_SESSION_PREFIX`) belonging to an ephemeral session that
+        # `_run_hook_agent` destroys after the turn, so it is never a dashboard slot
+        # and `caller_slot_key` cannot resolve it. Vouching it would only occupy a
+        # slot in the capped vouched map for an entry nothing can read. Publishing the
+        # record still lets the hook turn run.
+        bind_session_execution(
+            session_key, execution, replace_existing=True, expected=prior, vouch=False
+        )
+
+    await asyncio.to_thread(bind_captured)
+    if agent:
+        execution = replace(execution, template_id=agent)
+    else:
+        agent = execution.template_id or None
+    memory_store = await session_store_for_turn(state.context_builder, session_key)
     client, is_new, resumed = await state.sessions.get_or_create(session_key, agent=agent)
     full_message = message
+    # The ContextBuilder prompt is the only text on this path that legitimately
+    # MINTS structural boundary markers, so it is the one text the scrub below
+    # must leave byte-exact. Identity, not equality: a prompt rebuilt by any
+    # future step is a different object and is treated as untrusted.
+    trusted_prompt: str | None = None
     if is_new and state.context_builder:
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             state.context_builder.build_message,
-            message, is_new, session_key, agent=agent, resumed=resumed,
+            message,
+            is_new,
+            session_key,
+            agent=agent,
+            resumed=resumed,
             provider_type=KiroCrewConfig.load().agent.provider,
+            memory_store=memory_store,
+            execution_context=execution,
         )
+        trusted_prompt = full_message
+    if full_message is not trusted_prompt:
+        # ``message`` is supplied by an external caller of /api/hooks/agent, and
+        # ContextBuilder.build_message is the only code that neutralizes forgeable
+        # boundary markers in it. It runs on the new-session branch alone, so a
+        # reused session would hand a forged ``[END OF SESSION CONTEXT]`` /
+        # ``[CURRENT USER REQUEST ...]`` pair to the model verbatim. The scrub sits
+        # at the last statement before the stream, and covers everything the
+        # builder did not produce, so a branch added above cannot route around it.
+        # Off-loop like the dashboard's sibling seam: the restored-context prefix
+        # ``_run_hook_agent`` prepends is not bounded by _HOOK_MESSAGE_MAX_LEN.
+        full_message = await asyncio.to_thread(_neutralize_structural_markers, full_message)
     result_text = ""
     _complete_event: object | None = None
     # Wall clock for the webhook agent turn: acp leaves TurnUsage.duration_ms
@@ -1041,6 +1268,147 @@ async def _run_hook_inner(
     async for event in client.stream(full_message):
         if event.kind == EVENT_TEXT_CHUNK:
             result_text += event.text
+        elif event.kind == _EVENT_PERMISSION_REQUEST_KIND:
+            # Webhook turns are headless and their payload is untrusted
+            # external input, so the default is DENY. An unanswered request
+            # stalls the provider until the _run_hook_agent timeout fires and
+            # the watchdog reports the turn as cancelled by the user. Route
+            # the request through the same hook gate every other headless
+            # runner uses (task_planner, llm_helpers, subagent_manager) and
+            # approve ONLY on the gate's affirmative TOOL_AUTO_APPROVE:
+            # TOOL_ALLOW means "ask the user" on interactive surfaces, and
+            # with no approver here it fails closed.
+            decision = None
+            deny_error = "no_hook_store"
+            hooks_gate = getattr(state.context_builder, "hooks", None)
+            if hooks_gate is not None:
+                try:
+                    decision = hooks_gate.on_tool_call(
+                        event.title,
+                        session_key=session_key,
+                        agent=agent or "",
+                        **hook_gate_kwargs(event),
+                    )
+                except Exception:
+                    # A raising gate must not leave the request unanswered --
+                    # an unanswered request is the exact stall this branch
+                    # exists to fix. No verdict is no positive authorization.
+                    logger.exception("webhook hook gate failed for %s", session_key)
+                    decision = None
+                    deny_error = "gate_error"
+                else:
+                    deny_error = (
+                        "hook_deny" if decision.action == TOOL_DENY else "no_interactive_approver"
+                    )
+            approve = False
+            if decision is not None and decision.action == TOOL_AUTO_APPROVE:
+                approve = True
+                if event.child_low_fidelity and not identity_grant_covers_child(decision, event):
+                    # A backend-child request whose security context is
+                    # unverified: every hook auto-approve except the
+                    # identity-keyed grant read the forgeable, agent-authored
+                    # title, so the dashboard runner and the subagent manager
+                    # both downgrade it. Headless there is no approval card to
+                    # downgrade to, so the downgrade is deny.
+                    approve = False
+                    deny_error = "child_low_fidelity"
+            if approve:
+                # An auto-approve tier is a statement about a PROGRAM name,
+                # and the shell re-resolves that name through a PATH that can
+                # lead with agent-writable directories. Verify it
+                # unconditionally, as every name-grant surface does at the
+                # point of honour; with no approver to downgrade to, a
+                # withheld grant denies (same as llm_helpers headless).
+                _ng_refusal = await name_grant.refusal_for_event(event)
+                if _ng_refusal is not None:
+                    if name_grant.should_log_decline(session_key, _ng_refusal):
+                        logger.warning(
+                            "declining a webhook hook auto-approve: %s",
+                            _ng_refusal.log_text,
+                        )
+                    name_grant.log_decline(
+                        source="webhook",
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        event=event,
+                        refusal=_ng_refusal,
+                        tier="hook_auto_approve",
+                        sel_factory=_sel,
+                    )
+                    approve = False
+                    deny_error = "name_grant_headless_reject"
+            if approve:
+                # Audit-or-deny: this surface runs unattended, so an
+                # auto-approve that cannot be audited must not run.
+                # critical=True writes synchronously and re-raises on a
+                # filesystem failure; audit BEFORE the wire call so a
+                # transport failure cannot skip the audit either (the stated
+                # invariant in llm_helpers / backend-security-controls).
+                try:
+                    # critical=True writes synchronously (open/write/flush)
+                    # and this is the branch's common path: off-loop it so an
+                    # SEL disk stall cannot pause every gateway task.
+                    await asyncio.to_thread(
+                        functools.partial(
+                            _sel().log_tool_invocation,
+                            session_key=session_key,
+                            agent=agent or "kirocrew",
+                            tool_name=event.title or "unknown",
+                            tool_kind=event.tool_kind,
+                            outcome=OUTCOME_PENDING_APPROVAL,
+                            source="webhook",
+                            request_id=str(event.request_id),
+                            critical=True,
+                        )
+                    )
+                except Exception:
+                    logger.exception("webhook auto-approve audit failed; denying %s", session_key)
+                    # The decision itself must not vanish from SEL: hand the
+                    # denial to the ordinary (batched) writer best-effort,
+                    # naming the audit failure as the reason.
+                    try:
+                        _sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=agent or "kirocrew",
+                            tool_name=event.title or "unknown",
+                            tool_kind=event.tool_kind,
+                            outcome="denied",
+                            source="webhook",
+                            request_id=str(event.request_id),
+                            error="audit_write_failed",
+                        )
+                    except Exception:
+                        logger.debug("denial record after audit failure also failed", exc_info=True)
+                    await client.reject_tool(event.request_id)
+                else:
+                    approval_sent = await client.approve_tool(event.request_id)
+                    outcome = (
+                        OUTCOME_REJECTED_TRANSPORT_FLOOR
+                        if approval_sent is False
+                        else "auto_approved"
+                    )
+                    _sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=agent or "kirocrew",
+                        tool_name=event.title or "unknown",
+                        tool_kind=event.tool_kind,
+                        outcome=outcome,
+                        source="webhook",
+                        request_id=str(event.request_id),
+                    )
+            else:
+                # Audit the denial BEFORE rejecting, for the same reason.
+                _sel().log_tool_invocation(
+                    session_key=session_key,
+                    agent=agent or "kirocrew",
+                    tool_name=event.title or "unknown",
+                    tool_kind=event.tool_kind,
+                    outcome="denied",
+                    source="webhook",
+                    request_id=str(event.request_id),
+                    error=deny_error,
+                )
+                await client.reject_tool(event.request_id)
         elif event.kind == EVENT_COMPLETE:
             _complete_event = event
             break
@@ -1086,6 +1454,7 @@ async def _run_hook_agent(
     deliver: bool,
     timeout_secs: int,
     token_id: str | None = None,
+    execution_context: ExecutionContext | None = None,
 ) -> None:
     """Execute a webhook-triggered agent turn in an ephemeral session.
 
@@ -1094,24 +1463,45 @@ async def _run_hook_agent(
     the agent calls ``register_hook`` to persist context_summary, and this
     handler injects it into the next fresh session.
     """
-    # Load persisted context from hooks.json (written by register_hook MCP tool)
+    # Pure, cannot raise, so it may sit outside the try below.
     hook_id = session_key.removeprefix(_HOOK_SESSION_PREFIX)
-    saved_context = await asyncio.to_thread(_load_hook_context, hook_id)
-    if saved_context:
-        message = (
-            f"=== Restored Context (from prior session) ===\n"
-            f"{saved_context}\n"
-            f"=== End Restored Context ===\n\n"
-            f"{message}"
-        )
 
     started_at = time.time()
     result_text = ""
     outcome = "completed"
     detail = ""
     try:
+        # Loading the persisted context (written by the register_hook MCP tool)
+        # is INSIDE the try because the caller's permit and the in-flight claim
+        # are released only by this function's finally, so anything that escapes
+        # a try entered any later gives back neither. Six of those wedge the
+        # endpoint at 429 `capacity_reached` permanently and one wedges that
+        # session key at 409 `session_busy` until the gateway restarts, which
+        # contradicts the invariants stated above at the semaphore and at
+        # `_hook_inflight_sessions`.
+        #
+        # Two distinct escapes, and they leave by different doors. A read error
+        # is NOT one of them -- `_read_json_file` answers `None` for an absent or
+        # corrupt store -- but `resolve_context` parses what that store holds, so
+        # malformed stored data raises, and that lands in the `except Exception`
+        # leg and is recorded as an `error` run instead of vanishing. Cancellation
+        # while this await is pending does not: `CancelledError` is a
+        # `BaseException` and passes straight through that leg. The `finally` is
+        # what covers it, and only from inside the try.
+        saved_context = await asyncio.to_thread(_load_hook_context, hook_id)
+        if saved_context:
+            message = (
+                f"=== Restored Context (from prior session) ===\n"
+                f"{saved_context}\n"
+                f"=== End Restored Context ===\n\n"
+                f"{message}"
+            )
+
         result_text = await asyncio.wait_for(
-            _run_hook_inner(state, session_key, message, agent), timeout=timeout_secs
+            _run_hook_inner(
+                state, session_key, message, agent, execution_context=execution_context
+            ),
+            timeout=timeout_secs,
         )
     except asyncio.TimeoutError:
         outcome = "timeout"
@@ -1130,6 +1520,21 @@ async def _run_hook_agent(
             state.sessions.release(session_key)
         except Exception:
             logger.exception("Hook session release failed: %s", session_key)
+        try:
+            # Withdraw this process's word on the hook's identity. Neither call
+            # below reaches it: `release` returns the slot and `SessionManager.reset`
+            # recycles the session without going near the execution maps. And the
+            # entry is always there to withdraw, because the hook path binds
+            # PERSISTENT only -- `_run_hook_inner` raises for any other mode -- so
+            # the bind leaves a vouched entry rather than a live carrier.
+            #
+            # Hook session keys are per-request by default (`hook:default:{ts}`),
+            # and per-event keys are the ordinary webhook pattern, so without this
+            # the map would gain one permanent entry per authenticated request and
+            # grow until the process restarted.
+            clear_session_execution(session_key)
+        except Exception:
+            logger.exception("Hook execution withdrawal failed: %s", session_key)
         try:
             await state.sessions.reset(session_key)
         except Exception:
@@ -1157,9 +1562,7 @@ async def _run_hook_agent(
             # with no handler, so a raising notifier lost the result AND skipped
             # the Slack attempt that might still have succeeded.
             try:
-                state.notify(
-                    "hook", title, result_text[:2000], meta={"session_key": session_key}
-                )
+                state.notify("hook", title, result_text[:2000], meta={"session_key": session_key})
                 destinations.append("notifications")
             except Exception:
                 logger.exception("Hook agent: notification delivery failed")
@@ -1294,8 +1697,8 @@ def _public_runs(runs: list[dict]) -> list[dict]:
     rendered on the dashboard, turning the run list into a disclosure surface.
 
     The record-time pass over ``name`` is not sufficient on its own: it runs only
-    the exfil-URL pass, covers just that one field, and cannot retroactively
-    clean rows written before this existed. Redacting on egress applies both
+    the exfil-URL pass, covers just that one field, and cannot clean a row
+    already on disk. Redacting on egress applies both
     passes to every field, on every read, which is the same discipline
     ``_list_hook_contexts`` already follows for the context list.
     """
@@ -1339,9 +1742,9 @@ def _delete_hook_context(hook_id: str) -> bool:
         target = hook_id
         if target not in raw:
             matches = [
-                k for k in raw
-                if _is_context_registration(raw[k])
-                and _redact_hook_identifier(k) == hook_id
+                k
+                for k in raw
+                if _is_context_registration(raw[k]) and _redact_hook_identifier(k) == hook_id
             ]
             if len(matches) != 1:
                 return False
@@ -1363,12 +1766,23 @@ async def api_webhooks_switch(request: web.Request) -> web.Response:
     turning webhooks back on restores every integration without re-provisioning
     the callers. Dashboard-authed like the rest of the management surface.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.switch")
+    if denied is not None:
+        return denied
     body = await _json_object(request)
     if body is None:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
-        return web.json_response({"error": "enabled must be a boolean", "code": "enabled_not_a_boolean"}, status=400)
+        return web.json_response(
+            {"error": "enabled must be a boolean", "code": "enabled_not_a_boolean"}, status=400
+        )
 
     try:
         stored = await asyncio.to_thread(webhooks.token_store().set_switch, enabled)
@@ -1425,9 +1839,7 @@ async def api_webhooks(request: web.Request) -> web.Response:
     # would each be a context switch, and a snapshot taken under one call is also
     # internally consistent rather than interleaved with a concurrent token edit.
     try:
-        tokens, switch_on, contexts, runs = await asyncio.to_thread(
-            _webhooks_snapshot
-        )
+        tokens, switch_on, contexts, runs = await asyncio.to_thread(_webhooks_snapshot)
     except webhooks.WebhookStoreUnreadable as exc:
         # Reads refuse rather than reporting an empty store, so the page gets a
         # named error it can show instead of an unhandled 500 that looks like a
@@ -1469,14 +1881,41 @@ async def api_webhooks(request: web.Request) -> web.Response:
 
 @_store_failure_guard
 async def api_webhook_token_create(request: web.Request) -> web.Response:
-    """POST /api/webhooks/tokens — mint a routed source credential."""
+    """POST /api/webhooks/tokens — mint a routed source credential. Owner-only.
+
+    The bearer this route hands back authenticates on ``POST /api/hooks/agent``
+    through :func:`_verify_hook_token`, and that route's own comment states what
+    the credential buys: a real agent turn with full tool access. Minting one is
+    therefore at least as privileged as the agent writes
+    ``handlers/agents.py::api_kirocrew_agents_create`` reserves for the owner, so
+    this route applies the same predicate and returns the same 403 shape.
+
+    The caller it stops is a real principal, not a hypothetical one: an
+    allow-listed messaging user running ``!dashboard`` holds an ordinary
+    dashboard session (``app == ""``, ``sub != owner_id``) that token auth
+    admits, and an ungated mint lets that scoped session trade itself for a
+    durable, session-independent credential.
+    """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.token_create")
+    if denied is not None:
+        return denied
     body = await _json_object(request)
     if body is None:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     require_signature = body.get("require_signature", True)
     if not isinstance(require_signature, bool):
         return web.json_response(
-            {"error": "require_signature must be a boolean", "code": "require_signature_not_a_boolean"}, status=400
+            {
+                "error": "require_signature must be a boolean",
+                "code": "require_signature_not_a_boolean",
+            },
+            status=400,
         )
     agent = body.get("agent")
     if not isinstance(agent, str) or not agent.strip():
@@ -1489,20 +1928,37 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
     except Exception:
         logger.warning("webhook destination-agent discovery failed", exc_info=True)
         return web.json_response(
-            {"error": "destination agent could not be verified", "code": "agent_discovery_unavailable"},
+            {
+                "error": "destination agent could not be verified",
+                "code": "agent_discovery_unavailable",
+            },
             status=503,
         )
     if agent not in installed_agents:
         return web.json_response(
-            {"error": "destination agent is not installed", "code": "destination_agent_unavailable"},
+            {
+                "error": "destination agent is not installed",
+                "code": "destination_agent_unavailable",
+            },
             status=400,
         )
     try:
         raw, signing_secret, entry = await asyncio.to_thread(
-            webhooks.token_store().create,
-            body.get("label", ""),
-            require_signature=require_signature,
-            agent=agent,
+            _commit_pinned_token,
+            agent,
+            lambda: webhooks.token_store().create(
+                body.get("label", ""),
+                require_signature=require_signature,
+                agent=agent,
+            ),
+        )
+    except _DestinationAgentGone:
+        return web.json_response(
+            {
+                "error": "destination agent is not installed",
+                "code": "destination_agent_unavailable",
+            },
+            status=400,
         )
     except webhooks.WebhookError as exc:
         _sel().log_api_access(
@@ -1531,6 +1987,15 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_webhook_token_update(request: web.Request) -> web.Response:
     """PATCH /api/webhooks/tokens/{token_id} — update source-owned settings."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.token_update")
+    if denied is not None:
+        return denied
     token_id = request.match_info["token_id"]
     if token_id == webhooks.LEGACY_TOKEN_ID:
         _sel().log_api_access(
@@ -1542,7 +2007,10 @@ async def api_webhook_token_update(request: web.Request) -> web.Response:
             error="legacy credential is config-managed",
         )
         return web.json_response(
-            {"error": "the legacy credential is config-managed", "code": "legacy_credential_in_config"},
+            {
+                "error": "the legacy credential is config-managed",
+                "code": "legacy_credential_in_config",
+            },
             status=400,
         )
     body = await _json_object(request)
@@ -1552,25 +2020,36 @@ async def api_webhook_token_update(request: web.Request) -> web.Response:
     unknown = sorted(set(body) - allowed)
     if unknown or not body:
         return web.json_response(
-            {"error": "patch may only contain agent, enabled, or label", "code": "invalid_source_patch"},
+            {
+                "error": "patch may only contain agent, enabled, or label",
+                "code": "invalid_source_patch",
+            },
             status=400,
         )
     if "agent" in body:
         agent = body["agent"]
         if not isinstance(agent, str) or not agent.strip():
-            return web.json_response({"error": "agent is required", "code": "agent_required"}, status=400)
+            return web.json_response(
+                {"error": "agent is required", "code": "agent_required"}, status=400
+            )
         agent = agent.strip()
         try:
             installed_agents = await asyncio.to_thread(_installed_agent_names)
         except Exception:
             logger.warning("webhook destination-agent discovery failed", exc_info=True)
             return web.json_response(
-                {"error": "destination agent could not be verified", "code": "agent_discovery_unavailable"},
+                {
+                    "error": "destination agent could not be verified",
+                    "code": "agent_discovery_unavailable",
+                },
                 status=503,
             )
         if agent not in installed_agents:
             return web.json_response(
-                {"error": "destination agent is not installed", "code": "destination_agent_unavailable"},
+                {
+                    "error": "destination agent is not installed",
+                    "code": "destination_agent_unavailable",
+                },
                 status=400,
             )
     else:
@@ -1583,13 +2062,29 @@ async def api_webhook_token_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "label must be a string", "code": "label_not_a_string"}, status=400
         )
-    try:
-        entry = await asyncio.to_thread(
-            webhooks.token_store().update,
+
+    def _update() -> dict[str, Any] | None:
+        return webhooks.token_store().update(
             token_id,
             agent=agent,
             enabled=body.get("enabled") if "enabled" in body else None,
             label=body.get("label") if "label" in body else None,
+        )
+
+    try:
+        # A re-pin commits under the agents spec lock, like a mint; a change
+        # that leaves the pin alone has nothing to serialize with.
+        if agent is not None:
+            entry = await asyncio.to_thread(_commit_pinned_token, agent, _update)
+        else:
+            entry = await asyncio.to_thread(_update)
+    except _DestinationAgentGone:
+        return web.json_response(
+            {
+                "error": "destination agent is not installed",
+                "code": "destination_agent_unavailable",
+            },
+            status=400,
         )
     except webhooks.WebhookStoreUnreadable:
         raise
@@ -1610,6 +2105,15 @@ async def api_webhook_token_update(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_webhook_token_delete(request: web.Request) -> web.Response:
     """DELETE /api/webhooks/tokens/{token_id} — revoke one token."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.token_delete")
+    if denied is not None:
+        return denied
     token_id = request.match_info["token_id"]
     if token_id == webhooks.LEGACY_TOKEN_ID:
         _sel().log_api_access(
@@ -1645,6 +2149,15 @@ async def api_webhook_token_delete(request: web.Request) -> web.Response:
 @_store_failure_guard
 async def api_webhook_context_delete(request: web.Request) -> web.Response:
     """DELETE /api/webhooks/contexts/{hook_id} — drop a stored context."""
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.context_delete")
+    if denied is not None:
+        return denied
     hook_id = request.match_info["hook_id"]
     if not await asyncio.to_thread(_delete_hook_context, hook_id):
         return web.json_response({"error": "not found", "code": "context_not_found"}, status=404)
@@ -1666,6 +2179,15 @@ async def api_webhook_test(request: web.Request) -> web.Response:
     secret, then revokes the token, so the probe exercises the genuine bearer +
     signature auth path rather than a bypass.
     """
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    denied = await require_owner_dashboard_request(request, "webhooks.test")
+    if denied is not None:
+        return denied
     body = await _json_object(request, default_empty=True)
     if body is None:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
@@ -1720,8 +2242,7 @@ async def api_webhook_test(request: web.Request) -> web.Response:
             {
                 "ok": False,
                 "error": (
-                    f"Cannot mint a probe token ({exc}). Revoke an unused "
-                    "token and try again."
+                    f"Cannot mint a probe token ({exc}). Revoke an unused " "token and try again."
                 ),
                 "code": "probe_credential_mint_failed",
             },
@@ -1754,9 +2275,7 @@ async def api_webhook_test(request: web.Request) -> web.Response:
         "Authorization": f"Bearer {raw}",
         "Content-Type": "application/json",
         webhooks.TIMESTAMP_HEADER: str(timestamp),
-        webhooks.SIGNATURE_HEADER: webhooks.sign_payload(
-            signing_secret, timestamp, body_bytes
-        ),
+        webhooks.SIGNATURE_HEADER: webhooks.sign_payload(signing_secret, timestamp, body_bytes),
     }
     status = 0
     error = ""

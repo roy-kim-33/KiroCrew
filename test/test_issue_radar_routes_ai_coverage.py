@@ -44,10 +44,12 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew import llm_helpers
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
+from kiro_crew.start_priority import StartPriority
 
 BASE = "/api/apps/issue-radar"
 
@@ -85,6 +87,21 @@ def _get(path: str, query: dict | None = None, state: object | None = None) -> w
     return make_mocked_request("GET", full, app=_app(state))
 
 
+#: Forge writes behind the dashboard-owner gate; their requests carry owner state.
+_OWNER_GATED_WRITES = frozenset(
+    {
+        "labels/apply",
+        "labels/apply-bulk",
+        "labels/create",
+        "issue/state",
+        "issue/assignees",
+        "investigation",
+        "tagging",
+        "recommendations",
+    }
+)
+
+
 def _json_request(
     method: str, path: str, body: object, state: object | None = None
 ) -> web.Request:
@@ -93,7 +110,11 @@ def _json_request(
     ``None`` models a malformed payload: ``request.json()`` raising is exactly what
     each handler's ``except Exception -> 400`` branch is written for.
     """
+    if state is None and path in _OWNER_GATED_WRITES:
+        state = NoConfiguredOwner()
     req = make_mocked_request(method, f"{BASE}/{path}", app=_app(state))
+    req["user"] = "local-app"
+    req["app"] = ""
     if body is None:
         req.json = AsyncMock(side_effect=ValueError("not json"))  # type: ignore[method-assign]
     else:
@@ -173,9 +194,32 @@ class TestRunOneshotModel(unittest.IsolatedAsyncioTestCase):
         # Tool-less by construction: the ephemeral session may not run anything.
         _, kwargs = stream.call_args
         self.assertEqual(kwargs["approval_policy"], llm_helpers.ToolApprovalPolicy.REJECT_ALL)
-        state.sessions.get_or_create.assert_awaited_once_with("k1", agent="kirocrew-lite")
+        state.sessions.get_or_create.assert_awaited_once_with(
+            "k1", agent="kirocrew-lite", start_priority=StartPriority.BACKGROUND
+        )
         state.sessions.release.assert_called_once_with("k1")
         state.sessions.destroy.assert_awaited_once_with("k1")
+
+    async def test_the_start_priority_is_read_from_who_asked(self):
+        """Only the dashboard owner's own click claims FOREGROUND (and with it the
+        person-only cold-start reserve); an app token or an internal caller with no
+        user is BACKGROUND, like every other dashboard claimer."""
+        for user, app_token, expected in (
+            ("local-app", "", StartPriority.FOREGROUND),
+            ("local-app", "some-third-party-app", StartPriority.BACKGROUND),
+            ("", "", StartPriority.BACKGROUND),
+        ):
+            with self.subTest(user=user, app=app_token):
+                state = _sessions()
+                state.owner_id = ""
+                request = _get("issue-ai", state=state)
+                request["user"] = user
+                request["app"] = app_token
+                with _stream("hello"):
+                    await routes._run_oneshot_model(request, "k1", "prompt")
+                self.assertIs(
+                    state.sessions.get_or_create.await_args.kwargs["start_priority"], expected
+                )
 
     async def test_a_missing_session_manager_is_a_runtime_error(self):
         request = _get("issue-ai")
@@ -1156,7 +1200,7 @@ class TestBuildRecoPrompt(unittest.TestCase):
         self.assertIn("(no open issues)", routes._build_reco_prompt("o", "r", LABELS, []))
 
 
-# ── AI output-language localization (#4290) ──────────────────────────────────
+# ── AI output-language localization ──────
 
 
 class TestAiPromptLocalization(unittest.TestCase):
@@ -1230,7 +1274,7 @@ class TestAiPromptLocalization(unittest.TestCase):
         )
 
     def test_a_tag_localizes_only_the_tagging_reason(self):
-        # The fourth builder, and the one this class used to be missing: the
+        # The fourth builder, and the one this class was missing: the
         # tagging queue renders each `reason` as a tooltip, so an unsteered prompt
         # left that tooltip English inside a localized UI.
         legacy = routes._build_tagging_prompt("o", "r", LABELS, self.TAG_ISSUES)
@@ -1360,7 +1404,7 @@ class TestAiLanguageWiring(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BCP-47 tag ko", prompt)
 
     async def test_issue_ai_handler_reads_and_writes_the_language_partition(self):
-        # The route no longer compares a stored tag -- it addresses the partition
+        # The route does not compare a stored tag -- it addresses the partition
         # for the resolved language, so another language's summary is absent here
         # rather than evicted. Dropping either wire regresses: reading the wrong
         # partition serves foreign prose, writing it destroys someone else's.
@@ -1442,7 +1486,7 @@ class TestAiLanguageWiring(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBrowserLanguageHint(unittest.IsolatedAsyncioTestCase):
-    """A browser's own resolved language reaches the prose prompts (#7144).
+    """A browser's own resolved language reaches the prose prompts.
 
     The dashboard's default is "follow the browser", resolved client-side in the
     SPA's ``resolveLanguage()``; the backend reads ``Accept-Language`` nowhere, so

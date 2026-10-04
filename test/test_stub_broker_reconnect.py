@@ -6,9 +6,9 @@ to the session afterwards. That leaves the property this module exists for
 unasserted: *after the broker comes back, can the session still call its
 servers?*
 
-The answer used to be no, and the failure was silent and permanent. A session's
-MCP toolset is frozen at ``session/new``, so the tools stayed listed and simply
-failed for the rest of the session's life; the only recovery was opening a new
+Without a reconnect the failure is silent and permanent. A session's
+MCP toolset is frozen at ``session/new``, so the tools stay listed and simply
+fail for the rest of the session's life; the only recovery is opening a new
 one. Two shapes, neither observable from a "nothing errored" assertion:
 
 * with a call in flight, the liveness monitor failed it with ``-32603`` and a
@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from fake_pool_mcp_server import recorded
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import gatewayd as gw
@@ -197,10 +198,14 @@ def _resolver_for(
 
 
 def _observed_callers(log: Path) -> list[str]:
-    """The session key each ``tools/call`` reached the backend carrying."""
-    if not log.exists():
-        return []
-    return log.read_text(encoding="utf-8").splitlines()
+    """The session key each ``tools/call`` reached the backend carrying.
+
+    Read through the fake's own :func:`~fake_pool_mcp_server.recorded`, which is
+    the only thing that knows the on-disk layout: each daemon generation here
+    spawns its own backend process, so the identities are spread across per-pid
+    files that a direct read of *log* would never see.
+    """
+    return recorded(log)
 
 
 async def _start_daemon(sock: Path, resolver) -> tuple[asyncio.Event, asyncio.Task]:
@@ -233,13 +238,32 @@ async def _stop_daemon(stop: asyncio.Event, task: asyncio.Task) -> None:
 
 
 async def _reap(procs: list[asyncio.subprocess.Process]) -> None:
+    """Retire the stubs the way kiro-cli does, and only then force the stragglers.
+
+    Closing stdin is the stub's ordinary shutdown -- it reads EOF as
+    ``stdin_eof`` and exits on its own (pinned below by
+    :func:`test_a_closed_stdin_is_not_a_reconnectable_ending`). A SIGKILL to a
+    process that would have left cleanly hides a stub that does NOT act on EOF,
+    so it is reserved for one that is still alive after the graceful window.
+    """
     for p in procs:
-        if p.returncode is None:
+        if p.returncode is None and p.stdin is not None:
             try:
-                await pc.kill_process_tree_async(p.pid, pc.SIGKILL)
-            except Exception:  # noqa: BLE001 - teardown must never mask a failure
+                p.stdin.close()
+            except OSError:  # a pipe the stub already closed on its side
                 pass
     for p in procs:
+        if p.returncode is not None:
+            continue
+        try:
+            await asyncio.wait_for(p.wait(), timeout=15)
+            continue
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await pc.kill_process_tree_async(p.pid, pc.SIGKILL)
+        except Exception:  # noqa: BLE001 - teardown must never mask a failure
+            pass
         try:
             await asyncio.wait_for(p.wait(), timeout=15)
         except (asyncio.TimeoutError, ProcessLookupError):
@@ -472,7 +496,7 @@ async def test_replay_refuses_a_generation_that_answers_differently() -> None:
     The session's toolset was frozen at ``session/new`` against the first
     answer. If a new generation resolves this server to something else -- a
     different binary, a changed config -- then reconnecting would leave the
-    session calling tools that are no longer the ones it was offered. Answering
+    session calling tools that differ from the ones it was offered. Answering
     wrongly is worse than the terminal exit, so this fails closed. It is also
     REFUSE rather than RETRY: that generation owns the endpoint, so the next
     attempt would get the same answer.
@@ -671,8 +695,8 @@ async def test_a_closed_stdin_is_not_a_reconnectable_ending() -> None:
 # --- A reconnect must not silently drop resource subscriptions --------------
 # The daemon's subscription table lives in its process. Replaying only
 # ``initialize`` would return a connection that answers calls while resource
-# updates never arrive again -- a quiet degradation where there used to be a
-# visible one, which is the opposite of what this fix is for. A subscribed
+# updates never arrive again -- a quiet degradation in place of a visible
+# one, which is the opposite of what this fix is for. A subscribed
 # session is refused the reconnect until replaying subscriptions is done
 # properly.
 
@@ -862,3 +886,130 @@ async def test_reconnect_accepts_that_daemon_when_sharing_was_requested(
         pool_label="probe:fake",
     )
     assert attached is not None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_refuses_a_daemon_of_another_code_generation_at_once(
+    monkeypatch,
+) -> None:
+    """A generation refusal is terminal on the reconnect path, not an outage.
+
+    The handshake raises its refusal for a daemon whose ``registered`` reply names
+    no code fingerprint, or another one. Were that caught by the transient arm it
+    would be retried for the whole reconnect budget -- each attempt a fully
+    accepted register the stub then closes -- against a daemon that is UP and
+    will keep answering the same way, before reaching the same terminal exit.
+    """
+    from kiro_crew.mcp_gateway import stub as stub_mod
+
+    # Small enough that the OLD behaviour (retry until the budget is spent)
+    # finishes within the test instead of running for ten minutes, large
+    # enough that it visibly makes more than one attempt.
+    monkeypatch.setattr(stub_mod, "_RECONNECT_TOTAL_BUDGET_SECS", 0.4)
+    monkeypatch.setattr(stub_mod, "_RECONNECT_BACKOFF_START_SECS", 0.01)
+    monkeypatch.setattr(stub_mod, "_RECONNECT_BACKOFF_MAX_SECS", 0.02)
+    attempts: list[int] = []
+
+    async def _hs(_socket_path: str, _payload: dict):
+        attempts.append(1)
+        raise stub_mod.StaleGenerationError(
+            "gateway code fingerprint does not match this stub; using direct execution"
+        )
+
+    monkeypatch.setattr(stub_mod, "handshake", _hs)
+    session = _session_with_captured_init(_SERVER_RESULT)
+    attached = await stub_mod._reconnect(
+        "unused",
+        {
+            "stub_uuid": "u",
+            "session_key": "dashboard:x",
+            "stub_code_fingerprint": "this-stubs-generation",
+        },
+        session,  # type: ignore[arg-type]
+        asyncio.Event(),
+        poolable=True,
+        pool_label="probe:fake",
+    )
+    assert attached is None
+    assert len(attempts) == 1, (
+        f"the reconnect made {len(attempts)} handshake attempts against a daemon "
+        "of another code generation, so the refusal was retried as if the "
+        "gateway were merely not back yet"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_still_retries_a_gateway_that_is_not_back_yet(
+    monkeypatch,
+) -> None:
+    """The terminal arm must not swallow the outage class it sits beside.
+
+    A connect failure is the shape of a daemon still being respawned, and that
+    is exactly what the budget is bought for.
+    """
+    from kiro_crew.mcp_gateway import stub as stub_mod
+
+    monkeypatch.setattr(stub_mod, "_RECONNECT_BACKOFF_START_SECS", 0.01)
+    attempts: list[int] = []
+
+    async def _hs(_socket_path: str, _payload: dict):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise stub_mod.FallbackRequestedError("connect failed: not bound yet")
+        return (
+            _reader_with({"jsonrpc": "2.0", "id": 7, "result": dict(_SERVER_RESULT)}),
+            _CaptureWriter(),
+            "stub-uuid",
+            {"type": "registered", "capabilities": ["poolable_ack"]},
+        )
+
+    monkeypatch.setattr(stub_mod, "handshake", _hs)
+    session = _session_with_captured_init(_SERVER_RESULT)
+    attached = await stub_mod._reconnect(
+        "unused",
+        {"stub_uuid": "u", "session_key": "dashboard:x"},
+        session,  # type: ignore[arg-type]
+        asyncio.Event(),
+        poolable=True,
+        pool_label="probe:fake",
+    )
+    assert attached is not None
+    assert len(attempts) == 2
+
+
+def test_the_reconnect_budget_covers_the_supervisor_s_own_recovery() -> None:
+    """The budget has to outlast the recovery it is waiting for.
+
+    A stub that gives up before its gateway can possibly be back turns an
+    ordinary slow restart into permanent tool loss for the session: kiro-cli is
+    told the server is done, and nothing re-establishes it without a new session.
+    The supervisor's owned liveness path cannot beat 91s -- three
+    `_LIVENESS_PING_INTERVAL_SECS` cycles must elapse before the third failure
+    can even be counted, and only then does it kill and respawn -- so any budget
+    at or below that is a guarantee of loss rather than a bound on patience.
+
+    Asserted against the manager's own constants rather than a copied number, so
+    raising the detection cost fails here instead of silently re-breaking it.
+    """
+    from kiro_crew.mcp_gateway import manager as mgr
+    from kiro_crew.mcp_gateway import stub as stub_mod
+
+    floor = mgr._LIVENESS_MAX_CONSECUTIVE_FAILURES * mgr._LIVENESS_PING_INTERVAL_SECS
+    assert stub_mod._RECONNECT_TOTAL_BUDGET_SECS > floor, (
+        f"a {stub_mod._RECONNECT_TOTAL_BUDGET_SECS:.0f}s reconnect budget cannot "
+        f"outlast the {floor:.0f}s of sleeps the liveness loop needs before it "
+        "even declares the daemon dead, so an ordinary recovery loses the session"
+    )
+
+    # The probes and the SIGTERM wait sit on top of those sleeps; the budget
+    # should clear the whole worst case with room, not merely edge past it.
+    worst = (
+        floor
+        + mgr._LIVENESS_MAX_CONSECUTIVE_FAILURES
+        * (3 * mgr._PING_TIMEOUT_SECS + mgr._LIVENESS_ESCALATED_TIMEOUT_SECS)
+        + mgr._SHUTDOWN_GRACE_SECS
+    )
+    assert stub_mod._RECONNECT_TOTAL_BUDGET_SECS > worst, (
+        f"budget {stub_mod._RECONNECT_TOTAL_BUDGET_SECS:.0f}s does not clear the "
+        f"derived worst-case recovery of {worst:.0f}s"
+    )

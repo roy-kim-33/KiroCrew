@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,13 @@ from kiro_crew.platform.update_provider import (
     _trusted_path_env,
     resolve_provider,
 )
+
+#: A pid NO supported OS can allocate, so a mock carrying it cannot make a real
+#: process the target of a real signal. Every mock subprocess in this file uses
+#: it: the timeout and cancellation paths hand the mock to
+#: ``platform_compat.kill_and_reap``, which resolves ``proc.pid`` against the
+#: runner's live process table and SIGKILLs whatever owns it.
+_UNALLOCATABLE_PID = 99_999_999_999
 
 
 class TestUpdateCheckResult:
@@ -479,6 +488,25 @@ def _stream(data: bytes) -> asyncio.StreamReader:
     return reader
 
 
+def _wait_for_raising(exc: BaseException):
+    """A ``wait_for`` stand-in that fails with *exc* without running the awaitable.
+
+    The code under test hands ``wait_for`` a fresh ``proc.communicate()``
+    coroutine on both the turn and the reap path. A plain ``AsyncMock`` with a
+    ``side_effect`` drops that argument un-awaited, and the interpreter reports
+    it at garbage collection against some later test; closing it first keeps
+    the stand-in faithful to the real ``wait_for``, which always consumes what
+    it is given.
+    """
+
+    async def _wait_for(aw, timeout=None):
+        if asyncio.iscoroutine(aw):
+            aw.close()
+        raise exc
+
+    return _wait_for
+
+
 def _fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> "MagicMock":
     """Build a mock subprocess the production code can actually read.
 
@@ -486,6 +514,22 @@ def _fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") ->
     than calling ``communicate()``, so the streams must be real readers; a bare
     MagicMock attribute is not awaitable. ``communicate`` is still stubbed for
     the cleanup paths that call it.
+
+    ``pid`` is a number NO supported OS can allocate, which is load-bearing
+    rather than cosmetic. The timeout and cancellation paths hand this mock to
+    ``platform_compat.kill_and_reap``, whose only handle on its target is that
+    integer: it resolves it against the runner's REAL process table and sends
+    SIGKILL. A plausible pid therefore signals whichever genuine process owns
+    that number. ``kill_process_tree``'s self-group refusal does not save it --
+    that refusal declines only the GROUP signal and then sends a pid-scoped
+    SIGKILL, which reaches a same-group process just as hard. Under pytest-xdist
+    the runner's own group is full of siblings, so the casualty is a worker: its
+    channel closes mid-batch and the shard reports whichever test it had been
+    sent, with no assertion and no traceback.
+
+    An unallocatable pid makes the lookup fail before any signal is composed.
+    ``TestCancellationKillsUpdaterChild`` already used this convention for the
+    same reason; this is the file's shared fixture adopting it.
     """
     proc = MagicMock()
     proc.returncode = returncode
@@ -494,12 +538,77 @@ def _fake_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") ->
     proc.communicate = AsyncMock(return_value=(stdout, stderr))
     proc.wait = AsyncMock(return_value=returncode)
     proc.kill = MagicMock()
-    proc.pid = 4242
+    proc.pid = _UNALLOCATABLE_PID
     return proc
+
+
+class TestNoMockNamesAPidARealProcessCanOwn:
+    """A mock subprocess here must not carry a pid a live process can own.
+
+    The timeout and cancellation paths hand these mocks to
+    ``platform_compat.kill_and_reap``, and the only handle it has on its target
+    is the integer ``proc.pid``. It resolves that number against the runner's
+    REAL process table and sends SIGKILL, so a plausible pid signals whichever
+    genuine process owns it. ``kill_process_tree``'s self-group refusal is not a
+    defence: it declines only the GROUP signal and then sends a pid-scoped
+    SIGKILL, which reaches a same-group process just as hard. Under pytest-xdist
+    the runner's own group is full of sibling workers, so the casualty is a
+    worker -- its channel closes mid-batch and the shard reports whichever test
+    it had been sent, with no assertion and no traceback to explain it.
+
+    Running this file alone hides it: with 92 tests the process table is sparse,
+    the lookup raises, and the suppressed exception swallows the whole path.
+    """
+
+    def test_the_shared_fake_proc_cannot_name_a_real_process(self) -> None:
+        assert _fake_proc().pid == _UNALLOCATABLE_PID
+        # Above every pid_max any supported platform will allocate, so the
+        # lookup fails before a signal is composed.
+        assert _UNALLOCATABLE_PID > 2**32
+
+    def test_no_mock_in_this_file_assigns_an_allocatable_pid(self) -> None:
+        """The ratchet: a new mock written with a plausible pid fails here.
+
+        Matched on ANY attribute assignment and on the constructor kwarg, not on
+        a list of variable names. A pin keyed to ``proc``/``rt``/``p`` would let
+        the same mistake through under any other name, or through the kwarg form
+        of the same assignment, while still reading as though it covered them --
+        which is worse than no pin, because it reports coverage it does not have.
+
+        It scans this file, including this docstring, so the prose above names
+        the kwarg form without spelling a digit. That is the same trade every
+        grep-based gate in this repository makes, and the failure is loud.
+
+        Source-level on purpose. A behavioural check would have to reach the
+        kill path to observe the defect, which is the very thing that must not
+        happen on a runner shared with other tests.
+        """
+        source = Path(__file__).read_text(encoding="utf-8")
+        assigned = re.findall(r"^\s*\w+\.pid\s*=\s*(.+)$", source, re.MULTILINE)
+        assert assigned, "the attribute pattern found nothing -- it has drifted"
+        # Numeric literal only: a kwarg naming the constant is already covered by
+        # the allowed set, and a non-numeric kwarg cannot name a live process.
+        kwargs = re.findall(r"(?<![\w.])pid\s*=\s*(\d[\d_]*)", source)
+        allowed = {"_UNALLOCATABLE_PID", "1"}
+        offenders = [v.strip() for v in [*assigned, *kwargs] if v.strip() not in allowed]
+        assert not offenders, (
+            f"mock pid(s) a real process could own: {offenders}. Use "
+            "_UNALLOCATABLE_PID, or a reserved pid the kill helpers refuse outright."
+        )
 
 
 class TestCommandProviderNoShellAndTimeout:
     """CommandProvider fail-closed shell + timeout + stderr redaction."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_process_tree(self, monkeypatch):
+        # This class owns only process doubles. PID 4242 is not ours to signal.
+        tree = AsyncMock()
+        monkeypatch.setattr("kiro_crew.platform_compat.kill_process_tree_async", tree)
+        monkeypatch.setattr(
+            "kiro_crew.platform_compat._shares_own_process_group", lambda pid: False
+        )
+        return tree
 
     @pytest.mark.asyncio
     async def test_check_no_trusted_shell(self) -> None:
@@ -521,7 +630,7 @@ class TestCommandProviderNoShellAndTimeout:
             assert await p.apply() is False
 
     @pytest.mark.asyncio
-    async def test_check_timeout_kills_proc(self) -> None:
+    async def test_check_timeout_kills_proc(self, _fake_process_tree) -> None:
         p = CommandProvider(check_command="sleep 100", apply_command="echo ok")
         proc = _fake_proc(returncode=0)
         with (
@@ -534,11 +643,14 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.TimeoutError())),
         ):
             result = await p.check()
         assert result.error == "check_command timed out"
         proc.kill.assert_called_once()
+        _fake_process_tree.assert_awaited_once()
+        assert _fake_process_tree.await_args.args[0] == proc.pid
+        proc.communicate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_check_file_not_found(self) -> None:
@@ -559,12 +671,12 @@ class TestCommandProviderNoShellAndTimeout:
             patch.object(sys, "platform", "linux"),
         ):
             result = await p.check()
-        # Any spawn failure becomes an error verdict; the message no longer
-        # names the shell because OSError covers more than "missing binary".
+        # Any spawn failure becomes an error verdict; the message does not
+        # name the shell because OSError covers more than "missing binary".
         assert result.error and result.available is False
 
     @pytest.mark.asyncio
-    async def test_apply_timeout_kills_proc(self) -> None:
+    async def test_apply_timeout_kills_proc(self, _fake_process_tree) -> None:
         p = CommandProvider(check_command="echo hi", apply_command="sleep 100")
         proc = _fake_proc(returncode=0)
         with (
@@ -577,10 +689,13 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.TimeoutError())),
         ):
             assert await p.apply() is False
         proc.kill.assert_called_once()
+        _fake_process_tree.assert_awaited_once()
+        assert _fake_process_tree.await_args.args[0] == proc.pid
+        proc.communicate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_apply_file_not_found(self) -> None:
@@ -733,7 +848,7 @@ class TestCancellationKillsUpdaterChild:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.CancelledError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.CancelledError())),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await p.apply()
@@ -753,7 +868,7 @@ class TestCancellationKillsUpdaterChild:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.CancelledError())),
+            patch("asyncio.wait_for", _wait_for_raising(asyncio.CancelledError())),
         ):
             with pytest.raises(asyncio.CancelledError):
                 await p.check()
@@ -790,7 +905,7 @@ class TestCancellationKillsUpdaterChild:
         child leaves its members running and can leave communicate() waiting on
         pipes those survivors hold."""
         proc = MagicMock()
-        proc.pid = 4242
+        proc.pid = _UNALLOCATABLE_PID
         proc.kill = MagicMock()
         proc.communicate = AsyncMock(return_value=(b"", b""))
         proc.stdout = _stream(b"")
@@ -799,7 +914,7 @@ class TestCancellationKillsUpdaterChild:
         with patch("kiro_crew.platform_compat.kill_process_tree_async", AsyncMock()) as tree:
             await _kill_and_reap(proc)
         tree.assert_awaited_once()
-        assert tree.await_args.args[0] == 4242
+        assert tree.await_args.args[0] == proc.pid
 
     @pytest.mark.asyncio
     async def test_kill_and_reap_bounds_the_reap(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1101,6 +1216,224 @@ class TestWheelUpdateCommandPropagatesDownloadFailure:
         env["TMPDIR"] = str(tmp_path)
         result = subprocess.run(shell, capture_output=True, cwd=tmp_path, env=env)
         assert result.returncode != 0, "a failed download must fail the command"
+
+
+class TestNonManagedPipUpgradeCommand:
+    """The plain-pip refusal hint must install the channel's signed, hash-pinned
+    wheel by direct URL, so pip consults no index for `kirocrew` and a public
+    PyPI squat of the name cannot win. When the signed wheel cannot be fetched
+    or verified it reports the failure with retry/manual-install guidance — it
+    emits NO name-resolving command, because a `--extra-index-url` fallback
+    would reopen the dependency-confusion vector the pinned URL closes."""
+
+    _PAYLOAD = {
+        "schema": "kirocrew-cli-artifact-manifest-v1",
+        "channel": "insider",
+        "version": "9.9.9rc1",
+        "wheel_url": (
+            "https://download.crew.kiro.dev/cli/insider/9.9.9rc1/"
+            "kirocrew-9.9.9rc1-py3-none-any.whl"
+        ),
+        "sha256": "a" * 64,
+    }
+
+    def _payload_for(self, channel: str, version: str):
+        wheel = (
+            f"https://download.crew.kiro.dev/cli/{channel}/{version}/"
+            f"kirocrew-{version}-py3-none-any.whl"
+        )
+        return {
+            "schema": "kirocrew-cli-artifact-manifest-v1",
+            "channel": channel,
+            "version": version,
+            "wheel_url": wheel,
+            "sha256": "b" * 64,
+        }
+
+    def test_hint_pins_the_signed_wheel_url_and_sha_not_the_index(self) -> None:
+        """When the signed manifest resolves, the command installs the exact
+        pinned wheel by URL+sha256 — no `-U kirocrew`, no `--extra-index-url`,
+        so pip never resolves the name across public PyPI."""
+        import sys
+
+        from kiro_crew.platform import update_layout
+
+        with (
+            patch(
+                "kiro_crew.platform.update_layout.cdn_bases",
+                return_value=("https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"),
+            ),
+            patch(
+                "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+                return_value=self._payload_for("insider", "9.9.9rc1"),
+            ),
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("insider")
+        assert hint.command is not None
+        assert hint.note == ""
+        cmd = hint.command
+        # Dependency confusion is closed: a direct pinned URL, no name resolution.
+        assert (
+            '"https://download.crew.kiro.dev/cli/insider/9.9.9rc1/'
+            "kirocrew-9.9.9rc1-py3-none-any.whl#sha256=" + "b" * 64 + '"'
+        ) in cmd
+        assert "--extra-index-url" not in cmd
+        assert "-U kirocrew" not in cmd
+        # Still keyed to THIS interpreter, not a bare PATH-resolved `pip`.
+        assert sys.executable in cmd
+        assert "-m pip install" in cmd
+        assert not cmd.startswith("pip ")
+
+    def test_hint_does_not_stage_under_the_agent_writable_trust_keystone(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """RED-THEN-GREEN. The hint's verification workdir must be a
+        gateway-private temp dir, NOT `trust/update-staging` — `trust` is
+        sandbox read-write (an in-sandbox agent can write it), so staging there
+        lets an agent plant a symlink the gateway would follow. Fails the prior
+        attempt that staged under `_staging_dir()` (`trust/update-staging`)."""
+        from kiro_crew.platform import update_layout, wheel_engine
+
+        # Mark where the trust keystone would be, so we can assert we're NOT in it.
+        keystone = tmp_path / "trust" / "update-staging"
+        monkeypatch.setattr(wheel_engine, "_staging_dir", lambda: keystone, raising=True)
+
+        seen = {}
+
+        def _capture(*, channel, feed_base, artifact_base, workdir):
+            seen["workdir"] = Path(workdir)
+            return self._payload_for(channel, "9.9.9rc1")
+
+        with (
+            patch(
+                "kiro_crew.platform.update_layout.cdn_bases",
+                return_value=("https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"),
+            ),
+            patch(
+                "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+                side_effect=_capture,
+            ),
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("insider")
+        assert hint.command is not None
+        workdir = seen["workdir"].resolve()
+        # The workdir is NOT the agent-writable trust keystone (nor under it).
+        assert workdir != keystone.resolve()
+        assert (
+            keystone.resolve() not in workdir.parents
+        ), f"hint staged under the agent-writable trust keystone {workdir}"
+
+    def test_verification_failure_reports_and_emits_no_name_based_command(self) -> None:
+        """RED-THEN-GREEN. When the signed manifest cannot be verified, the hint
+        carries NO command — just a failure report pointing at the channel's
+        artifact directory. The old `--extra-index-url ... -U kirocrew` fallback
+        must not reappear: it resolves `kirocrew` across public PyPI, where a
+        higher-versioned squat wins. This fires on a plain-pip Windows host with
+        no trusted openssl and on any transient CDN outage, so it is not rare."""
+        from kiro_crew.platform import update_layout
+        from kiro_crew.platform.wheel_engine import WheelUpdateError
+
+        with (
+            patch(
+                "kiro_crew.platform.update_layout.cdn_bases",
+                return_value=("https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"),
+            ),
+            patch(
+                "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+                side_effect=WheelUpdateError("verification failed"),
+            ),
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("insider")
+        # No runnable command is handed over at all.
+        assert hint.command is None
+        # The report names the channel artifact directory for a manual install.
+        assert "https://download.crew.kiro.dev/cli/insider/" in hint.note
+        assert "SHA256SUMS" in hint.note
+        # The dependency-confusion forms must appear NOWHERE in the report.
+        assert "--extra-index-url" not in hint.note
+        assert "-U kirocrew" not in hint.note
+        assert "/simple/" not in hint.note
+
+    def test_oserror_also_reports_rather_than_falling_back(self) -> None:
+        """A missing openssl / network OSError is a verification failure too, so
+        it reports rather than emitting the name-based command."""
+        from kiro_crew.platform import update_layout
+
+        with (
+            patch(
+                "kiro_crew.platform.update_layout.cdn_bases",
+                return_value=("https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"),
+            ),
+            patch(
+                "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+                side_effect=OSError("no openssl"),
+            ),
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("stable")
+        assert hint.command is None
+        assert "--extra-index-url" not in hint.note
+        assert "-U kirocrew" not in hint.note
+
+    def test_pinned_hint_follows_the_cdn_override(self, monkeypatch) -> None:
+        """A test or alternate CDN upgrades from the same place it installed
+        from, so the override flows into the pinned wheel URL too."""
+        from kiro_crew.platform import update_layout
+
+        monkeypatch.setenv("KIROCREW_CDN_BASE", "https://cdn.example.invalid")
+        payload = {
+            "schema": "kirocrew-cli-artifact-manifest-v1",
+            "channel": "nightly",
+            "version": "9.9.9rc1",
+            "wheel_url": (
+                "https://cdn.example.invalid/cli/nightly/9.9.9rc1/"
+                "kirocrew-9.9.9rc1-py3-none-any.whl"
+            ),
+            "sha256": "c" * 64,
+        }
+        with patch(
+            "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+            return_value=payload,
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("nightly")
+        assert hint.command is not None
+        assert (
+            '"https://cdn.example.invalid/cli/nightly/9.9.9rc1/'
+            "kirocrew-9.9.9rc1-py3-none-any.whl#sha256=" + "c" * 64 + '"'
+        ) in hint.command
+        assert "--extra-index-url" not in hint.command
+
+    def test_failure_report_follows_the_cdn_override(self, monkeypatch) -> None:
+        """On verification failure the manual-install guidance points at the
+        same CDN the install came from, honouring the override."""
+        from kiro_crew.platform import update_layout
+        from kiro_crew.platform.wheel_engine import WheelUpdateError
+
+        monkeypatch.setenv("KIROCREW_CDN_BASE", "https://cdn.example.invalid")
+        with patch(
+            "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+            side_effect=WheelUpdateError("offline"),
+        ):
+            hint = update_layout.non_managed_pip_upgrade_command("nightly")
+        assert hint.command is None
+        assert "https://cdn.example.invalid/cli/nightly/" in hint.note
+
+    def test_pair_hint_upgrade_matches_the_command_and_restart_is_second(self) -> None:
+        from kiro_crew.platform import update_layout
+        from kiro_crew.platform.wheel_engine import WheelUpdateError
+
+        with (
+            patch(
+                "kiro_crew.platform.update_layout.cdn_bases",
+                return_value=("https://updates.crew.kiro.dev", "https://download.crew.kiro.dev"),
+            ),
+            patch(
+                "kiro_crew.platform.wheel_engine.fetch_verified_manifest",
+                side_effect=WheelUpdateError("offline"),
+            ),
+        ):
+            upgrade, restart = update_layout.non_managed_pip_update_hint("stable")
+            assert upgrade == update_layout.non_managed_pip_upgrade_command("stable")
+        assert restart == "kirocrew restart"
 
 
 class TestTrustedEnvDropsLoaderInjection:
@@ -1432,7 +1765,7 @@ class TestWhitespaceCommandsAreNotPresence:
 
 class TestRedactionHappensBeforeTruncation:
     """Slicing stderr to 500 chars BEFORE redacting can cut a credential in half,
-    and half a token no longer matches the redactors' patterns, so the surviving
+    and half a token does not match the redactors' patterns, so the surviving
     fragment reaches gateway.log and /api/logs verbatim. Order, not presence, is
     what makes the redaction effective."""
 

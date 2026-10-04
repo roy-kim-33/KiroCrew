@@ -9,7 +9,7 @@ absolute paths.
 **Nothing has to be installed by hand.** ``pip install kirocrew`` is the only
 prerequisite: ``uv`` is a declared Python dependency and is resolved through the
 installed package (:func:`resolve_uv`) rather than assumed to be on ``PATH``, and
-the engine arrives over plain HTTPS, so ``git`` is no longer required at all.
+the engine arrives over plain HTTPS, so ``git`` is not required at all.
 
 Why this is a Python job and not a ``setup.onInstall`` shell script: a BUILTIN
 app's source lives read-only inside the installed Python package, and the
@@ -39,10 +39,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiro_crew.apps.builtins.pptx_maker.backend import engine_source, paths
+from kiro_crew.apps.builtins.pptx_maker.backend import engine, engine_source, paths
 from kiro_crew.apps.manager import app_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.env import resolve_uv as _shared_resolve_uv
 from kiro_crew.sandbox import cgroup_scope_argv, run_limited, sandboxed_spawn_argv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
@@ -110,22 +112,10 @@ _uv_path_resolved = False
 def resolve_uv() -> str | None:
     """Absolute path to a usable ``uv``, or ``None`` when genuinely absent.
 
-    ``uv`` is a DECLARED Python dependency (``setup.cfg``), so a stock
-    ``pip install kirocrew`` always has the binary — but not necessarily on
-    ``PATH``: a wheel install puts it in the venv's scripts dir, and the gateway
-    may run with a minimal ``PATH`` (an installed launchd/systemd service). So it
-    is resolved through the INSTALLED PACKAGE rather than looked up by name.
-
-    Order, widest-trust first:
-
-    1. ``uv.find_uv_bin()`` — the wheel's own locator, the normal pip case. It
-       raises ``UvNotFound`` (a ``FileNotFoundError`` subclass) when the binary
-       is missing, e.g. an odd repackaging;
-    2. ``shutil.which("uv")`` — a user's own, possibly newer, uv still works;
-    3. ``None``.
-
-    Never raises: an absent uv is a reportable condition, so the caller can fail
-    with an actionable message instead of a traceback in a background job.
+    The ladder itself — ``uv.find_uv_bin()`` from the declared wheel, then
+    ``shutil.which("uv")``, never raising — is :func:`kiro_crew.env.resolve_uv`,
+    shared with pod provisioning so the minimal-``PATH`` case (an installed
+    launchd/systemd gateway) is handled in exactly one place.
 
     Cached process-wide: this runs on every provision and the answer cannot
     change within a process (the interpreter's own site-packages are fixed at
@@ -134,27 +124,9 @@ def resolve_uv() -> str | None:
     global _uv_path_cache, _uv_path_resolved
     if _uv_path_resolved:
         return _uv_path_cache
-    _uv_path_cache = _resolve_uv_uncached()
+    _uv_path_cache = _shared_resolve_uv()
     _uv_path_resolved = True
     return _uv_path_cache
-
-
-def _resolve_uv_uncached() -> str | None:
-    """The resolution ladder itself. See :func:`resolve_uv`."""
-    try:
-        # Optional-dependency import (the `top-level-imports` carve-out): `uv` is a
-        # declared dependency, but this must still answer on an install where the
-        # wheel is absent or repackaged without its binary — a missing uv is a
-        # reported "engine unavailable", never an ImportError at module load.
-        import uv as uv_package
-
-        found = uv_package.find_uv_bin()
-        if found and os.path.isfile(found):
-            return found
-    except (ImportError, FileNotFoundError, OSError) as exc:
-        logger.debug("pptx-maker: uv.find_uv_bin() did not resolve: %s", exc)
-
-    return shutil.which(_UV_BASENAME)
 
 
 def mcp_tools_path() -> str:
@@ -171,16 +143,25 @@ def mcp_tools_path() -> str:
     is no managed directory yet, so rendering never produces an empty entry (an
     empty element in ``PATH`` means "the current directory" on POSIX, which would
     make tool resolution depend on the server's cwd).
-    """
-    # Local import: `paths` imports the app manager, which imports the builtins
-    # package that owns this module.
-    from kiro_crew.apps.builtins.pptx_maker.backend import paths as _paths
 
+    A tool installed at a fixed platform install root that its installer does not put
+    on ``PATH`` — LibreOffice on Windows — is appended too, from
+    :func:`.engine.system_install_dirs`. Without that entry the engine's own
+    ``shutil.which("soffice")`` cannot see an install the app has already resolved,
+    so ``/deps`` reports LibreOffice present while every thumbnail still fails. It
+    sits before the managed directory and after the inherited ``PATH``: a system tool
+    keeps its precedence over the shim, and nothing already resolvable by name is
+    shadowed.
+    """
     inherited = os.environ.get("PATH", "")
-    managed = _paths.preview_tools_bin()
-    if not managed.is_dir():
-        return inherited
-    return f"{inherited}{os.pathsep}{managed}" if inherited else str(managed)
+    entries = [inherited] if inherited else []
+    system_dir = engine.soffice_install_dir()
+    if system_dir:
+        entries.append(system_dir)
+    managed = paths.preview_tools_bin()
+    if managed.is_dir():
+        entries.append(str(managed))
+    return os.pathsep.join(entries)
 
 
 def reset_uv_cache() -> None:
@@ -224,7 +205,7 @@ def _run(argv: list[str], *, cwd: str, timeout: int) -> tuple[int, str]:
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=timeout,
             check=False,
         )
@@ -304,9 +285,11 @@ def _venv_ready(engine_root: Path) -> bool:
 
     Root-parameterized rather than reading ``paths.engine_python()``, so it can ask
     the same question of a STAGED tree as of the live one. Same probe
-    ``engine.engine_status`` reports to the provisioning banner.
+    ``engine.engine_status`` reports to the provisioning banner. The layout itself
+    comes from ``paths.venv_python`` so this probe cannot disagree with the
+    interpreter the install step actually writes.
     """
-    return (engine_root / "mcp-local" / ".venv" / "bin" / "python").is_file()
+    return paths.venv_python(engine_root).is_file()
 
 
 def _ensure_venv(engine_root: Path, log: list[str], uv_bin: str) -> bool:
@@ -351,7 +334,7 @@ def _relink_editable_skill(engine_root: Path, log: list[str], uv_bin: str) -> bo
     Idempotent and cheap: the dependencies are already resolved into the venv, and this
     is a local path install with no network.
     """
-    python = engine_root / "mcp-local" / ".venv" / "bin" / "python"
+    python = paths.venv_python(engine_root)
     log.append("installing the engine skill package…")
     code, out = _run(
         [
@@ -556,7 +539,7 @@ def provision() -> ProvisionOutcome:
 
     # `uv` ships as a declared Python dependency, so this only fails on a
     # genuinely broken install. Reported precisely (and only about uv — `git` is
-    # no longer used) so the message is actionable rather than a guess.
+    # not used) so the message is actionable rather than a guess.
     uv_bin = resolve_uv()
     if uv_bin is None:
         log.append(

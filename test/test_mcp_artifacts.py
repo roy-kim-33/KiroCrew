@@ -842,7 +842,7 @@ class TestArtifactGetCommentsFullBody:
         assert body in result
 
     def test_long_body_not_truncated(self) -> None:
-        # 500-char body — previously would be cut to 200
+        # 500-char body: the full body is preserved, not truncated to 200.
         body = "A" * 250 + " MIDDLE " + "B" * 242
         assert len(body) == 500
         with patch(
@@ -1006,6 +1006,17 @@ class TestArtifactGetCommentsEdgeCases:
         assert get.call_args.args[0] == "/api/artifacts/empty/comments"
         assert "No comments" in result
 
+    def test_exclude_resolved_is_opt_in(self) -> None:
+        """The default stays unfiltered; the flag is what adds the param."""
+        with patch(
+            "kiro_crew.mcp_core._get",
+            return_value={"comments": []},
+        ) as get:
+            _call_tool_inner(
+                "artifact_get_comments", {"slug": "empty", "exclude_resolved": True}
+            )
+        assert get.call_args.args[0] == "/api/artifacts/empty/comments?exclude_resolved=true"
+
     def test_error_response(self) -> None:
         with patch(
             "kiro_crew.mcp_core._get",
@@ -1054,6 +1065,40 @@ class TestArtifactGetCommentsEdgeCases:
         ):
             result = _call_tool_inner("artifact_get_comments", {"slug": "doc"})
         assert "↳" in result
+
+    def test_interleaved_replies_name_parent_and_time(self) -> None:
+        # Two threads whose replies interleave — the indent alone
+        # cannot say which root a reply answers, so each line must carry it.
+        rows = [
+            ("r1", None, "2026-10-01T10:00:00Z"),
+            ("r2", None, "2026-10-01T10:01:00Z"),
+            ("a1", "r2", "2026-10-01T10:02:00Z"),
+            ("b1", "r1", "2026-10-01T10:03:00Z"),
+            ("a2", "r2", "2026-10-01T10:04:00Z"),
+        ]
+        comments = [
+            {
+                "id": cid,
+                "author": "u",
+                "body": f"body-{cid}",
+                "status": "open",
+                "parent_id": pid,
+                "created_at": ts,
+            }
+            for cid, pid, ts in rows
+        ]
+        with patch("kiro_crew.mcp_core._get", return_value={"comments": comments}):
+            result = _call_tool_inner("artifact_get_comments", {"slug": "doc"})
+        lines = {
+            cid: next(ln for ln in result.splitlines() if f"body-{cid} " in ln)
+            for cid, _, _ in rows
+        }
+        for cid, pid, ts in rows:
+            assert f" at={ts}" in lines[cid]
+            if pid:
+                assert f" parent={pid}" in lines[cid]
+            else:
+                assert "parent=" not in lines[cid]
 
     def test_comment_count_in_header(self) -> None:
         with patch(
@@ -1350,14 +1395,12 @@ class TestArtifactDeleteCommentTool:
 
 
 class TestArtifactPatchUsesTheVerbHelper:
-    """The two artifact PATCH senders owe the same recovery every verb has (#4106).
+    """Both artifact PATCH senders carry the same recovery every verb has.
 
-    They were hand-rolled because ``_post`` sends POST and PATCH was needed;
-    ``mcp_core._patch`` did not exist yet. It does now, and it carries the
-    refusal->invalidate->re-resolve->replay rule that a raw ``_api_urlopen``
-    does not: a gateway that came up (or moved ports) after this tool server
-    booted is recorded only in the run marker, so the first attempt is refused
-    and every other verb recovers from that while these two did not.
+    ``mcp_core._patch`` carries the refusal->invalidate->re-resolve->replay
+    rule that a raw ``_api_urlopen`` does not: a gateway that came up (or moved
+    ports) after this tool server booted is recorded only in the run marker, so
+    the first attempt is refused and every verb must recover from that.
 
     The resolver is scripted at ``_resolve_api_port`` — the one seam the whole
     discovery chain funnels through — so these tests do not depend on how many
@@ -1426,8 +1469,8 @@ class TestArtifactPatchUsesTheVerbHelper:
 
     def test_both_senders_carry_the_caller_attribution_header(self, monkeypatch) -> None:
         """``X-Internal-Caller`` lets the gateway audit log name the component
-        that wrote (#3503). The hand-rolled requests omitted it, so an artifact
-        write was the one internal write the audit could not attribute."""
+        that wrote. Without it an artifact write is the one internal write the
+        audit cannot attribute."""
         import kiro_crew.mcp_core as mcp_core
 
         monkeypatch.setattr(mcp_core, "internal_caller", lambda: "kirocrew-artifacts")

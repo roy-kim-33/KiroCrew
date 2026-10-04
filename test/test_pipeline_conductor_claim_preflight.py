@@ -12,11 +12,15 @@ regressing back into the old blind spot.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from skill_script_helpers import load_skill_script
+
+from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -82,9 +86,15 @@ def clean_checks(**overrides) -> dict:
             "bug_class_by": None,
         },
         "recency": {"age_days": 200, "author_association": "NONE", "risk": "low"},
+        "forge_claim": {"label": None, "assignees": [], "foreign": False},
     }
     checks.update(overrides)
     return checks
+
+
+def a_forge_claim(label: str | None = "claimed", *assignees: str, foreign: bool = True) -> dict:
+    """A ``forge_claim`` check value, as the detector would have produced it."""
+    return {"label": label, "assignees": list(assignees), "foreign": foreign}
 
 
 class TestVerdictPrecedence:
@@ -161,6 +171,7 @@ class TestVerdictPrecedence:
                     "author": "someone",
                     "is_cross_repository": True,
                     "untrusted_fork": False,
+                    "closes_item": True,
                 }
             ]
         )
@@ -180,7 +191,12 @@ class TestVerdictPrecedence:
         )
 
     def test_landed_merged_pr_outranks_an_open_one(self, mod):
-        """Precedence 1 before 2: already-fixed is triage debt, not a skip."""
+        """Precedence 1 before 2: already-fixed is triage debt, not a skip.
+
+        The open hit claims closure, so rule 2 WOULD fire on it. Without that the
+        comparison is vacuous -- a mention-only open hit reaches no verdict at
+        all, so rule 1 would win by default rather than by rank.
+        """
         checks = clean_checks(
             merged_prs=[
                 {
@@ -190,7 +206,14 @@ class TestVerdictPrecedence:
                     "closes_item": True,
                 }
             ],
-            open_prs=[{"number": 8100, "author": "x", "is_cross_repository": False}],
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "x",
+                    "is_cross_repository": False,
+                    "closes_item": True,
+                }
+            ],
         )
         assert mod.verdict(checks)[:2] == ("CLOSE", "already-fixed")
 
@@ -216,8 +239,10 @@ class TestVerdictPrecedence:
         )
 
     def test_closure_request_outranks_a_prose_claim(self, mod):
-        """Precedence 3 before 4: if the reporter says it is done, it is triage
-        debt even when somebody also said they were working on it."""
+        """Precedence 3 before 4: if the reporter says it is done, that reading
+        is the one worth surfacing even when somebody also said they were
+        working on it. It surfaces as REVIEW, not CLOSE -- see
+        :class:`TestClosureProseNeverCloses`."""
         checks = clean_checks(
             prose_claim={
                 "closure_requested": True,
@@ -230,20 +255,156 @@ class TestVerdictPrecedence:
         )
         assert naive_claim(checks) is True
         name, reason, evidence = mod.verdict(checks)
-        assert (name, reason) == ("CLOSE", "reporter-asked-close")
+        assert (name, reason) == ("REVIEW", "reporter-asked-close")
         assert evidence == {"comment_id": 123456, "where": "comment"}
-        assert mod.EXIT_CODES[name] == 11
+        assert mod.EXIT_CODES[name] == 13
+        # The risk is not the caller's to choose here: risk_of() derives it from
+        # the same checks the verdict came from, so the line cannot claim a
+        # REVIEW is low-risk.
+        assert mod.risk_of(checks) == "high"
         assert (
-            mod.human_line(ITEM, name, reason, evidence, "low")
-            == f"CLOSE {ITEM} reporter-asked-close comment-id=123456"
+            mod.human_line(ITEM, name, reason, evidence, mod.risk_of(checks))
+            == f"REVIEW {ITEM} reporter-asked-close comment-id=123456 risk=high"
         )
 
     def test_closure_request_in_the_body_reports_where_instead_of_an_id(self, mod):
         evidence = {"comment_id": None, "where": "body"}
         assert (
-            mod.human_line(ITEM, "CLOSE", "reporter-asked-close", evidence, "low")
-            == f"CLOSE {ITEM} reporter-asked-close where=body"
+            mod.human_line(ITEM, "REVIEW", "reporter-asked-close", evidence, "high")
+            == f"REVIEW {ITEM} reporter-asked-close where=body risk=high"
         )
+
+    def test_a_claimed_label_with_no_assignee_skips(self, mod):
+        """The measured defect, on fabricated checks: another pipeline's
+        ``claimed`` label with nobody assigned reads as CLAIM on a live item. A
+        label is a claim in its own right -- the skill's own contract calls
+        labels and assignees the cross-operator lock -- so it is honoured
+        with or without an assignee, the way an open PR is."""
+        checks = clean_checks(forge_claim=a_forge_claim("claimed"))
+        assert naive_claim(checks) is True  # the old predicate would dispatch
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("SKIP", "forge-claim")
+        assert evidence == {"label": "claimed", "assignees": []}
+        assert mod.EXIT_CODES[name] == 10
+        assert (
+            mod.human_line(ITEM, name, reason, evidence, "low")
+            == f"SKIP {ITEM} forge-claim label=claimed assignees=none"
+        )
+
+    def test_a_foreign_assignee_with_no_label_skips(self, mod):
+        """Either field alone is a claim. Measured on this repository, the two
+        arrive together from an atomic claim and apart from a human assigning by
+        hand, so a rule that needed both would miss half of each."""
+        checks = clean_checks(forge_claim=a_forge_claim(None, "otherdev"))
+        assert naive_claim(checks) is True
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("SKIP", "forge-claim")
+        assert evidence == {"label": None, "assignees": ["otherdev"]}
+        assert (
+            mod.human_line(ITEM, name, reason, evidence, "low")
+            == f"SKIP {ITEM} forge-claim label=none assignees=otherdev"
+        )
+
+    def test_the_line_names_every_assignee(self, mod):
+        evidence = {"label": "claimed", "assignees": ["otherdev", "boss"]}
+        assert (
+            mod.human_line(ITEM, "SKIP", "forge-claim", evidence, "low")
+            == f"SKIP {ITEM} forge-claim label=claimed assignees=otherdev,boss"
+        )
+
+    def test_our_own_claim_is_not_somebody_elses(self, mod):
+        """The detector already answered WHOSE claim it is; the verdict only
+        reads ``foreign``. A label with ourselves assigned is the shape of our
+        own atomic claim, and skipping it would tell a conductor to abandon the
+        item it just locked."""
+        checks = clean_checks(forge_claim=a_forge_claim("claimed", "us", foreign=False))
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("CLAIM", "clean")
+        assert evidence == {"risk": "low"}
+
+    def test_a_landed_merged_pr_outranks_a_forge_claim(self, mod):
+        """SKILL.md: an item that is open, claimed and already fixed is triage
+        debt, not a work item. The claim must not hide the CLOSE."""
+        checks = clean_checks(
+            merged_prs=[
+                {
+                    "number": 7900,
+                    "merge_commit_sha": "abc1234def567890",
+                    "landed": True,
+                    "closes_item": True,
+                }
+            ],
+            forge_claim=a_forge_claim("claimed", "otherdev"),
+        )
+        assert mod.verdict(checks)[:2] == ("CLOSE", "already-fixed")
+
+    def test_a_covering_open_pr_outranks_a_forge_claim(self, mod):
+        """Both SKIP; the reason printed is the stronger evidence, and a PR that
+        exists is stronger than a label that says one will."""
+        checks = clean_checks(
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "otherdev",
+                    "is_cross_repository": False,
+                    "closes_item": True,
+                }
+            ],
+            forge_claim=a_forge_claim("claimed", "otherdev"),
+        )
+        assert mod.verdict(checks)[:2] == ("SKIP", "open-pr")
+
+    def test_a_closure_request_outranks_a_forge_claim(self, mod):
+        """Same rank order as closure-over-prose-claim, for the same reason: if
+        the reporter says it is done, a human should hear that before a worker
+        -- the claimant's included -- spends a session on it."""
+        checks = clean_checks(
+            prose_claim={
+                "closure_requested": True,
+                "claimed_by_other": False,
+                "where": "comment",
+                "comment_id": 123456,
+                "pattern": "x",
+            },
+            forge_claim=a_forge_claim("claimed", "otherdev"),
+        )
+        assert mod.verdict(checks)[:2] == ("REVIEW", "reporter-asked-close")
+
+    def test_a_forge_claim_outranks_a_prose_claim(self, mod):
+        """Both SKIP. The forge field is the stronger evidence -- it is what the
+        skill calls the lock -- so it is the reason that gets printed when the
+        same owner also wrote a sentence."""
+        checks = clean_checks(
+            prose_claim={
+                "closure_requested": False,
+                "claimed_by_other": True,
+                "claimed_by": "otherdev",
+                "claimed_by_where": "body",
+                "where": "body",
+                "comment_id": None,
+                "pattern": SELF_CLAIM_SAMPLE_PATTERN,
+            },
+            forge_claim=a_forge_claim("claimed", "otherdev"),
+        )
+        assert mod.verdict(checks)[:2] == ("SKIP", "forge-claim")
+
+    def test_a_forge_claim_outranks_an_errored_check(self, mod):
+        """A definite answer to the ownership question beats a partial view of
+        the symbol question, same as every other positive finding."""
+        checks = clean_checks(
+            forge_claim=a_forge_claim("claimed"),
+            symbol_on_base={"error": "no-clone"},
+        )
+        assert mod.verdict(checks)[:2] == ("SKIP", "forge-claim")
+
+    def test_a_forge_claim_that_is_not_foreign_never_skips(self, mod):
+        """``foreign`` is the only bit the verdict reads. A label with assignees
+        that the detector attributed to us must not SKIP however it is spelled."""
+        for label, assignees in (("claimed", ["us"]), (None, ["us"]), (None, [])):
+            checks = clean_checks(
+                forge_claim={"label": label, "assignees": assignees, "foreign": False}
+            )
+            assert mod.verdict(checks)[0] == "CLAIM", (label, assignees)
 
     def test_absent_symbol_skips_only_for_a_corroborated_bug_item(self, mod):
         checks = clean_checks(
@@ -325,7 +486,7 @@ class TestVerdictPrecedence:
 
     @pytest.mark.parametrize(
         "name",
-        ["open_prs", "merged_prs", "prose_claim", "symbol_on_base", "recency"],
+        ["open_prs", "merged_prs", "prose_claim", "symbol_on_base", "recency", "forge_claim"],
     )
     def test_any_errored_check_is_unknown_never_claim(self, mod, name):
         checks = clean_checks(**{name: {"error": "rate-limited"}})
@@ -344,7 +505,14 @@ class TestVerdictPrecedence:
         """Precedence 6 sits BELOW the positive findings: a partial view of one
         question does not erase a definite answer to another."""
         checks = clean_checks(
-            open_prs=[{"number": 8100, "author": "x", "is_cross_repository": False}],
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "x",
+                    "is_cross_repository": False,
+                    "closes_item": True,
+                }
+            ],
             recency={"error": "rate-limited"},
         )
         assert mod.verdict(checks)[:2] == ("SKIP", "open-pr")
@@ -364,7 +532,7 @@ class TestVerdictPrecedence:
         """`closedByPullRequestsReferences` measured `[]` on two items that WERE
         closed by merged PRs, so it is dropped rather than carried as a bonus: a
         per-candidate forge call that cannot change the verdict is pure cost
-        against a shared rate limit. Five checks, and none of them is that one.
+        against a shared rate limit. Six checks, and none of them is that one.
         """
         assert mod.CHECK_NAMES == (
             "open_prs",
@@ -372,6 +540,7 @@ class TestVerdictPrecedence:
             "prose_claim",
             "symbol_on_base",
             "recency",
+            "forge_claim",
         )
         source = SCRIPT.read_text(encoding="utf-8")
         assert "closed_by" not in source
@@ -392,7 +561,7 @@ class TestVerdictPrecedence:
         (This docstring deliberately does not spell any wrong count, since the
         scan reads its own file too.)
         """
-        wrong = {"six": 6, "four": 4, "seven": 7}
+        wrong = {"five": 5, "six": 6, "four": 4, "seven": 7}
         for path in (SCRIPT, Path(__file__).resolve()):
             text = path.read_text(encoding="utf-8")
             for word, count in wrong.items():
@@ -788,6 +957,132 @@ class TestBugClassCorroboration:
         # Also present on the error shapes, so the verdict never reads a missing
         # key as "not a bug".
         assert mod.symbols_on_base(["X_Y"], None, "main", bug_class=True)["bug_class"] is True
+
+
+class TestForgeClaim:
+    """Check 6, the detector: the forge's own ownership fields, read as a claim.
+
+    Measured on live items: four in three days carried another pipeline's
+    ``claimed`` label -- two of them with the assignee set too -- and every one
+    read CLAIM when nothing here read either field. The queue
+    build excludes the label; the live recheck immediately before the atomic
+    claim is this script, and it was the one reader that did not look.
+    """
+
+    def test_a_claimed_label_alone_is_a_claim(self, mod):
+        got = mod.scan_forge_claim(an_issue(labels=[{"name": "claimed"}]), "us")
+        assert got == {"label": "claimed", "assignees": [], "foreign": True}
+
+    def test_an_assignee_alone_is_a_claim(self, mod):
+        got = mod.scan_forge_claim(an_issue(assignees=[{"login": "otherdev"}]), "us")
+        assert got == {"label": None, "assignees": ["otherdev"], "foreign": True}
+
+    def test_our_own_atomic_claim_is_ours(self, mod):
+        """Label plus ourselves assigned is exactly what the skill's atomic
+        claim writes, so a conductor re-checking an item it holds must not be
+        told to skip it."""
+        issue = an_issue(labels=[{"name": "claimed"}], assignees=[{"login": "us"}])
+        got = mod.scan_forge_claim(issue, "us")
+        assert got == {"label": "claimed", "assignees": ["us"], "foreign": False}
+        assert mod.scan_forge_claim(an_issue(assignees=[{"login": "us"}]), "us")["foreign"] is False
+
+    def test_a_co_assignee_makes_it_foreign(self, mod):
+        """Somebody else is on it too. The fail-safe direction is SKIP."""
+        issue = an_issue(assignees=[{"login": "us"}, {"login": "otherdev"}])
+        got = mod.scan_forge_claim(issue, "us")
+        assert got["assignees"] == ["us", "otherdev"]
+        assert got["foreign"] is True
+
+    def test_an_unknown_identity_reads_every_claim_as_foreign(self, mod):
+        """Same rule as :func:`scan_prose`: when ``whoami`` could not answer, a
+        claim that might be ours still counts as somebody else's."""
+        assert mod.scan_forge_claim(an_issue(assignees=[{"login": "us"}]), None)["foreign"] is True
+        assert mod.scan_forge_claim(an_issue(labels=[{"name": "claimed"}]), None)["foreign"] is True
+
+    def test_nothing_is_not_a_claim(self, mod):
+        got = mod.scan_forge_claim(an_issue(), "us")
+        assert got == {"label": None, "assignees": [], "foreign": False}
+        assert mod.scan_forge_claim(an_issue(), None)["foreign"] is False
+
+    @pytest.mark.parametrize(
+        ("name", "term"),
+        [
+            ("claimed", "claimed"),
+            ("Claimed", "claimed"),
+            ("CLAIMED", "claimed"),
+            ("in-progress", "in-progress"),
+            ("in progress", "in-progress"),
+            ("crew: in progress", "in-progress"),
+            ("status: In Progress", "in-progress"),
+        ],
+    )
+    def test_the_ownership_vocabulary(self, mod, name, term):
+        """The skill's documented ``skip_signals`` default names ``claimed`` and
+        ``in-progress``; this repository spells the second ``crew: in progress``
+        and applies it with no assignee (measured: 4 of 8 closed items carrying
+        it had none), so the assignee rule alone would miss it."""
+        assert mod.claim_label_of(an_issue(labels=[{"name": name}])) == term
+
+    @pytest.mark.parametrize(
+        "name",
+        ["unclaimed", "reclaimed", "bug", "auto-fixable", "needs-human", "progress", "wip"],
+    )
+    def test_a_label_outside_the_vocabulary_is_not_a_claim(self, mod, name):
+        """``\\b`` keeps ``unclaimed`` out. ``wip`` is deliberately NOT in the
+        vocabulary: the skill's own default does not list it, and widening a
+        veto past the documented contract is how a label nobody meant as a lock
+        starts parking items."""
+        assert mod.claim_label_of(an_issue(labels=[{"name": name}])) is None
+
+    def test_the_term_is_this_modules_not_the_labels_text(self, mod):
+        """Same rule as :func:`bug_class_of`: a label name is user-authored and
+        this value is printed, so what comes back is the vocabulary word that
+        matched, never the label itself."""
+        got = mod.scan_forge_claim(an_issue(labels=[{"name": "Claimed (by the bot!!)"}]), "us")
+        assert got["label"] == "claimed"
+        line = mod.human_line(
+            ITEM, "SKIP", "forge-claim", {"label": got["label"], "assignees": []}, "low"
+        )
+        assert "by the bot" not in line
+        assert line == f"SKIP {ITEM} forge-claim label=claimed assignees=none"
+
+    def test_the_first_matching_label_wins_in_payload_order(self, mod):
+        issue = an_issue(labels=[{"name": "crew: in progress"}, {"name": "claimed"}])
+        assert mod.claim_label_of(issue) == "in-progress"
+
+    def test_junk_metadata_degrades_quietly(self, mod):
+        """Strings where dicts were expected, a singular ``assignee`` where the
+        list is missing, nulls everywhere: none of it raises, and only the
+        shapes the forge actually sends are read."""
+        assert mod.claim_label_of(an_issue(labels=["claimed"])) == "claimed"
+        assert mod.claim_label_of(an_issue(labels=[None, 7, {"name": None}])) is None
+        assert mod.claim_label_of(an_issue(labels=None)) is None
+        assert mod.assignee_logins(an_issue(assignees=None, assignee={"login": "solo"})) == ["solo"]
+        assert mod.assignee_logins(an_issue(assignees=[None, {"login": 3}, {"x": 1}])) == []
+        assert mod.assignee_logins(an_issue(assignees="otherdev")) == []
+        assert mod.assignee_logins({}) == []
+        got = mod.scan_forge_claim({"labels": "claimed", "assignees": 42}, "us")
+        assert got == {"label": None, "assignees": [], "foreign": False}
+
+    def test_the_pipelines_own_claim_wording_is_not_a_prose_claim(self, mod):
+        """A known miss, pinned on purpose. "This issue is now claimed by X's
+        instance" -- the sentence every operator's claim comment on this
+        repository shares -- matches no self-claim pattern, and this change does
+        NOT teach the prose scanner to read it: that comment always lands with
+        the label and the assignee it announces, so check 6 is its channel. (The
+        newer template's second sentence, "A worker session is picking it up
+        now", already fires ``picking it up``; measured here, so the pin is on
+        the shared sentence alone.) If a later change adds the phrase, this test
+        reds and the question gets asked rather than answered by accident."""
+        shared = (
+            "Kiro Crew Auto-Pipeline [operator: redacted]: Starting an automated "
+            "fix -- this issue is now claimed by redacted's instance."
+        )
+        assert mod._first_match(mod.SELF_CLAIM_RES, mod.plain_prose(shared)) is None
+        newer = shared + " A worker session is picking it up now."
+        assert mod._first_match(mod.SELF_CLAIM_RES, mod.plain_prose(newer)) is not None
+        # Control: the instrument can match.
+        assert mod._first_match(mod.SELF_CLAIM_RES, "I'm claiming this") is not None
 
 
 class TestClosureNeedsAnIssueAsItsObject:
@@ -1366,7 +1661,7 @@ class TestNoClosurePatternShipsUnguarded:
         assert unguarded == []
 
     def test_the_declared_set_does_not_drift_from_the_list(self, mod):
-        """A pattern declared item-scoped but no longer present would leave the
+        """A pattern declared item-scoped but missing from the list would leave the
         ratchet passing over a phrase nobody ships."""
         assert mod.ITEM_SCOPED_CLOSURE_RES <= set(mod.CLOSURE_RES)
 
@@ -1543,6 +1838,7 @@ class TestUntrustedForkAnnotation:
                         "author": "stranger",
                         "is_cross_repository": True,
                         "untrusted_fork": untrusted,
+                        "closes_item": True,
                     }
                 ]
             )
@@ -1559,6 +1855,7 @@ class TestUntrustedForkAnnotation:
                     "author": "stranger",
                     "is_cross_repository": True,
                     "untrusted_fork": True,
+                    "closes_item": True,
                 }
             ]
         )
@@ -1568,6 +1865,32 @@ class TestUntrustedForkAnnotation:
         assert mod.human_line(ITEM, name, reason, evidence, mod.risk_of(checks)) == (
             f"SKIP {ITEM} open-pr=#8100 fork=true author=stranger untrusted-fork=true risk=high"
         )
+
+    def test_a_mention_only_fork_is_not_reported_as_a_suppression(self, mod):
+        """The marker names a suppression, so it must not fire where none happens.
+
+        A fork PR that merely MENTIONS the item leaves it in the queue, so calling
+        that an untrusted-fork SKIP would name a suppression that does not occur.
+        The doubt is not dropped -- the mention path raises the risk on its own --
+        but it is reported as what it is.
+        """
+        checks = clean_checks(
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "stranger",
+                    "is_cross_repository": True,
+                    "untrusted_fork": True,
+                    "closes_item": False,
+                }
+            ]
+        )
+        assert mod.untrusted_fork_skip(checks) is None
+        assert mod.mention_only_open_prs(checks) == [8100]
+        assert mod.risk_of(checks) == "high"
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("CLAIM", "clean")
+        assert evidence["open_pr_mention_only"] == [8100]
 
     def test_a_routine_skip_carries_no_marker(self, mod):
         """A marker on every SKIP is noise; this exists so the one that needs a
@@ -1579,6 +1902,7 @@ class TestUntrustedForkAnnotation:
                     "author": "teammate",
                     "is_cross_repository": False,
                     "untrusted_fork": False,
+                    "closes_item": True,
                 }
             ]
         )
@@ -1591,7 +1915,12 @@ class TestUntrustedForkAnnotation:
 
     def test_the_marker_names_no_user_authored_text(self, mod):
         """Same rule as everywhere else here: an association is a forge enum and
-        is used to DECIDE, but only metadata is printed."""
+        DECIDES the outcome, but only metadata is printed.
+
+        The hit claims closure so this reads the SKIP evidence it is about. A
+        mention-only hit would take the CLAIM branch and pass without ever
+        building the dict under test.
+        """
         checks = clean_checks(
             open_prs=[
                 {
@@ -1600,10 +1929,12 @@ class TestUntrustedForkAnnotation:
                     "is_cross_repository": True,
                     "author_association": "NONE",
                     "untrusted_fork": True,
+                    "closes_item": True,
                 }
             ]
         )
         name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("SKIP", "open-pr")
         assert "author_association" not in evidence
         assert "NONE" not in mod.human_line(ITEM, name, reason, evidence, "high")
 
@@ -1645,7 +1976,7 @@ class TestClosingReference:
         assert not mod.closing_reference_re(REPO, ITEM).search(text)
 
     def test_a_prefix_number_does_not_match(self, mod):
-        """`#802` must not satisfy a pattern aimed at `#8029`, and `#80291`
+        """`#802` must not satisfy a pattern aimed at `8029`, and `80291`
         must not either."""
         assert not mod.closing_reference_re(REPO, 802).search("Fixes #8029")
         assert not mod.closing_reference_re(REPO, ITEM).search("Fixes #80291")
@@ -1902,6 +2233,300 @@ def run_main(mod, monkeypatch, forge: Forge, extra: list[str] | None = None) -> 
     return mod.main(["--repo", REPO, "--item", str(ITEM), *(extra or [])])
 
 
+class TestADisclaimedOpenPrDoesNotSuppress:
+    """Rule 2 demands a closing keyword, the same thing rule 1 demands.
+
+    The defect these pin: the timeline event rule 2 reads is ``cross-referenced``,
+    which is keyword-free by construction -- it fires on a bare mention -- so an
+    open PR that said in plain words it was NOT fixing an item took that item out
+    of the dispatch queue anyway. ``Refs #N`` is this repository's own idiom for
+    referenced-but-deliberately-not-closed and its PR template keeps
+    ``Related Issues`` apart from a closing trailer, so the clearest signal an
+    author can give that they are leaving an item for somebody else was read as
+    the reason to skip it. Silently: the item never appeared as
+    refused-for-a-reason, it simply never came up.
+
+    Measured over one real candidate list, of 21 (item, covering PR) pairs 18
+    carried a closing keyword and 3 did not, and all 3 of those PRs disclaimed the
+    fix in their own words.
+
+    Both directions are here. Declining to suppress is only safe because the
+    decline is REPORTED -- a bare reference can still be work in flight whose
+    author never spelled a keyword -- so the risk goes high and the item takes the
+    live recheck instead of the batch.
+    """
+
+    def test_an_open_pr_claiming_closure_is_annotated_and_skips(self, mod, monkeypatch, capsys):
+        """The 18-of-21 majority, unchanged. This is the half that must NOT move:
+        a PR carrying ``Fixes #N`` is coverage and the item leaves the queue."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 10
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "SKIP"
+        assert payload["reason"] == "open-pr"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is True
+
+    def test_an_open_pr_that_only_mentions_the_item_claims_instead(self, mod, monkeypatch, capsys):
+        """The defect, end to end. ``a_pull(closes=None)`` writes
+        ``Related to #N`` -- a reference with no closing keyword -- and the item
+        is dispatched rather than dropped."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100, closes=None)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is False
+
+    def test_the_declined_suppression_is_reported_not_dropped(self, mod, monkeypatch, capsys):
+        """Declining silently would trade one blind spot for another, so the
+        finding is published and forces the live recheck."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100, closes=None)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["evidence"]["open_pr_mention_only"] == [8100]
+        assert payload["risk"] == "high"
+
+    def test_the_repositorys_own_refs_idiom_does_not_suppress(self, mod, monkeypatch, capsys):
+        """The sharpest measured case, in the words the author actually used: a PR
+        whose only reference is ``Refs #N`` and which says the real fix is a
+        follow-up tracked in that very item."""
+        disclaiming = dict(
+            a_pull(8100, closes=None),
+            body=f"Refs #{ITEM} -- the amplifier problem and the follow-up are tracked there.",
+        )
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: disclaiming})
+        assert run_main(mod, monkeypatch, forge) == 0
+        assert f"CLAIM {ITEM} risk=high" in capsys.readouterr().out
+
+    def test_a_closing_pr_is_chosen_over_a_mentioning_one(self, mod, monkeypatch, capsys):
+        """Rule 2 reports the PR that actually covers the item, not whichever
+        reference the timeline happened to list first. The mentioning PR comes
+        first here, so a rule that returned the first hit would name it."""
+        forge = Forge(
+            timeline=[a_xref(8100), a_xref(8101)],
+            pulls={8100: a_pull(8100, closes=None), 8101: a_pull(8101)},
+        )
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert f"SKIP {ITEM} open-pr=#8101" in capsys.readouterr().out
+
+    def test_a_mention_only_hit_is_kept_rather_than_discarded(self, mod):
+        """The report needs the number, so the hit stays on the check. A filter
+        that dropped it would leave nothing to publish and the decline would be
+        as silent as the suppression it replaced."""
+        checks = clean_checks(
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "someone",
+                    "is_cross_repository": False,
+                    "closes_item": False,
+                }
+            ]
+        )
+        assert mod.covering_open_prs(checks) == []
+        assert mod.mention_only_open_prs(checks) == [8100]
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("CLAIM", "clean")
+        assert evidence["open_pr_mention_only"] == [8100]
+        assert mod.EXIT_CODES[name] == 0
+
+
+class TestAClosingKeywordCannotSpanTwoFields:
+    """A closing reference counts only WITHIN one field.
+
+    The forge honours a closing keyword inside the title or inside the body, never
+    assembled across the two. The closing pattern's ``\\s+`` matches a newline, so
+    searching a newline-joined ``title + body`` matches a reference NEITHER field
+    carries: a title ending ``fix`` glued to a body opening ``#N`` reads as
+    ``fix\\n#N``.
+
+    That direction is the dangerous one. It fabricates coverage, and fabricated
+    coverage SKIPs an item nobody is fixing -- silently, which is the harm this
+    module exists to prevent. The text is arbitrary and opening a fork PR needs no
+    permission, so it is craftable rather than accidental.
+    """
+
+    @pytest.fixture
+    def closing(self, mod):
+        return mod.closing_reference_re(REPO, ITEM)
+
+    def test_a_keyword_in_the_title_and_a_reference_in_the_body_is_not_closure(self, mod, closing):
+        assert mod.claims_closure(closing, "fix", f"#{ITEM}") is False
+
+    @pytest.mark.parametrize("word", ["fix", "fixes", "closes", "resolved"])
+    def test_no_closing_word_reaches_across_the_boundary(self, mod, closing, word):
+        """Every member of the keyword vocabulary, not just the one measured."""
+        assert mod.claims_closure(closing, word, f"#{ITEM}") is False
+
+    def test_a_real_closure_in_the_body_still_counts(self, mod, closing):
+        assert mod.claims_closure(closing, "some title", f"Fixes #{ITEM}") is True
+
+    def test_a_real_closure_in_the_title_still_counts(self, mod, closing):
+        """Both fields are searched, so moving the keyword does not lose it."""
+        assert mod.claims_closure(closing, f"Fixes #{ITEM}", "body text") is True
+
+    def test_a_bare_reference_in_one_field_is_still_not_closure(self, mod, closing):
+        assert mod.claims_closure(closing, "some title", f"Refs #{ITEM}") is False
+
+    @pytest.mark.parametrize("title,body", [(None, None), ("", ""), (None, f"Fixes #{ITEM}")])
+    def test_absent_fields_do_not_raise(self, mod, closing, title, body):
+        """The forge may omit either field; an absent one is empty, not a crash."""
+        assert isinstance(mod.claims_closure(closing, title, body), bool)
+
+    def test_the_fabricated_reference_does_not_skip_the_item(self, mod, monkeypatch, capsys):
+        """End to end, through the real verdict: the craftable pair leaves the item
+        in the queue and is reported as a mention instead of suppressing it."""
+        crafted = dict(a_pull(8100), title="fix", body=f"#{ITEM}")
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: crafted})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is False
+        assert payload["evidence"]["open_pr_mention_only"] == [8100]
+
+    def test_a_merged_pr_cannot_be_closed_by_a_fabricated_reference_either(
+        self, mod, monkeypatch, capsys
+    ):
+        """The merged path reads the same annotation, so rule 1 is covered by the
+        same fix. A fabricated closure there would CLOSE a live item, which is
+        stronger than a SKIP and is why the fix belongs at the shared read rather
+        than on the open branch alone."""
+        crafted = dict(
+            a_pull(8100, state="closed", merged=True, sha="a" * 40),
+            title="fix",
+            body=f"#{ITEM}",
+        )
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: crafted})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["merged_prs"][0]["closes_item"] is False
+
+
+class TestClosureProseNeverCloses:
+    """Rule 3 reads HAND-WRITTEN ENGLISH, and a naive reading answers with the
+    strongest thing this script can say about somebody else's live work.
+
+    Nine false-CLOSE paths reached review in one change and each was fixed on the
+    merits, but the space of English that accidentally means "close this" has no
+    edge, so the next unguarded phrasing was always going to arrive. These tests
+    pin the structural answer instead: the reading survives, the response does
+    not. They are deliberately split -- one pins the CONSEQUENCE (no dispatch),
+    one pins the INTEGER -- because those two can drift apart in a refactor and a
+    caller that branches on the number would then break while a
+    consequence-only test stayed green.
+    """
+
+    def closure_checks(self) -> dict:
+        return clean_checks(
+            prose_claim={
+                "closure_requested": True,
+                "claimed_by_other": False,
+                "claim_without_standing": False,
+                "claimed_by": None,
+                "closure_by": "reporter",
+                "where": "comment",
+                "comment_id": 777,
+                "pattern": "x",
+            }
+        )
+
+    def closure_forge(self) -> Forge:
+        return Forge(comments=[a_comment("happy to have this closed", ident=777)])
+
+    def test_a_standing_closure_request_is_never_dispatched(self, mod, monkeypatch):
+        """The consequence that matters. A sentence is not permission to spend a
+        worker session, and it never was -- this is the half of the old behaviour
+        that was right."""
+        checks = self.closure_checks()
+        assert naive_claim(checks) is True
+        name, _, _ = mod.verdict(checks)
+        assert name != "CLAIM"
+        assert mod.EXIT_CODES[name] != mod.EXIT_CODES["CLAIM"]
+        # End to end as well: verdict() is not the only code between the comment
+        # and the dispatch, and a test of the pure function alone would not
+        # notice collect() or main() losing the reading on the way.
+        assert run_main(mod, monkeypatch, self.closure_forge()) != 0
+
+    def test_a_standing_closure_request_is_never_closed_either(self, mod, monkeypatch):
+        """The half that was wrong, and the whole point of the change: the item
+        must not be CLOSED on prose. Asserting the absence of CLOSE is what
+        distinguishes this from the old behaviour, which also refused to
+        dispatch."""
+        name, _, _ = mod.verdict(self.closure_checks())
+        assert name != "CLOSE"
+        assert mod.EXIT_CODES[name] != mod.EXIT_CODES["CLOSE"]
+        assert run_main(mod, monkeypatch, self.closure_forge()) != mod.EXIT_CODES["CLOSE"]
+
+    def test_a_standing_closure_request_exits_thirteen(self, mod, monkeypatch, capsys):
+        """The integer, asserted on its own. The caller branches on this number
+        and nothing else, so it is part of the contract rather than an
+        implementation detail of the verdict name."""
+        name, reason, _ = mod.verdict(self.closure_checks())
+        assert (name, reason) == ("REVIEW", "reporter-asked-close")
+        assert mod.EXIT_CODES["REVIEW"] == 13
+        assert run_main(mod, monkeypatch, self.closure_forge()) == 13
+        assert capsys.readouterr().out.strip().startswith("REVIEW")
+
+    def test_a_review_verdict_is_always_high_risk(self, mod):
+        """``risk`` is computed by risk_of() from the same checks the verdict came
+        from, so the two cannot disagree. Without this, a REVIEW line could print
+        ``risk=low`` -- a verdict that exists BECAUSE the evidence is weak,
+        reporting that the evidence is fine."""
+        checks = self.closure_checks()
+        assert mod.verdict(checks)[0] == "REVIEW"
+        assert mod.risk_of(checks) == "high"
+        assert mod.closure_request(checks) is True
+
+    def test_the_review_line_names_the_comment_to_read(self, mod):
+        """This verdict delegates to a human, and it never prints the matched
+        sentence, so the identifier that lets them find it is the payload."""
+        _, reason, evidence = mod.verdict(self.closure_checks())
+        line = mod.human_line(ITEM, "REVIEW", reason, evidence, "high")
+        assert "comment-id=777" in line
+        assert "risk=high" in line
+
+    def test_a_merged_landed_pr_still_closes(self, mod):
+        """The scope boundary. Rule 1 is EVIDENCE -- a merge commit that is an
+        ancestor of the base -- not a reading of prose, so it keeps CLOSE.
+        Downgrading it too would leave exit 11 with no producers at all."""
+        checks = clean_checks(
+            merged_prs=[
+                {
+                    "number": 8712,
+                    "landed": True,
+                    "closes_item": True,
+                    "merge_commit_sha": "c791f0f1",
+                }
+            ]
+        )
+        name, reason, _ = mod.verdict(checks)
+        assert (name, reason) == ("CLOSE", "already-fixed")
+        assert mod.EXIT_CODES[name] == 11
+
+    def test_an_auto_pipeline_stand_down_is_not_read_as_closure_prose(self, mod):
+        """A pipeline's own stand-down note is the phrasing that most looks like
+        closure without being a reporter's verdict, and it is measurably INERT
+        here: it fires no closure pattern and no self-claim pattern.
+
+        Pinned because that is a property somebody could remove by accident. If
+        a future change teaches this scanner to read "standing down", this test
+        reds and forces the question of whether a pipeline's own note should
+        route through REVIEW at all -- rather than the phrase quietly acquiring a
+        verdict. It does NOT claim such an item is otherwise protected: this
+        script has no check for "my own pipeline already dispositioned this".
+        """
+        stand_down = (
+            "Kiro Crew Auto-Pipeline [operator: redacted] - standing down and "
+            "handing back to `needs-human`. No longer being worked by the fleet; "
+            "the investigation notes are below for whoever picks it up."
+        )
+        assert mod._first_match(mod.CLOSURE_RES, mod.plain_prose(stand_down)) is None
+        assert mod._first_match(mod.SELF_CLAIM_RES, mod.plain_prose(stand_down)) is None
+        # Control: the harness really can match, so the two Nones above are
+        # findings and not a silently broken instrument.
+        assert mod._first_match(mod.CLOSURE_RES, mod.plain_prose("This is resolved.")) is not None
+
+
 class TestEndToEnd:
     def test_clean_item_exits_zero_and_prints_the_claim_line(self, mod, monkeypatch, capsys):
         fresh = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2083,16 +2708,19 @@ class TestEndToEnd:
         out = capsys.readouterr().out.strip()
         assert out == f"SKIP {ITEM} prose-claim claimed-by=otherdev where=body"
 
-    def test_reporter_asked_close_in_the_last_comment_exits_eleven(self, mod, monkeypatch, capsys):
+    def test_reporter_asked_close_in_the_last_comment_exits_thirteen(
+        self, mod, monkeypatch, capsys
+    ):
         forge = Forge(
             comments=[
                 a_comment("automated triage summary", login="github-actions[bot]", kind="Bot"),
                 a_comment("happy to have this closed", ident=777),
             ]
         )
-        assert run_main(mod, monkeypatch, forge) == 11
+        assert run_main(mod, monkeypatch, forge) == 13
         assert (
-            capsys.readouterr().out.strip() == f"CLOSE {ITEM} reporter-asked-close comment-id=777"
+            capsys.readouterr().out.strip()
+            == f"REVIEW {ITEM} reporter-asked-close comment-id=777 risk=high"
         )
 
     def test_an_absent_symbol_on_a_labelled_bug_exits_ten(self, mod, monkeypatch, capsys):
@@ -2249,12 +2877,123 @@ class TestEndToEnd:
         # The machine form and the human form must agree about the doubt.
         assert payload["risk"] == "high"
 
-    def test_json_mode_reports_the_five_checks_even_on_unknown(self, mod, monkeypatch, capsys):
+    def test_json_mode_reports_the_six_checks_even_on_unknown(self, mod, monkeypatch, capsys):
         forge = Forge(failures={"/timeline": "API rate limit exceeded"})
         assert run_main(mod, monkeypatch, forge, ["--json"]) == 3
         payload = json.loads(capsys.readouterr().out)
         assert set(payload["checks"]) == set(mod.CHECK_NAMES)
         assert payload["checks"]["open_prs"] == {"error": "rate-limited"}
+
+
+class TestForgeClaimEndToEnd:
+    """Check 6 through ``main``: the issue payload the script already fetched
+    answers the ownership question, so the common path costs no extra call."""
+
+    def test_a_claimed_label_with_no_assignee_exits_ten(self, mod, monkeypatch, capsys):
+        """The shape as measured live: ``claimed`` for half an hour, no
+        assignee, and two CLAIM verdicts in that window."""
+        forge = Forge(issue=an_issue(labels=[{"name": "claimed"}]))
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert (
+            capsys.readouterr().out.strip()
+            == f"SKIP {ITEM} forge-claim label=claimed assignees=none"
+        )
+        # No assignee to attribute, so identity is not asked for: the label is
+        # foreign whoever we are.
+        assert ["gh", "api", "user"] not in forge.calls
+
+    def test_a_claimed_label_with_a_foreign_assignee_exits_ten(self, mod, monkeypatch, capsys):
+        """The commoner live shape: label and assignee both set by another
+        operator's pipeline. Measured to read CLAIM before this check existed."""
+        forge = Forge(
+            issue=an_issue(labels=[{"name": "claimed"}], assignees=[{"login": "CrysisDeu"}]),
+            login="NicholasRBowers",
+        )
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert (
+            capsys.readouterr().out.strip()
+            == f"SKIP {ITEM} forge-claim label=claimed assignees=CrysisDeu"
+        )
+
+    def test_a_foreign_assignee_with_no_label_exits_ten(self, mod, monkeypatch, capsys):
+        forge = Forge(issue=an_issue(assignees=[{"login": "otherdev"}]))
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert (
+            capsys.readouterr().out.strip()
+            == f"SKIP {ITEM} forge-claim label=none assignees=otherdev"
+        )
+
+    def test_our_own_claim_still_claims(self, mod, monkeypatch, capsys):
+        forge = Forge(
+            issue=an_issue(labels=[{"name": "claimed"}], assignees=[{"login": "us"}]), login="us"
+        )
+        assert run_main(mod, monkeypatch, forge) == 0
+        assert capsys.readouterr().out.strip() == f"CLAIM {ITEM} risk=low"
+
+    def test_an_unknown_identity_reads_our_assignee_as_foreign(self, mod, monkeypatch, capsys):
+        """``gh api user`` failed, so the login that LOOKS like ours cannot be
+        confirmed ours. SKIP costs one dispatch; the other reading dispatches
+        onto somebody's live work."""
+        forge = Forge(issue=an_issue(assignees=[{"login": "us"}]), failures={"user": "boom"})
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert "forge-claim label=none assignees=us" in capsys.readouterr().out
+
+    def test_a_claimed_item_that_already_landed_still_closes(self, mod, monkeypatch, capsys):
+        """SKILL.md: open, claimed and already fixed is triage debt. The forge
+        claim sits below rule 1 so the CLOSE is not hidden behind the SKIP."""
+        forge = Forge(
+            timeline=[a_xref(7900)],
+            pulls={7900: a_pull(7900, state="closed", merged=True, sha="abc1234def567890")},
+            issue=an_issue(labels=[{"name": "claimed"}], assignees=[{"login": "otherdev"}]),
+            git_rc={"merge-base": 0},
+        )
+        assert run_main(mod, monkeypatch, forge, ["--repo-dir", "/clone"]) == 11
+        assert capsys.readouterr().out.strip().startswith(f"CLOSE {ITEM} merged-pr=#7900")
+
+    def test_a_covering_open_pr_is_the_reason_printed(self, mod, monkeypatch, capsys):
+        forge = Forge(
+            timeline=[a_xref(8100)],
+            pulls={8100: a_pull(8100, user="otherdev")},
+            issue=an_issue(labels=[{"name": "claimed"}], assignees=[{"login": "otherdev"}]),
+        )
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert capsys.readouterr().out.strip().startswith(f"SKIP {ITEM} open-pr=#8100")
+
+    def test_identity_is_asked_once_when_two_checks_need_it(self, mod, monkeypatch):
+        """A foreign assignee AND an insider's prose claim both need to know who
+        we are. One forge call answers both; the shared rate limit is why."""
+        forge = Forge(
+            issue=an_issue(assignees=[{"login": "otherdev"}]),
+            comments=[a_comment("I am claiming this issue", login="boss", association="MEMBER")],
+        )
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert forge.calls.count(["gh", "api", "user"]) == 1
+
+    def test_an_unreadable_item_errors_the_check_with_the_others(self, mod, monkeypatch, capsys):
+        forge = Forge(failures={f"repos/{REPO}/issues/{ITEM}": "could not resolve host"})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 3
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["checks"]["forge_claim"] == {"error": "forge-unreachable"}
+
+    def test_json_mode_carries_the_check_and_the_evidence(self, mod, monkeypatch, capsys):
+        forge = Forge(issue=an_issue(labels=[{"name": "crew: in progress"}]))
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 10
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "SKIP"
+        assert payload["reason"] == "forge-claim"
+        assert payload["checks"]["forge_claim"] == {
+            "label": "in-progress",
+            "assignees": [],
+            "foreign": True,
+        }
+        assert payload["evidence"] == {"label": "in-progress", "assignees": []}
+
+    def test_a_clean_item_costs_no_identity_call(self, mod, monkeypatch):
+        """The common path: no label, no assignee, no prose claim. Nothing here
+        may add a forge call to it."""
+        forge = Forge()
+        assert run_main(mod, monkeypatch, forge) == 0
+        assert ["gh", "api", "user"] not in forge.calls
 
 
 class TestArgumentHandling:
@@ -2283,7 +3022,21 @@ class TestArgumentHandling:
         assert excinfo.value.code == 2
 
     def test_exit_codes_are_the_documented_ones(self, mod):
-        assert mod.EXIT_CODES == {"CLAIM": 0, "SKIP": 10, "CLOSE": 11, "UNKNOWN": 3}
+        assert mod.EXIT_CODES == {
+            "CLAIM": 0,
+            "SKIP": 10,
+            "CLOSE": 11,
+            "REVIEW": 13,
+            "UNKNOWN": 3,
+        }
+
+    def test_no_two_verdicts_share_an_exit_code(self, mod):
+        """The caller branches on the integer alone, so a shared number is a
+        wrong branch rather than a confusing message. This is the invariant that
+        matters; which particular integers are unallocated is not one, so it is
+        deliberately not asserted here."""
+        codes = list(mod.EXIT_CODES.values())
+        assert len(codes) == len(set(codes))
 
 
 class TestForgeHelpers:
@@ -2381,13 +3134,35 @@ class TestAgainstRealGit:
     unlanded. One small real repo pins both.
     """
 
-    @pytest.fixture
-    def clone(self, tmp_path):
-        root = tmp_path / "clone"
+    @pytest.fixture(autouse=True)
+    def _hermetic_git_for_the_script(self, monkeypatch):
+        """The SCRIPT's git inherits this process's environment, unlike the fixture's.
+
+        ``_git`` below hands its spawns ``_fixture_git_env``; ``mod.git`` does not
+        take an environment and reads ``os.environ``. Pin the same containment
+        there for the duration of each test: the operator's global and system config
+        are pointed away and the ``GIT_DIR`` family dropped, so the ancestry and grep
+        questions are answered about the clone and nothing else.
+        """
+        for name in _GIT_LOCATION_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+
+    @pytest.fixture(scope="module")
+    def _clone_template(self, tmp_path_factory):
+        """Build the landed/sidetrack clone once per module; ``clone`` copies it.
+
+        Six git subprocesses (~2.3-4.7s) would otherwise be paid on every one of the
+        8 tests below. Module scope is safe because the template is never handed
+        to a test, only copied from via ``shutil.copytree`` -- no test here moves
+        a branch or adds a commit to it, they only read commits already present.
+        """
+        root = tmp_path_factory.mktemp("claim-preflight-seed") / "clone"
         root.mkdir()
 
         def run_git(*args):
-            rc, out, err = 0, "", ""
             rc, out, err = _git(root, list(args))
             assert rc == 0, f"git {args} failed: {err}"
             return out
@@ -2405,6 +3180,18 @@ class TestAgainstRealGit:
         run_git("commit", "-q", "-m", "elsewhere")
         off_main = run_git("rev-parse", "HEAD")
         run_git("checkout", "-q", "main")
+        return root, on_main, off_main
+
+    @pytest.fixture
+    def clone(self, tmp_path, _clone_template):
+        template_root, on_main, off_main = _clone_template
+        root = tmp_path / "clone"
+        shutil.copytree(template_root, root)
+        # A copied checkout reads as "unstaged changes" on Windows (fresh inode/
+        # ctime invalidate the index stat cache); nothing in the template is
+        # uncommitted, so this changes no content and only re-stats the index.
+        rc, _out, err = _git(root, ["reset", "--hard", "HEAD"])
+        assert rc == 0, err
         return root, on_main, off_main
 
     def test_ancestry_distinguishes_landed_from_elsewhere(self, mod, clone):
@@ -2475,6 +3262,38 @@ class TestAgainstRealGit:
         assert got["error"] == "unknown-default-branch"
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """Env for a fixture git call: no host config, templates, hooks, or identity bleed.
+
+    The session/module-scoped template builders below run BEFORE the function-scoped
+    ``_git_identity`` autouse fixture in ``test/conftest.py`` has pinned anything, so
+    they would otherwise read the developer's real ``~/.gitconfig`` -- a
+    ``commit.gpgSign`` aborts the whole template, and a ``core.hooksPath`` or
+    ``init.templateDir`` would EXECUTE host hooks from inside the test run. The
+    ``GIT_DIR`` location family is dropped (the production list, so an exported
+    ``GIT_DIR`` from a hook or ``rebase --exec`` cannot retarget the fixture), both
+    template channels are emptied, and identity is supplied. Deliberately NOT
+    ``git_command_env()``: that pins ``diff.external`` empty for commands that never
+    diff, and these fixtures run ``git diff``.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+    env.update(
+        {
+            "GIT_TEMPLATE_DIR": "",
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "init.templateDir",
+            "GIT_CONFIG_VALUE_0": "",
+        }
+    )
+    return env
+
+
 def _git(root: Path, args: list[str]):
     """Run git against ``root``, contained two ways.
 
@@ -2488,6 +3307,7 @@ def _git(root: Path, args: list[str]):
     done = subprocess.run(
         ["git", "-C", str(root), *args],
         cwd=str(root),
+        env=_fixture_git_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",

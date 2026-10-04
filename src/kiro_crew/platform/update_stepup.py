@@ -1,7 +1,7 @@
 """Host-local step-up for the dashboard's in-app wheel update (RFC OQ7).
 
-A dashboard session is NOT sufficient authority to install code: issue #1762
-documents that IP pinning breaks under every same-host proxy, which makes the
+A dashboard session is NOT sufficient authority to install code: IP pinning
+breaks under every same-host proxy, which makes the
 session token an effectively transferable bearer for remote access. Acceptable
 for chat and operations; not for replacing the gateway's own bytes. So the
 in-app Apply is split into two actions with different authority:
@@ -33,12 +33,13 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-import os
 import secrets
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
 from kiro_crew.platform_compat import make_owner_only_dir
 
@@ -57,6 +58,18 @@ PENDING_TTL_SECS = 600
 #: exists to keep apart. The gateway writes it directly (keystone readers
 #: never route through is_sensitive_path), so arming is unaffected.
 _PENDING_FILENAME = "pending-update-approval.json"
+
+#: Serializes every read-validate-remove of the nonce file against arm's
+#: atomic swap. Arm and approve run as concurrent executor threads in ONE
+#: gateway process, so without this an approve that validated request A
+#: could unlink a request B that arm swapped in between the read and the
+#: unlink — accepting A while silently destroying B.
+#: The approval/consumption write plane lives entirely in the gateway, so an
+#: in-process lock closes it. One reader lives elsewhere: `kirocrew update
+#: approve` calls read_pending() from its own CLI process, outside this lock.
+#: Reading never writes by default (clear_expired=False), so that caller
+#: cannot write at all — the lock covers every writer that exists.
+_PENDING_MUTEX = threading.RLock()
 
 
 class StepUpError(Exception):
@@ -90,8 +103,8 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
     """Record a pending update request; return it (nonce included, for the FILE).
 
     The caller serving the SPA must never forward the nonce — hand the SPA
-    :func:`public_view` instead. Written atomically (temp + ``os.replace``)
-    with owner-only permissions, replacing any previous request: arming grants
+    :func:`public_view` instead. Written atomically and owner-only from birth,
+    so no readable moment exists, replacing any previous request: arming grants
     nothing by itself, so last-writer-wins needs no coordination.
     """
     pending = PendingUpdate(
@@ -102,37 +115,13 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
         created_at=time.time(),
     )
     path = pending_path()
-    # Owner-only from BIRTH, not chmod-after-write: under umask 022 a plain
-    # write_text creates the temp 0644, and the instant before a tighten is
-    # exactly when another local account could read the nonce. The directory
-    # is created owner-only too, and the file is opened O_CREAT|O_EXCL with
-    # mode 0600 so no readable moment ever exists.
     make_owner_only_dir(path.parent)
-    # The request id, not the pid: two concurrent arms run in the SAME process
-    # (executor threads), so a pid-keyed temp name is one shared file both
-    # writers interleave into. The request id is fresh entropy per arm.
-    tmp = path.with_name(f"{path.name}.{pending.request_id}.tmp")
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "request_id": pending.request_id,
-                        "nonce": pending.nonce,
-                        "version": pending.version,
-                        "channel": pending.channel,
-                        "created_at": pending.created_at,
-                        "source": source,
-                    }
-                )
+        with _PENDING_MUTEX:
+            atomic_write(
+                path, json.dumps({**asdict(pending), "source": source}), restrict_to_owner=True
             )
-        os.replace(tmp, path)
     except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise StepUpError(f"could not record the pending update request: {exc}") from exc
     logger.info(
         "Armed update request %s (v%s, %s channel, from %s)",
@@ -144,58 +133,94 @@ def arm(version: str, channel: str, *, source: str = "dashboard") -> PendingUpda
     return pending
 
 
-def read_pending() -> PendingUpdate | None:
+def read_pending(*, clear_expired: bool = False) -> PendingUpdate | None:
     """The current armed request, or ``None`` when absent, expired or unreadable.
 
-    An expired file is removed on read so a stale arm cannot sit on disk as a
-    standing invitation. Unreadable/malformed files also read as ``None`` —
+    Reading never writes by default. Removing an expired file on read is safe
+    only from INSIDE the gateway process — under the module mutex, serialized
+    against arm — so it is an explicit opt-in (``clear_expired=True``) for
+    gateway callers, never a behavior another process inherits silently: an
+    out-of-process unlink (the ``kirocrew update approve`` CLI) could delete
+    a fresh request it never read. An expired file that lingers grants
+    nothing — every reader checks expiry — and the next arm replaces it.
+    Unreadable/malformed files also read as ``None`` —
     an approval must never be minted from a file this module cannot vouch for.
     """
     path = pending_path()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    try:
-        pending = PendingUpdate(
-            request_id=str(raw["request_id"]),
-            nonce=str(raw["nonce"]),
-            version=str(raw["version"]),
-            channel=str(raw["channel"]),
-            created_at=float(raw["created_at"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
-    if pending.expired:
-        clear_pending()
-        return None
-    return pending
+    with _PENDING_MUTEX:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        try:
+            pending = PendingUpdate(
+                request_id=str(raw["request_id"]),
+                nonce=str(raw["nonce"]),
+                version=str(raw["version"]),
+                channel=str(raw["channel"]),
+                created_at=float(raw["created_at"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if pending.expired:
+            if clear_expired:
+                # Still under the mutex: the file this removes is the expired
+                # one just read, never a fresh request a concurrent arm
+                # swapped in.
+                clear_pending()
+            return None
+        return pending
 
 
 def consume(nonce: str) -> PendingUpdate:
     """Validate *nonce* against the armed request and consume it (single-use).
 
-    The comparison is constant-time. The file is removed BEFORE this returns,
-    so a second approve with the same nonce fails whatever the first one went
-    on to do — single-use means the apply gets at most one trigger.
+    The comparison is constant-time. The read, the validation and the removal
+    happen as ONE critical section under the module mutex, so a concurrent
+    arm cannot swap a fresh request in between the read and the unlink — the
+    request this removes is the request it validated. The file is removed
+    BEFORE this returns, so a second approve with the same nonce fails
+    whatever the first one went on to do — single-use means the apply gets at
+    most one trigger.
     """
-    pending = read_pending()
-    if pending is None:
-        raise StepUpError(
-            "no armed update request (it may have expired) — arm one from the "
-            "dashboard's About panel first"
-        )
-    if not nonce or not hmac.compare_digest(pending.nonce, nonce):
-        raise StepUpError("approval nonce does not match the armed request")
-    clear_pending()
-    return pending
+    with _PENDING_MUTEX:
+        pending = read_pending(clear_expired=True)
+        if pending is None:
+            raise StepUpError(
+                "no armed update request (it may have expired) — arm one from the "
+                "dashboard's About panel first"
+            )
+        # Bytes, not ``str``: ``compare_digest`` raises ``TypeError`` on a str
+        # holding a non-ASCII character, which would skip the caller's audited
+        # StepUpError refusal. ``surrogatepass`` because a JSON body can carry
+        # a lone surrogate, which a strict encode would refuse by raising.
+        if not nonce or not hmac.compare_digest(
+            pending.nonce.encode("utf-8", "surrogatepass"),
+            nonce.encode("utf-8", "surrogatepass"),
+        ):
+            raise StepUpError("approval nonce does not match the armed request")
+        _consume_pending_file()
+        return pending
+
+
+def _consume_pending_file() -> None:
+    """Remove the nonce for a successful approval, failing closed on error.
+
+    Called only from consume(), which already holds ``_PENDING_MUTEX`` around
+    its whole read-validate-remove section — no re-acquisition here.
+    """
+    try:
+        pending_path().unlink()
+    except OSError as exc:
+        raise StepUpError(f"could not consume the pending update request: {exc}") from exc
 
 
 def clear_pending() -> None:
-    try:
-        pending_path().unlink(missing_ok=True)
-    except OSError:
-        pass
+    with _PENDING_MUTEX:
+        try:
+            pending_path().unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def public_view(pending: PendingUpdate) -> dict[str, object]:

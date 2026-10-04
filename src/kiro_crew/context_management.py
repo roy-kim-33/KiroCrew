@@ -1,7 +1,7 @@
 """Context management for sub-agent results and session workspaces.
 
 Enforces size limits on disk files, memory buffers, and session history
-to prevent unbounded growth during multi-agent orchestration.
+to prevent unbounded growth during multi-agent runs.
 
 All limits are centralized here so they can be tuned in one place.
 """
@@ -10,11 +10,9 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
 
 from kiro_crew.config.loader import config_dir
 
@@ -35,7 +33,7 @@ RESULT_SUMMARY_WORDS = 200
 
 # Default character cap for the completion event injected into the parent
 # session. The full transcript stays in result.txt (capped by
-# RESULT_FILE_MAX_BYTES above) until cleanup removes it after delivery.
+# RESULT_FILE_MAX_BYTES above) for a retention window after delivery.
 # Override per-installation via ``agent.completion_keep_chars`` in
 # ``~/.kiro/crew/config.json``. Pair with ``agent.completion_keep`` to choose
 # whether the head, tail, or both ends of the transcript are kept (see
@@ -53,305 +51,6 @@ SESSION_MAX_AGE_SECS = 86400 * 7  # 7 days
 
 # Max completed sub-agents retained in SubagentManager._agents dict.
 MAX_RETAINED_AGENTS = 50
-
-# ── Orchestration guards ────────────────────────────────────────────
-
-# Max consecutive failures on the same sub-task before forcing user escalation.
-MAX_TASK_FAILURES = 3
-MAX_STAGE_ROUNDS = 3
-MAX_STAGE_ESCALATIONS = 2  # after 2 escalations (= 9 rounds), force-fail
-
-
-class OrchestrationTracker:
-    """Track failures and rounds per orchestrated session.
-
-    Enforces hard limits that the LLM prompt cannot override.
-    """
-
-    def __init__(self, stage_timeout_seconds: int = 1800) -> None:
-        self._task_failures: dict[str, int] = {}  # task_key → failure count
-        self._stage_rounds: dict[int, int] = {}  # stage_num → round count
-        self._stage_escalations: dict[int, int] = {}  # stage_num → escalation count
-        self._stage_results: dict[int, str] = {}  # stage_num → result file path
-        self.stopped: bool = False
-        self._stage_timeout: int = stage_timeout_seconds
-        self._stage_start: float = 0.0  # set when stage begins
-
-    def stop(self) -> None:
-        """User requested stop after escalation."""
-        self.stopped = True
-
-    @property
-    def has_escalated(self) -> bool:
-        """True if any task hit failure limit or any stage hit round limit."""
-        return (
-            any(v >= MAX_TASK_FAILURES for v in self._task_failures.values())
-            or any(v >= MAX_STAGE_ROUNDS for v in self._stage_rounds.values())
-        )
-
-    def reset_after_guidance(self) -> None:
-        """Reset round counters after user provides guidance. Increments escalation count."""
-        for stage, rounds in self._stage_rounds.items():
-            if rounds >= MAX_STAGE_ROUNDS:
-                self._stage_escalations[stage] = self._stage_escalations.get(stage, 0) + 1
-                self._stage_rounds[stage] = 0
-        # Also reset task failures so user guidance gets a fresh start
-        self._task_failures.clear()
-        self._stage_start = 0.0  # reset timeout clock for next stage
-
-    def is_force_failed(self, stage: int) -> bool:
-        """True if stage has exhausted all escalations (2 escalations = 9 rounds)."""
-        return self._stage_escalations.get(stage, 0) >= MAX_STAGE_ESCALATIONS
-
-    def record_failure(self, task_key: str) -> bool:
-        """Record a failure. Returns True if limit reached (must escalate)."""
-        self._task_failures[task_key] = self._task_failures.get(task_key, 0) + 1
-        return self._task_failures[task_key] >= MAX_TASK_FAILURES
-
-    def record_success(self, task_key: str) -> None:
-        """Reset failure count for a task."""
-        self._task_failures.pop(task_key, None)
-
-    def failure_count(self, task_key: str) -> int:
-        return self._task_failures.get(task_key, 0)
-
-    def record_round(self, stage: int) -> bool:
-        """Record a spawn round for a stage. Returns True if limit reached."""
-        self._stage_rounds[stage] = self._stage_rounds.get(stage, 0) + 1
-        if self._stage_rounds[stage] == 1 or not self._stage_start:
-            self._stage_start = time.monotonic()
-        return self._stage_rounds[stage] >= MAX_STAGE_ROUNDS
-
-    def is_stage_timed_out(self) -> bool:
-        """True if current stage has exceeded the timeout."""
-        if not self._stage_start or not self._stage_timeout:
-            return False
-        return (time.monotonic() - self._stage_start) > self._stage_timeout
-
-    @property
-    def stage_timeout_seconds(self) -> int:
-        """Configured per-stage timeout in seconds (0 = disabled).
-
-        Public accessor for callers that need the raw budget -- e.g. the
-        orchestrator's ``asyncio.wait_for`` around a stage turn and its
-        subagent-wait poll cap, both of which derive from this value.
-        """
-        return self._stage_timeout
-
-    @stage_timeout_seconds.setter
-    def stage_timeout_seconds(self, seconds: int) -> None:
-        """Set the per-stage budget after construction.
-
-        The orchestrator builds its tracker before it knows the configured
-        value: reading the config blocks, so it is loaded on a worker, and a
-        plan cancel arriving during that load needs a tracker already published
-        to stop. The tracker therefore starts on the default above and is
-        adjusted here once the load returns.
-
-        Safe at that point, and only at that point: the budget is consulted by
-        ``is_stage_timed_out`` and by callers deriving a wait from it, all of
-        which run per stage, and ``_stage_start`` is still 0 until the first
-        round is recorded. Changing it mid-stage would move a deadline the
-        current stage is already being measured against, so callers must not.
-        """
-        self._stage_timeout = seconds
-
-    @property
-    def timeout_human(self) -> str:
-        """Human-friendly timeout string, e.g. '30m' or '1m30s'."""
-        s = self._stage_timeout
-        if s >= 60:
-            m, rem = divmod(s, 60)
-            return f"{m}m{rem}s" if rem else f"{m}m"
-        return f"{s}s"
-
-    def round_count(self, stage: int) -> int:
-        return self._stage_rounds.get(stage, 0)
-
-    @property
-    def current_stage(self) -> int:
-        return max(self._stage_rounds.keys(), default=1)
-
-    # ── Python-controlled stage loop helpers ──
-
-    def record_stage_result(self, stage_num: int, result_path: str) -> None:
-        """Record that *stage_num* (1-based) completed with result at *result_path*."""
-        self._stage_results[stage_num] = result_path
-
-    def status_summary(self, current: int, total: int, titles: list[str]) -> str:
-        """Build a compact plan status block.
-
-        *current* is 0-based index of the stage about to execute.
-        """
-        lines: list[str] = []
-        for i in range(total):
-            t = titles[i] if i < len(titles) else ""
-            label = f"Stage {i + 1}: {t}" if t else f"Stage {i + 1}"
-            if i < current:
-                lines.append(f"  ✅ {label} — completed")
-            elif i == current:
-                lines.append(f"  ▶️ {label} — execute now")
-            else:
-                lines.append(f"  ⬜ {label} — pending")
-        return "\n".join(lines)
-
-
-# ── Plan format validation ──────────────────────────────────────────
-
-_PLAN_HEADER_RE = re.compile(r"📋\s*Plan for:", re.IGNORECASE)
-_STAGE_RE = re.compile(r"^Stage\s+(\d+)\s*:", re.MULTILINE | re.IGNORECASE)
-_STAGE_TITLE_RE = re.compile(r"^Stage\s+(\d+)\s*:\s*(.*)", re.MULTILINE | re.IGNORECASE)
-_PLAN_GOAL_RE = re.compile(r"📋\s*Plan for:\s*\"?(.+?)\"?\s*$", re.MULTILINE | re.IGNORECASE)
-_OPTION_RE = re.compile(r"\[OPTION:\s*Go\s*\|.*Cancel\s*\]")
-
-
-def extract_plan_metadata(text: str) -> tuple[list[str], str, list[list[str]]]:
-    """Extract stage titles, goal, and descriptions from plan text.
-
-    Returns (titles, goal, descriptions) where titles[i] is Stage i+1's title
-    and descriptions[i] is a list of bullet-point tasks for that stage.
-    """
-    pairs = _STAGE_TITLE_RE.findall(text)
-    max_stage = max((int(n) for n, _ in pairs), default=0)
-    titles = [""] * max_stage
-    for num_str, title in pairs:
-        idx = int(num_str) - 1
-        if 0 <= idx < max_stage:
-            titles[idx] = title.strip()
-    goal_m = _PLAN_GOAL_RE.search(text)
-    goal = goal_m.group(1).strip() if goal_m else ""
-    # Extract bullet points under each stage heading
-    descriptions: list[list[str]] = [[] for _ in range(max_stage)]
-    lines = text.splitlines()
-    current_stage = -1
-    for line in lines:
-        m = _STAGE_TITLE_RE.match(line)
-        if m:
-            current_stage = int(m.group(1)) - 1
-            continue
-        stripped = line.strip()
-        if current_stage >= 0 and current_stage < max_stage and stripped.startswith("- "):
-            descriptions[current_stage].append(stripped)
-        elif stripped and not stripped.startswith("-") and current_stage >= 0:
-            # Non-bullet, non-empty line ends bullet collection for this stage
-            current_stage = -1
-    return titles, goal, descriptions
-
-
-PLAN_TEMPLATE = """\
-📋 Plan for: "<task description>"
-
-Stage 1: <Title>
-  - <task>
-  - <task>
-
-Stage 2: <Title>
-  - <task>
-
-Stage N: Verification
-  - <verification task>
-
-[OPTION: Go | Go All | Cancel]"""
-
-
-# Loose pre-filter: catches plan-like text cheaply. False positives are
-# handled by rephrase_plan(might_not_be_plan=True) which asks the LLM.
-_PLAN_LIKE_RE = re.compile(
-    r"(?:^|\n)\s*(?:Phase|Step|Stage|Part)\s+\d+\s*[:\-—]"
-    r"|(?:^|\n)\s*\d+\.\s+\*\*[A-Z]",
-    re.IGNORECASE,
-)
-
-
-def looks_like_plan(text: str) -> bool:
-    """Cheap heuristic: does the text look like it might be a plan?
-
-    Intentionally loose — false positives are caught downstream by the
-    LLM-based rephrase which can reject non-plans.
-    """
-    return len(_PLAN_LIKE_RE.findall(text)) >= 2
-
-
-_GO_ALL_RE = re.compile(r"\[OPTION:\s*Go\s*\|\s*Cancel\s*\]")
-
-
-def ensure_go_all_option(text: str) -> str:
-    """Patch [OPTION: Go | Cancel] → [OPTION: Go | Go All | Cancel]."""
-    return _GO_ALL_RE.sub("[OPTION: Go | Go All | Cancel]", text)
-
-
-def validate_plan_format(text: str) -> tuple[bool, bool, list[str]]:
-    """Check if text contains a plan and whether it follows the expected format.
-
-    Returns (has_plan, valid, issues).
-    """
-    if not _PLAN_HEADER_RE.search(text):
-        return False, False, []
-    issues: list[str] = []
-    stages = _STAGE_RE.findall(text)
-    if not stages:
-        issues.append("No 'Stage N:' lines found")
-    else:
-        nums = [int(s) for s in stages]
-        if nums != list(range(1, len(nums) + 1)):
-            issues.append(f"Stages not sequential: {nums}")
-    if not _OPTION_RE.search(text):
-        issues.append("Missing [OPTION: Go | Go All | Cancel] footer")
-    return True, len(issues) == 0, issues
-
-
-async def rephrase_plan(text: str, issues: list[str], client: Any, *, might_not_be_plan: bool = False) -> str | None:
-    """Ask the LLM to reformat a malformed plan. Returns fixed text or None.
-
-    When *might_not_be_plan* is True, the LLM is instructed to return the
-    input unchanged (prefixed with ``NOT_A_PLAN:``) if it is not an
-    execution plan.
-    """
-    from kiro_crew.llm_helpers import stream_and_collect
-
-    if might_not_be_plan:
-        prompt = (
-            "First, decide: is the following text an execution plan with "
-            "actionable steps the user wants to carry out?\n"
-            "- If NO (e.g. it is an analysis, summary, explanation, or general "
-            "response), return ONLY the string 'NOT_A_PLAN'\n"
-            "- If YES, reformat it to match this template:\n\n"
-            f"{PLAN_TEMPLATE}\n\n"
-            f"Issues to fix: {', '.join(issues)}\n"
-            "Keep all original stage content. Number stages from 1. "
-            "End with [OPTION: Go | Go All | Cancel]. Return ONLY the result.\n\n"
-            f"Text:\n{text}"
-        )
-    else:
-        prompt = (
-            "Reformat the following plan to match this exact template:\n\n"
-            f"{PLAN_TEMPLATE}\n\n"
-            f"Issues to fix: {', '.join(issues)}\n\n"
-            "Rules:\n"
-            "- Keep all original stage content and tasks\n"
-            "- Number stages sequentially starting from 1\n"
-            "- End with [OPTION: Go | Go All | Cancel]\n"
-            "- Return ONLY the reformatted plan, nothing else\n\n"
-            f"Plan to reformat:\n{text}"
-        )
-    try:
-        result = await stream_and_collect(client, prompt)
-        if not result:
-            return None
-        if might_not_be_plan and result.strip().startswith("NOT_A_PLAN"):
-            return None
-        return result
-    except Exception:
-        logger.warning("Plan rephrase failed", exc_info=True)
-        return None
-
-
-def strip_plan_markers(text: str) -> str:
-    """Remove plan structure markers, leaving content as plain text."""
-    text = _PLAN_HEADER_RE.sub("", text)
-    text = _STAGE_RE.sub("", text)
-    text = _OPTION_RE.sub("", text)
-    return text.strip()
 
 
 def cap_result_file(path: Path) -> bool:
@@ -406,11 +105,11 @@ def apply_completion_keep(text: str, mode: str, max_chars: int) -> str:
     in ``config/loader.py``; callers may rely on receiving one of
     ``head``/``tail``/``both``.
 
-    The full untruncated transcript stays in
-    ``~/.kiro/crew/subagents/<id>/result.txt`` until the completion event is
-    delivered to the parent session, after which it is cleaned up by
-    ``subagent.py`` (see ``delete_agent_folder``). Use the ``spawn_status``
-    MCP tool to read it before delivery completes.
+    The transcript stays in ``~/.kiro/crew/subagents/<id>/result.txt``, trimmed towards
+    ``RESULT_FILE_MAX_BYTES``, for at least ``agent.subagent_result_ttl_secs`` (default
+    3600) after the completion event reaches the parent: delivery writes a
+    ``cause="delivered"`` tombstone instead of deleting the folder, and the reaper prunes
+    a tombstoned folder once that window closes. Read it there with ``spawn_status``.
     """
     if max_chars <= 0 or len(text) <= max_chars:
         return text

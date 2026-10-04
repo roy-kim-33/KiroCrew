@@ -115,6 +115,8 @@ function bmpDarkPixelCount(file, { left, top, right, bottom }) {
   return count;
 }
 
+const { BUILD_TIME_INPUTS } = require("./build-time-inputs");
+
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const bundledFiles = pkg.build.files;
@@ -136,9 +138,64 @@ describe("electron-builder files list", () => {
     assert.deepStrictEqual(missing, [], `Missing from build.files: ${missing.join(", ")}`);
   });
 
+  it("reaches every runtime owner from main.js through requires the packaging scans read", () => {
+    // shell-contract.test.js checks that every double-quoted relative require
+    // resolves to a listed file. That check is blind to a single-quoted or
+    // template require, and to an owner no facade composes (listed, shipped and
+    // dead). Walk the closure from the entry point to close both gaps.
+    const closure = new Set();
+    const pending = ["main.js"];
+    while (pending.length) {
+      const file = pending.pop();
+      if (closure.has(file)) continue;
+      closure.add(file);
+      const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+      assert.doesNotMatch(
+        source,
+        /require\(\s*(?:'\.|`\.)/,
+        `${file} has a relative require the packaging scans cannot read; use double quotes`,
+      );
+      for (const match of source.matchAll(/require\(\s*"(\.{1,2}\/[^"]+)"\s*\)/g)) {
+        const target = path.posix.normalize(path.posix.join(path.posix.dirname(file), match[1]));
+        const resolved = target.endsWith(".js") ? target : `${target}.js`;
+        if (!fs.existsSync(path.join(ROOT, resolved))) continue;
+        pending.push(resolved);
+      }
+    }
+    // Every runtime owner on disk is reached from main.js and packaged: none is
+    // an orphan that only a test loads.
+    const runtimeOwners = [];
+    for (const area of fs.readdirSync(path.join(ROOT, "runtime"))) {
+      for (const name of fs.readdirSync(path.join(ROOT, "runtime", area))) {
+        if (name.endsWith(".js")) runtimeOwners.push(`runtime/${area}/${name}`);
+      }
+    }
+    assert.deepStrictEqual(
+      runtimeOwners.filter((f) => !closure.has(f)).sort(),
+      [],
+      "every runtime owner is composed by a facade main.js reaches",
+    );
+    for (const facade of ["gateway-supervisor.js", "window-lifecycle.js", "auto-update.js", "crash-collector.js"]) {
+      assert.ok(closure.has(facade), `${facade} stays the entry the shell loads`);
+    }
+  });
+
   it("does not reference files that no longer exist", () => {
-    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)));
+    // Every entry is checked-in source EXCEPT the build-time inputs a build
+    // places here on demand (BUILD_TIME_INPUTS, shared with shell-contract.test.js):
+    // absent in a checkout by design, so their absence is not staleness.
+    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)) && !BUILD_TIME_INPUTS.has(f));
     assert.deepStrictEqual(stale, [], `Stale entries in build.files: ${stale.join(", ")}`);
+  });
+
+  it("lists the baked EXTERNALLY-MANAGED marker so a build that places it packs it into app.asar", () => {
+    // build-desktop.sh copies KIROCREW_MANAGED_INSTALL_MARKER here; without this
+    // entry electron-builder would leave it out and readExternallyManaged would
+    // find nothing beside main.js -- the edition silently ships un-managed.
+    assert.ok(bundledFiles.includes("EXTERNALLY-MANAGED"));
+    const script = fs.readFileSync(path.join(ROOT, "..", "..", "packaging", "build-desktop.sh"), "utf8");
+    assert.match(script, /KIROCREW_MANAGED_INSTALL_MARKER/);
+    assert.match(script, /\$ELECTRON_DIR\/EXTERNALLY-MANAGED/);
   });
 });
 
@@ -298,10 +355,14 @@ describe(
     );
     assert.match(buildWorkflow, /test-windows-installer\.ps1/);
     assert.match(runtimeScript, /^\$MaxInstallSeconds = 120$/m);
-    assert.match(runtimeScript, /^\$MaxGatewayReadySeconds = 30$/m);
+    assert.match(runtimeScript, /^\$MaxGatewayReadySeconds = 50$/m);
     assert.match(runtimeScript, /silent-install-seconds=/);
     assert.match(runtimeScript, /gateway-ready-seconds=/);
-    assert.match(runtimeScript, /startupPycCount -lt 1000/);
+    // The pyc floor is a parameter now (build.yml passes a lower value for the
+    // PR-time job, whose payload has no voice extras); the 1000 default is the
+    // full-bundle contract and stays pinned here.
+    assert.match(runtimeScript, /^\s*\[int\]\$MinStartupPycs = 1000$/m);
+    assert.match(runtimeScript, /startupPycCount -lt \$MinStartupPycs/);
     assert.match(runtimeScript, /\/api\/ready/);
     assert.match(
       runtimeScript,
@@ -309,6 +370,55 @@ describe(
     );
     assert.match(runtimeScript, /WaitForExit\(\$MaxInstallSeconds \* 1000\)/);
     assert.match(runtimeScript, /native-install-mode\.png/);
+  });
+
+  it("discloses the external Kiro CLI prerequisite before first launch", () => {
+    // A fresh install launches the app from the native finish page. The default
+    // backend needs Kiro CLI, but the desktop bundle deliberately does not
+    // install or sign in to it. Keep that handoff on the installer surface so a
+    // user does not discover the extra setup only after leaving the wizard.
+    assert.match(installer, /!define MUI_FINISHPAGE_TEXT "\$\(KiroCliPrerequisiteText\)"/);
+    assert.match(installer, /!define MUI_FINISHPAGE_LINK "\$\(KiroCliPrerequisiteLink\)"/);
+    assert.match(
+      installer,
+      /!define MUI_FINISHPAGE_LINK_LOCATION "https:\/\/kiro\.dev\/cli\/"/,
+    );
+    assert.match(
+      installer,
+      /LangString KiroCliPrerequisiteText 1033 ".*default Kiro agent requires Kiro CLI.*kiro-cli login.*"/,
+    );
+    assert.match(
+      installer,
+      /LangString KiroCliPrerequisiteLink 1033 "Open the Kiro CLI setup guide"/,
+    );
+
+    const configSections = fs.readFileSync(
+      path.join(REPO_ROOT, "src", "kiro_crew", "config", "sections.py"),
+      "utf8",
+    );
+    assert.match(
+      configSections,
+      /acp_backend: str = field\(\s*default=""/,
+      "installer copy must change if a fresh configuration stops defaulting to Kiro",
+    );
+
+    const updateLocales = [
+      ...installer.matchAll(/^LangString KiroUpdateProgress (\d+) /gm),
+    ]
+      .map((match) => match[1])
+      .sort();
+    for (const key of ["KiroCliPrerequisiteText", "KiroCliPrerequisiteLink"]) {
+      const prerequisiteLocales = [
+        ...installer.matchAll(new RegExp(`^LangString ${key} (\\d+) `, "gm")),
+      ]
+        .map((match) => match[1])
+        .sort();
+      assert.deepEqual(
+        prerequisiteLocales,
+        updateLocales,
+        `${key} must cover every language shipped by the NSIS installer`,
+      );
+    }
   });
 
   it("publishes the staged Windows payload without a second small-file copy pass", () => {
@@ -323,6 +433,19 @@ describe(
       installer,
       /!macro customPublishAppPackage SOURCE DESTINATION[\s\S]*?Rename "\$\{SOURCE\}\\resources" "\$\{DESTINATION\}\\resources"[\s\S]*?Rename "\$\{SOURCE\}\\locales" "\$\{DESTINATION\}\\locales"[\s\S]*?CopyFiles \/SILENT "\$\{SOURCE\}\\\*" "\$\{DESTINATION\}"/
     );
+  });
+
+  it("bundles the pinned Windows kiro-cli without installing the MSI", () => {
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    assert.match(buildScript, /kiro-cli-x86_64-pc-windows-msvc\.msi/);
+    assert.match(buildScript, /msiexec\.exe \/a/);
+    assert.match(buildScript, /cp -a "\$extracted" "\$dest\/\$entry"/);
+    assert.match(buildScript, /threading\.Thread\(target=read_stdout/);
+    assert.doesNotMatch(buildScript, /select\.select/);
+    assert.doesNotMatch(buildScript, /\[ "\$OS" != "windows" \]/);
   });
 
   it("ships the Windows startup caches generated after the platform prune", () => {

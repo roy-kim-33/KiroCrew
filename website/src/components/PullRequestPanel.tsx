@@ -17,6 +17,7 @@ import {
   Loader,
   RefreshCw,
   SkipForward,
+  TriangleAlert,
   XCircle,
 } from 'lucide-react'
 import { api } from '../api/client'
@@ -32,7 +33,7 @@ import {
   MAX_PULL_REQUEST_SOURCES,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
-import { sourceProviderMeta } from '../utils/sourceProviderMeta'
+import { sourceProviderMeta, sourceTabQualifier } from '../utils/sourceProviderMeta'
 import CopyBranchButton from './CopyBranchButton'
 import { PierrePatch } from '../pierre'
 import GithubLogo from './icons/GithubLogo'
@@ -44,8 +45,7 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
-import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../utils/pullRequestErrors'
-import { SettingsLink } from './SettingsLink'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
@@ -370,6 +370,22 @@ const CI_LABEL_KEY: Record<NonNullable<PullRequestStatus['ci']>, string> = {
   failed: 'components.pullRequestPanel.checks_failed',
 }
 
+/** Catalog keys for a changed file's `status` — GitHub's per-file vocabulary
+ * (added|modified|removed|renamed|copied|changed|unchanged). The wire value was
+ * printed raw and CSS-capitalized: untranslated in every locale and invisible
+ * to the i18n added-lines gate. Flat and indexed inline so the key gate
+ * resolves the map, like LIFECYCLE_LABEL_KEY. `?? file_status_changed` covers a
+ * value outside the known set so an unmapped status still reads as a word. */
+const FILE_STATUS_LABEL_KEY: Record<string, string> = {
+  added: 'components.pullRequestPanel.file_status_added',
+  modified: 'components.pullRequestPanel.file_status_modified',
+  removed: 'components.pullRequestPanel.file_status_removed',
+  renamed: 'components.pullRequestPanel.file_status_renamed',
+  copied: 'components.pullRequestPanel.file_status_copied',
+  changed: 'components.pullRequestPanel.file_status_changed',
+  unchanged: 'components.pullRequestPanel.file_status_unchanged',
+}
+
 /** CI rollup glyph, tone, and catalog KEY. Keys not strings — see LIFECYCLE_META. */
 const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check; tone: string; spin?: boolean }> = {
   running: { icon: Loader, tone: 'text-warn', spin: true },
@@ -378,16 +394,25 @@ const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check
 }
 
 /** State markers for one pull-request tab in the source strip: lifecycle glyph
- * plus, while the pull request is still live, its CI rollup. CI is suppressed
- * once merged or closed — the lifecycle glyph is the terminal signal there.
- * `ChatSidebar.tsx::showsChipCi` applies the same rule to the sidebar chip; the
- * two render the same pull request and must not disagree about its lifecycle. */
+ * plus one health glyph while the pull request is live. Failed CI wins; a merge
+ * conflict otherwise replaces pending/passed CI so an unmergeable branch never
+ * reads as ready. Merged/closed suppress both CI and conflict because lifecycle
+ * is the terminal signal there. `ChatSidebar.tsx::chipStatusGlyph` applies the
+ * same precedence to the sidebar chip. */
 function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   const lifecycle = status?.state
-  const ci = lifecycle === 'merged' || lifecycle === 'closed' ? undefined : status?.ci
-  if (!lifecycle && !ci) return null
+  const terminal = lifecycle === 'merged' || lifecycle === 'closed'
+  const ci = terminal ? undefined : status?.ci
+  const conflicting = !terminal && (
+    status?.mergeable === 'conflicting' || status?.mergeStateStatus === 'dirty'
+  )
+  // Failed CI is already a red, actionable stop signal. Otherwise a settled
+  // conflict outranks a pending/passing rollup, matching the sidebar chip.
+  const showConflict = conflicting && ci !== 'failed'
+  const shownCi = showConflict ? undefined : ci
+  if (!lifecycle && !shownCi && !showConflict) return null
   const life = lifecycle ? LIFECYCLE_META[lifecycle] : null
-  const check = ci ? CI_META[ci] : null
+  const check = shownCi ? CI_META[shownCi] : null
   const LifeIcon = life?.icon
   const CheckIcon = check?.icon
   // Resolved here, in the component body, so a language switch re-renders into
@@ -396,12 +421,18 @@ function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   // through a looked-up object is a shape `scripts/check-i18n-keys.mjs` cannot
   // resolve, which would exempt these sites from every catalog check.
   const lifeLabel = lifecycle ? i18nT(LIFECYCLE_LABEL_KEY[lifecycle]) : ''
-  const checkLabel = ci ? i18nT(CI_LABEL_KEY[ci]) : ''
+  const checkLabel = shownCi ? i18nT(CI_LABEL_KEY[shownCi]) : ''
+  const conflictLabel = showConflict ? i18nT('components.pullRequestPanel.merge_conflicts') : ''
   return (
     <>
       {LifeIcon && life && (
         <span className={`inline-flex shrink-0 ${life.tone}`} aria-label={lifeLabel} title={lifeLabel}>
           <LifeIcon className="lucide-inline" aria-hidden="true" />
+        </span>
+      )}
+      {showConflict && (
+        <span className="inline-flex shrink-0 text-danger" aria-label={conflictLabel} title={conflictLabel}>
+          <TriangleAlert className="lucide-inline" aria-hidden="true" />
         </span>
       )}
       {CheckIcon && check && (
@@ -458,7 +489,7 @@ function ChangeRow({ file }: { file: PullRequestFile }) {
       >
         {open ? <ChevronDown className="lucide-inline shrink-0 text-muted" /> : <ChevronRight className="lucide-inline shrink-0 text-muted" />}
         <span className="text-[13px] text-text truncate min-w-0 flex-1">{file.path}</span>
-        <span className="text-[11px] text-muted capitalize shrink-0">{file.status}</span>
+        <span className="text-[11px] text-muted shrink-0">{i18nT(FILE_STATUS_LABEL_KEY[file.status?.toLowerCase()] ?? 'components.pullRequestPanel.file_status_changed')}</span>
         <span className="text-[11px] shrink-0"><span className="text-ok">+{file.additions}</span> <span className="text-danger">-{file.deletions}</span></span>
       </Btn>
       {open && (
@@ -714,19 +745,6 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
-    {/* The remedy link lives OUTSIDE the action row, on its own line — never
-        as a row peer, which would push the row past the two-button cap in the
-        confirm state (Cancel + Confirm are already there). */}
-    {error && errorDetails.ownerNotConfigured && (
-      <div className="mt-1.5">
-        <SettingsLink
-          {...OWNER_SETTINGS_TARGET}
-          className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
-        >
-          {i18nT('components.pullRequestPanel.open_slack_settings')} <ArrowRight className="lucide-inline" />
-        </SettingsLink>
-      </div>
-    )}
     </>
   )
 }
@@ -842,6 +860,17 @@ export default function PullRequestPanel({
 }) {
   const cappedSources = sources.slice(0, MAX_PULL_REQUEST_SOURCES)
   const selected = cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
+  // A GitLab MR IID is unique only within its project, so tabs read as bare
+  // `MR !1` and two projects sharing an IID become indistinguishable. When the
+  // rendered tabs span more than one distinct project, qualify each tab label
+  // with its project; a single-project panel keeps the concise form. Identity
+  // is host-aware (self-managed GitLab can carry the same group/project path as
+  // gitlab.com), and sources whose project cannot be recovered (Jira, an
+  // unparseable url) never force qualification on their own.
+  const tabQualifier = useMemo(
+    () => sourceTabQualifier(sources.slice(0, MAX_PULL_REQUEST_SOURCES)),
+    [sources],
+  )
   const [tab, setTab] = useState<SourceTab>('changes')
   const [checkPollState, setCheckPollState] = useState({ url: '', failures: 0 })
   const checkPollStateRef = useRef({ url: '', failures: 0 })
@@ -1095,6 +1124,7 @@ export default function PullRequestPanel({
       <div role="tablist" aria-label={i18nT('components.pullRequestPanel.pull_requests')} className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto">
         {cappedSources.map(item => {
           const itemMeta = sourceProviderMeta(item.provider)
+          const qualifier = tabQualifier(item)
           return (
           <Btn
             key={item.url}
@@ -1115,6 +1145,12 @@ export default function PullRequestPanel({
                   // `1em`, which is 12px in this tab strip, so the neutral glyph
                   // rendered a pixel smaller than every branded one beside it.
                   : <GitPullRequest size={13} className="lucide-inline shrink-0" />}
+            {/* No CSS truncation here: sourceTabQualifier shortens deep paths
+                to their minimal unique trailing suffix, so the discriminating
+                segment is always visible. The full url stays on the Btn's
+                title. The reference (`MR !1`) is the part that must stay
+                legible. */}
+            {qualifier && <span>{qualifier}</span>}
             <span>{itemMeta.refLabel(item.number)}</span>
             <SourceTabState status={statusByUrl[item.url]} />
           </Btn>

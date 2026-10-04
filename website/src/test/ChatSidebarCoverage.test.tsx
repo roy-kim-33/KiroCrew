@@ -49,7 +49,7 @@ vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 
 const cfg = vi.hoisted(() => ({
   saveChatConfig: vi.fn(),
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -124,11 +124,32 @@ function renderSidebar(opts: {
   historyHasMore?: boolean
   /** Pre-set chat.revealRequest, simulating a reveal requested while the
    *  sidebar was unmounted (the #912 D1 regression case). */
-  revealRequest?: { key: string; nonce: number }
+  revealRequest?: { kind: 'session' | 'folder'; target: string; nonce: number }
+  /** Serve folders from a stub that APPLIES each PATCH, instead of one that
+   *  keeps replaying the seeded fixture. Needed only when a test observes the
+   *  RESULT of a folder write rather than just the call that made it — see the
+   *  note at the stub below. */
+  persistFolderWrites?: boolean
 } = {}) {
   const slots = opts.slots ?? []
   const folders = opts.folders ?? []
   mocks.chatFolders.mockResolvedValue(folders)
+  // The default stub REPLAYS the seeded fixture on every read, and the folder
+  // mutation ends with `onSettled: invalidateQueries(['chat-folders'])` — so a
+  // successful PATCH is followed by a refetch that puts the pre-PATCH value
+  // straight back, silently undoing the optimistic write. Tests that only assert
+  // the CALL never notice; a test that waits for the expansion to render waits
+  // forever. When asked, serve a stub that applies the body instead, which is
+  // what the real endpoint does.
+  if (opts.persistFolderWrites) {
+    const live = folders.map(f => ({ ...f }))
+    mocks.chatFolders.mockImplementation(async () => live.map(f => ({ ...f })))
+    mocks.updateChatFolder.mockImplementation(async (id: string, body: Partial<ChatFolder>) => {
+      const hit = live.find(f => f.id === id)
+      if (hit) Object.assign(hit, body)
+      return { ok: true }
+    })
+  }
   // Redux Toolkit REPLACES a slice's state with `preloadedState` -- it does not
   // merge with the slice's initialState. A hand-rolled partial therefore drops
   // every key it forgets, and reducers that legitimately assume the real shape
@@ -148,11 +169,18 @@ function renderSidebar(opts: {
     chat: {
       ...defaults.chat,
       activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {},
-      goalLoops: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
+      automations: {}, workflowRuns: {}, subagentQueued: {}, slotHistory: [],
       revealRequest: opts.revealRequest ?? null,
       revealNonce: opts.revealRequest?.nonce ?? 0,
     } as unknown as RootState['chat'],
   })
+  // `freezeQueries` opts ONE test out of refetch-on-mount. It is not tidiness:
+  // `onMutate` awaits `cancelQueries`, which reverts an in-flight fetch to its
+  // pre-fetch data, so an optimistic write racing the mount fetch can be undone
+  // — which is how a test that expands a collapsed ancestor ended up asserting
+  // against a folder that silently stayed collapsed for its whole run. Left OFF
+  // by default because the board-lane tests here depend on their queries
+  // refetching.
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], folders)
   qc.setQueryData(['tag-columns'], [])
@@ -191,7 +219,7 @@ function openHistory() {
 
 beforeEach(() => {
   localStorage.clear()
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   mocks.cleanupSessions.mockResolvedValue({ ok: true, archived: 0, keys: [], failed: [] })
   mocks.chatSlotsModel.mockResolvedValue({ ok: true, failed: [] })
   mocks.clearSessions.mockResolvedValue({ ok: true })
@@ -323,6 +351,33 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
     expect(await screen.findByText('gateway down')).toBeTruthy()
   })
 
+  it('renders the failure notice as a block on its own line above the button row', async () => {
+    // At sidebar width an inline notice inside the Cancel/Switch flex row gets
+    // only the leftover width (flex-1 = flex-basis 0), and the inline variant's
+    // overflow-wrap:anywhere then wraps it one character per line (#10814).
+    // The notice must sit outside the row, as the Clean Up panel's does.
+    mocks.chatSlotsModel.mockRejectedValue(new Error('gateway down'))
+    renderSidebar({ slots: SLOTS })
+    await openHeaderPanel('Switch all to model…')
+    fireEvent.click(screen.getByRole('option', { name: /auto/i }))
+    fireEvent.click(screen.getByText(/^Switch 1 session$/))
+    const notice = await screen.findByTestId('bulk-model-error')
+    // Outside the button row: the element holding Cancel + Switch does not
+    // contain the notice, and the notice is a preceding sibling (same parent,
+    // earlier in document order — exact adjacency is not the invariant).
+    const row = screen.getByText('Cancel').closest('button')!.parentElement!
+    expect(within(row).getByText(/^Switch 1 session$/)).toBeTruthy()
+    expect(row.contains(notice)).toBe(false)
+    expect(notice.parentElement).toBe(row.parentElement)
+    expect(row.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+    // Block variant: the boxed banner div, not the inline-flex span.
+    expect(notice.tagName).toBe('DIV')
+    expect(notice.getAttribute('role')).toBe('alert')
+    expect(notice.className).not.toMatch(/\binline-flex\b/)
+    // No flex-1: the notice must not compete with the buttons for row width.
+    expect(notice.className).not.toMatch(/\bflex-1\b/)
+  })
+
   it('closes on Cancel and does not call the endpoint', async () => {
     renderSidebar({ slots: SLOTS })
     await openHeaderPanel('Switch all to model…')
@@ -359,7 +414,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // shape the view toggle once created, so no predicate can tell a disposable
     // placeholder from a bare column the user added. Seeding therefore deletes
     // nothing at all -- including when the board is nothing BUT bare columns.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare-1', name: '', tag_ids: [], mode: 'any', order: 0 },
       { id: 'c-bare-2', name: '', tag_ids: [], mode: 'any', order: 1 },
@@ -375,7 +430,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // Idempotence plus a real recovery path: with two lanes already present the
     // menu still offers to add lanes, and doing so creates only the other two --
     // never a duplicate set. This is what a partial failure recovers through.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'l-1', name: '', tag_ids: [], mode: 'any', order: 0, source: 'state', state_key: 'needs_approval' },
       { id: 'l-2', name: '', tag_ids: [], mode: 'any', order: 1, source: 'state', state_key: 'working' },
@@ -393,7 +448,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('surfaces a failed seed instead of leaving an empty board', async () => {
     // The toggle flips tagColumnsEnabled BEFORE the mutation runs, so a failure
     // with no feedback looks identical to a board that is simply empty.
-    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([])
     mocks.createTagColumn.mockRejectedValue(new Error('persist failed'))
     renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
@@ -401,7 +456,11 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     fireEvent.click(await screen.findByText('Switch to board view'))
     const banner = await screen.findByTestId('lane-seed-error')
     expect(banner.textContent).toContain('Could not add the automatic columns')
-    expect(banner.textContent).toContain('Try again')
+    expect(banner.textContent).toContain('persist failed')
+    // The notice is the shared ErrorNotice (hand-off inside); the retry is a
+    // separate control beside it, not text inside the banner.
+    expect(within(banner).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
   })
 
   it('gives back the pre-board width when switching to list view', async () => {
@@ -409,7 +468,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // the width the user chose and strands a wide sidebar in list view.
     localStorage.setItem('mc-sidebar-width', '300')
     localStorage.setItem('mc-sidebar-width-pre-board', '300')
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue(
       ['needs_approval', 'waiting', 'working', 'idle'].map((k, i) => (
         { id: `l-${i}`, name: '', tag_ids: [], mode: 'any', order: i, source: 'state', state_key: k }
@@ -424,7 +483,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('labels a legacy bare column as showing every session once lanes exist', async () => {
     // Seeding does not delete it (indistinguishable from a user's own column), so
     // the duplicate-cards effect has to be named rather than left to be guessed.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
       { id: 'l-0', name: '', tag_ids: [], mode: 'any', order: 1, source: 'state', state_key: 'idle' },
@@ -435,7 +494,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   })
 
   it('does not label a bare column when there are no lanes', async () => {
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
     ])
@@ -447,7 +506,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('hides the add-lanes entry once all four lanes exist', async () => {
     // The affordance is keyed on there being something to add, so a complete
     // board does not offer a no-op action.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue(
       ['needs_approval', 'waiting', 'working', 'idle'].map((k, i) => (
         { id: `l-${i}`, name: '', tag_ids: [], mode: 'any', order: i, source: 'state', state_key: k }
@@ -463,7 +522,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // No rollback and no deletion: a partial failure just means fewer lanes.
     // The bare column survives, so the board still renders and the next seed
     // fills the gap rather than starting from an empty strip.
-    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
     ])
@@ -479,7 +538,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   })
 
   it('offers the way back to list view once board view is on', async () => {
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([{ id: 'c1', name: 'Doing', tag_ids: [], mode: 'any', order: 0 }])
     const view = renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
     view.rerender(<div />)
@@ -589,6 +648,24 @@ describe('ChatSidebar — Older Sessions pane', () => {
     expect(screen.queryByText('Fresh history')).toBeNull()
   })
 
+  it('carries the main session search into Older Sessions and keeps following it', async () => {
+    renderSidebar({ history: HISTORY })
+    const sessionSearch = screen.getByPlaceholderText('Search sessions…')
+
+    fireEvent.change(sessionSearch, { target: { value: 'Week' } })
+    openHistory()
+
+    const historySearch = screen.getByPlaceholderText('Search older sessions…')
+    expect(historySearch).toHaveValue('Week')
+    expect(screen.getByText('Week history')).toBeTruthy()
+    expect(screen.queryByText('Fresh history')).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('Search sessions…'), { target: { value: 'Fresh' } })
+    await waitFor(() => expect(screen.getByPlaceholderText('Search older sessions…')).toHaveValue('Fresh'))
+    expect(screen.getByText('Fresh history')).toBeTruthy()
+    expect(screen.queryByText('Week history')).toBeNull()
+  })
+
   it('groups backend search results by folder and collapses a group', async () => {
     mocks.sessionsSearch.mockResolvedValue({
       sessions: [
@@ -624,6 +701,9 @@ describe('ChatSidebar — Older Sessions pane', () => {
 })
 
 describe('ChatSidebar — narrow-width header', () => {
+  // The header create label is the short 'New' (recorded in docs/decisions).
+  // The caret menu is closed in every case below, so the only node carrying it
+  // is the header button's own span.
   it('keeps the full header at a comfortable width', () => {
     localStorage.setItem('mc-sidebar-width', '400')
     renderSidebar()
@@ -674,20 +754,55 @@ describe('ChatSidebar — reveal request (store-driven, issue #912)', () => {
     const { store } = renderSidebar({
       slots: [{ key: 'k-deep', title: 'Deep one', running: false, folder_id: 'f-child' }],
       folders,
-      revealRequest: { key: 'k-deep', nonce: 1 },
+      revealRequest: { kind: 'session', target: 'k-deep', nonce: 1 },
+      // The optimistic expansion has to SURVIVE for this test to mean anything:
+      // the row is mounted from the first paint (a collapsed FolderBody keeps its
+      // children) and only stops being inert once the expansion renders, which is
+      // the state the scroll waits for.
+      persistFolderWrites: true,
     })
     await waitFor(() => expect(mocks.updateChatFolder).toHaveBeenCalledWith('f-child', { collapsed: false }))
     expect(mocks.updateChatFolder).toHaveBeenCalledWith('f-parent', { collapsed: false })
-    // The row enters the DOM only after the optimistic expansion re-render —
-    // the bounded retry (not a one-shot timeout) must still find it (D3).
+    // The row is VISIBLE only after the optimistic expansion re-render — until
+    // then it sits inert inside the collapsed body — so the bounded retry (not a
+    // one-shot timeout) is what has to land the scroll (D3).
     await waitFor(() => expect(scrollIntoView).toHaveBeenCalled())
+    expect(document.querySelector('[data-session-row="k-deep"]')?.closest('[inert]')).toBeNull()
     expect(store.getState().chat.revealRequest).toBeNull()
+  })
+
+  it('never scrolls a row while it is still inert inside a collapsed ancestor', async () => {
+    // The reveal's first attempt runs SYNCHRONOUSLY, before the expansion it just
+    // requested has rendered — and a collapsed FolderBody keeps its children
+    // mounted, marked inert. So on the common path the target is already
+    // queryable and unusable. Accepting it scrolled a height-0 collapsed row and
+    // stopped retrying, because the retry only fires when nothing was found.
+    //
+    // Asserted on the ELEMENT AT CALL TIME rather than after the fact: the folder
+    // does expand a moment later here, so a check that runs afterwards passes
+    // either way and pins nothing.
+    const inertAtCall: boolean[] = []
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+      inertAtCall.push(!!this.closest('[inert]'))
+    })
+    const folders: ChatFolder[] = [
+      { id: 'f-parent', name: 'Parent', order: 0, collapsed: true },
+      { id: 'f-child', name: 'Child', order: 1, parent_id: 'f-parent', collapsed: true },
+    ]
+    renderSidebar({
+      slots: [{ key: 'k-deep', title: 'Deep one', running: false, folder_id: 'f-child' }],
+      folders,
+      revealRequest: { kind: 'session', target: 'k-deep', nonce: 1 },
+      persistFolderWrites: true,
+    })
+    await waitFor(() => expect(inertAtCall.length).toBeGreaterThan(0))
+    expect(inertAtCall).not.toContain(true)
   })
 
   it('flashes the revealed row so an in-place reveal is visible', async () => {
     renderSidebar({
       slots: [{ key: 'k-a', title: 'Alpha', running: false }],
-      revealRequest: { key: 'k-a', nonce: 1 },
+      revealRequest: { kind: 'session', target: 'k-a', nonce: 1 },
     })
     // The confirmation outline is the only signal when the row was already on
     // screen (D4) — scrollIntoView on a visible row is a visual no-op.

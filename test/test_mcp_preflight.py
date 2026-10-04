@@ -427,7 +427,7 @@ class TestEvaluateOnlyWhatChanged:
     async def test_a_divergence_is_reported_but_never_frozen(
         self, patch_probe, tmp_path
     ) -> None:
-        """The #4339 fix, and the reason it needs no expiry clock.
+        """A reported divergence is never frozen, and needs no expiry clock.
 
         Two spawns that disagree cannot say WHY they disagree: an answer computed
         from ``clientInfo`` and an answer that varies for the server's own reasons
@@ -715,7 +715,7 @@ class TestPreflight:
 class TestToolSurfaceIsCompared:
     """The tool list is a facet of its own, and the only one an old server has.
 
-    Tool ANNOTATIONS arrived in MCP 2025-03-26, so a server older than that can
+    Tool ANNOTATIONS arrived in a later MCP revision, so a server older than that can
     be measured on nothing else — these pin that it is measured at all, and that
     the three ways this comparison could produce a false positive do not.
     """
@@ -942,7 +942,7 @@ class TestAnnotationsAreNeverPairedWithATool:
         assert pf._tool_surface(a) == pf._tool_surface(b), "a reorder is not a divergence"
 
     def test_a_changed_claim_is_caught_even_when_the_tool_is_unknown(self) -> None:
-        """The signal the length guard used to throw away.
+        """The signal a length guard would throw away.
 
         The server told one caller ``readOnlyHint: true`` and the other ``false``.
         Which tool it was about is unknowable, and does not matter: a pooled backend
@@ -1120,7 +1120,7 @@ class TestMeasuredIsCountedApartFromAttempted:
 
         This is not a corner -- the probe cannot spawn at all on some hosts, so
         every server in the configuration takes the ``ran=False`` branch and the
-        readout used to say it had measured all of them.
+        readout must not claim it measured all of them.
         """
         import kiro_crew.mcp_gateway.evaluate as ev
 
@@ -1245,9 +1245,42 @@ class TestOneServerCannotEndThePass:
     pass already paid two spawns each for.
     """
 
+    @pytest.fixture
+    def no_cyclic_gc_at_the_recursion_limit(self):
+        """Keep the cyclic collector out of the frames next to the recursion limit.
+
+        The deep-payload test below drives the projection to ``RecursionError`` on
+        purpose, so its innermost frames have no headroom left. A gen0 sweep that
+        lands there -- the allocation counter decides where, not the test -- runs
+        the finalizers of whatever cyclic garbage the worker is carrying. A pending
+        Task leaked by an earlier test reports itself through ``logger.error`` on
+        ``__del__``; at that depth the report itself raises ``RecursionError``, the
+        interpreter hands the escaped exception to ``sys.unraisablehook``, and
+        pytest's hook overflows in the same place, which it surfaces as
+        ``RuntimeError: Failed to process unraisable exception`` against THIS test
+        (3 unrelated heads, Linux and Windows). Reproduced on demand by planting
+        such garbage at every projection depth: every run.
+
+        Collect once at depth zero, so the inherited garbage pays its finalizers
+        where there is stack for them, then hold the collector off for the walk.
+        Reference counting still frees the projection's own dicts; only cycles
+        wait, and they are collected at teardown.
+        """
+        import gc
+
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+
     @pytest.mark.asyncio
     async def test_deep_annotations_do_not_discard_the_other_verdicts(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, no_cyclic_gc_at_the_recursion_limit
     ) -> None:
         """The exact trigger GPT named: nesting deep enough to exhaust the stack.
 
@@ -1312,6 +1345,40 @@ class TestOneServerCannotEndThePass:
                 [McpServerInfo(name="s", command="/bin/true")], tmp_path, budget=None
             )
 
+    @pytest.mark.asyncio
+    async def test_a_disabled_row_with_a_malformed_command_does_not_end_the_pass(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A disabled placeholder's config is the one nobody has exercised.
+
+        ``probe_all`` carries a disabled server as an unprobed placeholder, and
+        ``command`` is stored from the config JSON unvalidated, so a disabled row
+        can arrive here with a dict where a string belongs. Its identity hashes
+        that command, and identities were derived for EVERY row before the
+        disabled filter and outside the per-server boundary -- so one such row
+        raised ``AttributeError`` and Measure All measured nothing. The healthy
+        neighbour is measured and stored; the disabled row is neither spawned
+        nor given a verdict."""
+        import kiro_crew.mcp_gateway.evaluate as ev
+
+        spawned: list[str] = []
+
+        async def route(server):
+            spawned.append(server.name)
+            return SimpleNamespace(ran=True, caller_sensitive=False, reasons=())
+
+        monkeypatch.setattr(ev, "preflight", route)
+        servers = [
+            McpServerInfo(name="good-mcp", command="/bin/true"),
+            McpServerInfo(name="off-mcp", command={"not": "a string"}, disabled=True),
+        ]
+        out = await ev.evaluate_new_servers(servers, tmp_path, budget=None)
+        assert spawned == ["good-mcp"]
+        assert set(out) == {"good-mcp"}, out
+        stored = vc.VerdictCache(tmp_path / vc.VERDICT_CACHE_FILENAME)
+        stored.load()
+        assert stored.server_names() == {"good-mcp"}, stored.server_names()
+
 
 class TestSupersededRowIsNotReadable:
     """A row for replaced code must not survive where the dashboard can read it.
@@ -1319,7 +1386,7 @@ class TestSupersededRowIsNotReadable:
     ``get`` refusing to return a row is not enough on its own: the dashboard row
     builder reads through ``get_by_name``, which checks neither identity nor
     version. So a row left in place after the pre-flight fails to re-measure is
-    still rendered -- as evidence about code that no longer exists, and in the
+        still rendered -- as evidence about code that does not exist, and in the
     permissive direction.
     """
 
@@ -1347,7 +1414,7 @@ class TestSupersededRowIsNotReadable:
         assert cache.get_by_name("srv") is not None, "row should start present"
 
         assert cache.get("srv", ident, "2.0") is None, "the read must refuse it"
-        # The point of the fix: the dashboard's own reader can no longer see it.
+        # The dashboard's own reader cannot see it.
         assert cache.get_by_name("srv") is None
         assert "srv" not in cache.server_names()
 

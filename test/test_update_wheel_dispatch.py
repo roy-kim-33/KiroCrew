@@ -1,4 +1,4 @@
-"""Tests for the CLI ``kirocrew update`` wheel-install dispatch (issue #1871).
+"""Tests for the CLI ``kirocrew update`` wheel-install dispatch.
 
 Covers:
 - Install layout detection (git, wheel, externally managed)
@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import subprocess  # noqa: F401 -- used via monkeypatch.setattr
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,63 @@ def _init_repo(path) -> None:
     )
 
 
+def _pin_probe_git(monkeypatch, tmp_path):
+    """Resolve the worktree probe's git to a fake under ``tmp_path``.
+
+    ``update_capability._git_toplevel`` finds git through ``trusted_system_bin``
+    (fixed system directories, never PATH) and asks ``rev-parse --show-toplevel``
+    about the install root. Left alone, that is the HOST's git running from the
+    test process -- and on a host that keeps git outside those directories the
+    probe silently degrades to the on-disk fallback, so which branch a test
+    exercised depended on the machine. The fake answers the one question the
+    probe asks the way git does: the ``-C`` root itself when it carries ``.git``,
+    exit 128 otherwise. Every argv it sees is appended to ``git-calls.log``
+    beside it. The probe's own reading of real repositories is covered in
+    ``test_update_capability.py``; here the install shape is a precondition.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = bin_dir / "git-calls.log"
+    if os.name == "nt":
+        fake = bin_dir / "git.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'echo %* >> "{log}"\r\n'
+            ":loop\r\n"
+            'if "%~1"=="" goto miss\r\n'
+            'if "%~1"=="-C" (\r\n'
+            '  if exist "%~2\\.git" (echo %~2& exit /b 0)\r\n'
+            "  goto miss\r\n"
+            ")\r\n"
+            "shift\r\n"
+            "goto loop\r\n"
+            ":miss\r\n"
+            "echo fatal: not a git repository 1>&2\r\n"
+            "exit /b 128\r\n",
+            encoding="utf-8",
+        )
+    else:
+        fake = bin_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            "root=\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = "-C" ]; then root=$2; shift; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -n "$root" ] && [ -e "$root/.git" ]; then printf \'%s\\n\' "$root"; exit 0; fi\n'
+            "echo 'fatal: not a git repository' >&2\n"
+            "exit 128\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.trusted_system_bin", lambda _name: str(fake)
+    )
+    return fake
+
+
 class TestDetectInstallLayout:
     """Tests for platform/update_layout.detect_install_layout."""
 
@@ -33,6 +91,7 @@ class TestDetectInstallLayout:
         proj = tmp_path / "project"
         proj.mkdir()
         _init_repo(proj)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -78,6 +137,7 @@ class TestDetectInstallLayout:
         proj = tmp_path / "project"
         proj.mkdir()
         _init_repo(proj)
+        _pin_probe_git(monkeypatch, tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
         monkeypatch.setattr(
             "kiro_crew.platform.update_capability.running_from_checkout",
@@ -143,7 +203,7 @@ class TestReleaseChannel:
     from the async update check, and ``config_dir`` is resolve-AND-maintain (it
     refreshes the recovery breadcrumb and re-runs a leftover-archive sweep that can
     ``shutil.rmtree``), so calling it there put a destructive sweep on the event
-    loop -- issue #1057. ``test_no_config_dir_in_async.py`` guards the production
+    loop. ``test_no_config_dir_in_async.py`` guards the production
     side; patch whichever name that module actually uses.
     """
 
@@ -248,11 +308,21 @@ class TestUpdateWheelCli:
         assert "latest version" in out.lower()
 
     def test_newer_version_runs_installer(self, monkeypatch, tmp_path, capsys) -> None:
-        """When feed has a newer version, runs the shell installer."""
+        """When feed has a newer version on a pipx install, runs the shell installer.
+
+        pipx owns its venv and the installer re-run upgrades it in place, so this
+        shape keeps the installer path. (A plain-pip install refuses instead —
+        see ``test_non_managed_pip_refuses_with_hint``.)"""
         monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
         monkeypatch.setattr("kiro_crew.platform.update_layout.distribution", lambda: "wheel")
         monkeypatch.setattr("kiro_crew.platform.update_layout.data_home", lambda: tmp_path)
         monkeypatch.delenv("KIROCREW_CDN_BASE", raising=False)
+        # The managed venv takes the shadow path; a pipx install takes the
+        # installer re-run this test asserts on.
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: False
+        )
+        monkeypatch.setattr("kiro_crew.platform.wheel_engine.running_from_pipx", lambda: True)
 
         monkeypatch.setattr("kiro_crew.cli_server.__version__", "0.1.3")
         monkeypatch.setattr("kiro_crew.__version__", "0.1.3")
@@ -278,16 +348,18 @@ class TestUpdateWheelCli:
 
         monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
 
-        # Mock subprocess.run to capture the installer invocation
+        # Mock subprocess.Popen to capture the installer invocation
         calls: list[tuple] = []
 
-        def fake_run(*args, **kwargs):
+        def fake_popen(*args, **kwargs):
             calls.append(args)
-            result = MagicMock()
-            result.returncode = 0
-            return result
+            proc = MagicMock()
+            # Above every pid_max: no stop path could signal a live process.
+            proc.pid = 99_999_999_999
+            proc.wait.return_value = 0
+            return proc
 
-        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
         # Ensure the platform guard doesn't short-circuit on Windows CI.
         monkeypatch.setattr("sys.platform", "linux")
 
@@ -298,6 +370,137 @@ class TestUpdateWheelCli:
         # The installer should be run via sh -c
         assert calls[0][0][0] == "sh"
         assert calls[0][0][1] == "-c"
+
+    def _drive_non_managed_pip(self, monkeypatch, tmp_path, platform: str, cdn_base: str = ""):
+        """Run ``_update_wheel`` for a newer version on a plain-pip install.
+
+        Simulates the shape the issue is about: not the managed venv, not pipx —
+        a user's own ``pip install`` into an environment they manage. Returns the
+        captured ``SystemExit`` so the caller asserts on the exit code and output.
+        Any ``subprocess.run`` is a test failure: the whole point is that the
+        installer re-run must NOT fire for this shape.
+        """
+        monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
+        monkeypatch.setattr("kiro_crew.platform.update_layout.distribution", lambda: "wheel")
+        monkeypatch.setattr("kiro_crew.platform.update_layout.data_home", lambda: tmp_path)
+        if cdn_base:
+            monkeypatch.setenv("KIROCREW_CDN_BASE", cdn_base)
+        else:
+            monkeypatch.delenv("KIROCREW_CDN_BASE", raising=False)
+        monkeypatch.setattr("kiro_crew.cli_server.__version__", "0.1.3")
+        monkeypatch.setattr("kiro_crew.__version__", "0.1.3")
+        monkeypatch.setattr(
+            "kiro_crew.platform.wheel_engine.running_from_managed_venv", lambda: False
+        )
+        monkeypatch.setattr("kiro_crew.platform.wheel_engine.running_from_pipx", lambda: False)
+        monkeypatch.setattr("sys.platform", platform)
+
+        import kiro_crew.cli_server as cs
+        from kiro_crew.platform.update_layout import InstallLayout
+
+        layout = InstallLayout(
+            kind="wheel", proj="", is_git=False, is_externally_managed=False, guidance=""
+        )
+
+        # The in-place hint prefers the signed pinned wheel, which fetches +
+        # openssl-verifies the manifest. This path drives the verification-
+        # FAILURE report deterministically (no CDN in the test), so make the
+        # fetch raise cleanly rather than hit the `subprocess.run` guard below.
+        # The refusal then reports the failure with manual-install guidance and
+        # emits no name-resolving command.
+        from kiro_crew.platform.wheel_engine import WheelUpdateError
+
+        def _no_manifest(*a, **k):
+            raise WheelUpdateError("no CDN in test")
+
+        monkeypatch.setattr("kiro_crew.platform.wheel_engine.fetch_verified_manifest", _no_manifest)
+
+        manifest = self._make_manifest("0.2.0")
+
+        class FakeResp:
+            def read(self, n=-1):
+                return manifest
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+
+        def _no_installer(*a, **k):  # pragma: no cover - must not be called
+            raise AssertionError("the installer re-run must not fire for a plain-pip install")
+
+        monkeypatch.setattr("subprocess.run", _no_installer)
+        # The snapshot step would try to reach a running gateway; a refusal must
+        # happen before any of that, so stub it to a no-op to keep the test local.
+        monkeypatch.setattr(cs, "_snapshot_memory_or_exit", lambda: None)
+
+        with pytest.raises(SystemExit) as exc:
+            cs._update_wheel(layout)
+        return exc
+
+    def test_non_managed_pip_refuses_with_hint(self, monkeypatch, tmp_path, capsys) -> None:
+        """A plain-pip install refuses and never runs the installer (the
+        second-copy bug). With no CDN reachable in the test, the signed wheel
+        cannot be verified, so the refusal REPORTS the failure with manual-
+        install guidance and emits no name-resolving command."""
+        exc = self._drive_non_managed_pip(monkeypatch, tmp_path, "linux")
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        # The report points at the channel's artifact directory for a manual,
+        # hash-verified install — it must NOT hand out the dependency-confusion
+        # `--extra-index-url ... -U kirocrew` form.
+        assert "https://download.crew.kiro.dev/cli/stable/" in out
+        assert "SHA256SUMS" in out
+        assert "--extra-index-url" not in out
+        assert "-U kirocrew" not in out
+        assert "/simple/" not in out
+        assert "kirocrew restart" in out
+        # It must not have printed the installer-run banner or a success line.
+        assert "Running installer" not in out
+        assert "updated to 0.2.0" not in out.lower()
+
+    def test_non_managed_pip_refuses_with_hint_on_windows(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """On Windows the same shape gives an actionable report instead of the
+        uninformative exit 1 the installer path produced. Windows plain-pip
+        hosts often lack a trusted openssl, so this is the common path — and it
+        must still refuse the name-based form."""
+        exc = self._drive_non_managed_pip(monkeypatch, tmp_path, "win32")
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "https://download.crew.kiro.dev/cli/stable/" in out
+        assert "--extra-index-url" not in out
+        assert "-U kirocrew" not in out
+        assert "kirocrew restart" in out
+        # The old Windows message was "not supported on Windows" with no next step.
+        assert "not supported on Windows" not in out
+
+    def test_non_managed_pip_refusal_redacts_cdn_userinfo_from_the_print(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        """A userinfo-bearing KIROCREW_CDN_BASE (user:pass@host) passes
+        _SAFE_CDN_BASE_RE and reaches the CLI output, which lands in terminal
+        scrollback — so the credential must be redacted everywhere it is
+        printed: the feed-fetch diagnostic AND the refusal hint. The host and
+        index path survive so the command is still recognizable."""
+        exc = self._drive_non_managed_pip(
+            monkeypatch, tmp_path, "linux", cdn_base="https://user:s3cr3t@cdn.example.invalid"
+        )
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        # The secret must not appear anywhere in the printed output — neither the
+        # "Checking <feed_url>" diagnostic nor the refusal report.
+        assert "s3cr3t" not in out
+        # The verification-failure report still shows the artifact host + path
+        # (credentials stripped) so the operator can install manually.
+        report_block = out.split("The signed upgrade", 1)[1]
+        assert "cdn.example.invalid/cli/" in report_block
+        # And the feed-fetch diagnostic still names the host (redacted of creds).
+        assert "cdn.example.invalid" in out.split("Checking", 1)[1].split("\n", 1)[0]
 
     def test_feed_unreachable_prints_manual_command(self, monkeypatch, tmp_path, capsys) -> None:
         """Network failure prints the manual update command."""
@@ -507,6 +710,9 @@ class TestUpdateDivergenceGuard:
                     result.stdout = f"{proj}\n"
                 elif "--abbrev-ref" in args:
                     result.stdout = "main\n"
+                elif "--verify" in args:
+                    # The upstream pin every later judgment and the reset name.
+                    result.stdout = "0123456789abcdef0123456789abcdef01234567\n"
                 elif "diff" in args:
                     # Non-zero: the upstream has new commits, so the update
                     # proceeds past the up-to-date early return.
@@ -524,6 +730,16 @@ class TestUpdateDivergenceGuard:
                         result.stdout = counts
                 elif "status" in args:
                     result.stdout = porcelain
+                elif "show" in args:
+                    # The pre-reset interpreter-floor gate reads pyproject /
+                    # setup.cfg out of the fetched commit, capturing BYTES like
+                    # the real call. Answer "no such path" in git's own words
+                    # (the gate distinguishes an absent path from a failed
+                    # read by them) so the gate does not fire: the divergence
+                    # guard is what these tests are about.
+                    result.returncode = 128
+                    result.stdout = b""
+                    result.stderr = b"fatal: path 'pyproject.toml' does not exist in 'origin/main'"
             return result
 
         monkeypatch.setattr("subprocess.run", fake_run)

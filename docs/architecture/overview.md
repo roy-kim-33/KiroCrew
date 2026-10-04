@@ -7,8 +7,8 @@ subsystem has a module spec under
 [Feature and subsystem map](#feature-and-subsystem-map) below indexes all of
 them with their owning source path.
 
-For installation see [`../guides/install.md`](../guides/install.md); for a first
-run see [`../guides/install.md`](../guides/install.md).
+For installation and the first run, see
+[`../guides/install.md`](../guides/install.md).
 
 ---
 
@@ -16,32 +16,41 @@ run see [`../guides/install.md`](../guides/install.md).
 
 Three layers sit beneath Kiro Crew, and the distinction matters:
 
-1. **kiro-cli** is an agent *runtime*, not an agent. It owns the LLM connection,
-   tool execution (bash, file read/write, grep, glob), MCP server management,
-   session persistence, context compaction, and **ACP** (the Agent Client
-   Protocol): a JSON-RPC 2.0 stdio interface any orchestrator can drive.
+1. **An ACP harness** is an agent *runtime*, not an agent. `kiro-cli` is the
+   default and baseline harness; it owns the LLM connection, tool execution
+   (bash, file read/write, grep, glob), MCP server management, session
+   persistence, context compaction, and **ACP** (the Agent Client Protocol): a
+   JSON-RPC 2.0 stdio interface any orchestrator can drive. Other selectable
+   harnesses implement that same transport with capability-gated differences.
 2. **Agent configs** (JSON under `~/.kiro/agents/`, or a project's own
-   `<project>/.kiro/agents/`) tell kiro-cli *how* to
-   behave: system prompt, enabled tools, MCP servers. Every agent runs as
-   `kiro-cli acp --agent <name>`; the `--agent` flag selects the config, the
-   runtime is always kiro-cli. Kiro Crew generates and refreshes its own
-   `kirocrew.json` there (`agent.py`).
+   `<project>/.kiro/agents/`) tell the default harness *how* to behave: system
+   prompt, enabled tools, MCP servers. With the default backend Kiro Crew runs
+   `kiro-cli acp --agent <name>` and generates its own `kirocrew.json` there
+   (`agent.py`); other harnesses receive the equivalent projection through the
+   ACP provider seam.
 3. **Kiro Crew** is the gateway: a single asyncio process that multiplexes
-   surfaces onto that runtime and adds everything a runtime deliberately has no
-   opinion about.
+   surfaces onto the selected harness and adds everything a runtime deliberately
+   has no opinion about.
 
+<<<<<<< HEAD
 Kiro Crew defaults to **KiroACP**: `agent.provider` defaults to `acp`, and
 kiro-cli is a hard requirement for that path. The fork additionally supports
 `agent.provider = "claude_code"`, which drives an Anthropic-compatible router
 (e.g. a local CLIProxyAPI) through claude-agent-acp instead — see
 [acp-client.md § Custom LLM router wiring (fork)](../system-specs/modules/acp-client.md).
+=======
+Kiro Crew is **ACP-provider-only**: `agent.provider` is fixed to `acp`.
+`agent.acp_backend` selects the harness, with `kiro-cli` as the required baseline
+and default. The authoritative backend inventory and capability matrix are in
+[`../system-specs/modules/providers.md`](../system-specs/modules/providers.md).
+>>>>>>> upstream/main
 
 | Capability | kiro-cli alone | With Kiro Crew |
 |---|---|---|
 | Sessions | One per terminal | Many concurrent (channel threads, dashboard slots, cron jobs, subagents, task steps) |
-| Surfaces | Terminal only | CLI, web dashboard, Electron desktop, and seven messaging channels |
+| Surfaces | Terminal only | CLI, web dashboard, Electron desktop, and the messaging channels under [`src/kiro_crew/docs/`](../../src/kiro_crew/docs/README.md) (Slack, Discord, Telegram, Teams, WeChat and more) |
 | Persistence | Per-directory transcript | Cross-session memory (preferences, projects, daily history, lessons) |
-| Cross-session awareness | None | Sessions share memory, so one session sees what another learned |
+| Cross-session awareness | None | Sessions bound to the same Global V1 or private member V2 store share its learning; separate member stores do not cross |
 | Scheduling | None | Cron jobs (`every` / `at` / `cron` expression) with cross-process file locking |
 | Autonomous tasks | None | TaskRunner: spec, decompose, execute, retry, replan, checkpoint |
 | Self-learning | None | Lessons extracted from corrections, injected into later sessions |
@@ -55,8 +64,9 @@ kiro-cli is a hard requirement for that path. The fork additionally supports
   human typing commands.
 - **Specialization.** Different surfaces and jobs can each run a different agent
   config concurrently.
-- **Accumulation.** Conversations feed shared memory and lessons persist, so a
-  later session starts with what an earlier one learned.
+- **Accumulation.** Conversations feed the memory store bound to their session
+  and lessons persist, so a later session on that store starts with what an
+  earlier one learned.
 
 ### The agent hierarchy
 
@@ -91,8 +101,8 @@ graph TB
     end
 
     subgraph "Agent Backend"
-        KC[kiro-cli<br/>ACP over stdio]
-        LLM[LLM Provider<br/><i>via kiro-cli auth</i>]
+        KC[ACP harness<br/><i>kiro-cli by default</i>]
+        LLM[LLM Provider<br/><i>via harness auth</i>]
         MCP[MCP Servers<br/><i>tools</i>]
     end
 
@@ -109,7 +119,7 @@ graph TB
 ## Message flow
 
 A user message is hooked, routed to a session, enriched with context, forwarded
-to kiro-cli over ACP, and streamed back.
+to the selected harness over ACP, and streamed back.
 
 ```mermaid
 sequenceDiagram
@@ -119,7 +129,7 @@ sequenceDiagram
     participant Hooks as HookManager
     participant Session as SessionManager
     participant Context as ContextBuilder
-    participant ACP as kiro-cli (ACP)
+    participant ACP as ACP harness (kiro-cli default)
     participant LLM as LLM
 
     User->>Surface: sends message
@@ -127,7 +137,7 @@ sequenceDiagram
     GW->>Hooks: auto-reply, transform, inject, deny
     Hooks-->>GW: pass / block / auto-reply
     GW->>Session: get_or_create(session_key, agent)
-    Session-->>GW: kiro-cli process (warm or cold)
+    Session-->>GW: ACP harness process (warm or cold)
     GW->>Context: assemble prompt context
     Note over Context: memory + skills + lessons<br/>+ history + cross-tab
     Context-->>GW: enriched context
@@ -207,7 +217,7 @@ graph TB
 
     subgraph "Security"
         HOOKS[hooks.py<br/>PreToolUse gate]
-        SEC[security.py<br/>Deny rules + paths]
+        SEC[security/<br/>Deny rules + paths]
         PLAT[platform/<br/>Governance + CPP seam]
         SEL[sel.py<br/>Security event log]
     end
@@ -256,14 +266,14 @@ graph TB
     end
 
     subgraph "Session Pool"
-        WARM[Warm Pool<br/><i>pre-started kiro-cli</i>]
+        WARM[Warm Pool<br/><i>pre-started ACP harnesses</i>]
         ACTIVE[Active Sessions<br/><i>keyed by session_key</i>]
     end
 
-    subgraph "kiro-cli Processes"
-        P1[kiro-cli acp --agent kirocrew]
-        P2[kiro-cli acp --agent reviewer]
-        P3[kiro-cli acp --agent ...]
+    subgraph "ACP Harness Processes"
+        P1[default: kiro-cli acp --agent kirocrew]
+        P2[default: kiro-cli acp --agent reviewer]
+        P3[alternative ACP harness]
     end
 
     S1 --> ACTIVE
@@ -284,11 +294,11 @@ graph TB
   older than `session.pool_ttl_secs` (default 1800s) are discarded at claim time.
 - **Idle timeout** reclaims a session after `session.timeout_secs`, default
   **3600s**.
-- **Turn ceiling**: `agent.chat_turn_timeout_secs` defaults to **7200s** (2h),
-  clamped to 300s..7200s and never disable-able. It is a runaway backstop, so a
+- **Turn ceiling**: `agent.chat_turn_timeout_secs` defaults to **14400s** (4h),
+  clamped to 300s..86400s (`CHAT_TURN_TIMEOUT_MAX`, deliberately decoupled from the 14400s default) and never disable-able. It is a runaway backstop, so a
   turn that hits it ends with a card naming the limit rather than failing
-  silently. The ACP transport carries its own prompt timeout of the same
-  magnitude and bounds the turn first.
+  silently. The ACP transport's prompt timeout follows the configured ceiling
+  (plus a margin) so the dashboard's card always fires first.
 - **Tool-approval window**: `agent.tool_approval_timeout_secs` defaults to
   **600s** (10 min). It must expire *inside* the turn that opened it — otherwise
   an unanswered prompt is reported as a turn timeout and the real cause is lost —
@@ -333,12 +343,15 @@ order, and the order is load-bearing:
    session, so they would otherwise outlive the gateway).
 6. Concurrently: cancel subagents, close all sessions, close WebSocket
    connections and then the dashboard runner, close each channel client, and
-   cancel background tasks (model download, home migration, update check).
+   cancel background tasks (model download, memory-store auto-migration, update check).
 
 ## Memory lifecycle
 
 Memory is what lets a new session benefit from past conversations without
-replaying them.
+replaying them. The diagram below is the Global V1 path. A member-bound V2
+session instead uses one managed SQLite store under
+`~/.kiro/crew/memory_stores/<store>/`; unavailable V2 memory fails explicitly
+rather than falling back to Global V1.
 
 ```mermaid
 graph LR
@@ -382,7 +395,7 @@ graph LR
     DAILY --> VSIM
 ```
 
-**History decay** (`memory.read_recent_history`, default window 14 days): a day
+**Global V1 history decay** (`memory.read_recent_history`, default window 14 days): a day
 newer than the requested window is injected in full; days from the window
 boundary through day 60 are summarized (header plus the first entry, with a count
 of the rest); days 61 through 180 collapse to a one-line marker naming the date
@@ -442,12 +455,20 @@ Outer to inner:
    only as strong as the config, and the agent can write agent JSON. Rules are
    default-ON and user-configurable from Settings → Security; the governance
    `commands` scope is the force-pin a user cannot opt out of. Sensitive-path
-   blocking (`~/.aws`, `~/.ssh`, the trust-root files) runs here too.
+   blocking (`~/.aws`, `~/.ssh`, the trust-root files) runs here too — for the
+   **file tools' resolved paths**. A shell command's text is deliberately not
+   path-matched; what a spawned shell can `open()` is decided by the OS sandbox
+   tier below.
 4. **OS sandbox** (`sandbox.py`). `agent.sandbox` defaults to `auto`, engaging
    OS-level isolation (user namespaces on Linux, `sandbox-exec`/Seatbelt on
-   macOS). On macOS, when kiro-cli's own internal sandbox is enabled, Kiro Crew
-   delegates to it instead (the two are mutually exclusive because nested
-   Seatbelt profiles fail with EPERM). Set to `off` to skip Kiro Crew's sandbox.
+   macOS) at the **standard** tier, which masks `~/.gnupg`, `~/.docker`,
+   `~/.azure`, `~/.config/gcloud` and the crew vault but deliberately leaves
+   `~/.aws`, `~/.ssh` and `~/.kube` visible so the `aws` CLI,
+   `credential_process`, git-over-SSH and `kubectl` work inside the agent. Set
+   `strict` to also mask those (at the cost of those tools); set `off` to skip
+   Kiro Crew's sandbox. On macOS, when kiro-cli's own internal sandbox is
+   enabled, Kiro Crew delegates to it instead of applying either tier (the two
+   are mutually exclusive because nested Seatbelt profiles fail with EPERM).
 5. **Output redaction.** Credential shapes (AWS access key IDs, presigned-URL
    credential parameters, and more) are scrubbed before text reaches a user or
    an egress tool.
@@ -498,14 +519,14 @@ surface up there cannot be built as an app, the missing seam is the bug to file.
 
 **That boundary is enforced against the agent, not against app code.** Every
 control in the table gates the agent's tool-call surface. An app's Python runs in
-the gateway process: `src/kiro_crew/apps/module_loader.py:34-39` states that the
+the gateway process: `apps.module_loader._warn_third_party_execution` states that the
 permission system "does NOT restrict `import`, filesystem, network, or access to
 in-memory credentials. Installing an app is therefore equivalent to granting it
 full gateway-process privileges." So the table says what no app may be *asked* to
 supply, and the mechanism that would stop one supplying it anyway does not exist
 yet — the keystone path list is a mutable module-level list
-(`src/kiro_crew/security.py:4436`), and app admission admits when no policy file
-is present (`src/kiro_crew/apps/admission.py:25-30`). Read the table as the
+(`security._SENSITIVE_HOME_DIRS`), and app admission admits when no policy file
+is present (`apps.admission`). Read the table as the
 intended boundary and
 [`../request-for-change/rfc-app-sandbox-isolation.md`](../request-for-change/rfc-app-sandbox-isolation.md)
 as the work that makes it real.
@@ -531,10 +552,10 @@ open against that standard today:
   `on_shutdown`) and `setup.onEnable` / `onDisable` are the in-gateway entry
   points, and none of them lets an app take a position in a flow the core owns.
   `HookManager` is built only from `config.json`'s `hooks` section
-  (`src/kiro_crew/hooks.py:931`) and exposes no registration path.
+  (`hooks.HookManager.__init__`) and exposes no registration path.
 - The platform states no version for its own app-facing surface.
   `minKiroCrewVersion` is a floor an app declares about the gateway, checked at
-  install and update only (`src/kiro_crew/apps/manager.py:281`), so changing or
+  install and update only (`apps.manager._check_min_version`), so changing or
   withdrawing a seam carries no compatibility promise in the other direction.
 - Manifest fields that nothing reads. `ui.sidebar.section` and `ui.sidebar.order`
   are documented and parsed, and the dashboard does not place apps by them, so
@@ -596,27 +617,32 @@ graph LR
     end
 
     subgraph "Required"
-        KIRO[kiro-cli<br/><i>agent runtime</i>]
-        LLM2[LLM Provider<br/><i>via kiro-cli auth</i>]
+        KIRO[kiro-cli<br/><i>baseline/default ACP harness</i>]
+        LLM2[LLM Provider<br/><i>via selected harness auth</i>]
     end
 
     subgraph "Optional"
+        ACP_ALT[Alternative ACP harness]
         CHAN_API[Messaging APIs<br/><i>Slack, Discord, …</i>]
         MCP_EXT[External MCP Servers<br/><i>user-configured</i>]
         AWS[AWS<br/><i>cloud launcher, artifact deploy, cloud STT</i>]
     end
 
     GW2 --> KIRO
+    GW2 -.-> ACP_ALT
     KIRO --> LLM2
+    ACP_ALT -.-> LLM2
     GW2 -.-> CHAN_API
     KIRO -.-> MCP_EXT
+    ACP_ALT -.-> MCP_EXT
     GW2 -.-> AWS
 ```
 
 | Dependency | Required | Purpose |
 |---|---|---|
-| **kiro-cli** | Yes | Agent runtime: LLM inference plus tool execution |
-| **LLM provider** | Yes | Reached through kiro-cli's authenticated connection |
+| **kiro-cli** | Yes | Baseline and default ACP harness; also serves the KAS backend |
+| **LLM provider** | Yes | Reached through the selected ACP harness's authenticated connection |
+| **Alternative ACP harness** | No | Optional runtime selected by `agent.acp_backend`; see the provider spec |
 | **Messaging APIs** | No | Slack, Discord, Telegram, Webex, WeCom, Teams, Weixin gateways (the dashboard works without any) |
 | **AWS** | No | Cloud launcher, artifact deploy, optional cloud STT |
 | **External MCP servers** | No | Additional tools, user-configured |
@@ -628,8 +654,9 @@ there is no optional embedding service to stand up.
 
 Persistent state lives under `~/.kiro/crew/` (override with `KIROCREW_HOME`).
 The root nests under kiro-cli's own `~/.kiro/` so every Kiro-family app shares
-one directory a user can secure; a legacy `~/.kirocrew` is migrated
-automatically. Selected entries:
+one directory a user can secure. A legacy `~/.kirocrew` is fully deprecated and
+does not auto-migrate; it survives only in sensitive-path deny lists. Selected
+entries:
 
 ```
 ~/.kiro/crew/
@@ -642,8 +669,10 @@ automatically. Selected entries:
 │   ├── memory/             # preferences.md, projects.md, history/
 │   ├── knowledge/          # knowledge.db (FTS5 + graph + vectors)
 │   └── HEARTBEAT.md        # heartbeat task list
+├── members/                # stable crew-member identities and briefs
+├── memory_stores/          # member/named stores (SQLite memory + lessons)
 ├── sessions/               # JSONL conversation logs (+ archive/)
-├── lessons.jsonl           # learned corrections
+├── lessons.jsonl           # Global V1 learned corrections
 ├── crons.json              # scheduled jobs
 ├── crons/                  # cron script bodies
 ├── hooks.json              # webhook workflow context
@@ -671,7 +700,7 @@ detail; this table is only an index.
 |---|---|---|
 | ACP client (JSON-RPC transport to kiro-cli) | `src/kiro_crew/acp/` | [acp-client.md](../system-specs/modules/acp-client.md) |
 | App Kit platform contracts | `src/kiro_crew/apps/` | [app-kit-platform.md](../system-specs/modules/app-kit-platform.md) |
-| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py` | [artifacts.md](../system-specs/modules/artifacts.md) |
+| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py`, `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
 | Browser automation auth layer | `src/kiro_crew/browser/` | [browser.md](../system-specs/modules/browser.md) |
 | Channel history buffer | `src/kiro_crew/channel_history.py` | [channel-history.md](../system-specs/modules/channel-history.md) |
 | CLI surface | `src/kiro_crew/cli.py` | [cli.md](../system-specs/modules/cli.md) |
@@ -685,7 +714,7 @@ detail; this table is only an index.
 | Instances (multi-instance over SSH) | `src/kiro_crew/instances/` | [instances.md](../system-specs/modules/instances.md) |
 | Issue Radar app | `src/kiro_crew/apps/builtins/issue_radar/` | [issue-radar.md](../system-specs/modules/issue-radar.md) |
 | Knowledge library (ingest + hybrid retrieval) | `src/kiro_crew/knowledge/` | [knowledge.md](../system-specs/modules/knowledge.md) |
-| Self-learning, cron, and dashboard API | `src/kiro_crew/learn.py`, `cron.py`, `dashboard/` | [learn-cron-dashboard.md](../system-specs/modules/learn-cron-dashboard.md) |
+| Self-learning, cron, and dashboard API | `src/kiro_crew/learn.py`, `cron.py`, `cron_service/`, `dashboard/` | [learn-cron-dashboard.md](../system-specs/modules/learn-cron-dashboard.md) |
 | MCP Apps (interactive `ui://` rendering) | `src/kiro_crew/mcp_gateway/` | [mcp-apps.md](../system-specs/modules/mcp-apps.md) |
 | Markdown Notebook app | `src/kiro_crew/apps/builtins/md_notebook/` | [md-notebook.md](../system-specs/modules/md-notebook.md) |
 | Meetings app | `src/kiro_crew/apps/builtins/meetings/` | [meetings.md](../system-specs/modules/meetings.md) |
@@ -693,13 +722,13 @@ detail; this table is only an index.
 | Messaging transport abstraction | `src/kiro_crew/messaging/` | [messaging.md](../system-specs/modules/messaging.md) |
 | Metrics telemetry (default off) | `src/kiro_crew/metrics/` | [metrics.md](../system-specs/modules/metrics.md) |
 | Mochi app (desktop pet) | `src/kiro_crew/apps/builtins/mochi/` | [mochi.md](../system-specs/modules/mochi.md) |
-| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
+| Foreign-agent onboarding import | `src/kiro_crew/onboarding_import.py`, `onboarding_scan.py`, `onboarding_plan.py`, `onboarding_apply.py`, `onboarding_sources/` | [onboarding-import.md](../system-specs/modules/onboarding-import.md) |
 | Papyrus app (LaTeX authoring) | `src/kiro_crew/apps/builtins/papyrus/` | [papyrus.md](../system-specs/modules/papyrus.md) |
 | Persistent agent channels | `src/kiro_crew/channel.py` | [persistent-agent-channels.md](../system-specs/modules/persistent-agent-channels.md) |
 | Platform context (CPP seam) | `src/kiro_crew/platform/` | [platform-context.md](../system-specs/modules/platform-context.md) |
 | PPTX Maker app | `src/kiro_crew/apps/builtins/pptx_maker/` | [pptx-maker.md](../system-specs/modules/pptx-maker.md) |
 | Providers (LLMProvider ABC + ACP provider) | `src/kiro_crew/providers/` | [providers.md](../system-specs/modules/providers.md) |
-| Security controls (deny rules, paths, auth) | `src/kiro_crew/security.py` | [security.md](../system-specs/modules/security.md) |
+| Security controls (deny rules, paths, auth) | `src/kiro_crew/security/` | [security.md](../system-specs/modules/security.md) |
 | Security Event Log | `src/kiro_crew/sel.py` | [sel.md](../system-specs/modules/sel.md) |
 | Session manager (pool, expiry, compaction) | `src/kiro_crew/session.py` | [session.md](../system-specs/modules/session.md) |
 | Side conversations | `src/kiro_crew/dashboard/side_state.py` | [side.md](../system-specs/modules/side.md) |
@@ -708,10 +737,13 @@ detail; this table is only an index.
 | Task state machine | `src/kiro_crew/task.py` | [task.md](../system-specs/modules/task.md) |
 | TaskRunner (spec to plan to execution) | `src/kiro_crew/taskrunner.py` | [taskrunner.md](../system-specs/modules/taskrunner.md) |
 | Themes | `src/kiro_crew/dashboard/handlers/themes.py` | [themes.md](../system-specs/modules/themes.md) |
+| Third-party account connections | `src/kiro_crew/connections/` | [connections.md](../system-specs/modules/connections.md) |
 
-Smaller, feature-scoped specs live in
-[`../system-specs/features/`](../system-specs/features/), and cross-cutting
-patterns in [`../system-specs/common/`](../system-specs/common/).
+This table indexes the principal subsystems, not every spec.
+[`../system-specs/modules/README.md`](../system-specs/modules/README.md) is the
+complete spec index — one index, so a spec cannot be reachable from one and missing
+from the other — and cross-cutting patterns are in
+[`../system-specs/common/`](../system-specs/common/).
 
 ## How it fits together
 
@@ -777,6 +809,7 @@ The dashboard port default is 5476, overridable with `KIROCREW_PORT`.
 ## Further reading
 
 - [`../system-specs/README.md`](../system-specs/README.md): the spec index
+- [`../system-specs/modules/providers.md`](../system-specs/modules/providers.md): ACP harnesses and capability differences
 - [`mcp.md`](mcp.md): MCP server discovery and tool management
 - [`security-deep-dive.md`](security-deep-dive.md): security model in depth
 - [`resource-protection.md`](resource-protection.md): resource limits and backpressure

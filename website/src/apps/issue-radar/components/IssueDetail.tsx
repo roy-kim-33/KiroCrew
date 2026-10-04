@@ -61,6 +61,7 @@ import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
 import { providerTerms, readOnlyHint } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtDateTime, fmtDateTimeNumeric } from '../../../i18n/format'
 /** A relative timestamp that flips to the absolute local date-time when
  * clicked (and always shows it on hover). Within the last 24h it reads
@@ -80,7 +81,7 @@ function RelTime({ iso, className = '' }: { iso?: string | null; className?: str
       title={absolute}
       onClick={(e) => { e.stopPropagation(); toggle() }}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle() } }}
-      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent/40 ${className}`}
+      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/40 ${className}`}
     >
       {abs ? absolute : relativeTimeOrDate(iso)}
     </span>
@@ -181,7 +182,6 @@ function AiSuggestions({
               initial={reduce ? false : { opacity: 0, y: 4 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.25, ease: 'easeOut', delay: reduce ? 0 : i * 0.05 }}
-              whileHover={canWrite && !reduce ? { y: -1 } : undefined}
               onClick={() => onAccept(s.name)}
               disabled={!canWrite || pending}
               title={tip}
@@ -190,7 +190,7 @@ function AiSuggestions({
                 borderColor: hexToRgba(color, 0.5),
                 color: 'var(--text)',
               }}
-              className="group relative inline-flex items-center gap-1 max-w-full rounded-full px-2 py-0.5 text-[12px] border border-dashed cursor-pointer overflow-hidden disabled:cursor-default"
+              className="group relative inline-flex items-center gap-1 max-w-full rounded-full px-2 py-0.5 text-[12px] border border-dashed cursor-pointer overflow-hidden enabled:hover:brightness-125 disabled:cursor-default"
             >
               {/* A gentle drift in the label's OWN colour — subtle, not flashy. */}
               {!reduce && (
@@ -516,16 +516,11 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
   const copyLink = async () => {
     const attempt = ++copyAttemptRef.current
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
-    let next: 'copied' | 'failed'
-    try {
-      await copyToClipboard(detail?.url ?? issue.url)
-      next = 'copied'
-    } catch {
-      // Reported, never swallowed: a row that does nothing on press is
-      // indistinguishable from a copy that worked, so the URL is silently
-      // missing from the clipboard at the moment it is about to be pasted.
-      next = 'failed'
-    }
+    const ok = await copyToClipboard(detail?.url ?? issue.url)
+    // Reported, never swallowed: a row that does nothing on press is
+    // indistinguishable from a copy that worked, so the URL is silently
+    // missing from the clipboard at the moment it is about to be pasted.
+    const next = ok ? 'copied' : 'failed'
     if (attempt !== copyAttemptRef.current) return
     setCopyStatus(next)
     copyTimerRef.current = setTimeout(() => setCopyStatus('idle'), 1500)
@@ -923,9 +918,14 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               </DetailOverflowMenu>
             </>}
             extra={stateMutation.isError && (
-              <div className="mt-2 text-[12px] text-danger">
-                {(stateMutation.error as Error).message}
-              </div>
+              /* Acts on a persisted issue; this pane holds no composer, so the
+                 hand-off loses nothing. Same for the three notices below. */
+              <ErrorNotice
+                message={(stateMutation.error as Error).message}
+                variant="inline"
+                askAgent
+                className="mt-2"
+              />
             )}
           />
 
@@ -1000,7 +1000,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
 
             {activityLoading && <TimelineSkeleton />}
             {activityError && (
-              <div className="py-2 text-[12px] text-danger">{i18nT('apps.issueRadar.components.issueDetail.couldn_t_load_activity')} {activityError.message}</div>
+              <ErrorNotice
+                title={i18nT('apps.issueRadar.components.issueDetail.couldn_t_load_activity')}
+                message={activityError.message}
+                askAgent
+                className="my-2"
+              />
             )}
             {!activityLoading && !activityError && activityDesc.length === 0 && (
               <div className="py-2 text-[12px] text-muted">{i18nT('apps.issueRadar.components.issueDetail.no_activity_yet')}</div>
@@ -1060,7 +1065,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               )}
 
               {assigneesMutation.isError && (
-                <div className="mt-2 text-[11px] text-danger">{(assigneesMutation.error as Error).message}</div>
+                <ErrorNotice
+                  message={(assigneesMutation.error as Error).message}
+                  variant="inline"
+                  askAgent
+                  className="mt-2"
+                />
               )}
             </Section>
 
@@ -1111,7 +1121,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               />
 
               {labelMutation.isError && (
-                <div className="mt-2 text-[11px] text-danger">{(labelMutation.error as Error).message}</div>
+                <ErrorNotice
+                  message={(labelMutation.error as Error).message}
+                  variant="inline"
+                  askAgent
+                  className="mt-2"
+                />
               )}
             </Section>
 

@@ -1,23 +1,29 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
-import { Component, ExternalLink, MessageSquare, MessageSquarePlus, Send, Loader2, Copy, Maximize2, Minimize2 } from 'lucide-react'
+import { Component, Copy, ExternalLink, MessageSquare, MessageSquarePlus, Send, Loader2, Maximize2, Minimize2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import DetailPanel from './DetailPanel'
 import Clickable from './Clickable'
 import SelectionToolbar, { type SelectionAction } from './SelectionToolbar'
 import { SendBtn } from './ui'
+import ErrorNotice from './ErrorNotice'
 import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage } from './ArtifactBody'
 import { useFileArtifactComments } from './FileArtifactComments'
+import { useConfirm } from './ConfirmDialog'
 import { formatArtifactCommentsMessage } from './CommentOverlay'
+import { filterCommentsForForward } from '../lib/commentFilter'
 import { copyToClipboard } from '../utils/clipboard'
+import { safeSetItem } from '../utils/safeStorage'
 import { offlineProps } from '../utils/offline'
 import { api } from '../api/client'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useArtifactLiveReload } from '../hooks/useArtifactLiveReload'
 import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { isEditableTarget } from '../utils/editableTarget'
 interface Props {
   slug: string
   /** Kind captured at open time; the live query overrides it once loaded. */
@@ -33,8 +39,11 @@ interface Props {
   active?: boolean
   /** Mirror of the local-file submit path: sends a formatted USER message to
    *  the chat session the panel was opened from (panel.slot). When omitted the
-   *  submit-to-chat affordance is hidden (read-only embedding). */
-  onSubmitComments?: (message: string) => void
+   *  submit-to-chat affordance is hidden (read-only embedding). The return is
+   *  an optional delivery verdict: an explicit `false` (or a promise of one)
+   *  means the message was NOT delivered, so the batch must stay pending; any
+   *  other return counts as delivered. */
+  onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
   /** Gateway connection flag. Gates the submit-to-chat affordance (mirrors
    *  ChatInput's Send gating) so a batch submit can't fire while the chat
    *  send path would silently refuse it. Defaults true for embeddings
@@ -50,6 +59,14 @@ interface Props {
 }
 
 const BODY_HEIGHT_STYLE: React.CSSProperties = { height: '100%', minHeight: 0 }
+
+/** Sent-to-chat comment ids for one artifact — see "submitted-to-chat
+ *  tracking" in the component. A corrupt/absent entry reads as "nothing
+ *  sent yet", which only ever over-counts the pending batch. */
+const readSentIds = (key: string): Set<string> => {
+  try { return new Set<string>(JSON.parse(localStorage.getItem(key) || '[]')) }
+  catch { return new Set<string>() }
+}
 // Non-fullscreen sidebar stacks below content (not beside it) and is
 // height-capped so content stays the primary region in the narrow panel.
 const STACKED_SIDEBAR_CLASS = 'w-full shrink-0 flex flex-col rounded-xl border border-border bg-card overflow-hidden'
@@ -57,8 +74,11 @@ const STACKED_SIDEBAR_STYLE: React.CSSProperties = { maxHeight: 280, minHeight: 
 
 /** Submit-to-chat bar with an optional "Add instruction" affordance. The
  *  free-form note is threaded through as the `extraPrompt` arg only when the
- *  toggle is open, and cleared after submit. */
-function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
+ *  toggle is open, and cleared after submit.
+ *
+ *  Exported so the standalone artifact page can put the SAME bar in the comments
+ *  sidebar's footer, rather than growing a second one that drifts. */
+export function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
   count: number; submitting: boolean; onSubmit: (extraPrompt?: string) => void
   /** Bleed to the panel edges (non-fullscreen, inside the negative-margin
    *  content wrapper). Fullscreen uses its own padding, so omit it there. */
@@ -102,7 +122,7 @@ function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = tru
           value={extraPrompt}
           onChange={e => setExtraPrompt(e.target.value)}
           rows={2}
-          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
         />
       )}
     </div>
@@ -145,15 +165,39 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     staleTime: 10_000,
   })
   const artifact = detailQuery.data
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead.
+  useArtifactLiveReload(slug, artifact?.source_path)
   const effectiveKind = artifact?.kind ?? kind
   const effectiveContent = artifact?.content ?? content
   const name = artifact?.name ?? slug
   const usesIframe = effectiveKind === 'widget' || effectiveKind === 'html'
+  // Where a selection can become an anchored comment: an iframe body (through
+  // the bridge) and the two native kinds whose renderer attaches the preview
+  // ref the anchor resolver maps a selection against (the same two the
+  // artifact page allows). `ArtifactBodyNative` renders json / svg / image
+  // through rich viewers that attach no ref, so a toolbar over those could
+  // never open — it is not mounted at all rather than mounted dead.
+  const canAnchorComments = usesIframe || effectiveKind === 'markdown' || effectiveKind === 'text'
   // The panel opens synchronously without awaiting the fetch, so only show the
   // loading state when we genuinely have nothing yet (no seed and the shared
   // query is still in flight) — otherwise the seed renders and never flashes.
   const isHydrating = detailQuery.isLoading && !artifact && !content
   const loadFailed = detailQuery.isError && !artifact && !content
+
+  // Escape / ✕ on a typed comment draft, and the panel's own full-screen and
+  // close actions (each unmounts the toolbar the draft lives in), ask first —
+  // in the draft's own words, since "unsaved changes" would read as file edits.
+  const { confirm, confirmDialog } = useConfirm()
+  const confirmDiscardDraft = useCallback(() => confirm({
+    title: i18nT('components.markdownPanel.discard_unsaved_comment'),
+    confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
+    // Raised from inside the full-screen shell too (Exit full screen over a
+    // draft): that shell is an opaque body portal at z-[9999], so the prompt
+    // must take the layer above it or the button looks dead.
+    layer: 'top',
+  }), [confirm])
 
   // Two instances (non-fullscreen body / fullscreen body) read the SAME durable
   // comments via the shared query cache; only local UI state (sidebar open,
@@ -163,28 +207,59 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     sidebarDefaultOpen: false,
     sidebarClassName: STACKED_SIDEBAR_CLASS,
     sidebarStyle: STACKED_SIDEBAR_STYLE,
+    confirmDiscardDraft,
   })
-  const faFull = useFileArtifactComments({ slug, previewRef: fsPreviewRef, scrollRef: fsScrollRef, usesIframe })
+  const faFull = useFileArtifactComments({ slug, previewRef: fsPreviewRef, scrollRef: fsScrollRef, usesIframe, confirmDiscardDraft })
   // The active comment layer for the visible surface.
   const active = fullscreen ? faFull : fa
+  /** Run `proceed` unless the visible layer's comment draft would be lost, in
+   *  which case ask first (the layer's own guard: it knows the passage whose
+   *  persisted copy a confirmed discard must drop). */
+  const guardDraft = active.guardCommentDraft
+  const enterFullscreen = useCallback(() => { void guardDraft(() => setFullscreen(true)) }, [guardDraft])
+  const exitFullscreen = useCallback(() => { void guardDraft(() => setFullscreen(false)) }, [guardDraft])
+  const requestClose = useCallback(() => { void guardDraft(onClose) }, [guardDraft, onClose])
 
-  // Selection → anchored comment, reusing the active layer's create popover.
-  const handleCommentAction = useCallback(() => {
-    active.requestAnchoredComment()
-    window.getSelection()?.removeAllRanges()
-  }, [active])
-  const handleCopyAction = useCallback((text: string) => { if (text) copyToClipboard(text) }, [])
-  const selectionActions: SelectionAction[] = useMemo(() => [
-    { id: 'comment', icon: <MessageSquarePlus size={12} />, label: 'Comment', onClick: handleCommentAction },
-    // Icon only — a text "Copy" label would render as "Copy Copy" beside the label.
-    { id: 'copy', icon: <Copy size={12} />, label: 'Copy', onClick: handleCopyAction },
-  ], [handleCommentAction, handleCopyAction])
+  // Selecting text opens the layer's type-first comment composer (see
+  // `useFileArtifactComments().selectionComposer`). No row action beside it:
+  // the box already carries Add comment and Close, and a third control would
+  // break the two-per-row cap. Copying the selection is the composer's own
+  // Cmd/Ctrl+C while its input is empty.
+  const selectionActions: SelectionAction[] = useMemo(() => [], [])
+  // The kinds no anchor resolver can map (json, svg, …) get no composer — but
+  // they keep the Copy row the panel shipped before it: on touch there is no
+  // Cmd/Ctrl+C, so without a control a selection there has no reachable copy.
+  // One control, so the row is inside the two-per-row cap on its own.
+  const copyOnlyActions: SelectionAction[] = useMemo(() => [
+    { id: 'copy', icon: <Copy size={12} />, label: i18nT('components.selectionToolbar.copy'), onClick: (text: string) => copyToClipboard(text) },
+  ], [])
 
-  // Human-only: agent comments are filtered out here AND defensively inside
-  // formatArtifactCommentsMessage (which applies the hardened esc()).
-  const humanComments = useMemo(
-    () => fa.comments.filter(c => !c.is_agent),
-    [fa.comments],
+  // ── submitted-to-chat tracking ──
+  // Durable artifact comments survive a chat submission (unlike the local-file
+  // pending list, which the submit clears), so without per-id tracking every
+  // Submit would re-send the whole comment history and the "N comments to send"
+  // count would never reset — the bar reads as stuck on the previous batch and
+  // newly added comments are indistinguishable inside the stale total. Sent ids
+  // are persisted per artifact (mirroring the `mc-cmt-read:` key in
+  // useFileArtifactComments) so a slot switch / remount doesn't resurrect an
+  // already-sent batch.
+  // ponytail: append-only like the read-tracking key — ids of since-deleted
+  // comments linger harmlessly (pruning against a possibly-stale comment list
+  // could resurrect sent ids); cross-window sync is on remount only; an edit
+  // to an already-sent comment does not re-queue it.
+  const sentKey = `mc-cmt-sent:${slug}`
+  const [sentIds, setSentIds] = useState<Set<string>>(() => readSentIds(sentKey))
+  // Re-read when the panel is reused for a different artifact.
+  useEffect(() => { setSentIds(readSentIds(sentKey)) }, [sentKey])
+  // Pending = forwarding-eligible AND human-authored AND not yet submitted.
+  // The three filters answer different questions and all three are needed:
+  // filterCommentsForForward drops threads already resolved, `!is_agent` drops
+  // agent-authored comments (also filtered defensively inside
+  // formatArtifactCommentsMessage, hardened esc()), and `!sentIds.has` stops an
+  // already-submitted batch being re-sent.
+  const pendingComments = useMemo(
+    () => filterCommentsForForward(fa.comments).filter(c => !c.is_agent && !sentIds.has(c.id)),
+    [fa.comments, sentIds],
   )
   const [submitting, setSubmitting] = useState(false)
   // Tracks the "submitting" reset timer so it can be cancelled on unmount —
@@ -196,16 +271,39 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     // Bail while offline: the chat send path silently refuses messages in
     // that state, so firing the fake "submitting" spinner would just mislead.
     // The Submit button is disabled offline too — this is the backstop.
-    if (!connected || !onSubmitComments || humanComments.length === 0) return
+    if (!connected || !onSubmitComments || pendingComments.length === 0) return
     setSubmitting(true)
+    const batch = pendingComments
+    // The send itself fires synchronously; only the MARKING waits for the
+    // host's delivery verdict. An explicit `false` (or a throw/rejection)
+    // means the chat send was refused, so the batch stays pending and Submit
+    // re-offers it — sent ids are append-only, so marking an undelivered
+    // batch would silently drop it with no re-surface path. A void-returning
+    // host counts as delivered (embeddings without a verdict keep the
+    // clear-on-submit behavior).
+    let verdict: void | boolean | Promise<void | boolean>
     try {
-      onSubmitComments(formatArtifactCommentsMessage(slug, name, humanComments, extraPrompt))
-    } finally {
-      // Brief guard against double-fire.
-      clearTimeout(submitResetTimer.current)
-      submitResetTimer.current = setTimeout(() => setSubmitting(false), 400)
+      verdict = onSubmitComments(formatArtifactCommentsMessage(slug, name, batch, extraPrompt))
+    } catch {
+      verdict = false
     }
-  }, [connected, onSubmitComments, humanComments, slug, name])
+    Promise.resolve(verdict)
+      .then(delivered => {
+        if (delivered === false) return
+        setSentIds(prev => {
+          const next = new Set(prev)
+          for (const c of batch) next.add(c.id)
+          safeSetItem(sentKey, JSON.stringify([...next]))
+          return next
+        })
+      })
+      .catch(() => { /* undelivered — keep the batch pending */ })
+      .finally(() => {
+        // Brief guard against double-fire, released after the verdict settles.
+        clearTimeout(submitResetTimer.current)
+        submitResetTimer.current = setTimeout(() => setSubmitting(false), 400)
+      })
+  }, [connected, onSubmitComments, pendingComments, slug, name, sentKey])
   useEffect(() => () => clearTimeout(submitResetTimer.current), [])
 
   // Esc closes fullscreen first, then the panel; lock body scroll while the
@@ -221,13 +319,17 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
       // Don't hijack Esc while the user is in an editable field (e.g. the
       // add-instruction textarea) — let the field handle it instead of
       // closing/exiting the panel out from under them.
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
-      if (fullscreen) setFullscreen(false); else onClose()
+      if (isEditableTarget(e)) return
+      // An open annotation box owns Escape: the toolbar closes it (and hands the
+      // selection back) on its own, and the box need not hold focus (a touch or
+      // Shift+Arrow open leaves the caret elsewhere) — the panel must not ALSO
+      // close or exit full screen out from under it. Mirrors MarkdownPanel.
+      if (active.isComposerOpen()) return
+      if (fullscreen) exitFullscreen(); else requestClose()
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [visible, fullscreen, onClose])
+  }, [visible, fullscreen, exitFullscreen, requestClose, active])
   useEffect(() => {
     if (!fullscreen) return
     document.body.style.overflow = 'hidden'
@@ -236,7 +338,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
 
   // Submit-to-chat is the side-panel analog of the detail page's companion
   // chat. Only rendered when the host actually supplies a submit channel.
-  const showSubmitBar = !!onSubmitComments && humanComments.length > 0
+  const showSubmitBar = !!onSubmitComments && pendingComments.length > 0
 
   // `flush` drops the native body's card chrome so a markdown artifact in the
   // side panel looks like a markdown FILE in the side panel — same edge-to-edge
@@ -262,8 +364,13 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
           <span className="text-[13px]">{i18nT('components.artifactPanel.loading_artifact')}</span>
         </div>
       ) : loadFailed ? (
-        <div className="h-full flex items-center justify-center px-6 text-center text-[13px] text-danger">
-          {i18nT('components.artifactPanel.couldn_t_load_this_artifact_it_may_have_been_del')}
+        <div className="h-full flex items-center justify-center px-6">
+          {/* Read failure before anything loaded — nothing in the panel to lose, so the hand-off is on. */}
+          <ErrorNotice
+            askAgent
+            testId="artifact-panel-load-error"
+            message={i18nT('components.artifactPanel.couldn_t_load_this_artifact_it_may_have_been_del')}
+          />
         </div>
       ) : effectiveKind === 'image' && artifact ? (
         <ArtifactBodyImage
@@ -329,7 +436,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
       embedded={embedded}
       icon={<Component size={14} className="text-accent shrink-0" />}
       title={<span className="truncate">{name}</span>}
-      onClose={onClose}
+      onClose={requestClose}
       initialWidth={480}
       minWidth={420}
       storageKey="mc-panel-width"
@@ -338,7 +445,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
           {commentsToggle(fa.sidebarOpen, fa.toggleSidebar)}
           <button
             className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all"
-            onClick={() => setFullscreen(true)}
+            onClick={enterFullscreen}
             title={i18nT('components.artifactPanel.full_screen')}
             aria-label={i18nT('components.artifactPanel.full_screen')}
           ><Maximize2 size={14} /></button>
@@ -369,10 +476,20 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
           <div className="mt-3 pr-2 shrink-0">{fa.sidebar}</div>
         )}
         {showSubmitBar && (
-          <SubmitBar count={humanComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} bleed />
+          <SubmitBar count={pendingComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} bleed />
         )}
       </div>
-      {!usesIframe && !fullscreen && <SelectionToolbar containerRef={scrollRef} actions={selectionActions} />}
+      {/* Listens on the preview itself, not the scroll box around it, so the
+          composer only opens over text the anchor resolver can map. For an
+          iframe body the preview ref is never attached — the frame's
+          selections arrive through the bridge as `iframeSelection` instead and
+          `externalOnly` keeps the toolbar's own selection check off — so the
+          scroll box stands in as the container: it is what the box's placement
+          clamps to, and an unattached ref would let a right-half bridge
+          selection open the box over the comments sidebar. Suspended with the
+          tab so a hidden panel's open box does not stay on screen. */}
+      {!fullscreen && canAnchorComments && <SelectionToolbar containerRef={usesIframe ? scrollRef : previewRef} actions={selectionActions} composer={fa.selectionComposer} externalSelection={fa.iframeSelection} externalOnly={usesIframe} suspended={!visible} />}
+      {!fullscreen && !canAnchorComments && <SelectionToolbar containerRef={scrollRef} actions={copyOnlyActions} suspended={!visible} />}
       {!fullscreen && fa.popovers}
     </DetailPanel>
     {fullscreen && createPortal(
@@ -415,7 +532,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
               title={i18nT('components.artifactPanel.open_full_artifact_page')}
               aria-label={i18nT('components.artifactPanel.open_full_artifact_page')}
             ><ExternalLink size={14} /></button>
-            <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={() => setFullscreen(false)} title={i18nT('components.artifactPanel.exit_full_screen_esc')} aria-label={i18nT('components.artifactPanel.exit_full_screen')}><Minimize2 size={14} /></button>
+            <button className="p-1.5 rounded-md border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all" onClick={exitFullscreen} title={i18nT('components.artifactPanel.exit_full_screen_esc')} aria-label={i18nT('components.artifactPanel.exit_full_screen')}><Minimize2 size={14} /></button>
           </div>
         </div>
         <div className="relative flex-1 overflow-hidden min-h-0 px-16 py-4">
@@ -426,17 +543,19 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
             {faFull.sidebarOpen && faFull.sidebar}
           </div>
         </div>
-        {!usesIframe && <SelectionToolbar containerRef={fsScrollRef} actions={selectionActions} />}
+        {canAnchorComments && <SelectionToolbar containerRef={usesIframe ? fsScrollRef : fsPreviewRef} actions={selectionActions} composer={faFull.selectionComposer} externalSelection={faFull.iframeSelection} externalOnly={usesIframe} suspended={!visible} />}
+        {!canAnchorComments && <SelectionToolbar containerRef={fsScrollRef} actions={copyOnlyActions} suspended={!visible} />}
         {faFull.popovers}
         {showSubmitBar && (
           <div className="shrink-0 px-16 pb-3">
-            <SubmitBar count={humanComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} />
+            <SubmitBar count={pendingComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} />
           </div>
         )}
         <Clickable className="shrink-0 flex items-center px-16 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.artifactPanel.click_to_copy_slug')} onClick={() => copyToClipboard(slug)}>{i18nT('components.artifactPanel.artifacts')}{slug}</Clickable>
       </div>,
       document.body
     )}
+    {confirmDialog}
     </>
   )
 })

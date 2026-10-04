@@ -14,6 +14,12 @@
 #   --mise    Use mise (https://mise.jdx.dev) for Python and Node.js
 #             instead of system package managers. Does not modify your
 #             global mise config.
+#
+# Env:
+#   KIROCREW_ALLOW_SOURCE_BUILDS=1
+#             Let pip compile a dependency that has no prebuilt wheel for this
+#             host (needs a C toolchain and -dev headers). By default the
+#             install uses prebuilt wheels only and refuses instead of building.
 # ──────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -42,10 +48,14 @@ KIROCREW_APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 # pre-move ~/.kirocrew, which is not the data home).
 KIROCREW_DATA_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}"
 NODE_VERSION="24"
-# Minimum Node major the frontend build actually supports. Defined here
-# (not just at the post-install check) because DETECTION consults it: a
-# pre-existing but too-old node must not short-circuit the install ladder.
-NODE_MIN_MAJOR=22
+# Minimum Node version (major.minor.patch) Kiro Crew supports -- the same
+# floor as MIN_NODE_VERSION in src/kiro_crew/constants.py and ensure-node.sh.
+# A full version, not a major: an early 22.x lacks APIs the code needs
+# (worker_threads.markAsUncloneable landed in 22.10.0) and is below the
+# bundler's declared ">=22.12.0". Defined here (not just at the post-install
+# check) because DETECTION consults it: a pre-existing but too-old node must
+# not short-circuit the install ladder.
+NODE_MIN_VERSION="22.12.0"
 PYTHON_VERSION="3.12"
 KIROCREW_PORT="${KIROCREW_PORT:-5476}"
 ACP_NPM_PKG="@agentclientprotocol/claude-agent-acp"
@@ -129,8 +139,18 @@ has() { command -v "$1" >/dev/null 2>&1; }
 # fails the comparison, which is the intended answer.
 node_supported() {
     has node || return 1
-    _n="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
-    [ -n "$_n" ] && [ "$_n" -ge "$NODE_MIN_MAJOR" ] 2>/dev/null
+    _nv="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//')"
+    _maj="$(printf '%s' "$_nv" | cut -d. -f1)"
+    _min="$(printf '%s.0' "$_nv" | cut -d. -f2)"
+    _pat="$(printf '%s.0.0' "$_nv" | cut -d. -f3)"
+    _fmaj="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f1)"
+    _fmin="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f2)"
+    _fpat="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f3)"
+    [ "$_maj" -gt "$_fmaj" ] 2>/dev/null && return 0
+    [ "$_maj" -eq "$_fmaj" ] 2>/dev/null || return 1
+    [ "$_min" -gt "$_fmin" ] 2>/dev/null && return 0
+    [ "$_min" -eq "$_fmin" ] 2>/dev/null || return 1
+    [ "$_pat" -ge "$_fpat" ] 2>/dev/null
 }
 
 # ── Pre-flight ──
@@ -310,7 +330,7 @@ if node_supported; then
 elif has node; then
     # Present but below the floor: say so, then fall through to the install
     # ladder below rather than building against it.
-    info "Node.js $(node --version 2>/dev/null || echo v0) is below the supported floor (>= $NODE_MIN_MAJOR) — installing a supported Node…"
+    info "Node.js $(node --version 2>/dev/null || echo v0) is below the supported floor (>= v$NODE_MIN_VERSION) — installing a supported Node…"
     if has apt-get; then
         sudo apt-get install -y nodejs npm >/dev/null 2>&1 || true
     elif has dnf; then
@@ -333,7 +353,7 @@ elif has node; then
     fi
     node_supported \
         && ok "Node.js $(node --version) now active" \
-        || warn "Node.js is still below v$NODE_MIN_MAJOR — the frontend build will fail"
+        || warn "Node.js is still below v$NODE_MIN_VERSION — the frontend build will fail"
 elif has apt-get; then
     info "Installing nodejs via apt…"
     sudo apt-get install -y nodejs npm >/dev/null 2>&1
@@ -371,20 +391,19 @@ fi # USE_MISE -eq 0 (Node.js)
 if has node; then
     # `|| echo v0` keeps a broken node binary (loader error) from killing the
     # installer under `set -e`; v0 then trips the floor warning below.
-    _node_major="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
-    if [ -n "$_node_major" ] && [ "$_node_major" -lt "$NODE_MIN_MAJOR" ] 2>/dev/null; then
-        warn "Node.js v$_node_major is below the supported floor (>= $NODE_MIN_MAJOR) — the frontend build will fail"
+    if ! node_supported; then
+        warn "Node.js $( { node --version 2>/dev/null || echo v0; } ) is below the supported floor (>= v$NODE_MIN_VERSION) — the frontend build will fail"
         detail "Install Node.js $NODE_VERSION (LTS): https://nodejs.org or 'nvm install $NODE_VERSION'"
     fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════
-# Step 2: Agent Backend (claude-agent-acp)
+# Step 2: Optional alternate agent backend (claude-agent-acp)
 # ══════════════════════════════════════════════════════════════════════
-step "Agent Backend"
+step "Optional Agent Backend"
 
-# The default agent backend is the public ACP adapter, run via Node.
-# kiro-cli is optional and not installed here.
+# A fresh configuration defaults to Kiro CLI. Keep installing the public ACP
+# adapter as an available alternative, but do not misrepresent it as selected.
 if has claude-agent-acp; then
     ok "claude-agent-acp ($( which claude-agent-acp ))"
 elif has npm; then
@@ -399,7 +418,8 @@ else
     warn "npm not available — install the agent backend later:"
     detail "npm i -g $ACP_NPM_PKG"
 fi
-detail "kiro-cli is an optional alternative backend (https://kiro.dev/docs/cli/installation)"
+warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
+detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 3: Build
@@ -416,16 +436,60 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
     _fe_log="$(mktemp)"
     (
         cd "$KIROCREW_APP_DIR/website" &&
+        # Raise V8's heap ceiling for the bundle build. The default (~2 GB on
+        # 64-bit) is not enough for this app's 6k+ module graph, and the OOM
+        # surfaces as a build that dies without a clear cause -- leaving no
+        # dist/ and a "Dashboard HTML not found" page at first launch.
+        _fe_build() { NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" npm run build 2>>"$_fe_log"; }
+
+        # Install the exact platform-specific rolldown native binding the
+        # bundler needs, keyed off the resolved rolldown version. Last-resort
+        # repair for npm/cli#4828 when even a clean reinstall omits it.
+        _fe_install_binding() {
+            _rd_ver="$(node -p "require('./node_modules/rolldown/package.json').version" 2>/dev/null)" || return 1
+            [ -n "$_rd_ver" ] || return 1
+            case "$(uname -s)" in
+                Linux)  _rd_os="linux" ;;
+                Darwin) _rd_os="darwin" ;;
+                *) return 1 ;;
+            esac
+            case "$(uname -m)" in
+                x86_64|amd64)  _rd_arch="x64" ;;
+                aarch64|arm64) _rd_arch="arm64" ;;
+                *) return 1 ;;
+            esac
+            _rd_abi=""
+            if [ "$_rd_os" = "linux" ]; then
+                if ldd --version 2>&1 | grep -qi musl; then _rd_abi="-musl"; else _rd_abi="-gnu"; fi
+            fi
+            echo "installing @rolldown/binding-${_rd_os}-${_rd_arch}${_rd_abi}@${_rd_ver} explicitly (npm/cli#4828)" >>"$_fe_log"
+            npm install --no-audit --no-fund --no-save --loglevel=error \
+                "@rolldown/binding-${_rd_os}-${_rd_arch}${_rd_abi}@${_rd_ver}" 2>>"$_fe_log"
+        }
+
         if [ -f package-lock.json ]; then
             npm ci --no-audit --no-fund --loglevel=error 2>"$_fe_log"
         else
             npm install --no-audit --no-fund --loglevel=error 2>"$_fe_log"
         fi &&
-        # Raise V8's heap ceiling for the bundle build. The default (~2 GB on
-        # 64-bit) is not enough for this app's 6k+ module graph, and the OOM
-        # surfaces as a build that dies without a clear cause -- leaving no
-        # dist/ and a "Dashboard HTML not found" page at first launch.
-        NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" npm run build 2>>"$_fe_log"
+        # npm's optional-dependencies bug (npm/cli#4828) can leave `npm ci`
+        # without the platform-specific native binding the bundler needs
+        # (e.g. @rolldown/binding-<os>-<arch>), so the build aborts with
+        # "Cannot find native binding". `npm ci` replays a lockfile resolved
+        # on another OS/arch and drops the entry for THIS platform. Recover in
+        # two escalating steps: drop node_modules and let `npm install`
+        # re-evaluate optional deps for the current platform (the tracked
+        # package-lock.json is left in place), then, if that still omits it,
+        # install the exact binding explicitly. Each step rebuilds; the first
+        # that produces a bundle wins.
+        if ! _fe_build; then
+            echo "npm run build failed; re-resolving optional native deps (npm/cli#4828) and retrying" >>"$_fe_log"
+            rm -rf node_modules
+            npm install --no-audit --no-fund --loglevel=error 2>>"$_fe_log"
+            if ! _fe_build; then
+                _fe_install_binding && _fe_build
+            fi
+        fi
     ) &
     spinner $! "Installing npm packages & building React app…"
     _fe_ok=0
@@ -464,12 +528,26 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
     fi
 else
     warn "Skipping frontend build (Node.js or website/ not available)"
-    detail "Install Node.js 22+ (24 LTS recommended) for the full React dashboard experience"
+    detail "Install Node.js 22.12+ (24 LTS recommended) for the full React dashboard experience"
 fi
 
 # ── Python virtual environment & package ──
 info "Creating virtual environment…"
 _venv="$KIROCREW_APP_DIR/.venv"
+# Build the venv under a umask that masks group/other WRITE so bin/kirocrew
+# and its dirs are born non-group-writable -- `kirocrew service install`
+# refuses to attach its AppArmor profile to a group/world-writable launcher
+# (see the matching block in cli.sh for the full rationale). OR-ing with 022
+# only ADDS write-mask bits, so a stricter caller umask is preserved.
+_KC_PREV_UMASK="$(umask)"
+umask "$(printf '%03o' "$(( $(umask) | 022 ))")"
+# A reused venv keeps the perms it was born with: one built by an older installer
+# under a permissive umask still has a group/world-writable root or bin/, so the
+# AppArmor profile would keep refusing. Rebuild it under the tightened umask.
+if [ -d "$_venv" ] && [ -n "$(find "$_venv" "$_venv/bin" -prune \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null)" ]; then
+    warn "Existing venv is group/world-writable — recreating it"
+    rm -rf "$_venv"
+fi
 # An existing venv is reusable only while its interpreter still satisfies the
 # package's requires-python. On an upgrade from a pre-3.12 install, reusing a
 # 3.10/3.11 venv makes the `pip install -e .` below refuse the package outright
@@ -494,12 +572,25 @@ if [ "$WITH_VOICE" -eq 1 ]; then
     detail "Including voice extras (.[voice])"
 fi
 
+# Dependencies come from prebuilt wheels only, as in cli.sh: without this pip
+# builds any dependency that lacks a wheel for this host from its sdist, and a
+# native one (numpy, Pillow) then needs a compiler and -dev headers the host
+# was never required to have. The editable kirocrew install itself is a local
+# source tree, which pip builds regardless of the flag; only the dependency
+# resolution is restricted. KIROCREW_ALLOW_SOURCE_BUILDS=1 opts back in for a
+# host that has the toolchain.
+_pip_binary_only="--only-binary=:all:"
+if [ "${KIROCREW_ALLOW_SOURCE_BUILDS:-0}" = "1" ]; then
+    _pip_binary_only=""
+fi
+
 _pip_log="$(mktemp)"
 (
     "$_venv/bin/pip" install --upgrade pip setuptools wheel 2>&1 | tail -5 > "$_pip_log"
     cd "$KIROCREW_APP_DIR"
     # Frontend already built and staged above; skip rebuild in setup.py.
-    KIROCREW_SKIP_FRONTEND=1 "$_venv/bin/pip" install -e "$_pip_target" 2>&1 | tail -20 >> "$_pip_log"
+    # shellcheck disable=SC2086
+    KIROCREW_SKIP_FRONTEND=1 "$_venv/bin/pip" install $_pip_binary_only -e "$_pip_target" 2>&1 | tail -20 >> "$_pip_log"
 ) &
 spinner $! "Installing kirocrew and dependencies…"
 if wait $!; then
@@ -509,15 +600,41 @@ if wait $!; then
         die "Package installed but dependencies missing (aiohttp not importable).
      Try manually: $_venv/bin/pip install -e $KIROCREW_APP_DIR"
     fi
+    if [ ! -x "$_venv/bin/kirocrew" ]; then
+        die "Install incomplete: entry point $_venv/bin/kirocrew missing or not executable."
+    fi
+    if ! "$_venv/bin/python" -I -c "import kiro_crew" 2>/dev/null; then
+        die "Install incomplete: kiro_crew not importable."
+    fi
 else
     if [ -s "$_pip_log" ]; then
         echo ""
         tail -10 "$_pip_log" | while IFS= read -r _line; do detail "$_line"; done
         echo ""
     fi
+    # Under binary-only resolution this pip error means no release pip may
+    # install has a wheel this host can run. Its "(from versions: ...)" list
+    # cannot separate the causes (wheels for a newer libc or another arch are
+    # dropped before the list is built, so they read "none" exactly like a
+    # missing or unreachable index), so name the platform, the usual cause and
+    # the way out, and say the index is the other possibility.
+    if [ -n "$_pip_binary_only" ] && grep -q 'No matching distribution found for' "$_pip_log" 2>/dev/null; then
+        _missing="$(grep 'No matching distribution found for' "$_pip_log" \
+            | sed 's/.*No matching distribution found for //' | head -n 5 | tr '\n' ' ')"
+        _libc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+        die "pip found no prebuilt wheel it may install on this platform ($(uname -s) $(uname -m)${_libc:+, $_libc}) for: ${_missing}
+     Kiro Crew installs prebuilt wheels only and never compiles a dependency. Usually this
+     means the host is older than the wheels' floor: use a newer Linux (Amazon Linux 2023,
+     RHEL/Rocky 8+, Ubuntu 22.04+, Debian 12+) or macOS. It can also mean the package index
+     could not be reached or does not carry these releases (see pip's output above). To
+     compile on this host instead, install a C/C++ toolchain plus the -dev headers those
+     packages need and re-run with KIROCREW_ALLOW_SOURCE_BUILDS=1."
+    fi
     die "pip install failed. Check: $_venv/bin/pip --version"
 fi
 rm -f "$_pip_log"
+# Venv fully built and born non-group-writable; restore the caller's umask.
+umask "$_KC_PREV_UMASK"
 
 # Record install method so `kirocrew update` uses the right rebuild strategy
 echo "pip" > "$KIROCREW_APP_DIR/.install-method"
@@ -690,13 +807,17 @@ case "$(basename "${SHELL:-}")" in
     *) echo "       ${GREEN}Restart your terminal${RESET}" ;;
 esac
 echo ""
-echo "    ${CYAN}2.${RESET} Run the setup wizard:"
+echo "    ${CYAN}2.${RESET} Set up the default Kiro agent (skip if you selected another ACP backend):"
+echo "       ${GREEN}Install Kiro CLI from https://kiro.dev/cli/${RESET}"
+echo "       ${GREEN}kiro-cli login${RESET}"
+echo ""
+echo "    ${CYAN}3.${RESET} Run the setup wizard:"
 echo "       ${GREEN}kirocrew setup${RESET}"
 echo ""
-echo "    ${CYAN}3.${RESET} Start the dashboard:"
+echo "    ${CYAN}4.${RESET} Start the dashboard:"
 echo "       ${GREEN}kirocrew gateway${RESET}"
 echo ""
-echo "    ${CYAN}4.${RESET} Open ${CYAN}http://localhost:${KIROCREW_PORT}${RESET} in your browser"
+echo "    ${CYAN}5.${RESET} Open ${CYAN}http://localhost:${KIROCREW_PORT}${RESET} in your browser"
 echo ""
 # SSH tunnel tip for remote Linux users
 if [ "$(uname)" != "Darwin" ]; then

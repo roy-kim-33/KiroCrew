@@ -23,6 +23,7 @@ import { render, screen, fireEvent, waitFor, act, within } from '@testing-librar
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { PierreEditorHandle } from '../pierre'
+import { evictDocumentBodies } from '../hooks/usePanelTabs'
 
 // ── CSS Custom Highlight API stub (must precede the dynamic import) ──────────
 const highlightRegistry = new Map<string, Range[]>()
@@ -85,6 +86,8 @@ interface FetchOpts {
   knowledgePostStatus?: number
   fileReadOk?: boolean
   fileReadText?: string
+  /** Hold the /api/file-read answer until the returned release is called. */
+  fileReadHold?: { release: () => void }
   fileReadTruncated?: boolean
   downloadOk?: boolean
   downloadThrows?: boolean
@@ -110,6 +113,9 @@ function installFetch() {
       return { ok: true, blob: async () => new Blob(['bytes']) }
     }
     // /api/file-read
+    if (fetchOpts.fileReadHold) {
+      await new Promise<void>(r => { fetchOpts.fileReadHold!.release = r })
+    }
     const ok = fetchOpts.fileReadOk !== false
     return {
       ok,
@@ -143,6 +149,7 @@ beforeEach(() => {
   fetchOpts = {}
   highlightRegistry.clear()
   localStorage.clear()
+  sessionStorage.clear()
   document.getElementById('mc-comment-hl-style')?.remove()
   installFetch()
   vi.mocked(api.artifacts).mockResolvedValue({ artifacts: [] } as never)
@@ -265,8 +272,13 @@ describe('findCoords', () => {
 // OverflowMenu — the Download hand-off
 // ════════════════════════════════════════════════════════════════════════════
 
+/** Where a standalone OverflowMenu reports a failed row action (the panel
+ *  renders it through ErrorNotice in production). */
+const overflowError = vi.fn()
+
 function openOverflow(filePath = '/tmp/notes.md', content = '# hi\n') {
-  render(<OverflowMenu filePath={filePath} content={content} />, { wrapper })
+  overflowError.mockReset()
+  render(<OverflowMenu filePath={filePath} content={content} onError={overflowError} />, { wrapper })
   fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
 }
 
@@ -277,21 +289,24 @@ describe('OverflowMenu Download', () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       '/api/file-download?path=%2Ftmp%2Fnotes.md',
     ))
+    expect(overflowError).not.toHaveBeenCalled()
     expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('alerts instead of writing a zero-byte file when the endpoint refuses', async () => {
+  it('reports instead of writing a zero-byte file when the endpoint refuses', async () => {
     fetchOpts.downloadOk = false
     openOverflow()
     fireEvent.click(screen.getByText('Download'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('Download failed'))
+    await waitFor(() => expect(overflowError).toHaveBeenCalledWith('Download failed'))
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('alerts when the download request throws outright', async () => {
+  it('reports when the download request throws outright', async () => {
     fetchOpts.downloadThrows = true
     openOverflow()
     fireEvent.click(screen.getByText('Download'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('Download failed'))
+    await waitFor(() => expect(overflowError).toHaveBeenCalledWith('Download failed'))
+    expect(window.alert).not.toHaveBeenCalled()
   })
 })
 
@@ -363,6 +378,23 @@ describe('MarkdownPanel — refresh', () => {
     openPanelMenu()
     fireEvent.click(screen.getByText('Refresh'))
     await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('reloaded from disk'))
+  })
+
+  it('discards a re-read that straddled a document-body purge (redaction switch flipped)', async () => {
+    // The read starts while the owner's switch is off (raw bytes), the switch
+    // flips before it lands: the result is stale under the pass now in force and
+    // must not be applied to the tab.
+    const onContentChange = vi.fn()
+    fetchOpts.fileReadText = 'AKIA-raw-while-off'
+    fetchOpts.fileReadHold = { release: () => {} }
+    mountPanel({ onContentChange })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Refresh'))
+    await waitFor(() => expect(fetchOpts.fileReadHold!.release).not.toBeUndefined())
+    act(() => { evictDocumentBodies() })
+    await act(async () => { fetchOpts.fileReadHold!.release() })
+    await new Promise(r => setTimeout(r, 20))
+    expect(onContentChange).not.toHaveBeenCalledWith('AKIA-raw-while-off')
   })
 
   it('disables Refresh while the buffer is dirty so edits cannot be clobbered', () => {
@@ -558,6 +590,76 @@ describe('MarkdownPanel — save and cancel', () => {
     const onSave = vi.fn(async () => {})
     mountDirty({ onSave })
     fireEvent.keyDown(document, { key: 's', metaKey: true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  // The chord must be CLAIMED whenever the editor is active, even on a clean
+  // buffer: the editor-local capture handler in PierreEditorImpl only exists
+  // after its lazy chunk resolves, so this document-level handler is the one
+  // deterministic owner. If it lets a clean-buffer Cmd+S fall through,
+  // AppKit's default runs (the reporter saw it select the word under the
+  // cursor). It must preventDefault yet NOT issue a redundant write.
+  it('claims Cmd+S on a clean editing buffer without issuing a save', async () => {
+    const onSave = vi.fn(async () => {})
+    // A code file opens straight into the editor (editing=true) and is clean
+    // (no savedBaseline mismatch), so this is the fall-through case.
+    mountPanel({ filePath: '/tmp/module.ts', content: 'export const a = 1\n', onSave })
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('saves once on Cmd+S when the editing buffer is dirty', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // Caps Lock / Shift makes the browser report `e.key` as 'S'; the old exact
+  // `=== 's'` never matched, so the chord fell through. Match case-insensitively.
+  it('treats Shift+Cmd+S (key "S") the same as Cmd+S', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 'S', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // A background (inactive) tab is mounted but hidden; its handler must not
+  // claim the chord the user aimed at the visible tab.
+  it('ignores Cmd+S when the tab is inactive', async () => {
+    const onSave = vi.fn(async () => {})
+    render(
+      <MarkdownPanel embedded active={false} filePath="/tmp/module.ts" content="export const a = 1\n"
+        onContentChange={vi.fn()} onSave={onSave} onClose={vi.fn()} />,
+      { wrapper },
+    )
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  // PierreEditorImpl's capture handler runs first and preventDefaults the chord
+  // when it owns it. The document handler must then stand down so onSave fires
+  // once, not twice. Simulate the already-claimed event.
+  it('does not double-save when Cmd+S was already handled (defaultPrevented)', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    evt.preventDefault()
+    document.dispatchEvent(evt)
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(onSave).not.toHaveBeenCalled()
   })
@@ -967,7 +1069,11 @@ describe('MarkdownPanel — artifact promotion', () => {
     fetchOpts.fileReadTruncated = true
     mountPanel()
     fireEvent.click(await screen.findByLabelText('Add to artifact library'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('File is too large to add'))
+    // Rendered in the panel through the shared ErrorNotice, not a blocking alert.
+    const notice = await screen.findByTestId('markdown-panel-action-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent('File is too large to add')
+    expect(window.alert).not.toHaveBeenCalled()
     expect(api.createArtifact).not.toHaveBeenCalled()
   })
 
@@ -975,7 +1081,8 @@ describe('MarkdownPanel — artifact promotion', () => {
     fetchOpts.fileReadOk = false
     mountPanel()
     fireEvent.click(await screen.findByLabelText('Add to artifact library'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('Cannot read file'))
+    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent('Cannot read file')
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
   it('classifies the artifact kind from the extension', async () => {
@@ -1036,7 +1143,8 @@ describe('MarkdownPanel — knowledge library toggle', () => {
     fetchOpts.knowledgePostStatus = 500
     mountPanel()
     fireEvent.click(await screen.findByLabelText('Add to Knowledge Library'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('library refused'))
+    expect(await screen.findByTestId('markdown-panel-action-error')).toHaveTextContent('library refused')
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
   it('renders an inert badge for a file already in the library', async () => {
@@ -1052,7 +1160,8 @@ describe('MarkdownPanel — knowledge library toggle', () => {
 describe('MarkdownPanel — authoring an inline comment', () => {
   const BODY = '# Title\n\nalpha beta gamma\n'
 
-  /** Select `word` inside the rendered preview and raise the selection toolbar. */
+  /** Select `word` inside the rendered preview; the annotation input opens on
+   *  its own (type-first — there is no Comment button to click any more). */
   async function selectInPreview(word: string) {
     const para = await screen.findByText(/alpha beta gamma/)
     const textNode = para.firstChild as Text
@@ -1064,31 +1173,37 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     sel.removeAllRanges()
     sel.addRange(range)
     fireEvent.mouseUp(document)
-    return screen.findByRole('button', { name: 'Comment' })
+    return screen.findByLabelText('Comment on the selected text')
   }
 
   it('anchors a new comment to the selected text with resolved source coordinates', async () => {
     const onSubmitComments = vi.fn()
     mountPanel({ content: BODY, onSubmitComments })
-    fireEvent.click(await selectInPreview('beta'))
+    const box = await selectInPreview('beta')
+    // The selection is highlighted while the input has focus — via the
+    // highlight registry, never by wrapping preview text in <mark> elements.
+    expect(highlightRegistry.get('mc-annotate')?.[0]?.toString()).toBe('beta')
+    expect(document.querySelector('mark')).toBeNull()
 
-    const box = await screen.findByLabelText('Add a comment')
     fireEvent.change(box, { target: { value: 'needs a citation' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
 
-    // The comment lands in the pending list, keyed by its own id.
+    // The comment lands in the pending list, keyed by its own id. `findByText`
+    // (not `getByText`): the composer is still animating out for a frame and
+    // its textarea carries the same text until it unmounts.
     await waitFor(() => expect(document.querySelector('[data-comment-id]')).not.toBeNull())
-    expect(screen.getByText('needs a citation')).toBeInTheDocument()
+    expect(await screen.findByText('needs a citation')).toBeInTheDocument()
     // …and is persisted so it survives a panel close.
     const stored = JSON.parse(localStorage.getItem('mc-comment-drafts') || '{}')
     expect(stored['/tmp/notes.md'][0]).toMatchObject({ anchor: 'beta', text: 'needs a citation', line: 3, column: 7 })
+    // The highlight goes with the open box.
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
   })
 
   it('sends every pending comment to the chat and clears the drafts', async () => {
     const onSubmitComments = vi.fn()
     mountPanel({ content: BODY, onSubmitComments })
-    fireEvent.click(await selectInPreview('gamma'))
-    fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'rename this' } })
+    fireEvent.change(await selectInPreview('gamma'), { target: { value: 'rename this' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await screen.findByText('rename this')
 
@@ -1100,8 +1215,7 @@ describe('MarkdownPanel — authoring an inline comment', () => {
 
   it('edits a pending comment in place', async () => {
     mountPanel({ content: BODY, onSubmitComments: vi.fn() })
-    fireEvent.click(await selectInPreview('beta'))
-    fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'first draft' } })
+    fireEvent.change(await selectInPreview('beta'), { target: { value: 'first draft' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await screen.findByText('first draft')
 
@@ -1114,8 +1228,7 @@ describe('MarkdownPanel — authoring an inline comment', () => {
 
   it('removes a pending comment', async () => {
     mountPanel({ content: BODY, onSubmitComments: vi.fn() })
-    fireEvent.click(await selectInPreview('beta'))
-    fireEvent.change(await screen.findByLabelText('Add a comment'), { target: { value: 'drop me' } })
+    fireEvent.change(await selectInPreview('beta'), { target: { value: 'drop me' } })
     fireEvent.click(screen.getByLabelText('Add comment'))
     await screen.findByText('drop me')
 
@@ -1123,16 +1236,18 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     await waitFor(() => expect(screen.queryByText('drop me')).toBeNull())
   })
 
-  it('dismisses the popover on Escape without recording a comment', async () => {
+  it('dismisses the input on Escape without recording a comment, keeping the panel open', async () => {
     mountPanel({ content: BODY, onSubmitComments: vi.fn() })
-    fireEvent.click(await selectInPreview('beta'))
-    await screen.findByLabelText('Add a comment')
-    fireEvent.keyDown(document, { key: 'Escape' })
-    await waitFor(() => expect(screen.queryByLabelText('Add a comment')).toBeNull())
+    const box = await selectInPreview('beta')
+    fireEvent.keyDown(box, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
     expect(document.querySelector('[data-comment-id]')).toBeNull()
+    // The highlight is lifted and the panel itself did not treat Escape as close.
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
+    expect(screen.getByText(/alpha beta gamma/)).toBeInTheDocument()
   })
 
-  it('offers Copy only, with no Comment action, when the host cannot receive comments', async () => {
+  it('offers Copy only, with no annotation input, when the host cannot receive comments', async () => {
     mountPanel({ content: BODY })
     const para = await screen.findByText(/alpha beta gamma/)
     const textNode = para.firstChild as Text
@@ -1144,7 +1259,154 @@ describe('MarkdownPanel — authoring an inline comment', () => {
     sel.addRange(range)
     fireEvent.mouseUp(document)
     expect(await screen.findByRole('button', { name: 'Copy' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('Comment on the selected text')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull()
+  })
+
+  it('an open comment draft makes the tab NOT clean, so a rail click cannot re-target it under the draft', async () => {
+    // Otherwise the pending anchor (resolved against THIS file) and the typed
+    // text would be submitted under whatever file replaced the tab.
+    const ref = createRef<MarkdownPanelHandle>()
+    render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content={BODY}
+      savedBaseline={BODY} onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+    const box = await selectInPreview('beta')
+
+    let stillClean: (() => boolean) | undefined
+    const nav = vi.fn((fn?: () => boolean) => { stillClean = fn })
+    act(() => ref.current!.requestNavigate(nav))
+    // Empty input: still clean.
+    expect(stillClean?.()).toBe(true)
+    fireEvent.change(box, { target: { value: 'half a thought' } })
+    expect(stillClean?.()).toBe(false)
+    // Submitting releases the tab again.
+    fireEvent.click(screen.getByLabelText('Add comment'))
+    await waitFor(() => expect(stillClean?.()).toBe(true))
+  })
+
+  it('closing over an open comment draft asks first', async () => {
+    const onClose = vi.fn()
+    const ref = createRef<MarkdownPanelHandle>()
+    render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content={BODY}
+      savedBaseline={BODY} onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={onClose} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+    const box = await selectInPreview('beta')
+    fireEvent.change(box, { target: { value: 'unsaved' } })
+
+    act(() => ref.current!.requestClose())
+    const dialog = await screen.findByRole('dialog')
+    // Named as what it is — a comment, not file edits.
+    expect(within(dialog).getByText('Discard your unsaved comment?')).toBeInTheDocument()
+    expect(onClose).not.toHaveBeenCalled()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Discard comment' }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+  })
+
+  it('switching to Edit over a typed draft asks first; cancelling keeps the draft, confirming discards it', async () => {
+    mountPanel({ content: BODY, onSubmitComments: vi.fn() })
+    const box = await selectInPreview('beta')
+    fireEvent.change(box, { target: { value: 'not yet added' } })
+
+    // Edit would unmount the box (and the draft with it).
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('Discard your unsaved comment?')).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    // Still in preview, draft intact.
+    expect(screen.getByLabelText('Comment on the selected text')).toHaveValue('not yet added')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    const again = await screen.findByRole('dialog')
+    fireEvent.click(within(again).getByRole('button', { name: 'Discard comment' }))
+    await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
+  })
+
+  it('an inactive tab hides its composer without discarding the draft', async () => {
+    const { rerender } = render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} active />, { wrapper })
+    const box = await selectInPreview('beta')
+    fireEvent.change(box, { target: { value: 'typed in tab A' } })
+    rerender(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} active={false} />)
+    await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
+    rerender(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} active />)
+    expect(await screen.findByLabelText('Comment on the selected text')).toHaveValue('typed in tab A')
+  })
+
+  it('a draft survives the panel being torn down and remounted (chat-slot switch), riding the next selection', async () => {
+    const { unmount } = render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+    const box = await selectInPreview('beta')
+    fireEvent.change(box, { target: { value: 'not lost to a slot switch' } })
+    unmount()
+
+    render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+    // Only the passage the draft was written for gets it back.
+    const again = await selectInPreview('beta')
+    expect(again).toHaveValue('not lost to a slot switch')
+    fireEvent.click(screen.getByLabelText('Add comment'))
+    await waitFor(() => expect(document.querySelector('[data-comment-id]')).not.toBeNull())
+    expect(window.sessionStorage.getItem('mc-comment-composer-draft:/tmp/notes.md')).toBeNull()
+  })
+
+  it('a draft still survives a teardown when sessionStorage refuses the write (in-memory fallback)', async () => {
+    const setItem = vi.spyOn(window.sessionStorage, 'setItem').mockImplementation(() => { throw new DOMException('quota', 'QuotaExceededError') })
+    try {
+      const { unmount } = render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+        onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+        onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+      const box = await selectInPreview('beta')
+      // Typing must not throw even though every setItem does.
+      fireEvent.change(box, { target: { value: 'kept in memory' } })
+      unmount()
+      render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+        onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+        onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+      expect(await selectInPreview('beta')).toHaveValue('kept in memory')
+      // Submitting clears the memory copy too (the map outlives this test otherwise).
+      fireEvent.click(screen.getByLabelText('Add comment'))
+      await waitFor(() => expect(document.querySelector('[data-comment-id]')).not.toBeNull())
+    } finally {
+      setItem.mockRestore()
+    }
+  })
+
+  it('a confirmed discard from the Edit guard clears only the active passage\u2019s saved draft', async () => {
+    // A draft saved earlier for another passage of this file must survive.
+    const key = 'mc-comment-composer-draft:/tmp/notes.md'
+    window.sessionStorage.setItem(key, JSON.stringify({ '11|gamma': 'about gamma, saved earlier' }))
+    mountPanel({ content: BODY, onSubmitComments: vi.fn() })
+    const box = await selectInPreview('beta')
+    fireEvent.change(box, { target: { value: 'about beta' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Discard comment' }))
+    await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
+    const slots = JSON.parse(window.sessionStorage.getItem(key) ?? '{}')
+    expect(slots['6|beta']).toBeUndefined()
+    expect(slots['11|gamma']).toBe('about gamma, saved earlier')
+  })
+
+  it('a file change while the box is open drops the box and its anchor', async () => {
+    const { rerender } = render(<MarkdownPanel embedded filePath="/tmp/notes.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />, { wrapper })
+    await selectInPreview('beta')
+    expect(highlightRegistry.get('mc-annotate')?.[0]?.toString()).toBe('beta')
+    rerender(<MarkdownPanel embedded filePath="/tmp/other.md" content={BODY}
+      onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} onSubmitComments={vi.fn()} initialDiffMode={false} />)
+    await waitFor(() => expect(screen.queryByLabelText('Comment on the selected text')).toBeNull())
+    expect(highlightRegistry.has('mc-annotate')).toBe(false)
   })
 })
 

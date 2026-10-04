@@ -23,7 +23,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK, OwnerRequest
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _ROUTES = _APP_ROOT / "backend" / "routes.py"
@@ -177,7 +177,7 @@ class TestRunsPersistence(unittest.TestCase):
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
-    """Regression for the reviewed-index write path:
+    """The reviewed-index write path:
       * a PR is indexed as reviewed ONLY when the poster
         actually delivered (posted_comments >= posting_expected), not merely when
         the poster turn completed (post_ok). A failed gh post must not strand it.
@@ -230,7 +230,7 @@ class TestRecordReviewedDelivery(unittest.TestCase):
 
 
 class TestUnderLockRededup(unittest.TestCase):
-    """Regression for the TOCTOU + double-review guards: a run re-checks the
+    """The TOCTOU + double-review guards: a run re-checks the
     reviewed index AND the in-flight claim registry before it owns a change, so a
     PR another run just recorded (or is reviewing right now) is not re-reviewed."""
 
@@ -488,7 +488,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rv["effort"] == "" or rv["effort"] in _rp.VALID_EFFORTS)
 
     async def test_review_rejects_empty_input(self):
-        class _Req:
+        class _Req(OwnerRequest):
             async def json(self):
                 return {}
         resp = await self.mod._handle_review(_Req())
@@ -501,7 +501,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
 
         _url = "https://github.com/kirodotdev/KiroCrew/pull/20"
 
-        class _Req:
+        class _Req(OwnerRequest):
             async def json(self):
                 return {"links": _url}
         resp = await self.mod._handle_review(_Req())
@@ -640,8 +640,8 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Round 11: worker-authored merge content reached learned-patterns.md unredacted,
-# and a half-failed auto-post still deleted the records the retry needs.
+# Worker-authored merge content must reach learned-patterns.md redacted, and a
+# half-failed auto-post must keep the records the retry needs.
 # ---------------------------------------------------------------------------
 
 
@@ -756,8 +756,8 @@ class TestAdoptionRefusesAPlantedLink:
     """The reviewer worker owns the shared dir and has file tools.
 
     ``is_file()`` follows symlinks, and ``os.replace`` moves the LINK, so a link
-    planted where a record belongs used to land in the run dir intact — and
-    ``read_result`` dereferences it with a plain read. Adoption must never carry a
+    planted where a record belongs lands in the run dir intact unless refused —
+    and ``read_result`` dereferences it with a plain read. Adoption must never carry a
     link across, and must not leave one behind to retry.
     """
 
@@ -883,10 +883,10 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
 class TestAdoptionValidatesBeforeItWrites:
     """Adoption must be all-or-nothing.
 
-    Round 13 traded ``os.replace`` for an ``O_TRUNC`` write to close a symlink
-    hole, and that gave up atomicity: a malformed payload truncated whatever valid
-    record was already filed, and ``read_result`` then raised on the wreckage, so
-    no retry could recover it. Validate first, write via rename.
+    The ``O_TRUNC`` write that closes the symlink hole is not atomic: a malformed
+    payload truncates whatever valid record is already filed, and ``read_result``
+    then raises on the wreckage, so no retry can recover it. Validate first, write
+    via rename.
     """
 
     def _stage(self, tmp_path, change_id, body):
@@ -1069,7 +1069,7 @@ class TestRestartClearsAStrandedPostingFlag(unittest.TestCase):
         self.assertIn("restart", (run.get("post_error") or "").lower())
         # Delivery evidence survives, so re-posting sends only the remainder.
         self.assertEqual(run["posted_keys"], {"c1": ["k1"]})
-        # And the run is no longer considered live, so retention can reclaim it.
+        # And the run does not count as live, so retention can reclaim it.
         self.assertFalse(self.routes._is_live(run))
 
     def test_a_run_that_was_not_posting_is_untouched(self):
@@ -1093,11 +1093,11 @@ class TestGroupedPostAppliesKeysPerChange(unittest.TestCase):
     """A multi-change selection is one request, and each group keeps its own keys.
 
     `posting` is a per-run flag that only the poster clears, while the POST handler
-    returns as soon as it dispatches the poster -- so one request per change had
+    returns as soon as it dispatches the poster -- so one request per change gets
     every change after the first refused with `already_posting`. The grouped form
     is what makes the deliberate multi-select actually publish; the per-change key
-    scoping (round 8) has to survive inside it, or a selection made on one pull
-    request would be applied to another.
+    scoping has to survive inside it, or a selection made on one pull request would
+    be applied to another.
     """
 
     def setUp(self):
@@ -1345,6 +1345,111 @@ class TestOrphanReapDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
                 await hook(app)   # must not raise
 
 
+class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
+    """The layout self-heal must run off the event loop.
+
+    Same shape as the reap above, and the same reason: `register_routes` is sync
+    and `start_dashboard` is a coroutine, so its body executes ON the loop.
+    `ensure_layout` walks each of nine directories' ancestor chain to refuse a
+    planted link before creating it, so on a network-homed or stalled data
+    directory that is a synchronous filesystem walk holding the loop.
+
+    The ordering the UI depends on survives because aiohttp runs `on_startup`
+    before the site accepts a connection, so no request can observe a missing
+    `resolved_paths`.
+    """
+
+    def setUp(self):
+        self.routes = _load_routes_module()
+
+    def test_register_routes_does_not_build_the_layout_inline(self):
+        app = web.Application()
+        called = []
+
+        def _ensure() -> None:
+            called.append("built")
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _ensure):
+            self.routes.register_routes(app)
+        self.assertEqual(called, [], "the layout pass must not run during registration")
+        # Deferred, not dropped.
+        self.assertIn(
+            "_ensure_layout_on_startup",
+            {getattr(h, "__name__", "") for h in app.on_startup},
+            "no layout startup hook was registered")
+
+    async def test_the_startup_hook_builds_the_layout_off_the_loop(self):
+        app = web.Application()
+        threads = []
+
+        def _ensure() -> None:
+            threads.append(threading.current_thread().name)
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _ensure):
+            self.routes.register_routes(app)
+            for hook in app.on_startup:
+                await hook(app)
+
+        self.assertEqual(len(threads), 1, "the layout pass ran once")
+        self.assertNotEqual(
+            threads[0], threading.current_thread().name,
+            "the layout pass must run on a worker thread, not the loop thread")
+
+    async def test_a_failing_layout_never_breaks_startup(self):
+        app = web.Application()
+
+        def _boom() -> None:
+            raise OSError("read-only filesystem")
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _boom):
+            self.routes.register_routes(app)
+            for hook in app.on_startup:
+                await hook(app)   # must not raise
+
+        self.assertTrue(
+            [r for r in app.router.routes() if r.resource is not None],
+            "the routes are registered even when the layout pass fails")
+
+
+class TestTheRunRegistryRefusesAPlantedLink(unittest.TestCase):
+    """The registry's DIRECTORY, not just its guarded write.
+
+    `_write_runs` publishes through the shared link-refusing helper, but it has
+    to create the directory first, and a bare `mkdir(parents=True)` creates
+    THROUGH a link it meets -- so by the time the write's own refusal runs, the
+    tree already exists where the planter wants it. The review worker shares this
+    directory and is prompt-injectable, which is why the order matters here.
+    """
+
+    def setUp(self):
+        self.routes = _load_routes_module()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_link_above_the_registry_takes_no_bytes(self):
+        impostor = self.tmp / "impostor"
+        impostor.mkdir()
+        planted = self.tmp / "data"
+        try:
+            planted.symlink_to(impostor)
+        except (OSError, NotImplementedError):
+            self.skipTest("planting the attack needs symlink creation")
+        target = planted / "runs" / "runs.json"
+
+        with unittest.mock.patch.object(
+                self.routes, "_runs_file", lambda: target), \
+                unittest.mock.patch(
+                    "kiro_crew.config.paths.data_home", lambda: str(self.tmp)):
+            with self.assertRaises(OSError):
+                self.routes._write_runs("[]")
+
+        self.assertEqual(list(impostor.iterdir()), [],
+                         "the tree was built inside the link's target")
+
+
 class TestAdoptionRequiresAnExactChangeIdentity:
     """Adoption must compare change ids EXACTLY, not through `safe_change_id`.
 
@@ -1455,10 +1560,10 @@ class TestCountValuesMustBeNumeric:
 
 
 class TestReportsDirReadsDoNotFollowAPlant:
-    """Round 21 made the reports-dir WRITES not follow a plant; the READS did.
+    """The reports-dir READS must not follow a plant, just as the WRITES do not.
 
-    The dir is reachable by the review worker, so a symlink at `index.json` or
-    `focus-report.html` was followed on read and its contents flowed onward —
+    The dir is reachable by the review worker, so an unguarded read of a symlink at
+    `index.json` or `focus-report.html` follows it and its contents flow onward —
     into a rendered report, or into a shareable dashboard artifact.
     """
 
@@ -1529,7 +1634,7 @@ class TestRedactionReachesNestedValues:
     # Assembled at runtime, never written as one literal: the redactor only fires
     # on credential-SHAPED input (a plain sentinel passes through untouched, so the
     # test would prove nothing), but a real key shape sitting in the source trips
-    # `scripts/scrub-lint.sh`'s credential scan. Splitting it satisfies both — the
+    # the internal-content-scan credential rules. Splitting it satisfies both — the
     # value is key-shaped when the redactor sees it, and no line here matches.
     SECRET = "AKIA" + "1234567890EXAMPLE"
 
@@ -1772,7 +1877,7 @@ class TestNoFindingFieldIsExemptFromRedaction:
 
 
 class TestFindingLineMustBeANumber:
-    """The boundary enforces what the redactor used to assume."""
+    """The boundary enforces `line` as a number, so no exemption rests on it."""
 
     def _record(self, line):
         return {
@@ -1912,11 +2017,11 @@ class TestNestedStringFieldsMustBeScalars:
 class TestRetryRepairsTheReviewedIndex(unittest.TestCase):
     """A retry that succeeds after a failed post must leave the PR indexed.
 
-    `_record_reviewed` reads ONLY `summary.per_change`. The explicit-retry path
-    used to write just the run-level counters, so a record still showing the
-    original failure kept the PR out of the dedup index -- and the next repo
-    review reviewed and posted it a second time. Both the first attempt and the
-    retry now write those fields through `review_driver.apply_post_outcome`.
+    `_record_reviewed` reads ONLY `summary.per_change`. A retry writing just the
+    run-level counters leaves a record still showing the original failure, which
+    keeps the PR out of the dedup index -- and the next repo review reviews and
+    posts it a second time. Both the first attempt and the retry write those fields
+    through `review_driver.apply_post_outcome`.
     """
 
     def setUp(self):
@@ -2193,12 +2298,15 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
                          "a delete must not be refused after pruning the active list")
 
     async def _delete(self, ns):
-        req = unittest.mock.MagicMock()
-        req.method = "DELETE"
-        req.json = unittest.mock.AsyncMock(return_value={"name": ns})
-        req.query = {}
-        req.match_info = {}
-        return await self.mod._handle_namespaces(req)
+        class _DeleteReq(OwnerRequest):
+            method = "DELETE"
+            query: dict = {}
+            match_info: dict = {}
+
+            async def json(self):
+                return {"name": ns}
+
+        return await self.mod._handle_namespaces(_DeleteReq())
 
 
 class TestPhase1ValuesMustBeStrings(unittest.TestCase):
@@ -2242,11 +2350,11 @@ class TestPhase1ValuesMustBeStrings(unittest.TestCase):
         self.assertTrue(any("must be a string" in e for e in errs), errs)
 
     def test_numeric_gate_verdict_is_refused(self):
-        """This used to validate cleanly.
+        """A numeric gate_verdict must not validate cleanly.
 
-        The vocabulary check sat behind an isinstance() guard, so a numeric
-        gate_verdict was neither rejected as a shape nor checked against
-        VALID_VERDICTS — it reached `html.escape()` in the renderer, which raises.
+        Behind an isinstance() guard alone, a numeric gate_verdict is neither
+        rejected as a shape nor checked against VALID_VERDICTS — it reaches
+        `html.escape()` in the renderer, which raises.
         """
         from sage_lib import results
 
@@ -2270,7 +2378,7 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
     Redacting on read is idempotent, so a report this module built is unchanged.
     """
 
-    # Assembled at runtime: scrub-lint scans source text, while the redactor only
+    # Assembled at runtime: the scan reads source text, while the redactor only
     # fires on credential-shaped input.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
@@ -2345,19 +2453,19 @@ class TestPersistedReportIsRedactedOnRead(unittest.TestCase):
 class TestPlantedReportMetadataCannotBreakTheEndpoint(unittest.TestCase):
     """The remaining worker-writable fields in the read_report payload.
 
-    Round 40 redacted the rows and coerced the tallies but left two gaps in its
-    own hardening: `bands` was screened for truthiness rather than for being a
-    MAPPING, and `report_slug` was passed through untouched.
+    Redacting the rows and coercing the tallies is not enough on its own: `bands`
+    screened for truthiness rather than for being a MAPPING, and `report_slug`
+    passed through untouched, are two gaps.
 
-    `[] or {}` yields `{}`, so an empty list looked handled -- but a truthy
-    non-dict (a non-empty list, a string, a number) reached `.get` and raised
+    `[] or {}` yields `{}`, so an empty list looks handled -- but a truthy
+    non-dict (a non-empty list, a string, a number) reaches `.get` and raises
     AttributeError, turning a planted file into an HTTP 500 on the report
     endpoint. The slug names an artifact the dashboard turns into a share link, so
     it is screened against the artifact store's own grammar rather than redacted:
     a value that is not a slug cannot reference a real artifact.
     """
 
-    # Assembled at runtime so scrub-lint sees no credential-shaped literal.
+    # Assembled at runtime so the scan sees no credential-shaped literal.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
     def setUp(self):
@@ -2457,7 +2565,7 @@ class TestNoRowFieldIsExemptFromRedaction(unittest.TestCase):
     row whose band is not one of the three cannot be grouped, so it is dropped.
     """
 
-    # Assembled at runtime: scrub-lint scans source text, the redactor only fires
+    # Assembled at runtime: the scan reads source text, the redactor only fires
     # on credential-shaped input.
     _SENTINEL = "AKIA" + "IOSFODNN7EXAMPLE"
 
@@ -2669,8 +2777,9 @@ class _FakeState:
         return value
 
 
-class _Req:
+class _Req(OwnerRequest):
     def __init__(self, body=None, query=None):
+        super().__init__()
         self._body = body or {}
         self.query = query or {}
 

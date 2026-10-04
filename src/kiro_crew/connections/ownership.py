@@ -24,7 +24,6 @@ helpers directly, the judge and transaction through the disconnect endpoint.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -32,6 +31,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from kiro_crew.agent_spec_format import (
+    is_agent_spec_name,
+    is_markdown_spec,
+    opens_frontmatter_fence,
+    parse_agent_spec_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +90,11 @@ class DisconnectScope:
 
 
 def _json_spec_names(spec_dir: Path) -> list[str] | None:
-    """The ``*.json`` spec names in ``spec_dir``; ``None`` when it is unreadable.
+    """The spec names (``*.json`` and ``*.md``) in ``spec_dir``; ``None`` when unreadable.
+
+    Both forms: a markdown spec's ``mcpServers`` holds a grant exactly like a
+    JSON spec's, and reading only ``*.json`` would count that sharer as absent
+    and let a Disconnect revoke a grant it is still using.
 
     ``os.listdir``, not ``Path.glob``: glob SUPPRESSES scan errors (an
     executable-but-unlistable directory yields zero entries with no raise), which
@@ -94,7 +104,7 @@ def _json_spec_names(spec_dir: Path) -> list[str] | None:
     or no one could ever disconnect anything.
     """
     try:
-        return sorted(n for n in os.listdir(spec_dir) if n.endswith(".json"))
+        return sorted(n for n in os.listdir(spec_dir) if is_agent_spec_name(n))
     except FileNotFoundError:
         return []
     except OSError:
@@ -212,8 +222,8 @@ def spec_census(
         try:
             if label.endswith("/"):
                 # An unenumerable-DIRECTORY sentinel from agent_spec_sources,
-                # screened by its label rather than by a stat. A stat test is what
-                # round 7 already had to fix once: a plain file sitting where the
+                # screened by its label rather than by a stat. A stat test is the wrong
+                # screen here: a plain file sitting where the
                 # agents directory belongs is ``is_file()``, so the sentinel would
                 # be parsed as a document and a source whose entries are unknown
                 # would read as a source that declares none.
@@ -227,7 +237,14 @@ def spec_census(
                 continue
             if not path.is_file():
                 continue  # genuinely absent: no entries here, nothing hidden
-            data = json.loads(safe_read_file(str(path)))
+            text = safe_read_file(str(path))
+            if is_markdown_spec(path) and not opens_frontmatter_fence(text):
+                # A markdown file with no frontmatter fence (a README, notes) is
+                # not a spec: it declares nothing and hides nothing. Only a
+                # FENCED document that fails to parse -- an unclosed fence
+                # included -- is unknown, below.
+                continue
+            data = parse_agent_spec_text(text, path)
         except (OSError, ValueError):
             # PermissionError (an OSError) is what safe_read_file raises for a
             # sensitive path or a symlink race; a stalled mount and malformed
@@ -295,11 +312,11 @@ async def remove_provider_entry(
     grant in the first case and strand a live one (reported as a deliberate keep)
     in the second.
 
-    The sweep reads the RAW specs, not the probe view: ``list_servers`` drops
-    disabled entries outside the Kiro Crew scope, and a user's switched-off server
-    still owns its grant -- deleting it because its entry is disabled would force a
-    fresh consent the moment they re-enable it. The probe view is unioned in so a
-    row this census cannot parse still counts.
+    The sweep reads the RAW specs, not the probe view: ``list_servers`` is a
+    MERGED read that loses each row's provenance, and a user's switched-off
+    server still owns its grant -- deleting it because its entry is disabled
+    would force a fresh consent the moment they re-enable it. The probe view is
+    unioned in so a row this census cannot parse still counts.
 
     FAIL CLOSED, asymmetrically, because the two acts need opposite evidence. The
     revoke needs the ABSENCE of a sharer, which an unreadable source can hide, so
@@ -320,6 +337,13 @@ async def remove_provider_entry(
     destructive caller would let a forgotten argument narrow the census back to
     the gap this parameter exists to close, silently and only for users who have
     a project-local spec.
+
+    One non-destructive act follows, after the lock: the warm pool is asked to
+    re-arm this provider's premint, because an invalidated grant is what makes it
+    warmable again and nothing else would ask. It is scheduled, never awaited --
+    see :func:`kiro_crew.connections.warm.rearm_invalidated_provider` -- and only
+    when NO owned artifact survived, because a half-removed pair reads as a
+    definitive absence and would have the pool initiate consent over residue.
     """
     from kiro_crew.connections.tool_aliases import normalized_endpoint
     from kiro_crew.dashboard.handlers.mcp import (
@@ -328,7 +352,7 @@ async def remove_provider_entry(
         _purge_server_config,
     )
     from kiro_crew.mcp_discovery import list_servers
-    from kiro_crew.mcp_grant import grant_key, revoke_local_grant
+    from kiro_crew.mcp_grant import grant_key, revoke_local_grant, surviving_grant_artifacts
 
     wanted = normalized_endpoint(mcp_url)
     wanted_key = grant_key(mcp_url)
@@ -352,11 +376,11 @@ async def remove_provider_entry(
         refuted.
 
         ONE pipeline: the string that is screened is BYTE-IDENTICAL to the string
-        that is hashed. Round 3 guarded three malformed shapes and round 4 found a
-        fourth (a trailing space after an explicit port -- ``urlsplit`` lstrips
-        only) precisely because ``normalized_endpoint`` parsed ``value.strip()``
-        while ``grant_key`` parsed the raw value, so the screen's guarantee never
-        transferred.
+        that is hashed. One malformed shape -- a trailing space after an explicit
+        port, which ``urlsplit`` lstrips only -- slips through when
+        ``normalized_endpoint`` parses ``value.strip()`` while ``grant_key`` parses
+        the raw value, so the screen's guarantee never transfers unless both parse
+        identical bytes.
 
         THREE-valued, because two implementations compute this key. kiro-cli
         derives the artifact pair with the WHATWG url parser, which
@@ -364,7 +388,7 @@ async def remove_provider_entry(
         dot-segments and backslashes, and percent-encodes non-ASCII paths --
         transformations ``urlsplit`` does not perform. Hashing such a URL here
         answers a question about different bytes than the ones kiro-cli hashed:
-        round 7 measured ``%6dcp.notion.com`` and ``/a/../mcp`` both naming the
+        ``%6dcp.notion.com`` and ``/a/../mcp`` both name the
         registry pair over there while missing it here, with no exception
         anywhere. So key equality is asserted only inside the PROVABLE set --
         lowercase-ASCII LDH hosts and printable-ASCII paths free of ``%``,
@@ -547,6 +571,14 @@ async def remove_provider_entry(
             )
         removed: list[str] = []
         attempted: list[str] = []
+        # Whether any artifact this transaction OWNS is still on disk when it ends. The
+        # re-arm's gate: a partial unlink leaves an incomplete pair, and ``grant_presence``
+        # answers False on either artifact being definitively absent -- a DEFINITIVE absence,
+        # which is exactly what the warm scan initiates consent on. So the half-removed grant
+        # would start OAuth against a provider whose residue is still there. Derived from what
+        # each branch actually did rather than one sweep at the end: a branch that KEPT the
+        # grant knows it without a stat, and only an attempted pair is re-read.
+        residue = False
         if census_gap:
             # The gap is about the census as a whole -- an unreadable source or an
             # uncomparable URL could hide a sharer of ANY owned pair -- so every
@@ -559,6 +591,7 @@ async def remove_provider_entry(
                 ", ".join(unreadable) or "none",
                 ", ".join(unprovable) or "none",
             )
+            residue = bool(owned_urls)
         else:
             # Per owned KEY: ownership is slash-insensitive while the artifact pair
             # is not, so an owned trailing-slash variant holds its own pair, and a
@@ -575,6 +608,7 @@ async def remove_provider_entry(
                         owned_url,
                         ", ".join(sorted(key_sharers)),
                     )
+                    residue = True
                     continue
                 # Shielded for the same reason the purge is, and for one more: a
                 # cancellation that released the lock mid-unlink would reopen the
@@ -583,6 +617,14 @@ async def remove_provider_entry(
                 for label in await _offload_config_write(revoke_local_grant, owned_url):
                     if label not in removed:
                         removed.append(label)
+                # STILL INSIDE the lock, unlike the handler's own survivor read: this one
+                # decides whether to start an authorization, so it must not be able to
+                # disagree with the unlink it is judging. A survivor here is a failed
+                # unlink -- ``revoke_local_grant`` already logged it -- and the re-arm is
+                # withheld until a later full revoke, or the next activation's re-stat,
+                # sees a clean pair.
+                if await asyncio.to_thread(surviving_grant_artifacts, owned_url):
+                    residue = True
 
         # INSIDE the lock, and shielded. A post-lock rebuild snapshots the config
         # before another Disconnect's purge and can write last, resurrecting an
@@ -598,6 +640,22 @@ async def remove_provider_entry(
             await _offload_config_write(rebuild_agent_config)
         except Exception:  # noqa: BLE001 — the config write already landed
             logger.warning("agent config rebuild failed after disconnect", exc_info=True)
+
+    # OUTSIDE the lock and awaited by nobody. This provider is warmable again precisely
+    # because its stored grant is gone, and the pool only premints ahead of need -- so
+    # without this its next Authorize pays a full cold mint. Scheduling is all that happens
+    # here: an activation spawns a helper and negotiates OAuth, which must neither hold the
+    # config lock this transaction just released nor delay the caller's answer.
+    #
+    # ONLY on a grant that is completely gone. A kept grant is safe on its own -- both
+    # artifacts present reads as present, and the scan skips it -- but a PARTIAL unlink is
+    # not: one surviving artifact reads as a definitive absence, so the scan would warm a
+    # provider whose residue is still on disk and initiate consent it cannot honour. There is
+    # no rush to be wrong about it either, since the next activation re-stats the pair anyway.
+    if not residue:
+        from kiro_crew.connections.warm import rearm_invalidated_provider
+
+        rearm_invalidated_provider(slug)
 
     return DisconnectScope(
         entry_removed=bool(owned_scopes),

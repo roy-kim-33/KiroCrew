@@ -33,11 +33,14 @@ const themeState = {
   onboarded: true,
   importOnboarded: true,
   privacyAcked: true,
+  crewmatesOnboarded: true,
+  crewmatesFlowSeen: true,
   themeBootReady: false,
   themes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
   markPrivacyAcked: vi.fn(),
+  markCrewmatesOnboarded: vi.fn(),
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
 }
@@ -49,7 +52,6 @@ vi.mock('../hooks/useTheme', () => ({
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => null }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => null }))

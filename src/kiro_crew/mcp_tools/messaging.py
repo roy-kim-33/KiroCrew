@@ -23,12 +23,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import mcp_core
+from kiro_crew import file_delivery_consent, mcp_core
 from kiro_crew.constants import CHANNEL_OWNER_DM_NAMESPACES
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
+from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
-from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE
+from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
 #: ``session`` values that name a chat channel rather than a delivery mode. Each
 #: one delivers a DM to that channel's own configured owner: the gateway resolves
@@ -150,7 +152,14 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "blocks": {
                         "type": "array",
-                        "description": "Optional Slack Block Kit blocks array. When provided, the message is sent as a rich Block Kit message with text as fallback.",
+                        "description": (
+                            "Optional Slack Block Kit blocks array. When provided, "
+                            "the message is sent as rich Block Kit with text as "
+                            "fallback. Agent-supplied blocks cannot contain image "
+                            "or video blocks, or image_url, thumbnail_url, or "
+                            "video_url fields; those server-fetched media forms are "
+                            "refused."
+                        ),
                         "items": {"type": "object"},
                         "maxItems": 50,
                     },
@@ -194,11 +203,18 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "unfurl_links": {
                         "type": "boolean",
-                        "description": "Whether to unfurl URL link previews. Defaults to true.",
+                        "description": (
+                            "Deprecated. Link previews are always off on bot "
+                            "posts (a preview is a zero-click fetch of the "
+                            "URL). false is accepted; true is refused."
+                        ),
                     },
                     "unfurl_media": {
                         "type": "boolean",
-                        "description": "Whether to unfurl media (images/video) previews. Defaults to true.",
+                        "description": (
+                            "Deprecated. Media previews are always off on bot "
+                            "posts. false is accepted; true is refused."
+                        ),
                     },
                     "thread_ts": {
                         "type": "string",
@@ -215,6 +231,23 @@ def schemas() -> list[dict[str, Any]]:
                             "When true and 'thread_ts' is set, also broadcast the threaded reply "
                             "to the channel's main message list. Requires 'thread_ts' — passing "
                             "reply_broadcast=true without thread_ts returns 400. Defaults to false."
+                        ),
+                    },
+                    "include_session_link": {
+                        "type": "boolean",
+                        "description": (
+                            "When true and the message is delivered to Slack, append an "
+                            '"Open session" button that deep-links to THIS session\'s '
+                            "dashboard chat (a cron links to its origin session). The link "
+                            "is built server-side from the verified caller identity, so it "
+                            "always points at the calling session — you never assemble it. "
+                            "The button's embedded sign-in credential expires ~5 minutes "
+                            "after send: a later tap still opens the session for a browser "
+                            "holding a dashboard session cookie, and otherwise lands on "
+                            "the sign-in page — so do not present the button as a durable "
+                            "link. Silently omitted (message still delivered) for non-Slack "
+                            "delivery, a caller with no resolvable session, or when no "
+                            "dashboard origin/tunnel is available. Defaults to false."
                         ),
                     },
                     "session": {
@@ -329,6 +362,47 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "update_message",
+            "description": (
+                "Edit a message previously sent by this bot, in place. Only works "
+                "on messages authored by the Kiro Crew bot itself (Slack API "
+                "constraint). Use for a rolling status message — progress, a live "
+                "checklist, a result that supersedes an earlier one — instead of "
+                "posting a follow-up that buries the original. Either text or "
+                "blocks is required, and what you pass REPLACES the message: an "
+                "edit carrying only blocks drops the old text, and one carrying "
+                "only text drops the old blocks."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel ID where the message was posted.",
+                    },
+                    "ts": {
+                        "type": "string",
+                        "description": "Timestamp of the message to edit (from send_message response).",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "Replacement message text. Required unless blocks is "
+                            "given; pass it alongside blocks as the notification "
+                            "fallback."
+                        ),
+                    },
+                    "blocks": {
+                        "type": "array",
+                        "maxItems": 50,
+                        "items": {"type": "object"},
+                        "description": "Replacement Block Kit blocks (max 50).",
+                    },
+                },
+                "required": ["channel", "ts"],
+            },
+        },
+        {
             "name": "read_slack_profile",
             "description": (
                 "Read a Slack user's profile. Returns display name, title, "
@@ -355,7 +429,15 @@ def schemas() -> list[dict[str, Any]]:
                 "also delivered there natively; otherwise it uploads to "
                 "Slack when the caller's Slack identity permits it. Use "
                 "when you've generated a report, export, artifact, or any "
-                "file the user should receive."
+                "file the user should receive. Native channel delivery is "
+                "not guaranteed: the result reports skips and failures, and "
+                "a Slack-linked session reports a successful Slack upload. "
+                "If neither delivers, the file remains available from the "
+                "dashboard. To put an IMAGE inline in a "
+                "messaging conversation, reference it in your reply as "
+                "![alt](/abs/path) from the session's working directory — "
+                "the channel renderer uploads it as a native picture, which "
+                "this tool's outbox copy is not eligible for."
             ),
             "inputSchema": {
                 "type": "object",
@@ -434,6 +516,10 @@ def send_message(name: str, args: dict[str, Any]) -> str:
         payload["thread_ts"] = args["thread_ts"]
     if args.get("reply_broadcast"):
         payload["reply_broadcast"] = args["reply_broadcast"]
+    # Server-side deep-link button opt-in. Forwarded as a plain flag; the gateway
+    # resolves the caller identity and builds the URL, so no session key is sent.
+    if args.get("include_session_link"):
+        payload["include_session_link"] = True
     if session:
         payload["session"] = session
     # Always tell the gateway when the caller is a cron — even on a bare
@@ -661,7 +747,7 @@ def send_notification(name: str, args: dict[str, Any]) -> str:
 def delete_message(name: str, args: dict[str, Any]) -> str:
     channel = args.get("channel", "")
     msg_ts = args.get("ts", "")
-    if not CHANNEL_ID_RE.match(channel):
+    if len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         mcp_core.sel().log_tool_invocation(
             session_key=mcp_core._resolve_session_key(),
             source="mcp",
@@ -695,6 +781,89 @@ def delete_message(name: str, args: dict[str, Any]) -> str:
     return "Message deleted."
 
 
+def update_message(name: str, args: dict[str, Any]) -> str:
+    """Edit one of the bot's own Slack messages in place.
+
+    Gated like ``send_message``'s Slack leg, NOT like ``delete_message``. Deleting
+    retracts content the audience already has; an edit PUBLISHES new agent-authored
+    text to that same audience, which is the exfil surface every outbound gate
+    exists for. Without them a session whose ``capabilities.messaging`` was turned
+    off, or a channel agent confined to channel posts, could still push arbitrary
+    text into Slack by editing a message it posted earlier — the gate would hold on
+    ``send_message`` and leak here.
+
+    Shape is validated before identity so a malformed call is refused without a
+    governance-profile evaluation, and every return path lands on the SEL trail.
+    """
+    channel = args.get("channel", "")
+    msg_ts = args.get("ts", "")
+    text = args.get("text") or ""
+    blocks = args.get("blocks")
+
+    def _audit(outcome: str, session_key: str = "") -> None:
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key or mcp_core._resolve_session_key(),
+            source="mcp",
+            tool_name="update_message",
+            outcome=outcome,
+        )
+
+    if not CHANNEL_ID_RE.match(channel):
+        _audit("error")
+        return "Error: invalid channel ID format."
+    if not _SLACK_TS_RE.match(msg_ts):
+        _audit("error")
+        return "Error: invalid message timestamp format."
+    if not text and not blocks:
+        # chat.update needs replacement content: an edit carrying neither is at
+        # best a no-op and at worst blanks the message, so refuse it here.
+        _audit("error")
+        return "Error: text or blocks required."
+    # Strict identity, for the reason send_message's channel legs need it: the
+    # lenient resolver walks process ancestors, so an unattributable subagent
+    # would be gated (and audited) as its PARENT — and the channel-agent
+    # containment check below is keyed on exactly that identity.
+    caller, strict_err = mcp_core.require_strict_session_key(
+        "Error: cannot verify caller identity for an update_message edit "
+        "(no gateway-injected session key or HMAC-verified pid). "
+        "Refusing to publish text that cannot be attributed to a caller."
+    )
+    if not caller:
+        _audit("denied")
+        return strict_err
+    # Channel agents communicate exclusively through channel posts. kirocrew-core
+    # is auto-approved, so no permission event reaches channel.py's guard and the
+    # boundary has to hold here at MCP dispatch. This helper writes its own
+    # ``rejected_blocked_tool`` SEL record, so no _audit() call beside it.
+    chan_deny = mcp_core._deny_channel_agent_messaging(caller, "update_message")
+    if chan_deny:
+        return chan_deny
+    gov_msg = mcp_core._vet_messaging_governance(caller, tool_name="update_message")
+    if gov_msg:
+        _audit("denied", caller)
+        return f"Error: {gov_msg}"
+    # The per-transport ``channels`` allowlist as well: an edit leaves over Slack
+    # and only Slack, so a policy that permits messaging but not Slack must refuse
+    # it exactly as it refuses a Slack send.
+    gov_chan = mcp_core._vet_channel_governance(caller, "slack", tool_name="update_message")
+    if gov_chan:
+        _audit("denied", caller)
+        return f"Error: {gov_chan}"
+    payload: dict[str, Any] = {"channel": channel, "ts": msg_ts}
+    if text:
+        payload["text"] = text
+    if blocks:
+        payload["blocks"] = blocks
+    # Send the key the gate returned, never a re-resolved one: re-resolving would
+    # check one identity and write as another.
+    resp = mcp_core._post("/api/update-message", payload, session_key=caller)
+    if resp.get("error"):
+        _audit("error", caller)
+        return f"Failed: {resp['error']}"
+    _audit("success", caller)
+    return "Message updated."
+
+
 def read_slack_profile(name: str, args: dict[str, Any]) -> str:
     user_id = args["user"]
     resp = mcp_core._post("/api/slack-profile", {"user": user_id})
@@ -710,6 +879,72 @@ def read_slack_profile(name: str, args: dict[str, Any]) -> str:
             val, _ = redact_credentials(val)
             profile[key] = val
     return json.dumps(profile, indent=2)
+
+
+def _describe_channel_skip(reason: str) -> str:
+    """Render a channel-leg skip *reason* as an actionable warning clause.
+
+    The endpoint already decided, audited and serialized why native delivery
+    could not happen; this only makes that decision visible to the caller. The
+    reason codes are a closed vocabulary
+    (:mod:`kiro_crew.dashboard.upload_destination`), so an unrecognized value is
+    reported verbatim rather than guessed at — a new code must degrade to "we
+    told you the code we got", never to silence.
+
+    ``restricted_session`` deliberately gets NO remedy. It is a ceiling, not a
+    missing capability: the renderer's extraction path enforces the same shared
+    predicate, so the inline route is equally refused there. Suggesting it would
+    both fail and read as advice to route around a privacy boundary.
+
+    ``channel_upload_unsupported`` gets no remedy either, for the neighbouring
+    reason: it fires for any channel with no document verb wired, and that set
+    spans both capabilities. Discord would honour an inline reference
+    (``files_outbound=True``) but WeCom, Weixin, iMessage and Feishu declare
+    ``files_outbound=False``, so their renderers leave the reference in the text
+    as literal markup. The reason string cannot tell those cases apart, and
+    naming a route that silently does nothing on half of them is worse than
+    naming none — the channel type is already in the reason for a caller that
+    wants to look further.
+
+    This docstring is the ONE place that roster is written down; the spec and the
+    tests point here rather than restating it, so a channel flipping the flag
+    invalidates a single site instead of four.
+    """
+    head = f" (native channel delivery skipped: {reason}"
+    if reason == "restricted_session":
+        return (
+            f"{head}; this session may not ship local file bytes to a channel, "
+            "so the dashboard card is the only delivery)"
+        )
+    if reason.startswith("channel_upload_unsupported"):
+        return f"{head}; this channel has no file-upload path from this tool)"
+    if reason == "no_channel_destination":
+        # The one reason with a route worth naming: no destination here does not
+        # mean no destination anywhere, and the renderer's own outbound-image
+        # extraction uploads a real image referenced inline in the reply.
+        return (
+            f"{head}; for an inline image on a messaging channel, reference it as "
+            "![alt](/abs/path) from the session's working directory instead)"
+        )
+    return f"{head})"
+
+
+def _describe_slack_skip(reason: str) -> str:
+    """Render a SLACK-leg skip *reason* as a warning clause.
+
+    The Slack endpoint answers its own "cannot deliver here" the same way the
+    channel one does — ``{"ok": true, "skipped": "<reason>"}``, from `no_slack`
+    when no client is configured and from the shared destination oracle
+    otherwise — and this tool is that endpoint's only caller. Reporting only
+    ``error`` left a skip indistinguishable from an upload, which is the very
+    pattern the channel leg above stopped doing; fixing one branch and leaving
+    its sibling is what makes a point patch out of a general fix.
+
+    No remedy is named. Unlike a channel skip there is no alternative route to
+    point at: Slack either has a permitted destination for this caller or the
+    dashboard card is the delivery.
+    """
+    return f" (Slack upload skipped: {reason}; the file is available in the dashboard)"
 
 
 def file_send(name: str, args: dict[str, Any]) -> str:
@@ -744,14 +979,24 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="denied",
             error=f"sensitive_filename: {redact(clean_name)}",
         )
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name=redact(clean_name),
+            reason="flagged name",
+        )
         return "Error: filename contains sensitive content. Rename the file first."
-    # For text files, check content for sensitive data; binary files skip this
-    # and validate MIME against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
-    is_text = True
+    # Content is scanned whichever way it decodes: UTF-8 text through ``redact``,
+    # non-UTF-8 bytes through the shared ``binary_content_is_flagged``. Binary
+    # must also carry an allow-listed MIME type (deny-by-default), and that check
+    # runs first so bytes of a type this path refuses outright are never scanned.
+    # ``wide_content_is_flagged`` runs on BOTH branches: NUL-interleaved ASCII is
+    # valid UTF-8, so a wide-encoded credential decodes cleanly and its characters
+    # arrive NUL-separated, which the contiguous-ASCII detectors do not match.
+    flagged = False
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        is_text = False
         guessed = mimetypes.guess_type(clean_name)[0] or ""
         if guessed not in BINARY_MIME_ALLOWLIST:
             mcp_core.sel().log_tool_invocation(
@@ -762,22 +1007,47 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 error=f"binary_mime_not_allowed: {guessed}",
             )
             return f"Error: binary file type not allowed: {guessed or 'unknown'}. Allowed: audio, video, image, PDF."
-        mcp_core.sel().log_tool_invocation(
-            session_key="mcp_core",
-            source="mcp",
-            tool_name="file_send",
-            outcome="info",
-            error="binary_file_skipping_content_scan",
-        )
-    if is_text and redact(text) != text:
-        mcp_core.sel().log_tool_invocation(
-            session_key="mcp_core",
-            source="mcp",
-            tool_name="file_send",
-            outcome="denied",
-            error="sensitive_content_detected",
-        )
-        return "Error: file content contains sensitive data; send aborted"
+        flagged = binary_content_is_flagged(raw)
+    else:
+        flagged = redact(text) != text or wide_content_is_flagged(raw)
+    # A positive here is almost always CORRECT -- the reported case (a VPN device
+    # private key) matches the PEM branch, the highest-confidence detector in the
+    # catalogue -- so the remedy is not a looser scan but an owner who can say
+    # "that is mine". The grant covers ONLY this machine's outbox and the owner's
+    # own authenticated dashboard; the Slack and channel upload legs route through
+    # ``_gate_upload_file``, which does not read the consent store and refuses them
+    # regardless (see file_delivery_consent for why that is structural).
+    delivered_under_consent = False
+    if flagged:
+        if not file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD):
+            mcp_core.sel().log_tool_invocation(
+                session_key="mcp_core",
+                source="mcp",
+                tool_name="file_send",
+                outcome="denied",
+                error="sensitive_content_detected",
+            )
+            # The error string below reaches the AGENT. This entry is what reaches
+            # the OWNER, so it carries the name: the panel it points them at asks
+            # them to allow delivery, and an owner who cannot see which of their
+            # files was stopped has nothing to base that on.
+            file_delivery_consent.audit_refusal(
+                file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                leg="file_send",
+                name=clean_name,
+                reason="flagged content",
+            )
+            return (
+                "Error: file content contains sensitive data; send aborted. The owner "
+                "can allow delivery to this machine's outbox and their own dashboard "
+                "in Settings > Security > Flagged-file delivery (owner-gated; no agent "
+                "can write it). That panel ARMS the request via POST "
+                "/api/file-delivery/consent?destination_class=owner_dashboard; the grant "
+                "is then RECORDED only by running `kirocrew file-delivery approve` on the "
+                "host, so arming alone leaves delivery blocked. The Slack and channel "
+                "upload legs can never be granted."
+            )
+        delivered_under_consent = True
     dest = mcp_core.outbox_dir() / clean_name
     try:
         with dest.open("xb") as f:
@@ -788,6 +1058,26 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
         )
         dest.write_bytes(raw)
+    if delivered_under_consent:
+        # Emitted once the bytes are on disk. A full outbox or a read-only
+        # workspace is an ordinary operational condition, and only
+        # ``FileExistsError`` is recovered above, so any other write error
+        # propagates from here; a record written before the copy would claim a
+        # consented delivery that never happened and there is no retraction
+        # entry to correct it. Over-reporting a release of flagged content is the
+        # direction an incident review cannot afford.
+        mcp_core.sel().log_tool_invocation(
+            session_key="mcp_core",
+            source="mcp",
+            tool_name="file_send",
+            outcome="completed",
+            error="sensitive_content_delivered_with_consent",
+        )
+        file_delivery_consent.audit_decision(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            outcome="delivered",
+            detail=f"file_send: {clean_name}",
+        )
     mcp_core.sel().log_tool_invocation(
         session_key="mcp_core",
         source="mcp",
@@ -807,6 +1097,20 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     )
     if d.get("error"):
         return f"Error: {d['error']}"
+    # Under an owner grant the third-party legs are not attempted AT ALL. The
+    # shared ``_gate_upload_file`` would refuse them anyway -- it does not read the
+    # consent store, which is what makes that refusal structural rather than a
+    # check someone could invert -- but handing flagged bytes to a handler that
+    # will refuse them is a needless hop for content the owner scoped to their own
+    # dashboard. Returning here keeps the grant's blast radius to exactly the
+    # destination class it names, and belt-and-braces means neither layer is load
+    # bearing alone.
+    if delivered_under_consent:
+        msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
+        return (
+            f"{msg} (delivered to the dashboard under the owner's file-delivery "
+            "consent; Slack and channel upload skipped)"
+        )
     # Native channel delivery first: when the caller's session is linked to a
     # non-Slack conversation with a document-capable transport (a Telegram
     # chat today), the file belongs THERE — the user who asked for it is
@@ -827,6 +1131,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # native leg first would reroute the file to the linked chat instead of
     # the named Slack channel.
     channel_warning = ""
+    channel_skip_reason = ""
     # Resolve-half of the shared strict gate only: file_send degrades (skips
     # the native channel leg) rather than refusing when identity is absent.
     strict_key, _ = mcp_core.require_strict_session_key("file_send native delivery")
@@ -842,6 +1147,14 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             return f"{msg} (delivered to {via})"
         if channel_resp.get("error"):
             channel_warning = f" (channel upload failed: {channel_resp['error']})"
+        elif channel_resp.get("skipped"):
+            # A SKIP is the endpoint's "no destination here" answer, and it
+            # carries the reason it decided that. Reporting it is the whole
+            # point: without it the caller reads a bare "File sent" and cannot
+            # tell a delivery from a dashboard-only copy, so an agent that
+            # picked the wrong tool has nothing to correct against.
+            channel_skip_reason = str(channel_resp["skipped"])
+            channel_warning = _describe_channel_skip(channel_skip_reason)
     # Also upload to Slack when the caller's Slack identity permits it.
     #
     # Resolve identity as a THREE-state result (see
@@ -857,6 +1170,10 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # tracked channel) because its identity is known and none of those paths
     # broadcast at channel root for an unknown caller.
     identity, thread_ts = mcp_core._classify_slack_identity()
+    # Slack-linked sessions cannot have a native document-channel destination.
+    # Its routine no-destination skip says nothing about the Slack leg below.
+    if identity == "thread" and channel_skip_reason == "no_channel_destination":
+        channel_warning = ""
     slack_warning = ""
     if identity == "unresolved":
         mcp_core.sel().log_tool_invocation(
@@ -885,6 +1202,15 @@ def file_send(name: str, args: dict[str, Any]) -> str:
         )
         if slack_resp.get("error"):
             slack_warning = f" (Slack upload failed: {slack_resp['error']})"
+        elif slack_resp.get("skipped"):
+            # Same three-state response as the channel leg above, same rule: a
+            # skip the endpoint computed and audited must not read as an upload.
+            slack_warning = _describe_slack_skip(str(slack_resp["skipped"]))
+        elif slack_resp.get("ok") is True:
+            # ok-without-skipped means the endpoint actually delivered, for
+            # every resolved identity (owner DM, session-map thread, tracked
+            # channel) — not just Slack-linked threads.
+            slack_warning = " (delivered to Slack)"
     msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
     return msg + channel_warning + slack_warning
 
@@ -893,6 +1219,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "send_message": send_message,
     "send_notification": send_notification,
     "delete_message": delete_message,
+    "update_message": update_message,
     "read_slack_profile": read_slack_profile,
     "file_send": file_send,
 }

@@ -4,7 +4,7 @@ import { i18nT } from '../../i18n/t'
  * Shared types for the Apps page (Discover + Library) surfaces.
  *
  * ``RegistryApp`` mirrors the backend ``app-registry.json`` schema (core file
- * or federated external registry index) after ``registry.py`` enrichment:
+ * or federated external registry index) after ``registry_pipeline/`` enrichment:
  *  - ``_registry``: source registry name tagged by ``_load_external_registries``
  *    (absent for core-file entries and for built-ins merged client-side).
  *  - ``featured``: curator flag carried on registry INDEX entries (not
@@ -46,10 +46,10 @@ export type RegistryApp = {
   _registry?: string
   /**
    * Server-computed trust fields — the API trust boundary of
-   * ``/api/apps/registry`` (``_apply_trust_fields`` in ``registry.py``).
-   * Optional only because rows from an older gateway lack them; when
-   * present they are authoritative and the client must not re-derive
-   * trust from ``_registry`` absence.
+   * ``/api/apps/registry`` (``_apply_trust_fields`` in
+   * ``registry_pipeline/catalog.py``). Optional only because rows from an
+   * older gateway lack them; when present they are authoritative and the
+   * client must not re-derive trust from ``_registry`` absence.
    */
   // 'core' is the pre-migration spelling of 'official'; both mean "an app WE
   // list", the bundled index being the offline seed of that list.
@@ -66,6 +66,10 @@ export type RegistryApp = {
     // Set when the app's UI needs the Electron shell (native windows,
     // global shortcuts, tray). A UX gate only — the marker is client-side.
     requiresDesktopApp?: boolean }
+  manifest?: {
+    permissions?: { sessionApproval?: boolean }
+    platform?: { requiresDesktopApp?: boolean }
+  }
 }
 
 /** Installed app shape from ``GET /api/apps`` (mirrors app manager records). */
@@ -74,6 +78,7 @@ export type InstalledApp = {
   version: string
   displayName: string
   enabled: boolean
+  sessionApprovalConsentPending?: boolean
   installedAt: string
   source?: string
   origin?: string     // "builtin" | "registry" | "local" | "external"
@@ -120,12 +125,22 @@ export type InstalledApp = {
      * `contributedCommands.ts` (which carries its own record type, and validates the
      * shape because this data is third-party) could not otherwise see the field
      * exists. Left as `unknown` on purpose — the only code allowed to decide what a
-     * contribution IS is the module that checks it.
+     * contribution IS is the module that checks it. `panelTabs` is read the same way,
+     * by `hooks/panelTabRegistry.ts`.
      */
     contributes?: {
       commands?: unknown
+      panelTabs?: unknown
     }
-    permissions?: { api?: string[]; events?: string[]; mcpTools?: string[]; storage?: boolean; cron?: boolean; network?: boolean }
+    permissions?: {
+      api?: string[]
+      events?: string[]
+      mcpTools?: string[]
+      storage?: boolean
+      cron?: boolean
+      network?: boolean
+      sessionApproval?: boolean
+    }
     setup?: { onInstall?: string; onUpdate?: string; onUninstall?: string; onEnable?: string; onDisable?: string }
     minKiroCrewVersion?: string
     iconPath?: string
@@ -152,13 +167,25 @@ export type InstalledApp = {
   }
 }
 
+/** Filter identity, not a display name: external ids cannot alias host buckets. */
+export function sourceKey(app: Pick<RegistryApp, 'origin' | '_registry'>): string {
+  if (app._registry) return `registry:${app._registry}`
+  if (app.origin === 'builtin') return '__builtin__'
+  return '__core__'
+}
+
+/** The row keeps its raw name for display and metadata lookups. */
+export function sourceRowKey(row: { name: string; builtin: boolean }): string {
+  return row.builtin ? row.name : sourceKey({ _registry: row.name })
+}
+
 /**
  * Human label for the registry an app came from (trust provenance).
  *
  * The server-computed ``provenance`` field is authoritative
- * (``_apply_trust_fields`` in ``registry.py`` computes it where the
- * ``_registry`` tag is applied and overwrites anything an index publishes).
- * The ``_registry`` tag is still checked FIRST: it is equally
+ * (``_apply_trust_fields`` in ``registry_pipeline/catalog.py`` computes it
+ * where the ``_registry`` tag is applied and overwrites anything an index
+ * publishes). The ``_registry`` tag is still checked FIRST: it is equally
  * server-attached, and a row carrying it is external by construction — so
  * a ``provenance`` value smuggled through an OLDER gateway (which copies
  * index keys verbatim and computes nothing) can never relabel an external
@@ -187,15 +214,15 @@ export function sourceLabel(app: Pick<RegistryApp, '_registry' | 'origin' | 'pro
  * button that runs setup code with gateway privileges.
  *
  * The server-computed ``verified`` field is authoritative when present
- * (``_apply_trust_fields`` in ``registry.py`` overwrites anything an index
- * publishes). ``_registry`` is still rejected BEFORE it: the tag is equally
- * server-attached and the server never emits ``verified: true`` on a tagged
- * row, so this order only differs for a ``verified`` smuggled through an
- * OLDER gateway that copies index keys verbatim — exactly the case that must
- * lose. The ``origin``/``author`` derivation below is the legacy fallback
- * for rows from older gateways that emit neither field; genuine built-ins
- * merged client-side set ``verified: true`` directly and never carry
- * ``_registry``.
+ * (``_apply_trust_fields`` in ``registry_pipeline/catalog.py`` overwrites
+ * anything an index publishes). ``_registry`` is still rejected BEFORE it:
+ * the tag is equally server-attached and the server never emits
+ * ``verified: true`` on a tagged row, so this order only differs for a
+ * ``verified`` smuggled through an OLDER gateway that copies index keys
+ * verbatim — exactly the case that must lose. The ``origin``/``author``
+ * derivation below is the legacy fallback for rows from older gateways that
+ * emit neither field; genuine built-ins merged client-side set
+ * ``verified: true`` directly and never carry ``_registry``.
  */
 export function isVerified(app: Pick<RegistryApp, 'origin' | 'author' | '_registry' | 'verified'>): boolean {
   if (app._registry) return false
@@ -223,8 +250,8 @@ const REGISTRY_SOURCE_PREFIX = 'registry:'
  * the same secondary signal ``manager.py`` accepts for the same question. It is
  * also the fallback when ``source`` is present but not a string: the detail page
  * spreads a CATALOG row into its app object when the installed-record fetch
- * fails, and ``registry.py`` copies index keys verbatim for a row it has not
- * installed, so an external index can publish ``source: {type: "git"}``. The
+ * fails, and ``registry_pipeline/`` copies index keys verbatim for a row it has
+ * not installed, so an external index can publish ``source: {type: "git"}``. The
  * declared type says ``string``, but the payload is untrusted and this runs
  * inside the ``autoAction`` effect — an unguarded ``startsWith`` throws there and
  * Sync never dispatches at all.
@@ -254,11 +281,12 @@ export function sanitizeStargazersCount(v: unknown): number | undefined {
 /**
  * Normalize a registry row for rendering.
  *
- * ``registry.py`` intentionally yields a MINIMAL index row when an app's
- * ``app.json`` fetch fails (name/repo only, no display fields), and external
- * registries are user-supplied JSON — so display fields can be missing or the
- * wrong type. Every consumer sorts, lowercases, and renders these, so coerce
- * once at the query boundary instead of defending at each call site.
+ * ``registry_pipeline/manifests.py`` intentionally yields a MINIMAL index row
+ * when an app's ``app.json`` fetch fails (name/repo only, no display fields),
+ * and external registries are user-supplied JSON — so display fields can be
+ * missing or the wrong type. Every consumer sorts, lowercases, and renders
+ * these, so coerce once at the query boundary instead of defending at each
+ * call site.
  */
 export function normalizeRegistryApp(raw: RegistryApp): RegistryApp {
   const str = (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback)
