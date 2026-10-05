@@ -22,7 +22,8 @@ calls in general. The tree carries many raw POSIX call sites (``fcntl``,
 ``resource``, ``os.killpg``, ``pty``, ``termios``, …) and the overwhelming
 majority are legitimately POSIX-gated implementation detail; auditing them all
 here would bury this signal in noise. General portability is governed by the
-``platform_compat`` shim table in ``AGENTS.md``, the ``cross-platform.yml``
+``platform_compat`` shim table in
+``docs/system-specs/common/platform-compat.md``, the ``cross-platform.yml``
 added-line gate, and review. What makes signal-0 special is that getting it
 wrong is *destructive* rather than merely unavailable — and the CI gate only
 inspects lines a PR adds, so a probe that arrives by a file move or a rebase is
@@ -32,22 +33,23 @@ invisible to it. This test reads the whole tree on every run.
 from __future__ import annotations
 
 import ast
+import functools
+import unicodedata
 from pathlib import Path
 
+import pytest
+
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + a text filter, ast.parse on the ~70 files that can match). Under
+# `--dist loadgroup` an unmarked module is spread across workers and each worker re-pays
+# that scan. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_windows_kill_probe_audit")
 
 # ``file::function`` sites allowed to keep a raw signal-0 probe, with the reason
 # it can never run on Windows. Keep this list SHORT and each entry justified.
 GATED_PROBES: dict[str, str] = {
-    # POSIX-only sweep of children that reparented out of the killed process
-    # group. Guarded by an `if platform_compat.IS_WINDOWS: return` on the first
-    # line of the body, and moot there anyway: kill_process_tree already uses
-    # `taskkill /T` to walk the whole child tree, so nothing is left to sweep.
-    # The function docstring states this.
-    "acp/client.py::_kill_escaped_children": (
-        "explicit `if platform_compat.IS_WINDOWS: return` early-out; "
-        "process groups do not exist on Windows"
-    ),
     # platform_compat IS the shim — its POSIX branch is the real implementation
     # that every other caller is supposed to route through, and it is reached
     # only under `if IS_POSIX`.
@@ -84,15 +86,42 @@ def _enclosing_functions(tree: ast.AST) -> list[tuple[str, ast.AST]]:
     return out
 
 
-def _find_raw_probes() -> dict[str, list[int]]:
-    """Map ``file::function`` -> line numbers of raw signal-0 probes."""
+@functools.lru_cache(maxsize=1)
+def _find_raw_probes() -> dict[str, tuple[int, ...]]:
+    """Map ``file::function`` -> line numbers of raw signal-0 probes.
+
+    Cached: the scan is the same answer for every one of this module's tests, and
+    the source tree cannot change mid-run. Values are tuples so a cached entry
+    cannot be mutated in place.
+
+    Streams the tree -- read one file, decide, parse it only if it can match, drop
+    it -- rather than going through ``test/source_corpus.py``. That helper
+    memoizes the raw AND NFKC-normalised text of every module under ``src/``
+    (~1,700 files, most stored two bytes per character because they are not pure
+    ASCII), which measured at +280 MiB RSS on this test alone. The sharing it buys
+    is across gates in one module, and this module has exactly one consumer of the
+    tree, so here the cache was all cost: with the stream the high-water mark is
+    one file's parse.
+
+    Narrowing is the same as the corpus's: only a file whose text contains
+    ``.kill(`` is parsed, checked against the NFKC-normalised text because CPython
+    folds identifiers to NFKC at parse time -- so ``os.kill`` written with a
+    compatibility homoglyph of ``kill`` IS ``os.kill`` in the AST, and a raw-byte
+    filter would skip that file and let the probe through green. An
+    ``os.kill(pid, 0)`` call always spells ``.kill(`` verbatim after folding, so
+    narrowing cannot drop a real probe. A file that cannot be read is a file this
+    audit cannot see, so the ``OSError`` is not swallowed.
+    """
     found: dict[str, list[int]] = {}
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         rel = path.relative_to(_SRC_ROOT).as_posix()
         if rel.startswith("_vendor/"):
             continue  # vendored third-party code is excluded from all linters
+        source = path.read_text(encoding="utf-8")
+        if ".kill(" not in unicodedata.normalize("NFKC", source):
+            continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = ast.parse(source)
         except (SyntaxError, UnicodeDecodeError):
             continue
         funcs = _enclosing_functions(tree)
@@ -110,7 +139,8 @@ def _find_raw_probes() -> dict[str, list[int]]:
             if isinstance(sub, ast.Call) and _is_signal_zero_probe(sub):
                 if not any(sub.lineno in span for span in func_line_spans):
                     found.setdefault(f"{rel}::<module>", []).append(sub.lineno)
-    return found
+        del tree, funcs, source
+    return {k: tuple(v) for k, v in found.items()}
 
 
 def test_no_ungated_signal_zero_probe() -> None:
@@ -153,7 +183,7 @@ def test_gated_sites_carry_a_written_justification() -> None:
 
 
 def test_app_backend_pid_alive_uses_the_shim() -> None:
-    """Regression pin for a site that was previously a raw probe.
+    """Regression pin for a site that would otherwise be a raw probe.
 
     ``apps/backend.py::_pid_alive`` is called from the stale-reap escalation
     loop, which is otherwise fully shim-routed

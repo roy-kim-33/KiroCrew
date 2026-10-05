@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew import mcp_core
 from kiro_crew.apps.builtins.issue_radar.backend import routes as ir_routes
@@ -271,7 +272,7 @@ class TestMiddlewareDecision:
 
     Set membership alone would still pass if the middleware's prefix matcher
     changed, so assert the actual decision: the credential-less call the seed
-    prompt used to ask for is refused, and the tool's internal-secret call is
+    prompt asks for is refused, and the tool's internal-secret call is
     granted.
     """
 
@@ -300,7 +301,7 @@ class TestMiddlewareDecision:
 
     @pytest.mark.asyncio
     async def test_a_credentialless_put_is_still_refused(self):
-        # This is the exact 403 the Investigate prompt used to earn. Admitting
+        # This is the exact 403 the Investigate prompt earns. Admitting
         # the path for the internal secret must NOT have opened it up generally.
         resp = await self._mw()(self._request(), _ok_handler)
         assert resp.status == 403
@@ -345,6 +346,9 @@ class TestPutHandlerBoundsTheItemNumber:
 
     async def _put(self, body: dict):
         request = make_mocked_request("PUT", RECORD_PATH)
+        request.app["state"] = NoConfiguredOwner()
+        request["user"] = "local-app"
+        request["app"] = ""
 
         async def _json():
             return body

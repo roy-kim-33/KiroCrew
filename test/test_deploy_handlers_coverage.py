@@ -72,7 +72,7 @@ class _FakeReq:
 
     def __init__(self, body=None, *, match_info=None, query=None, headers=None, json_exc=None):
         self._body = {} if body is None else body
-        # When set, ``json()`` raises this instead of decoding ``_body`` — used to
+        # When set, ``json()`` raises this instead of decoding ``_body``, to
         # exercise the widened catch set (LookupError for an unknown charset codec,
         # UnicodeDecodeError for undecodable bytes) and to prove transport errors
         # propagate rather than being swallowed as a 400.
@@ -171,7 +171,10 @@ class TestHelpers:
         assert handlers._safe_resolve(boom) is boom
 
     def test_reaper_remediation_omits_empty_flags(self):
-        assert handlers._reaper_remediation("", "") == "install-reaper.sh"
+        # Absolute path now, so the command is actually runnable; the flag
+        # behaviour this pins is unchanged.
+        assert handlers._reaper_remediation("", "").endswith("install-reaper.sh")
+        assert "--profile" not in handlers._reaper_remediation("", "")
         assert "--profile p" in handlers._reaper_remediation("p", "us-west-2")
 
     def test_safe_site_id_strips_and_truncates(self):
@@ -333,7 +336,11 @@ class TestStageTreeSafe:
         real_dir = tmp_path / "elsewhere"
         real_dir.mkdir()
         os.symlink(str(real_dir), str(src / "linkdir"))
-        with pytest.raises(RuntimeError, match="symlinked directory"):
+        # Anchored on the prefix, because a bare "linked directory" is a SUBSTRING of
+        # "symlinked directory" and would pass whichever word the message carries.
+        # The fence names a link of either kind, a symlink here and a Windows
+        # junction on the arm test_junction_link_fences.py covers.
+        with pytest.raises(RuntimeError, match="in-tree: linked directory"):
             handlers._stage_tree_safe(src, tmp_path / "stage")
 
     def test_unstattable_file_blocks_staging(self, tmp_path: Path, monkeypatch):
@@ -579,7 +586,7 @@ class TestDoDeployRefusals:
         status, payload = await handlers._do_deploy(
             {"site_id": "s", "local_dir": str(_site), "confirm": True})
         assert status == 409
-        assert payload["remediation"].startswith("install-reaper.sh")
+        assert payload["remediation"].endswith("install-reaper.sh --profile p --region us-west-2")
 
     @pytest.mark.asyncio
     async def test_base_stack_parse_error_is_swallowed(self, _site, monkeypatch):
@@ -588,7 +595,7 @@ class TestDoDeployRefusals:
             engine, "run_aws", _aws_router([("describe-stacks", (0, "not-json", ""))]))
         status, payload = await handlers._do_deploy(
             {"site_id": "s", "local_dir": str(_site), "confirm": True})
-        assert status == 409 and "reaper base stack" in payload["error"]
+        assert status == 409 and "reaper base stack" in payload["details"]
 
     @pytest.mark.asyncio
     async def test_missing_reaper_stack_blocks_finite_ttl(self, _site, monkeypatch):
@@ -599,7 +606,10 @@ class TestDoDeployRefusals:
         ]))
         status, payload = await handlers._do_deploy(
             {"site_id": "s", "local_dir": str(_site), "confirm": True})
-        assert status == 409 and "kirocrew-deploy-reaper" in payload["error"]
+        # Stack names moved out of the banner text into `details`; `code` is the
+        # stable machine field.
+        assert status == 409 and "kirocrew-deploy-reaper" in payload["details"]
+        assert payload["code"] == "reaper_required"
 
     @pytest.mark.asyncio
     async def test_reaper_probe_exception_blocks_finite_ttl(self, _site, monkeypatch):
@@ -614,7 +624,8 @@ class TestDoDeployRefusals:
         monkeypatch.setattr(engine, "run_aws", _run_aws)
         status, payload = await handlers._do_deploy(
             {"site_id": "s", "local_dir": str(_site), "confirm": True})
-        assert status == 409 and "kirocrew-deploy-reaper" in payload["error"]
+        assert status == 409 and "kirocrew-deploy-reaper" in payload["details"]
+        assert payload["code"] == "reaper_required"
 
     @pytest.mark.asyncio
     async def test_stale_preview_digest_is_refused(self, _site, monkeypatch):
@@ -894,8 +905,8 @@ class TestAdapters:
 
     @pytest.mark.asyncio
     async def test_put_config_non_object_body_is_body_shape_400(self):
-        # Previously reachable bug: a non-object body collapsed to {}, so
-        # validate_field ran on profile=""/region="" and answered
+        # A non-object body must not collapse to {}: that makes validate_field
+        # run on profile=""/region="" and answer
         # "400 invalid config: ..." — a field error for a body-shape mistake.
         resp = await handlers._handle_put_config(_FakeReq([]))
         assert resp.status == 400
@@ -930,15 +941,22 @@ class TestAdapters:
     async def test_get_config_returns_registry_default(self):
         handlers._save_config("p", "eu-west-1")
         resp = await handlers._handle_get_config(_FakeReq())
-        # The response also carries ``cloudDeploymentEnabled`` so the frontend can
-        # hide the console when the platform withholds cloud deployment; the public
-        # default admits it. Asserted as a superset so a future additive field does
-        # not break this test again.
-        assert _payload(resp) == {
-            "profile": "p",
-            "region": "eu-west-1",
-            "cloudDeploymentEnabled": True,
+        # The key set is asserted exactly, not as a superset: this response is what
+        # the dashboard reads, so a field arriving here unannounced is exactly what
+        # this test exists to catch. ``cloudDeploymentEnabled`` lets the frontend
+        # hide the console when the platform withholds cloud deployment, and
+        # ``reaperInstallScript`` is the resolved auto-cleanup install command the
+        # setup guide renders. Adding a field means updating this set on purpose.
+        payload = _payload(resp)
+        assert set(payload) == {
+            "profile", "region", "cloudDeploymentEnabled", "reaperInstallScript",
         }
+        assert payload["profile"] == "p"
+        assert payload["region"] == "eu-west-1"
+        assert payload["cloudDeploymentEnabled"] is True
+        # Absolute, so the command the guide prints is runnable as shown.
+        assert os.path.isabs(payload["reaperInstallScript"])
+        assert payload["reaperInstallScript"].endswith("install-reaper.sh")
 
     @pytest.mark.asyncio
     async def test_deny_restricted_without_app_context(self):
@@ -1073,6 +1091,17 @@ class TestProfilesControlPlane:
         monkeypatch.setattr(profiles_mod, "discover_aws_profiles", lambda: ["p", "other"])
         body = _payload(await handlers._handle_profiles_get(_FakeReq()))
         assert body["default"] == "p" and body["available"] == ["other"]
+
+    @pytest.mark.asyncio
+    async def test_get_survives_a_scan_that_could_not_run(self, monkeypatch):
+        # `discover_aws_profiles` returns None when it could not ask, and this
+        # handler iterates its result -- so without narrowing it, the endpoint
+        # raises TypeError on exactly the hosts that cannot list profiles.
+        handlers._save_config("p", "us-west-2")
+        monkeypatch.setattr(profiles_mod, "discover_aws_profiles", lambda: None)
+        body = _payload(await handlers._handle_profiles_get(_FakeReq()))
+        assert body["available"] == []
+        assert body["default"] == "p"
 
     @pytest.mark.asyncio
     async def test_post_rejects_empty_name(self):

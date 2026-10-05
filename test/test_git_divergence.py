@@ -47,6 +47,11 @@ class TestArgs:
         assert divergence_count_args("origin/main")[-1] == "HEAD...origin/main"
         assert divergence_count_args("@{upstream}")[-1] == "HEAD...@{upstream}"
 
+    def test_explicit_head_preserves_left_is_ahead_semantics(self) -> None:
+        assert divergence_count_args("upstream-sha", head="scope-head-sha")[-1] == (
+            "scope-head-sha...upstream-sha"
+        )
+
 
 class TestParse:
     def test_left_is_ahead_right_is_behind(self) -> None:
@@ -279,7 +284,7 @@ class TestNoHandRolledCopies:
         Path("src/kiro_crew/git_divergence.py"),
         # A standalone skill script shipped to users' machines; it must stay
         # dependency-free, so it cannot import the shared module.
-        Path("src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/preflight.py"),
+        Path("src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/preflight.py"),
     }
 
     def test_no_new_hand_rolled_divergence_count(self) -> None:

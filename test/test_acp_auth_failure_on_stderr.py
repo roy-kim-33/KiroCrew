@@ -63,8 +63,20 @@ def _runtime(lines):
     from kiro_crew.acp.runtime import AcpRuntime
 
     runtime = AcpRuntime.__new__(AcpRuntime)
+    runtime.recording_allowed = True
     runtime._stderr_lines = []
     runtime._saw_auth_failure = False
+    # The same sink latches an OS-sandbox refusal. Seeded here because the drain
+    # guards itself with a broad `except Exception`, so a missing attribute does
+    # not raise -- it ends the drain after one line, and every assertion below
+    # then fails on a precondition instead of on what it is about.
+    runtime._saw_sandbox_init_failure = False
+    # Read by the sandbox latch's startup-window guard, on the same sink. That
+    # window runs to the first session handle, so both flags have to be present:
+    # the drain guards itself with a broad `except Exception`, and a missing
+    # attribute ends it after one line instead of raising.
+    runtime._initialized = False
+    runtime._first_session_ready = False
     runtime._process = _FakeProcess(lines)
     return runtime
 
@@ -147,6 +159,25 @@ def test_the_legacy_banner_still_classifies():
 
     assert is_auth_failure_output("kiro-cli: not logged in") is True
     assert is_auth_failure_output("Not Logged In") is True
+
+
+def test_the_kas_engine_not_signed_in_wording_classifies():
+    """The KAS engine reports a refused or absent credential in its own words.
+
+    Measured on the wire against kiro-cli 2.21.0's v3 relay with the host
+    answering ``_kiro/auth/getAccessToken`` with an error: ``session/prompt``
+    fails ``-32000`` with this sentence. It must land on the sign-in prompt,
+    not be shown as a raw backend error.
+    """
+    from kiro_crew.acp.client import is_auth_failure_output
+
+    assert (
+        is_auth_failure_output(
+            "Kiro could not load the available models because you are not signed in. "
+            "Please sign in and retry."
+        )
+        is True
+    )
 
 
 def test_noise_lines_are_not_flagged_individually():

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -111,6 +112,31 @@ class BlockingSourceStore:
         self.deleted.append(run_id)
 
 
+# A hang guard, not the assertion: ``_await_store_entry`` settles on causality
+# and this only turns a lost run into a failed test, well under pytest-timeout.
+_HANG_GUARD_SECS = 30.0
+
+
+async def _await_store_entry(store: BlockingSourceStore, task: asyncio.Task) -> None:
+    """Wait until the store's source-bearing save has begun blocking a worker.
+
+    ``begin_host_run`` reaches that save only after the run-id allocator's
+    fsync chain and scope admission, all off-loop; on a loaded Windows runner
+    that alone can outlast a fixed wall-clock budget. Waiting on the causal
+    signal keeps every assertion that follows (off-loop thread, responsive
+    loop, cancellation cleanup) exactly as strong while removing the clock.
+    If ``task`` settles first, its own failure surfaces; a clean settle without
+    the save is a deterministic failure.
+    """
+    give_up_at = time.monotonic() + _HANG_GUARD_SECS
+    while not store.started.is_set():
+        if task.done():
+            task.result()
+            raise AssertionError("the task settled before its source-bearing save began")
+        assert time.monotonic() < give_up_at, "the source-bearing save never began"
+        await asyncio.sleep(0.005)
+
+
 def _patch_stream(monkeypatch, replies: list[str]) -> dict:
     """Patch stream_and_collect to return successive canned replies."""
     state = {"i": 0}
@@ -140,6 +166,17 @@ async def _wait_terminal(svc: WorkflowService, run_id: str, timeout: float = 3.0
     raise AssertionError("run did not finish")
 
 
+async def _wait_durable_terminal(svc: WorkflowService, run_id: str):
+    """An orderly restart waits for the driver's terminal flush, not just RAM status."""
+    handle = svc.registry.get(run_id)
+    assert handle is not None and handle.task is not None
+    # The driver settles on causality; the cap only turns a hang into a failure.
+    await asyncio.wait_for(asyncio.shield(handle.task), timeout=_HANG_GUARD_SECS)
+    snap = svc.status(run_id)
+    assert snap and snap["status"] != "running"
+    return snap
+
+
 # --------------------------------------------------------------------------- #
 # author
 # --------------------------------------------------------------------------- #
@@ -166,6 +203,10 @@ async def test_author_uses_isolated_destroyed_lite_session(monkeypatch) -> None:
         provider.is_process_alive = lambda: True
         provider.context_usage_pct = lambda: 0.0
         provider.has_active_turn = lambda: False
+        # The identity reclaim after a turn calls the inner client's sync
+        # ``reclaim``; as an AsyncMock child it would return an un-awaited
+        # coroutine.
+        provider.client.reclaim = lambda: None
         provider.cwd = ""
         providers.append(provider)
         agents.append(agent or "")
@@ -249,6 +290,48 @@ async def test_author_retries_then_succeeds(monkeypatch) -> None:
     assert out["ok"] is True
 
 
+async def test_author_revises_budget_rebinding_before_returning_script(monkeypatch) -> None:
+    import kiro_crew.workflows.service as svc_mod
+
+    bad_script = GOOD_SCRIPT.replace("    ctx.log('hi')", "    ctx.budget = 7200")
+    prompts: list[str] = []
+
+    async def generate(provider, message, **kwargs):
+        prompts.append(message)
+        return bad_script if len(prompts) == 1 else GOOD_SCRIPT
+
+    monkeypatch.setattr(svc_mod, "stream_and_collect", generate)
+    sessions = FakeSessions([])
+    svc = WorkflowService(sessions=sessions, persist=False)
+
+    out = await svc.author("Audit changes within the caller's token budget")
+
+    assert out["ok"] is True
+    assert out["source"] == GOOD_SCRIPT
+    assert len(prompts) == 2
+    assert "ctx.budget is read-only" in prompts[1]
+    assert "budget_total" in prompts[1]
+    assert "Budget object" in prompts[0]
+    assert sessions.destroyed == [sessions.acquired[0][0]]
+
+
+async def test_author_budget_rebinding_stops_at_validation_retry_limit(monkeypatch) -> None:
+    from kiro_crew.workflows.service import _AUTHOR_RETRIES
+
+    bad_script = GOOD_SCRIPT.replace("    ctx.log('hi')", "    ctx.budget = 7200")
+    generated = _patch_stream(monkeypatch, [bad_script])
+    sessions = FakeSessions([])
+    svc = WorkflowService(sessions=sessions, persist=False)
+
+    out = await svc.author("Audit changes")
+
+    assert out["ok"] is False
+    assert generated["i"] == _AUTHOR_RETRIES + 1
+    assert any("ctx.budget is read-only" in error for error in out["errors"])
+    assert svc.list_runs() == []
+    assert sessions.destroyed == [sessions.acquired[0][0]]
+
+
 async def test_author_retries_transient_startup_with_fresh_session(monkeypatch) -> None:
     _patch_stream(monkeypatch, [GOOD_SCRIPT])
     import kiro_crew.workflows.service as svc_mod
@@ -323,6 +406,178 @@ async def test_author_all_invalid_fails_clean(monkeypatch) -> None:
     out = await svc.author("x")
     assert out["ok"] is False
     assert out["errors"]
+
+
+# Replies that stop mid-generation: the source ends inside an open bracket, an
+# open string, or an unfinished statement.
+_CUT_OFF_REPLIES = [
+    GOOD_SCRIPT.replace("    return {'ok': True}\n", "    r = await ctx.parallel([\n        1,\n"),
+    GOOD_SCRIPT.replace("    return {'ok': True}\n", "    return ctx.agent('summarise the"),
+    GOOD_SCRIPT.replace("    return {'ok': True}\n", "    if ctx.args:\n"),
+]
+
+
+def _record_prompts(
+    monkeypatch, replies: list[str], stop_reason: str | list[str] = ""
+) -> list[str]:
+    """Patch stream_and_collect to return ``replies`` in order, ending each turn
+    with a shared or per-turn ``stop_reason`` like the provider's EVENT_COMPLETE."""
+    import kiro_crew.workflows.service as svc_mod
+    from kiro_crew.acp.types import EVENT_COMPLETE, AcpEvent
+
+    prompts: list[str] = []
+
+    async def generate(provider, message, **kwargs):
+        prompts.append(message)
+        on_complete = kwargs.get("on_complete")
+        reason = (
+            stop_reason[min(len(prompts) - 1, len(stop_reason) - 1)]
+            if isinstance(stop_reason, list)
+            else stop_reason
+        )
+        if reason and on_complete is not None:
+            on_complete(AcpEvent(kind=EVENT_COMPLETE, stop_reason=reason))
+        return replies[min(len(prompts) - 1, len(replies) - 1)]
+
+    monkeypatch.setattr(svc_mod, "stream_and_collect", generate)
+    return prompts
+
+
+@pytest.mark.parametrize("cut_off", _CUT_OFF_REPLIES, ids=["bracket", "string", "statement"])
+async def test_author_retry_says_previous_script_was_cut_off(monkeypatch, cut_off) -> None:
+    prompts = _record_prompts(monkeypatch, [cut_off, GOOD_SCRIPT])
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is True
+    assert len(prompts) == 2
+    assert "CUT OFF" in prompts[1]
+    assert "SHORTER" in prompts[1]
+    assert "INVALID" not in prompts[1]
+
+
+async def test_author_retry_says_cut_off_when_turn_hit_output_limit(monkeypatch) -> None:
+    # The provider says the turn ended on the token limit; the parse error alone
+    # (an import, mid-file) would not look cut off.
+    bad = "import os\n" + GOOD_SCRIPT
+    prompts = _record_prompts(
+        monkeypatch, [bad, GOOD_SCRIPT], stop_reason=["max_tokens", "end_turn"]
+    )
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is True
+    assert "CUT OFF" in prompts[1]
+
+
+async def test_author_retry_rejects_valid_script_at_output_limit(monkeypatch) -> None:
+    prompts = _record_prompts(
+        monkeypatch, [GOOD_SCRIPT, GOOD_SCRIPT], stop_reason=["max_tokens", "end_turn"]
+    )
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is True
+    assert len(prompts) == 2
+    assert "CUT OFF" in prompts[1]
+    assert "SHORTER" in prompts[1]
+    assert "output length limit" in prompts[1]
+
+
+async def test_author_failure_reports_every_valid_script_at_output_limit(monkeypatch) -> None:
+    from kiro_crew.workflows.service import _AUTHOR_RETRIES
+
+    attempts = _AUTHOR_RETRIES + 1
+    prompts = _record_prompts(monkeypatch, [GOOD_SCRIPT], stop_reason="max_tokens")
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is False
+    assert len(prompts) == attempts
+    assert len(out["errors"]) == attempts
+    for n, error in enumerate(out["errors"], start=1):
+        assert error.startswith(f"attempt {n}/{attempts}:")
+        assert "output length limit" in error
+
+
+async def test_author_failure_bounds_each_attempts_errors(monkeypatch) -> None:
+    # The failed run's error is stored and served verbatim, so what is retained
+    # per attempt is bounded in count and in length, with one "+N more" marker.
+    from kiro_crew.workflows.service import (
+        _AUTHOR_ERROR_CHARS,
+        _AUTHOR_ERRORS_PER_ATTEMPT,
+        _AUTHOR_RETRIES,
+    )
+
+    attempts = _AUTHOR_RETRIES + 1
+    many = _AUTHOR_ERRORS_PER_ATTEMPT + 7
+    # ``many`` validator errors on every attempt: one from a dunder name long
+    # enough to exceed the per-error character cap, placed first so it is kept,
+    # then one per import line.
+    noisy = "x = __" + "a" * _AUTHOR_ERROR_CHARS + "__\n" + "\n".join(["import os"] * (many - 1))
+    noisy += "\n" + GOOD_SCRIPT
+    prompts = _record_prompts(monkeypatch, [noisy])
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is False
+    assert len(prompts) == attempts
+    assert len(out["errors"]) == attempts * (_AUTHOR_ERRORS_PER_ATTEMPT + 1)
+    for n in range(1, attempts + 1):
+        prefix = f"attempt {n}/{attempts}: "
+        kept = [e for e in out["errors"] if e.startswith(prefix)]
+        assert len(kept) == _AUTHOR_ERRORS_PER_ATTEMPT + 1
+        assert kept[-1] == f"{prefix}+{many - _AUTHOR_ERRORS_PER_ATTEMPT} more errors"
+        for error in kept:
+            assert len(error) <= len(prefix) + _AUTHOR_ERROR_CHARS
+        assert any(len(error) == len(prefix) + _AUTHOR_ERROR_CHARS for error in kept)
+    # The retry prompt still carries every validator error, untruncated.
+    assert prompts[1].count("'import os' is not allowed") == many - 1
+    assert "a" * _AUTHOR_ERROR_CHARS in prompts[1]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "import os\n" + GOOD_SCRIPT,
+        GOOD_SCRIPT.replace("async def workflow(ctx):", "async def workflow(ctx)"),
+    ],
+    ids=["validator-error", "mid-file-syntax-error"],
+)
+async def test_author_retry_keeps_invalid_wording_for_a_complete_script(
+    monkeypatch, invalid
+) -> None:
+    prompts = _record_prompts(monkeypatch, [invalid, GOOD_SCRIPT], stop_reason="end_turn")
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is True
+    assert "INVALID" in prompts[1]
+    assert "CUT OFF" not in prompts[1]
+
+
+async def test_author_failure_reports_every_attempts_error(monkeypatch) -> None:
+    from kiro_crew.workflows.service import _AUTHOR_RETRIES
+
+    attempts = _AUTHOR_RETRIES + 1
+    _record_prompts(monkeypatch, _CUT_OFF_REPLIES[:attempts])
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+
+    out = await svc.author("x")
+
+    assert out["ok"] is False
+    assert len(out["errors"]) == attempts
+    assert "'[' was never closed" in out["errors"][0]
+    assert "unterminated string literal" in out["errors"][1]
+    assert "expected an indented block" in out["errors"][2]
+    for n, error in enumerate(out["errors"], start=1):
+        assert error.startswith(f"attempt {n}/{attempts}: syntax error:")
 
 
 async def test_author_strips_code_fence(monkeypatch) -> None:
@@ -716,7 +971,7 @@ async def test_host_source_persistence_runs_off_event_loop() -> None:
 
     update = asyncio.create_task(svc.set_source(run_id, source, source_format="task-plan"))
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, update)
         await asyncio.sleep(0)
         assert update.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -743,7 +998,7 @@ async def test_host_registration_persistence_runs_off_event_loop() -> None:
         )
     )
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, registration)
         await asyncio.sleep(0)
         assert registration.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -767,7 +1022,7 @@ async def test_cancelled_host_registration_removes_the_partial_run() -> None:
             driver="taskrunner",
         )
     )
-    assert await asyncio.to_thread(store.started.wait, 1)
+    await _await_store_entry(store, registration)
 
     registration.cancel()
     store.release.set()
@@ -776,6 +1031,25 @@ async def test_cancelled_host_registration_removes_the_partial_run() -> None:
 
     assert svc.list_runs() == []
     assert store.deleted == ["wf_000001"]
+
+
+async def test_store_entry_barrier_is_causal_not_wall_clock() -> None:
+    store = BlockingSourceStore()
+
+    async def fail_before_saving() -> None:
+        raise RuntimeError("registration failed before the store")
+
+    with pytest.raises(RuntimeError, match="before the store"):
+        await _await_store_entry(store, asyncio.create_task(fail_before_saving()))
+    with pytest.raises(AssertionError, match="settled before its source-bearing save"):
+        await _await_store_entry(store, asyncio.create_task(asyncio.sleep(0)))
+
+    started = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        store.started.set()
+        await _await_store_entry(store, started)  # returns on the signal alone
+    finally:
+        started.cancel()
 
 
 async def test_host_rebind_persistence_runs_off_event_loop() -> None:
@@ -797,7 +1071,7 @@ async def test_host_rebind_persistence_runs_off_event_loop() -> None:
 
     checkpoint = asyncio.create_task(svc.rebind(run_id, driver_task, task_id="task_rebind"))
     try:
-        assert await asyncio.to_thread(store.started.wait, 1)
+        await _await_store_entry(store, checkpoint)
         await asyncio.sleep(0)
         assert checkpoint.done() is False
         assert store.save_thread_id != loop_thread_id
@@ -828,7 +1102,7 @@ async def test_promote_run_rejects_redacted_source_restored_after_restart(tmp_pa
     sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
     original = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
     started = await original.start(sensitive, name="Sensitive")
-    await _wait_terminal(original, started["run_id"])
+    await _wait_durable_terminal(original, started["run_id"])
 
     restored = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
     promoted = await restored.promote_run_definition(
@@ -855,7 +1129,7 @@ async def test_promote_run_accepts_exact_source_restored_after_restart(tmp_path)
     library = WorkflowDefinitionLibrary(tmp_path / "library")
     original = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
     started = await original.start(GOOD_SCRIPT, name="Exact")
-    await _wait_terminal(original, started["run_id"])
+    await _wait_durable_terminal(original, started["run_id"])
 
     restored = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
     promoted = await restored.promote_run_definition(started["run_id"], name="Still exact")
@@ -967,12 +1241,20 @@ async def test_start_task_plan_definition_delegates_to_taskrunner_without_python
 
     assert started["run_id"] == "wf_task"
     assert started["task_id"] == "task_123"
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
     assert task_runner.calls == [
         {
             "definition": saved,
             "input_text": "from slash",
             "author": "",
             "session_key": "",
+            "execution_context": ExecutionContext(
+                member_id=None,
+                store=MemoryStoreRef("default"),
+                selection_kind="template",
+                template_id="kirocrew",
+            ),
         }
     ]
 
@@ -1007,18 +1289,33 @@ async def test_start_definition_loads_saved_source_off_the_event_loop(
 async def test_start_launches_run_and_injects_on_done(monkeypatch) -> None:
     _patch_stream(monkeypatch, ["stub"])  # the workflow's ctx.agent uses this
     done: list[dict] = []
-    svc = WorkflowService(
-        sessions=FakeSessions([]),
-        on_done=lambda rid, snap: done.append({"rid": rid, **snap}),
-    )
+    notified = asyncio.Event()
+
+    def on_done(rid, snap):
+        done.append({"rid": rid, **snap})
+        notified.set()
+
+    svc = WorkflowService(sessions=FakeSessions([]), on_done=on_done)
     out = await svc.start(GOOD_SCRIPT, name="demo", session_key="slot:main")
     assert "run_id" in out
-    snap = await _wait_terminal(svc, out["run_id"])
+    # The driver settles only after the durable flush and the result-to-chat
+    # callback, so this wait is causal — not a wall-clock cover for disk I/O.
+    snap = await _wait_durable_terminal(svc, out["run_id"])
     assert snap["status"] == "finished"
     assert snap["result"] == {"ok": True}
-    # M6.4: on_done carried the originating session so the result routes to chat
-    await asyncio.sleep(0.02)
+    assert notified.is_set()
     assert done and done[0]["session_key"] == "slot:main"
+
+
+async def test_start_rejects_closed_gateway_admission() -> None:
+    sessions = FakeSessions([])
+    sessions.admission_closed = True
+    svc = WorkflowService(sessions=sessions, persist=False)
+
+    out = await svc.start(GOOD_SCRIPT)
+
+    assert out == {"error": "gateway admission is closed"}
+    assert svc.list_runs() == []
 
 
 async def test_start_rejects_invalid_script() -> None:
@@ -1041,8 +1338,8 @@ async def test_result_and_list(monkeypatch) -> None:
 
 async def test_run_ids_are_deterministic_monotonic() -> None:
     svc = WorkflowService(sessions=FakeSessions([]))
-    a = svc._new_run_id()
-    b = svc._new_run_id()
+    a = await svc._new_run_id()
+    b = await svc._new_run_id()
     assert a == "wf_000001" and b == "wf_000002"
 
 
@@ -1160,6 +1457,19 @@ async def test_start_from_intent_authoring_failure_is_failed_run(monkeypatch) ->
     assert snap["status"] == "failed"
 
 
+async def test_start_from_intent_failure_error_lists_every_attempt(monkeypatch) -> None:
+    """The run's failure text names each attempt's error, not only the last."""
+    _record_prompts(monkeypatch, _CUT_OFF_REPLIES)
+    svc = WorkflowService(sessions=FakeSessions([]), persist=False)
+    out = await svc.start_from_intent("a large multi-phase intent")
+    snap = await _wait_terminal(svc, out["run_id"])
+    assert snap["status"] == "failed"
+    error = snap["error"] or ""
+    for n in (1, 2, 3):
+        assert f"attempt {n}/3: syntax error:" in error
+    assert "'[' was never closed" in error
+
+
 async def test_start_from_intent_requires_intent() -> None:
     svc = WorkflowService(sessions=FakeSessions([]))
     out = await svc.start_from_intent("   ")
@@ -1216,7 +1526,7 @@ async def test_rerun_with_invalid_edited_source_rejected(monkeypatch) -> None:
 # originating slot AND (2) auto-run an agent turn so the launching agent actually
 # interprets the result. Drives the REAL WorkflowService -> runner -> on_done ->
 # inject_workflow_result(on_injected=...) wiring; only _run_chat is stubbed (no
-# model). Regression for "workflow result never reaches the agent to interpret".
+# model). Pins that the workflow result reaches the agent to interpret.
 # --------------------------------------------------------------------------- #
 
 
@@ -1229,6 +1539,7 @@ class _IntgSlot:
         self.linked_session_key = ""
         self.title = ""
         self.running = False
+        self._in_stage_execution = False
         self.turns: list[str] = []  # prompts that started an agent turn
 
     def append(self, role, content, cls="", ts="", *, broadcast=True, meta=None):
@@ -1240,7 +1551,12 @@ class _IntgSlot:
 
     def enqueue_or_run_prompt(self, prompt, run_chat_coro, state) -> bool:
         # Mirror the real state.py primitive: busy -> queue (False), else run (True).
-        if self.running:
+        # Busy is ``running or _in_stage_execution``: between a plan's stages
+        # ``running`` reads False while the plan is still live, and the real gate
+        # holds the prompt there rather than starting a turn alongside the plan. A
+        # double that mirrored ``running`` alone would keep passing after the real
+        # gate regressed.
+        if self.running or self._in_stage_execution:
             return False
         self.append("user", prompt, "msg msg-u")
         self.turns.append(prompt)
@@ -1287,8 +1603,7 @@ async def test_finished_run_injects_result_and_autoruns_agent_turn(monkeypatch) 
 
     svc = WorkflowService(sessions=FakeSessions([]), on_done=_on_done)
     out = await svc.start(GOOD_SCRIPT, name="demo", session_key="dashboard:chat-1")
-    await _wait_terminal(svc, out["run_id"])
-    await asyncio.sleep(0.05)  # let on_done fire
+    await _wait_durable_terminal(svc, out["run_id"])
 
     # (1) result summary injected as an assistant message into the ORIGINATING slot
     assert any(m["role"] == "assistant" and "demo" in m["content"] for m in origin.messages)
@@ -1317,12 +1632,53 @@ async def test_finished_run_busy_slot_queues_turn(monkeypatch) -> None:
         on_done=lambda rid, snap: inject_workflow_result(dstate, rid, snap, on_injected=_auto_turn),
     )
     out = await svc.start(GOOD_SCRIPT, name="demo", session_key="dashboard:chat-1")
-    await _wait_terminal(svc, out["run_id"])
-    await asyncio.sleep(0.05)
+    await _wait_durable_terminal(svc, out["run_id"])
     # Result still injected, but the turn was QUEUED (False), not started.
     assert any(m["role"] == "assistant" for m in origin.messages)
     assert started == [False]
     assert origin.turns == []
+
+
+async def test_workflow_auto_turn_queues_between_a_plans_stages(tmp_path) -> None:
+    """The workflow auto-turn carries no mid-plan gate, so the admission point is it.
+
+    ``_wf_on_done``'s ``_auto_turn`` (``dashboard/server.py``) hands the prompt
+    straight to ``enqueue_or_run_prompt`` and records no intent to interrupt a plan
+    -- it reads the return value only to log "started" or "queued", so the queued
+    outcome is the one it is already written for. Between a plan's stages
+    ``slot.running`` reads False while the plan is still live, so gating on
+    ``running`` alone would start a SECOND turn alongside it.
+
+    Driven through a REAL ``_ChatSlot``, not this module's slot double: the double
+    reimplements the gate, so a test through it would pass on its own copy of the
+    rule rather than on the product's.
+
+    Mutation guard: drop ``or self._in_stage_execution`` from the gate and this
+    starts a turn.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    slot = _ChatSlot(key="chat-1")
+    # The inter-stage shape: nothing in flight, plan still executing.
+    slot.task = None
+    slot._in_stage_execution = True
+    dstate = MagicMock()
+    dstate._background_tasks = set()
+    started: list[bool] = []
+
+    # The auto-turn's own shape, prompt text and all.
+    def _auto_turn(s, snap) -> None:
+        prompt = f"[Workflow `{snap.get('name')}` finished] interpret the result above."
+        started.append(s.enqueue_or_run_prompt(prompt, AsyncMock(), dstate))
+
+    _auto_turn(slot, {"name": "demo"})
+
+    assert started == [False], "a mid-plan workflow result must be queued, not started"
+    assert slot.task is None, "and no turn may be opened alongside the plan"
+    assert len(slot._queue) == 1, "the prompt is held for the plan's own drain"
+    assert "interpret the result above" in slot._queue[0]["content"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1354,3 +1710,265 @@ async def test_pool_agents_false_uses_per_call_sessions() -> None:
     # and a no-op when the run armed no nudges.
     assert runner._on_complete is not None
     await runner._on_complete()  # no nudge tasks → returns immediately
+
+
+async def test_author_publishes_identity_before_each_revision(monkeypatch):
+    from kiro_crew.messaging import identity
+    from kiro_crew.workflows import service as service_module
+
+    sessions = FakeSessions([])
+    events = []
+    replies = iter(["invalid syntax !", GOOD_SCRIPT])
+
+    async def publish(owner, key):
+        assert owner is sessions
+        assert sessions.acquired[-1][0] == key
+        events.append(("publish", key))
+
+    async def stream(provider, message, **kwargs):
+        key = sessions.acquired[-1][0]
+        assert events[-1] == ("publish", key)
+        events.append(("stream", key))
+        return next(replies)
+
+    monkeypatch.setattr(identity, "publish_turn_identity", publish)
+    monkeypatch.setattr(service_module, "stream_and_collect", stream)
+    service = WorkflowService(sessions=sessions, persist=False)
+    result = await service.author("draft a workflow")
+    assert result["ok"] is True
+    assert [event for event, _ in events] == ["publish", "stream", "publish", "stream"]
+    assert sessions.destroyed == [sessions.acquired[-1][0]]
+
+
+@pytest.mark.parametrize("entry", ["start", "intent", "rerun"])
+async def test_admission_closed_during_scope_binding_rejects_launch(monkeypatch, entry):
+    from kiro_crew.workflows.service import WorkflowScope
+
+    sessions = FakeSessions([])
+    service = WorkflowService(sessions=sessions, persist=False)
+    previous = None
+    if entry == "rerun":
+        previous = (await service.start(GOOD_SCRIPT))["run_id"]
+        await _wait_terminal(service, previous)
+    before = {row["run_id"] for row in service.list_runs()}
+    admit = WorkflowScope.admit
+
+    async def close_during_admission(*args, **kwargs):
+        scope = await admit(*args, **kwargs)
+        sessions.admission_closed = True
+        return scope
+
+    monkeypatch.setattr(WorkflowScope, "admit", close_during_admission)
+    if entry == "start":
+        result = await service.start(GOOD_SCRIPT)
+    elif entry == "intent":
+        result = await service.start_from_intent("draft a workflow")
+    else:
+        result = await service.rerun_subtree(previous, 0)
+    assert result == {"error": "gateway admission is closed"}
+    assert {row["run_id"] for row in service.list_runs()} == before
+
+
+async def test_cancelled_allocator_worker_burns_id_across_service_restart(monkeypatch):
+    import kiro_crew.workflow_memory as wm
+
+    written = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    real_write = wm._write_run_high_water
+
+    def blocked_write(path, value, anchor):
+        real_write(path, value, anchor)
+        if value == 1:
+            written.set()
+            try:
+                assert release.wait(5)
+            finally:
+                done.set()
+
+    monkeypatch.setattr(wm, "_write_run_high_water", blocked_write)
+    service = WorkflowService(sessions=FakeSessions([]), persist=False)
+    task = asyncio.create_task(service._new_run_id())
+    try:
+        assert await asyncio.to_thread(written.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    assert await asyncio.to_thread(done.wait, 5)
+    restarted = WorkflowService(sessions=FakeSessions([]), persist=False)
+    assert await restarted._new_run_id() == "wf_000002"
+    assert wm.read_binding("wf_000001") is None
+
+
+async def test_author_only_id_survives_service_restart(monkeypatch):
+    _patch_stream(monkeypatch, [GOOD_SCRIPT])
+    service = WorkflowService(sessions=FakeSessions([]), persist=False)
+    authored = await service.author("demo")
+    assert authored.get("ok"), authored
+    assert service.list_runs() == []
+    restarted = WorkflowService(sessions=FakeSessions([]), persist=False)
+    assert await restarted._new_run_id() == "wf_000002"
+
+
+async def test_restored_floor_advances_allocator_without_becoming_authority():
+    service = WorkflowService(sessions=FakeSessions([]), persist=False)
+    service._seq = 80
+    assert await service._new_run_id() == "wf_000081"
+    restarted = WorkflowService(sessions=FakeSessions([]), persist=False)
+    assert restarted._seq == 0
+    assert await restarted._new_run_id() == "wf_000082"
+
+
+async def test_evicted_identity_survives_an_empty_registry_restart():
+    from kiro_crew.workflows.registry import STATUS_FINISHED, RunHandle, RunRegistry
+
+    service = WorkflowService(sessions=FakeSessions([]), persist=False)
+    service.registry = RunRegistry(max_runs=0)
+    allocated = await service._new_run_id()
+    service.registry.register(RunHandle(allocated, "evicted", status=STATUS_FINISHED))
+    assert service.registry.list() == []
+    restarted = WorkflowService(sessions=FakeSessions([]), persist=False)
+    assert await restarted._new_run_id() == "wf_000002"
+
+
+async def test_orderly_restart_waits_for_terminal_snapshot(tmp_path, monkeypatch) -> None:
+    """Force RAM/disk disagreement; provenance checks run only after the flush."""
+    store = WorkflowRunStore(tmp_path / "store")
+    library = WorkflowDefinitionLibrary(tmp_path / "library")
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    real_save = store.save
+
+    def delayed_save(run_id, payload):
+        if payload["status"] == "finished":
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(2.0), "test did not release terminal write"
+        real_save(run_id, payload)
+
+    monkeypatch.setattr(store, "save", delayed_save)
+    original = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
+    sensitive = GOOD_SCRIPT.replace("ctx.log('hi')", "ctx.log('AKIAIOSFODNN7EXAMPLE')")
+    started = await original.start(sensitive)
+    waiter = asyncio.create_task(_wait_durable_terminal(original, started["run_id"]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        # This is what the old helper observed before the restart raced disk.
+        assert (await _wait_terminal(original, started["run_id"]))["status"] == "finished"
+        saved = await asyncio.wait_for(asyncio.to_thread(store.load_all), timeout=1.0)
+        assert saved[0]["status"] == "running"
+        assert not waiter.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(waiter, timeout=3.0)
+
+    restored = WorkflowService(sessions=FakeSessions([]), store=store, definition_library=library)
+    promoted = await restored.promote_run_definition(started["run_id"])
+    assert promoted["ok"] is False
+    assert promoted["source_not_original"] is True
+    assert library.list() == []
+
+
+@pytest.mark.parametrize("async_factory", [False, True])
+@pytest.mark.parametrize("failure", ["reported-load", "directory-scan"])
+async def test_failed_store_load_refuses_service_without_overwriting_legacy_run(
+    tmp_path, monkeypatch, async_factory, failure
+):
+    """A failed inventory must not seed allocation from an empty sequence floor."""
+    store = WorkflowRunStore(tmp_path / "store")
+    store.runs_dir.mkdir(parents=True)
+    legacy = store.runs_dir / "wf_000001.json"
+    legacy.write_text('{"run_id":"wf_000001","status":"finished"}', encoding="utf-8")
+    before = legacy.read_bytes()
+
+    def cannot_load():
+        raise OSError("inventory unavailable")
+
+    if failure == "reported-load":
+        monkeypatch.setattr(store, "load_all", cannot_load)
+    else:
+        from pathlib import Path
+
+        real_glob = Path.glob
+
+        def unreadable_inventory(path, pattern):
+            if path == store.runs_dir:
+                raise OSError("inventory unavailable")
+            return real_glob(path, pattern)
+
+        monkeypatch.setattr(Path, "glob", unreadable_inventory)
+    with pytest.raises(OSError, match="inventory unavailable"):
+        if async_factory:
+            await WorkflowService.create(sessions=FakeSessions([]), store=store)
+        else:
+            WorkflowService(sessions=FakeSessions([]), store=store)
+    assert legacy.read_bytes() == before
+
+
+@pytest.mark.parametrize("original", ["persistent", "incognito", "temporary"])
+@pytest.mark.parametrize("caller", ["persistent", "incognito", "temporary"])
+async def test_rerun_keeps_birth_mode_and_current_caller_policy(original, caller):
+    from types import SimpleNamespace
+
+    from kiro_crew.messaging.privacy_mode import strictest
+    from kiro_crew.workflow_memory import read_binding
+
+    modes = {"dashboard:original": original, "dashboard:caller": caller}
+
+    async def resolve_mode(key):
+        return modes[key]
+
+    context = SimpleNamespace(_session_memory_modes=modes, memory_mode_for_session=resolve_mode)
+    svc = WorkflowService(sessions=FakeSessions([]), context_builder=context)
+    first = await svc.start(GOOD_SCRIPT, session_key="dashboard:original")
+    assert "run_id" in first, first
+    await _wait_terminal(svc, first["run_id"])
+    del modes["dashboard:original"]
+    again = await svc.rerun_subtree(first["run_id"], caller_session="dashboard:caller", owner=True)
+    assert "run_id" in again, again
+    result = await _wait_terminal(svc, again["run_id"])
+    assert result["status"] == "finished"
+    handle = svc.registry.get(again["run_id"])
+    binding = await asyncio.to_thread(
+        read_binding, again["run_id"], required=True, record=handle.to_store_json()
+    )
+    if binding["memory_mode"] != "persistent":
+        assert not svc.registry._store._path_for(again["run_id"]).exists()
+    assert binding["memory_mode"] == (strictest((original, caller)) or "persistent")
+
+
+async def test_durable_terminal_wait_includes_the_completion_callback(monkeypatch):
+    _patch_stream(monkeypatch, ["stub"])
+    flushing = asyncio.Event()
+    release = asyncio.Event()
+    done = []
+    svc = WorkflowService(sessions=FakeSessions([]), on_done=lambda *args: done.append(args))
+    original_persist = svc.registry.persist_async
+
+    async def persist(run_id):
+        handle = svc.registry.get(run_id)
+        if handle is not None and handle.status == "finished":
+            flushing.set()
+            await release.wait()
+        await original_persist(run_id)
+
+    monkeypatch.setattr(svc.registry, "persist_async", persist)
+    out = await svc.start(GOOD_SCRIPT)
+    waiter = None
+    try:
+        await asyncio.wait_for(flushing.wait(), timeout=3.0)
+        assert svc.status(out["run_id"])["status"] == "finished"
+        assert done == []
+        waiter = asyncio.create_task(_wait_durable_terminal(svc, out["run_id"]))
+        # Give the waiter one turn. A RAM-only poll returns before release;
+        # a durable wait remains blocked on the deliberately held flush.
+        await asyncio.sleep(0)
+        assert not waiter.done()
+    finally:
+        release.set()
+        if waiter is not None:
+            await waiter
+        await _wait_durable_terminal(svc, out["run_id"])
+    assert len(done) == 1

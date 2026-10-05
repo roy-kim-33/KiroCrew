@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from kiro_crew.dashboard.origin import (
+    _host_without_port,
     bind_address_for,
     build_allowed_origins,
     build_dashboard_url,
@@ -309,6 +310,39 @@ class TestFormatDashboardUrls:
 
     @patch.dict("os.environ", {}, clear=True)
     @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
+    @patch(f"{_MOD}.machine_hostname", return_value="Mac-1234.local")
+    def test_a_hanging_hostname_lookup_cannot_stall_startup(self, _mh: object, _dp: object) -> None:
+        """The Remote hint is cosmetic; the event loop it runs on is not.
+
+        A GitHub macOS runner's own hostname does not resolve and the resolver
+        sits in a multi-second mDNS timeout. Unbounded, that blocked the loop
+        past the dashboard watchdog's 15 s threshold and the gateway exited
+        right after READY (first cross-OS boot matrix run). The lookup is
+        bounded and abandoned, so the lines come back without the hint.
+        """
+        import threading
+        import time
+
+        release = threading.Event()
+
+        def _hang(_host: str) -> str:
+            release.wait(30)
+            return "10.0.0.1"
+
+        with (
+            patch(f"{_MOD}.socket.gethostbyname", side_effect=_hang),
+            patch(f"{_MOD}.HOSTNAME_RESOLVE_TIMEOUT_SECS", 0.2),
+        ):
+            started = time.monotonic()
+            try:
+                lines = format_dashboard_urls("http://localhost:5476", port=5476, local_only=True)
+            finally:
+                release.set()
+        assert time.monotonic() - started < 5
+        assert not any("Remote" in ln for ln in lines)
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch(f"{_MOD}.devspaces_proxy_url", return_value=None)
     @patch(f"{_MOD}.machine_hostname", return_value="myhost.internal.example.com")
     @patch(f"{_MOD}.socket.gethostbyname", return_value="10.0.0.1")
     def test_custom_host_suppresses_remote_hint(
@@ -485,9 +519,32 @@ class TestShouldCanonicalizeHost:
             sec_fetch_dest="document",
         )
 
-    def test_redirects_127_to_canonical(self) -> None:
+    def test_a_literal_address_converges_like_a_name(self) -> None:
+        # The gateway holds both loopback families on its port, so every spelling
+        # in the canonicalizable set reaches the same listener and converging them
+        # is a spelling change. What a redirect must never move is a CREDENTIAL,
+        # and that is gated separately -- see the credential case below, which does
+        # not depend on which families are bound.
         assert should_canonicalize_host(
             "127.0.0.1:7777", "localhost", method="GET", sec_fetch_dest="document"
+        )
+
+    def test_no_redirect_for_a_credential_bearing_navigation(self) -> None:
+        # The 302 preserves the query verbatim, so redirecting a ?token=
+        # navigation hands the bearer to whatever answers the canonical name.
+        # This holds even between the two names, which are otherwise converged.
+        assert should_canonicalize_host(
+            "kirocrew.localhost:7777",
+            "localhost",
+            method="GET",
+            sec_fetch_dest="document",
+        ), "control: without a credential these two names do converge"
+        assert not should_canonicalize_host(
+            "kirocrew.localhost:7777",
+            "localhost",
+            method="GET",
+            sec_fetch_dest="document",
+            carries_credential=True,
         )
 
     def test_no_redirect_when_already_canonical(self) -> None:
@@ -539,8 +596,12 @@ class TestShouldCanonicalizeHost:
             "localhost", "kirocrew.localhost", method="GET", sec_fetch_dest="document"
         )
 
-    def test_ipv6_loopback_bracket_host_redirected(self) -> None:
-        # [::1]:7777 must parse to ::1 (not "[") and converge like other loopbacks.
+    def test_ipv6_loopback_bracket_host_not_redirected(self) -> None:
+        # [::1]:7777 must PARSE to ::1 rather than "[" -- that is what the bracket
+        # handling is for, and it is the part of this case that no rule change can
+        # make irrelevant, because a host that parses to "[" would silently fail
+        # every loopback comparison in this module.
+        assert _host_without_port("[::1]:7777") == "::1"
         assert should_canonicalize_host(
             "[::1]:7777",
             "kirocrew.localhost",
@@ -549,6 +610,10 @@ class TestShouldCanonicalizeHost:
         )
 
     def test_ipv6_loopback_bracket_host_without_port(self) -> None:
+        # Same as above for a bracket host with no port. The bracket branch of
+        # _host_without_port stays load-bearing for origin.py's own loopback
+        # check, which is where it is pinned directly.
+        assert _host_without_port("[::1]") == "::1"
         assert should_canonicalize_host(
             "[::1]", "kirocrew.localhost", method="GET", sec_fetch_dest="document"
         )
@@ -589,7 +654,7 @@ class TestBuildHostCanonicalRedirect:
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
                 "/chat",
-                params={"token": "abc123"},
+                params={"view": "split"},
                 headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
                 allow_redirects=False,
             )
@@ -598,7 +663,61 @@ class TestBuildHostCanonicalRedirect:
             assert loc.hostname == "kirocrew.localhost"  # host converged
             assert loc.port == 7777  # port preserved
             assert loc.path == "/chat"  # path preserved
-            assert "token=abc123" in loc.query  # ?token= preserved
+            assert "view=split" in loc.query  # query preserved
+
+    @pytest.mark.asyncio
+    async def test_credential_bearing_nav_is_served_not_redirected(self) -> None:
+        # A 302 preserves the query, so redirecting a ?token= navigation would put
+        # that bearer on a request to whatever answers the canonical host. The
+        # navigation is served where it was addressed instead, and the response
+        # body proves the handler ran rather than a redirect being followed.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("kirocrew.localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                params={"token": "abc123"},
+                headers={"Host": "localhost:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+            assert await resp.text() == "ok"
+            assert "Location" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_literal_address_nav_is_redirected_when_it_carries_nothing(self) -> None:
+        # End to end through the middleware: a credential-free document navigation
+        # on a literal converges onto the canonical name, because both families
+        # reach this same gateway. The credential case next door is what proves a
+        # bearer is never moved this way.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(middlewares=[build_host_canonical_redirect("localhost")])
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            assert resp.headers["Location"].startswith("http://localhost:7777/chat")
 
     @pytest.mark.asyncio
     async def test_xhr_and_post_not_redirected(self) -> None:
@@ -652,6 +771,120 @@ class TestBuildHostCanonicalRedirect:
                 allow_redirects=False,
             )
             assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_no_redirect_while_a_loopback_family_is_uncovered(self) -> None:
+        # A 302 onto an ambiguous name is a credential send: the browser follows it
+        # carrying the host-only Lax session cookie, on exactly the top-level
+        # navigation this middleware converts. `?token=` is refused separately and
+        # is not the only credential in play. So the redirect is withheld whenever
+        # this gateway does not hold every family the name resolves to -- and the
+        # usual reason a family is uncovered is that another process holds it,
+        # which is the party the redirect would hand the cookie to.
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="served here")
+
+        app = web.Application(
+            middlewares=[
+                build_host_canonical_redirect("localhost", holds_every_family=lambda: False)
+            ]
+        )
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 200
+            assert await resp.text() == "served here"
+
+    @pytest.mark.asyncio
+    async def test_redirect_still_happens_while_every_family_is_held(self) -> None:
+        # The control the case above needs: without it, a middleware that never
+        # redirects at all would pass, which is the redirect deleted rather than
+        # gated.
+        from urllib.parse import urlsplit
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from kiro_crew.dashboard.server import build_host_canonical_redirect
+
+        async def _ok(_request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(
+            middlewares=[
+                build_host_canonical_redirect("localhost", holds_every_family=lambda: True)
+            ]
+        )
+        app.router.add_get("/chat", _ok)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/chat",
+                headers={"Host": "127.0.0.1:7777", "Sec-Fetch-Dest": "document"},
+                allow_redirects=False,
+            )
+            assert resp.status == 302
+            assert urlsplit(resp.headers["Location"]).hostname == "localhost"
+
+
+class TestHoldsEveryLoopbackFamily:
+    """The server-side counterpart of ``listenerSecretsFor``.
+
+    Coverage is read from the recorded claims plus each guard's live socket, so a
+    family that was never bound and one whose listener has since died answer the
+    same. The pre-publication state answers False: nothing is recorded yet, so the
+    gateway cannot prove coverage, and a suppressed redirect costs one
+    un-canonicalized document.
+    """
+
+    @staticmethod
+    def _state(sidecars: dict[str, object] | None, **guards: object) -> object:
+        state = type("S", (), {})()
+        if sidecars is not None:
+            state._listener_sidecars = sidecars
+        for name, guard in guards.items():
+            setattr(state, name, guard)
+        return state
+
+    def test_both_claims_and_no_guards_is_covered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        state = self._state({"primary": (1, "127.0.0.1", "s"), "secondary": (1, "::1", "s")})
+        assert _holds_every_loopback_family(state) is True  # type: ignore[arg-type]
+
+    def test_a_missing_secondary_claim_is_uncovered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        state = self._state({"primary": (1, "127.0.0.1", "s")})
+        assert _holds_every_loopback_family(state) is False  # type: ignore[arg-type]
+
+    def test_nothing_published_yet_is_uncovered(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        assert _holds_every_loopback_family(self._state(None)) is False  # type: ignore[arg-type]
+
+    def test_a_closed_listener_is_uncovered_even_with_both_claims(self) -> None:
+        from kiro_crew.dashboard.server import _holds_every_loopback_family
+
+        class _Dead:
+            def listener_open(self) -> bool:
+                return False
+
+        state = self._state(
+            {"primary": (1, "127.0.0.1", "s"), "secondary": (1, "::1", "s")},
+            _secondary_listener_guard=_Dead(),
+        )
+        assert _holds_every_loopback_family(state) is False  # type: ignore[arg-type]
 
 
 class TestBuildAllowedHosts:
@@ -846,3 +1079,34 @@ class TestFrameAncestorsValue:
         from kiro_crew.dashboard.origin import frame_ancestors_value
 
         assert frame_ancestors_value([bad]) == "'self'"
+
+
+class TestBoundedHostnameResolve:
+    """The resolver is best-effort, and 'best-effort' has to include the failure
+    to START the worker at all."""
+
+    def test_thread_exhaustion_reads_as_unresolved_not_as_a_raise(self, monkeypatch):
+        """A RuntimeError from ``Thread.start`` must not escape into the banner.
+
+        ``_resolve_hostname_bounded``'s only caller decides whether to print one
+        extra ``ssh -NL`` hint line with it. Under thread exhaustion the naive
+        spelling propagates a RuntimeError out through the code that prints the
+        dashboard's URLs, so the operator loses the whole banner -- including the
+        authenticated URL they actually need -- to gain nothing. Unresolved is the
+        honest answer and it costs a hint line.
+        """
+        from kiro_crew.dashboard import urls as urls_mod
+
+        class _RefusingThread:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+            def join(self, timeout=None):  # pragma: no cover - never reached
+                raise AssertionError("join must not be reached when start failed")
+
+        monkeypatch.setattr(urls_mod.threading, "Thread", _RefusingThread)
+
+        assert urls_mod._resolve_hostname_bounded("example.invalid") is None

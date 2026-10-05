@@ -306,7 +306,7 @@ def test_status_ready_before_the_first_sync(omc):
 
 
 def test_status_reports_the_refusal_push_actually_makes(omc):
-    """A conflicted schedule is the one state that used to LIE on this card.
+    """A conflicted schedule must not LIE on this card.
 
     ``push`` refuses outright while ``rotation.yaml`` holds markers, and that refusal
     reached only the log and a SEL line -- so the card kept claiming "Syncing".
@@ -821,6 +821,28 @@ def test_resolve_conflict_rewrites_the_file_from_the_reconciled_entries(omc):
 def test_resolve_conflict_is_safe_with_nothing_to_resolve(omc):
     omc.ledger_lines(_entry("dlq fills"))
     assert ls.resolve_conflict() == 1
+
+
+def test_resolve_conflict_refuses_rather_than_truncating_on_a_read_fault(omc, monkeypatch):
+    """A failed read must raise, not rewrite the shared ledger from an empty list."""
+    omc.ledger_lines(_entry("dlq fills"), _entry("throttled writes", "raise the concurrency"))
+    before = ledger.ledger_path().read_bytes()
+    target = ledger.ledger_path()
+    real_open = Path.open
+    faulty = True
+
+    def _open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        if faulty and self == target and "r" in mode:
+            raise OSError("simulated read fault")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _open)
+
+    with pytest.raises(OSError):
+        ls.resolve_conflict()
+
+    faulty = False
+    assert ledger.ledger_path().read_bytes() == before
 
 
 # ── _resolve_schedule_conflict ───────────────────────────────────────────────

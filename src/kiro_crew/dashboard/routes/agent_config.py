@@ -12,7 +12,10 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
-from kiro_crew.dashboard.handlers.acp_backend_status import api_acp_backend_status
+from kiro_crew.dashboard.handlers.acp_backend_status import (
+    api_acp_backend_recheck,
+    api_acp_backend_status,
+)
 from kiro_crew.dashboard.handlers.mcp_custom import (
     api_mcp_custom_add,
     api_mcp_custom_get,
@@ -38,11 +41,21 @@ def register(app: web.Application) -> None:
     # the schema says which options this build/policy allows, this says which of
     # them would actually start.
     app.router.add_get("/api/acp-backends", api_acp_backend_status)
+    # The same facts, re-taken for ONE backend with this process's cached absence
+    # dropped first. A POST because it mutates spawn-path state: the GET above may
+    # only report the divergence, which is what ``restart_required`` is for.
+    app.router.add_post("/api/acp-backends/recheck", api_acp_backend_recheck)
     app.router.add_get("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_put("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)
     app.router.add_get("/api/config/theme", handlers.api_theme_config)
     app.router.add_put("/api/config/theme", handlers.api_theme_config)
+    # Host-side backup of the renderer's own settings (localStorage), so an
+    # origin or userData change does not read as "the upgrade ate my settings".
+    # Deliberately NOT under /api/config: these keys are client-owned and never
+    # enter config.json. See kiro_crew/ui_prefs.py.
+    app.router.add_get("/api/ui-prefs", handlers.api_ui_prefs)
+    app.router.add_put("/api/ui-prefs", handlers.api_ui_prefs)
     app.router.add_get(
         "/api/onboarding/import/scan",
         handlers.api_onboarding_import_scan,
@@ -89,6 +102,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/connections/test", handlers.api_connections_test)
     app.router.add_post("/api/connections/cancel", handlers.api_connections_cancel)
     app.router.add_post("/api/connections/disconnect", handlers.api_connections_disconnect)
+    app.router.add_get("/api/connections/oauth-clients", handlers.api_connections_oauth_clients)
+    app.router.add_put(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_put
+    )
+    app.router.add_delete(
+        "/api/connections/oauth-clients/{slug}", handlers.api_connections_oauth_client_delete
+    )
     # REST-style MCP server registration (App Kit)
     app.router.add_put("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)
     app.router.add_delete("/api/mcp/servers/{name}", handlers.api_mcp_server_detail)
@@ -97,6 +117,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/mcp-gateway/enable", handlers.api_mcp_gateway_enable)
     app.router.add_get("/api/mcp-gateway/metrics", handlers.api_mcp_gateway_metrics)
     app.router.add_get("/api/mcp-gateway/servers", handlers.api_mcp_gateway_servers)
+    app.router.add_get("/api/mcp-gateway/servers/launch", handlers.api_mcp_gateway_server_launch)
     app.router.add_post("/api/mcp-gateway/servers/stub", handlers.api_mcp_gateway_set_stub)
     app.router.add_post(
         "/api/mcp-gateway/servers/poolable", handlers.api_mcp_gateway_set_poolable

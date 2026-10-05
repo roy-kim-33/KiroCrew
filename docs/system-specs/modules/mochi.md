@@ -3,12 +3,30 @@
 A desktop pet companion: an always-on-top animated character plus a chat panel,
 a watch list, an appearance gallery, and an autonomous "owner loop" that plans
 moves/moods, checks watched items, and delivers notifications. The pet windows
-render only in the KiroCrew desktop (Electron) shell; the dashboard page is a
+render only in the Kiro Crew desktop (Electron) shell; the dashboard page is a
 browser-visible status/watch/plan surface.
 
 `defaultEnabled: false` and `platform.requiresDesktopApp: true` — it appears in
 the App Store, is opt-in, and its window surfaces need the Electron shell.
 `permissions`: `api`, `storage`, `events`, `cron`, `spawn`.
+
+The desktop pet keeps polling the gateway while disabled so enabling Mochi in
+the App Store takes effect without restarting the shell. Probe diagnostics are
+deduplicated per outcome for one minute, including alternating HTTP errors and
+disabled responses; actual enabled-state changes still log immediately.
+
+**A non-answer never creates a pet.** Every probe the reconcile tick makes is
+tri-state (`enabled` / `disabled` / `unknown`), including the remote instance's
+own Mochi flag (`instanceGate.remoteEnabledState`). `unknown` means keep
+whatever is on screen: it never tears a pet down, and it never opens one. With
+the host's Mochi disabled, a pet is created only on a definite `enabled` from
+the remote named by the shell's `petInstance` pointer; on a non-answer it is
+kept only if a pet window already exists, and a teardown resets the shown
+pointer to `self`. The pet overlay is a full-display window pinned at the
+`screen-saver` level on every Space, so an opaque page in it covers the whole
+machine with nothing to dismiss: a main-frame `did-fail-load` (gateway
+unreachable) and any `>=400` navigation both hide and latch the overlay, and
+the reconcile tick re-arms it once a target answers.
 
 ## Layout
 
@@ -31,6 +49,10 @@ the App Store, is opt-in, and its window surfaces need the Electron shell.
 | `website/electron/mochi/` | the Electron main-process shell (pet overlay windows, panel/settings/avatar windows, global shortcuts, multi-instance) |
 
 ## Load-bearing contracts
+
+The desktop shell rate-limits repeated instance-resolution diagnostics per
+outcome for one minute. Alternating unanswered and resolved polls do not flood
+the log, while a confirmed target change (including a new port) logs immediately.
 
 - **Reserved `mochi` chat slot.** The chat panel is backed by a dedicated core
   chat slot keyed `mochi`. It is the app's identity for streaming/approvals; do
@@ -55,6 +77,12 @@ the App Store, is opt-in, and its window surfaces need the Electron shell.
 - **Agent-authored data is redacted at every browser sink.** notify/mood/
   watchlist/chat-push/pins all pass through `redact.redact_tree` (or
   `_redact_plan_tree`) before reaching the browser.
+- **Mutating routes are owner-only for dashboard subjects.** Every POST/DELETE
+  handler in `backend/routes.py` calls `_owner_denied` first: a caller with an
+  empty or missing `app` claim must pass `require_owner_dashboard_request` or
+  gets the shared 403 `owner_only`, before any body read or runtime use. An app
+  token keeps the scope `token_auth` already granted it. GET routes are not
+  owner-gated. Pinned by `test/test_mochi_owner_gate.py`.
 
 ## Deliberate divergences (do NOT "fix" in an upstream sync)
 

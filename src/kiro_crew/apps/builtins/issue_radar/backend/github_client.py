@@ -31,6 +31,7 @@ from . import github_normalization, github_queries, github_transport
 from .errors import (
     ProviderCliError,
     ProviderInvalidInputError,
+    ProviderMergeRefusedError,
     ProviderPermissionError,
     ProviderSetupError,
     PrSearchError,
@@ -62,10 +63,12 @@ GhCliError = ProviderCliError
 GhSetupError = ProviderSetupError
 GhPermissionError = ProviderPermissionError
 GhInvalidInputError = ProviderInvalidInputError
+GhMergeRefusedError = ProviderMergeRefusedError
 
 __all__ = [
     "GhCliError",
     "GhInvalidInputError",
+    "GhMergeRefusedError",
     "GhPermissionError",
     "GhSetupError",
     "PrSearchError",
@@ -778,7 +781,7 @@ def list_pr_timeline(
 # ── dependency edges (blocked-by / blocking graph) ───────────────────────────
 #
 # Two sources feed the graph, tagged by provenance:
-#   • NATIVE — GitHub's issue-dependencies API (GA 2025-08-21). One call per open
+#   • NATIVE — GitHub's issue-dependencies API. One call per open
 #     issue reads its blocked_by set; a blocker of issue N is an edge
 #     ``{blocked: N, blocker: B}``. The endpoint is young, so a repo/token/GHES
 #     that has not enabled it answers 404/410 — handled as ZERO native edges for
@@ -894,12 +897,6 @@ def _batch_dependency_graph(
         timeout=timeout,
         gh_run=_gh_run,
     )
-
-
-# Hard page ceiling for the batched walk: 100 issues/page × 40 = 4000 open
-# issues, far past any repo this app realistically triages. A repo beyond it
-# still gets a graph for its first 4000 — bounded, never unbounded pagination.
-_DEPS_GRAPHQL_MAX_PAGES = github_queries.DEPS_GRAPHQL_MAX_PAGES
 
 
 def fetch_dependency_edges(
@@ -1369,8 +1366,9 @@ _CHECK_RUN_JQ = (
 )
 
 # Commit statuses have no queued/in-progress distinction: the state itself
-# carries "pending", so status is reported as completed and the mapping below
-# routes "pending" into the running bucket.
+# carries "pending", so status is reported as completed and
+# ``github_normalization.CHECK_RUNNING_STATES`` routes "pending" into the
+# running bucket.
 _COMMIT_STATUS_JQ = (
     '.statuses[] | {name: .context, status: "completed", conclusion: .state, '
     "url: (.target_url // null), started_at: .created_at, completed_at: .updated_at, "
@@ -1378,22 +1376,16 @@ _COMMIT_STATUS_JQ = (
     'source: "status"}'
 )
 
-# GitHub conclusion / state -> coarse bucket. Anything unrecognized is treated as
-# "other" (informational), never silently as success.
-_CHECK_FAILURE_CONCLUSIONS = github_normalization.CHECK_FAILURE_CONCLUSIONS
-_CHECK_RUNNING_STATES = github_normalization.CHECK_RUNNING_STATES
-_CHECK_OTHER_CONCLUSIONS = github_normalization.CHECK_OTHER_CONCLUSIONS
-
 
 def _check_bucket(status: str | None, conclusion: str | None) -> str:
     """Coarse bucket for one check: ``failure`` | ``running`` | ``success`` |
     ``other``. Status is consulted first — an in-flight run has no conclusion
     yet — then the conclusion value.
 
-    This is the ONLY bucketing table in the module: the REST check rows, the
-    GraphQL per-context rows and the GraphQL aggregate rollup all funnel through
-    it (values are case-folded, so GraphQL's ``IN_PROGRESS`` and REST's
-    ``in_progress`` are the same input). Keeping one table is what actually makes
+    The table lives in ``github_normalization`` and is the ONLY one: the REST
+    check rows, the GraphQL per-context rows and the GraphQL aggregate rollup all
+    funnel through it (values are case-folded, so GraphQL's ``IN_PROGRESS`` and
+    REST's ``in_progress`` are the same input). Keeping one table makes
     "a card dot and the detail sidebar can never disagree about red" true —
     parallel tables would only be edit-locked by convention.
     """
@@ -1505,26 +1497,6 @@ def list_pr_checks(
 # rows un-enriched rather than failing the list, because the diff size and the
 # check dot are nice-to-have decoration on a card, not its reason to exist.
 
-# Our own lifecycle names -> GraphQL PullRequestState literals. The values are
-# interpolated into the query, so they come from THIS map only — never from
-# caller input — which keeps the query free of injection surface.
-_GRAPHQL_PR_STATES = github_queries.GRAPHQL_PR_STATES
-
-# The bucket keys every counts dict carries, so the frontend never has to guard a
-# missing key and the render order of the card's badges is fixed.
-_CHECK_BUCKETS = github_normalization.CHECK_BUCKETS
-
-# How many rollup contexts one GraphQL page carries. A PR with more than this has
-# a TRUNCATED tally, which the row reports so the card can fall back to the
-# aggregate rollup instead of presenting an incomplete count as complete.
-_ROLLUP_CONTEXT_PAGE = github_queries.ROLLUP_CONTEXT_PAGE
-
-# One PR's contexts, projected into the SAME row shape the REST check list uses
-# (name / source / status / conclusion / timestamps) so they can go through
-# _dedupe_checks and _check_bucket unchanged, so card and sidebar classification
-# remain structurally identical.
-_ROLLUP_CONTEXTS_JQ = github_queries.ROLLUP_CONTEXTS_JQ
-
 # The GraphQL selection for one PR's card enrichment, shared by both fetchers so
 # the two paths can never drift apart in what they ask for.
 _PR_SUMMARY_SELECTION = github_queries.PR_SUMMARY_SELECTION
@@ -1556,8 +1528,6 @@ _PR_SUMMARY_SELECTION = github_queries.PR_SUMMARY_SELECTION
 # independently failable, and a failure costs only the readiness field rather than the
 # whole card payload.
 _PR_READINESS_SELECTION = github_queries.PR_READINESS_SELECTION
-
-_PR_READINESS_JQ_BODY = github_queries.PR_READINESS_JQ_BODY
 
 # Smaller than `_SUMMARY_BATCH` (100) on purpose: this is the field GitHub COMPUTES, and
 # the by-number form asks for N of them in one query. 50 is the largest page measured
@@ -1887,18 +1857,6 @@ _PR_SEARCH_JQ = github_queries.PR_SEARCH_JQ
 # "newest 300" rather than implying completeness.
 PR_SEARCH_MAX = github_queries.PR_SEARCH_MAX
 
-# Hard stop on pages walked, so a pathological `per_page`/`limit` combination can
-# never turn one filter toggle into an unbounded request loop.
-_SEARCH_MAX_PAGES = github_queries.SEARCH_MAX_PAGES
-
-# GitHub logins: alphanumerics and hyphens only. Validated before a login can
-# reach the search query string, so it cannot inject extra qualifiers.
-_LOGIN_RE = github_queries.LOGIN_RE
-
-# PR lifecycle -> search qualifiers. ``closed`` means closed WITHOUT being
-# merged, matching the frontend's three-way split (open / merged / closed).
-_PR_STATE_QUALIFIERS = github_queries.PR_STATE_QUALIFIERS
-
 
 def build_pr_search_query(
     owner: str,
@@ -2095,7 +2053,7 @@ def submit_pr_review(
 
     **``commit_id`` is ATTRIBUTION, not a rejecting precondition** — unlike the
     ``sha`` parameter on :func:`merge_pull_request`, which GitHub really does check
-    and 409s. GitHub accepts a review naming a commit that is no longer the head; it
+    and 409s. GitHub accepts a review naming a commit that is not the head; it
     just records the review against that commit, and whether the stale approval still
     counts toward branch protection depends on the repo's
     "dismiss stale pull request approvals" setting. So the pin makes the verdict
@@ -2280,14 +2238,33 @@ def merge_pull_request(
     *,
     timeout: float = GH_TIMEOUT_SEC,
 ) -> dict:
-    """Merge a pull request now (``PUT .../pulls/{n}/merge``).
+    """Merge a pull request now, through GitHub's asynchronous merge API.
+
+    ``PUT .../pulls/{n}/merge-async`` accepts the request and merges in the
+    background; this function then polls ``GET .../merge-async/{uuid}`` until the
+    request settles or :data:`MERGE_ASYNC_WAIT_SEC` runs out. GitHub recommends it
+    over the synchronous ``PUT .../merge``: the background job retries transient
+    errors on a busy repository and is not bound by the synchronous endpoint's
+    request timeout. It returns only once the merge has actually landed, so a
+    caller merging several PRs in turn still sees each one on the base before the
+    next starts.
+
+    ``merge_action`` is ``direct_merge``: the button means "merge now", and a
+    branch that requires a merge queue is reached through :func:`enable_auto_merge`
+    instead, which hands the PR to the queue once it is ready. ``bypass_rules`` is
+    sent as ``false`` explicitly, so even an account permitted to bypass the
+    repository's rules does not do so from here.
 
     **This cannot bypass a gate, and that is why it is safe to offer.** Branch
     protection — required reviews, required status checks, required conversation
-    resolution — is enforced by GitHub on this endpoint, not by the caller: a PR
-    that has not satisfied its rules comes back **405 Method Not Allowed** and
-    nothing is merged. A 409 means the head moved since the caller last read it.
-    Both surface as errors rather than being reported as a merge.
+    resolution — is enforced by GitHub in the background merge, not by the caller:
+    a PR whose rules are not satisfied settles as ``failed`` and nothing is merged.
+    That, and the immediate 400 for a closed or draft PR, raise
+    :class:`GhMergeRefusedError`, carrying GitHub's message for a ``failed``
+    result (an immediate 400 carries only the status). A request GitHub is
+    still working on when the wait runs out, or one that was already pending (409),
+    comes back as ``{"merged": False, "pending": True}`` rather than as a merge. A
+    pinned sha the head has moved past is a 400, so it is a refusal too.
 
     So the honest division of labour is:
 
@@ -2302,17 +2279,19 @@ def merge_pull_request(
     worse outcome than the one it was guarding against.
 
     ``method`` is one of :data:`PR_MERGE_METHODS`; a repo that disallows the chosen
-    method answers 405 too, so the error is the repo's own policy speaking.
+    method makes the merge settle as ``failed`` too, so the error is the repo's own
+    policy speaking.
 
     ``head_sha`` is REQUIRED and is sent as GitHub's ``sha`` precondition, so the
     merge is pinned to the commit the caller actually looked at. Without it, a push
     landing between the read and the click merges code nobody reviewed — and on a repo
     with no branch protection there is nothing else to catch that, which is exactly
-    the case this function exists to serve. A moved head answers 409 rather than
-    merging. It is a positional parameter with an empty default only so the two
-    clients keep identical signatures; an empty value is refused here, not defaulted.
+    the case this function exists to serve. A head that moves before the background
+    merge runs makes GitHub cancel it rather than merge. It is a positional parameter
+    with an empty default only so the two clients keep identical signatures; an empty
+    value is refused here, not defaulted.
 
-    Returns ``{merged, sha, message}``.
+    Returns ``{merged, sha, message, pending}``.
     """
     verb = (method or "").strip().upper()
     if verb not in PR_MERGE_METHODS:
@@ -2322,19 +2301,99 @@ def merge_pull_request(
         raise GhCliError(
             "refusing to merge without the head commit it was reviewed at " f"(got {head_sha!r})"
         )
-    data = _run_gh_write(
-        "PUT",
-        f"repos/{owner}/{repo}/pulls/{int(number)}/merge",
-        {"merge_method": verb.lower(), "sha": sha},
-        timeout=timeout,
-    )
-    if isinstance(data, dict):
-        return {
-            "merged": bool(data.get("merged", True)),
-            "sha": data.get("sha"),
-            "message": data.get("message") or "",
-        }
-    return {"merged": True, "sha": None, "message": ""}
+    path = f"repos/{owner}/{repo}/pulls/{int(number)}/merge-async"
+    try:
+        data = _run_gh_write(
+            "PUT",
+            path,
+            {
+                "merge_method": verb.lower(),
+                "sha": sha,
+                "merge_action": "direct_merge",
+                "bypass_rules": False,
+            },
+            timeout=timeout,
+        )
+    except GhPermissionError:
+        raise
+    except GhCliError as exc:
+        message = str(exc)
+        if "HTTP 400" in message:
+            raise GhMergeRefusedError(message) from exc
+        if "HTTP 409" in message:
+            # Verified live: 409 means a merge request for this PR is already in
+            # flight. A stale pinned sha answers 400 ("head branch was modified").
+            return _merge_pending("GitHub is already merging this pull request.")
+        raise
+
+    deadline = time.monotonic() + MERGE_ASYNC_WAIT_SEC
+    for delay in _MERGE_ASYNC_POLL_DELAYS:
+        outcome = _merge_async_outcome(data)
+        if outcome is not None:
+            return outcome
+        uuid = _merge_async_uuid(data)
+        if not uuid:
+            raise GhCliError(
+                f"GitHub accepted the merge of {owner}/{repo}#{int(number)} "
+                "but returned no request id to follow"
+            )
+        if time.monotonic() + delay > deadline:
+            break
+        time.sleep(delay)
+        data = _run_gh_write("GET", f"{path}/{quote(uuid, safe='')}", None, timeout=timeout)
+    outcome = _merge_async_outcome(data)
+    if outcome is not None:
+        return outcome
+    return _merge_pending("GitHub is still merging this pull request.")
+
+
+# How long merge_pull_request waits for GitHub's background merge to settle, and the
+# gaps between polls. A merge that has not settled by then is reported as pending,
+# never as merged.
+MERGE_ASYNC_WAIT_SEC = 60.0
+_MERGE_ASYNC_POLL_DELAYS = (1.0, 1.0, 2.0, 2.0, 3.0, 3.0) + (5.0,) * 10
+
+
+def _merge_pending(message: str) -> dict:
+    return {
+        "merged": False,
+        "pending": True,
+        "sha": None,
+        "message": f"{message} Refresh in a moment to see whether it landed.",
+    }
+
+
+def _merge_async_uuid(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    details = data.get("details")
+    uuid = (details.get("uuid") if isinstance(details, dict) else None) or data.get("uuid")
+    return uuid if isinstance(uuid, str) else ""
+
+
+def _merge_async_outcome(data: object) -> dict | None:
+    """The final result of an async merge response, or ``None`` while it is pending.
+
+    ``merged`` returns the merge. ``failed`` raises :class:`GhMergeRefusedError`
+    with GitHub's message. Any other status (``enqueued`` included, which a
+    ``direct_merge`` request does not produce) raises an error naming it.
+    """
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").lower()
+    raw_details = data.get("details")
+    details: dict = raw_details if isinstance(raw_details, dict) else {}
+    message = str(details.get("message") or "")
+    if status == "merged":
+        sha = details.get("sha")
+        return {"merged": True, "pending": False, "sha": sha, "message": message}
+    if status == "failed":
+        raise GhMergeRefusedError(
+            sanitize_cli_stderr(message) or "GitHub did not merge this pull request."
+        )
+    if status and status != "pending":
+        raise GhCliError(f"GitHub returned an unexpected merge status: {status!r}")
+    return None
 
 
 def enable_auto_merge(
@@ -2511,36 +2570,14 @@ def rerun_workflow_run(
 # the store because the rows are this module's shape and the marker's dependency on
 # a comment's ``id``/``updated_at`` is this module's contract.
 
-# The marker itself. ``\s+`` after the name is what keeps the brief sentinel
-# ``<!-- kirocrew-crew-brief v1 -->`` from matching: the next character there is a
-# hyphen, not whitespace. Lazy ``[^>]*?`` stops at the marker's own ``-->`` and
-# cannot run on into later prose.
-_CREW_CLAIM_MARKER_RE = github_normalization.CREW_CLAIM_MARKER_RE
-
-# ``key=value`` pairs inside the marker; values are whitespace-delimited. Unknown
-# keys are simply not read, so the marker can grow a field without this parser (or
-# an older crew reading a newer marker) breaking.
-_CREW_CLAIM_FIELD_RE = github_normalization.CREW_CLAIM_FIELD_RE
-
-# The ONLY accepted timestamp shape: ISO-8601 UTC with a trailing ``Z``.
-#
-# Deliberately stricter than ``_parse_gh_timestamp`` / ``datetime.fromisoformat``,
-# which also accept a space separator and an absent or offset timezone. Those forms
-# are hazardous here rather than merely lax: ``2026-08-08 20:44:12`` parses to a
-# NAIVE datetime, and comparing that against the aware ``now`` a freshness check
-# uses raises TypeError — so a malformed stamp would crash the claim reader instead
-# of reading as stale. Refusing it up front makes "unparseable" mean "not fresh",
-# which is the safe direction: a claim that cannot prove it is alive must not be
-# treated as alive.
-_CREW_CLAIM_ISO_Z_RE = github_normalization.CREW_CLAIM_ISO_Z_RE
-
 
 def _parse_crew_marker(body: str) -> dict | None:
     """The crew payload parsed out of ONE comment body, or ``None`` if it has none.
 
     Returns ``{crew_id, phase, pr, updated}``. ``pr`` is an int or ``None``;
     ``updated`` is the validated ISO-8601-``Z`` string or ``None`` (see
-    :data:`_CREW_CLAIM_ISO_Z_RE` — a malformed stamp is unparseable, NOT fresh).
+    :data:`github_normalization.CREW_CLAIM_ISO_Z_RE` — a malformed stamp is
+    unparseable, NOT fresh).
 
     The FIRST marker in a body wins. A body carrying two is malformed either way,
     and first-wins at least makes which one is honoured deterministic rather than

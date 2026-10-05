@@ -439,6 +439,11 @@ class TestPollWorkflowCampaign:
         await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=None)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.FAILED
         assert "snapshot lost" in (h.get_campaign(cid) or {})["error_message"]
+        # The terminal status commit and the SSE emit are two scheduling events:
+        # _sse_from_thread hands _emit_sse to the loop via call_soon_threadsafe
+        # from the worker thread, so a direct await of the poll can return before
+        # that callback has run. Wait on the signal this test asserts on.
+        assert await _await_until(lambda: "failed" in sse.types())
         assert sse.types() == ["failed"]
 
     @pytest.mark.asyncio
@@ -525,6 +530,11 @@ class TestPollWorkflowCampaign:
         await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert (h._campaign_dir(cid) / "FINDINGS.md").read_text() == "# Report\nAll done."
         assert _status(cid) == h.CampaignStatus.COMPLETE
+        # The terminal status commit and the SSE emit are two scheduling events:
+        # _sse_from_thread hands _emit_sse to the loop via call_soon_threadsafe
+        # from the worker thread, so a direct await of the poll can return before
+        # that callback has run. Wait on the signal this test asserts on.
+        assert await _await_until(lambda: "complete" in sse.types())
         assert sse.types() == ["complete"]
 
     @pytest.mark.asyncio
@@ -556,6 +566,11 @@ class TestPollWorkflowCampaign:
         await h._poll_workflow_campaign(cid, _workflow_state(result=MagicMock(return_value=snap)), h.get_campaign(cid)["started_at"])
         assert _status(cid) == h.CampaignStatus.FAILED
         assert (h.get_campaign(cid) or {})["error_message"] == "engine exploded"
+        # The terminal status commit and the SSE emit are two scheduling events:
+        # _sse_from_thread hands _emit_sse to the loop via call_soon_threadsafe
+        # from the worker thread, so a direct await of the poll can return before
+        # that callback has run. Wait on the signal this test asserts on.
+        assert await _await_until(lambda: "failed" in sse.types())
         assert sse.types() == ["failed"]
 
     @pytest.mark.asyncio
@@ -778,7 +793,9 @@ class TestWatchdogLoop:
             lambda: _status(cid) == h.CampaignStatus.FAILED and "failed" in sse.types(),
         )
         assert "stalled" in (h.get_campaign(cid) or {})["error_message"]
-        svc.update.assert_awaited_once_with(terminating_loop.id, active=False)
+        svc.update.assert_awaited_once_with(
+            terminating_loop.id, active=False, stopped_reason="campaign_failed"
+        )
         svc.remove.assert_awaited_once_with(terminating_loop.id)
         assert "failed" in sse.types()
 
@@ -1579,7 +1596,7 @@ class TestKnowledgeRoutes:
 
     @pytest.mark.asyncio
     async def test_ingest_store_statements_run_off_the_event_loop(self, _isolate: Path):
-        """Issue #7020's loop-stall class: every store statement for the
+        """Every store statement for the
         to-knowledge flow must run in a worker thread, so a lock wait on the
         store's busy timeout stalls a thread instead of the event loop (which
         the watchdog would kill). Pins add_source, the syncing/synced UPDATEs,
@@ -1723,9 +1740,9 @@ class TestAssortedHelpers:
             get_by_slot=MagicMock(return_value=loop), remove=AsyncMock(), update=AsyncMock()
         )
         monkeypatch.setattr(h, "_autonudge_instance", lambda: svc)
-        await h._stop_loop("a1b2c3d4", remove=remove)
+        await h._stop_loop("a1b2c3d4", remove=remove, stop_reason="campaign_stopped")
         if remove:
-            svc.remove.assert_awaited_once_with("l1")
+            svc.remove.assert_awaited_once_with("l1", stop_reason="campaign_stopped")
         else:
             svc.update.assert_awaited_once_with("l1", active=False)
 
@@ -1926,7 +1943,9 @@ class TestActionDispatch:
         if mode == "workflow":
             dispatch.stop_workflow.assert_awaited_once()
         else:
-            dispatch.stop_loop.assert_awaited_once_with(cid, remove=True)
+            dispatch.stop_loop.assert_awaited_once_with(
+                cid, remove=True, stop_reason="campaign_stopped"
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mode", ["agent", "workflow"])
@@ -1940,7 +1959,9 @@ class TestActionDispatch:
         if mode == "workflow":
             dispatch.stop_workflow.assert_awaited_once()
         else:
-            dispatch.stop_loop.assert_awaited_once_with(cid, remove=True)
+            dispatch.stop_loop.assert_awaited_once_with(
+                cid, remove=True, stop_reason="campaign_deleted"
+            )
 
     @pytest.mark.asyncio
     async def test_delete_of_a_missing_campaign_is_a_404(self, _isolate: Path, dispatch):

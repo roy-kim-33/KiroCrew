@@ -21,6 +21,10 @@ def _fake_state():
     state = MagicMock()
     # conversation_log must be truthy for _persist_title to attempt a write.
     state.conversation_log = MagicMock()
+    # A restricted slot's title write looks up ``state._slots`` for a live
+    # same-key replacement to pre-tighten; a bare MagicMock there would pose
+    # as one at every key. No slot is registered in these tests.
+    state._slots = {}
     return state
 
 
@@ -218,7 +222,7 @@ class TestAutoTitleInFlightGuard:
             release_first = asyncio.Event()
             attempts = []
 
-            async def _generate(_state, messages):
+            async def _generate(_state, messages, *, session_key: str = ""):
                 attempts.append(list(messages))
                 if len(attempts) == 1:
                     first_started.set()
@@ -344,8 +348,8 @@ class TestSkipFallbackBranch:
 class TestAutoTitleRunsForEveryMemoryMode:
     """Titling is not gated on ``memory_mode``.
 
-    It used to bail on ``slot.blocks_reads`` (true only for ``temporary``),
-    which left temporary tabs showing "New Session…" for their whole life.
+    It must not bail on ``slot.blocks_reads`` (true only for ``temporary``),
+    which would otherwise leave temporary tabs showing "New Session…" for their whole life.
     Titling reads only the slot's own messages, so no memory-privacy rule
     applies; the manual generate-title endpoint never had the guard either.
     """
@@ -358,7 +362,7 @@ class TestAutoTitleRunsForEveryMemoryMode:
         state = _fake_state()
         attempts = []
 
-        async def _generate(_state, messages):
+        async def _generate(_state, messages, *, session_key: str = ""):
             attempts.append(list(messages))
             return generated
 

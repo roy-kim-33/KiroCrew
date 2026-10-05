@@ -33,12 +33,13 @@ The administrator sets two things on the Kiro profile (Kiro console → Settings
 Shared settings): an MCP on/off toggle, and an **MCP Registry URL** pointing at a
 registry JSON file listing the allow-listed servers.
 
-With a registry URL configured, the client is in **registry access mode**, and
-its filter is *symmetric*:
+With a registry URL configured, the client is in **registry access mode**. The
+filter is symmetric for entries in the agent spec; Kiro CLI 2.6.0 and later can
+also load personal `mcp.json` servers alongside the registry-managed set:
 
-| Access mode | Entries that connect | Entries that are dropped |
+| Access mode | Agent-spec entries that connect | Agent-spec entries that are dropped |
 |---|---|---|
-| registry (a registry URL is set) | only entries carrying `"type": "registry"` that resolve to a catalog entry **of the same name** | everything else |
+| registry (a registry URL is set) | entries carrying `"type": "registry"` that resolve to a catalog entry **of the same name** | ordinary, non-registry entries in the agent spec |
 | non-registry (no registry URL) | ordinary entries | entries carrying `"type": "registry"` |
 
 Two consequences worth internalising:
@@ -83,7 +84,7 @@ Kiro Crew needs three servers, and they must appear in the registry file under
 |---|---|
 | `kirocrew-core` | `spawn_run`, `learn_add`, artifacts, knowledge, monitoring — the bulk of the product |
 | `kirocrew-cron` | every scheduled job (`cron_add` and the whole cron surface) |
-| `kirocrew-computer` | desktop automation (inert unless separately enabled, but still filtered) |
+| `kirocrew-computer` | desktop automation on supported macOS and Windows hosts (inert unless separately enabled, but still filtered) |
 
 The registry file format is a subset of the MCP registry standard's server
 schema. Each entry needs a `packages` entry describing how to launch the server,
@@ -91,7 +92,10 @@ and — because all three Kiro Crew servers live behind one package — a
 `packageArguments` entry naming the subcommand. For a `pypi` package the client
 derives `uvx <identifier> <packageArguments>`, so an entry without the argument
 launches `uvx kirocrew` with no subcommand, which prints CLI help instead of
-speaking MCP and fails the handshake:
+speaking MCP and fails the handshake. Kiro Crew releases are not published to
+the public Python Package Index; the `pypi` example below therefore requires
+your organisation to mirror the matching `kirocrew` wheel into the Python index
+that `uvx` uses:
 
 ```json
 {
@@ -99,7 +103,7 @@ speaking MCP and fails the handshake:
     {
       "name": "kirocrew-core",
       "description": "Kiro Crew orchestration: subagents, memory, artifacts, monitoring",
-      "version": "0.3.0",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -112,7 +116,7 @@ speaking MCP and fails the handshake:
     {
       "name": "kirocrew-cron",
       "description": "Kiro Crew scheduled jobs",
-      "version": "0.3.0",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -124,8 +128,8 @@ speaking MCP and fails the handshake:
     },
     {
       "name": "kirocrew-computer",
-      "description": "Kiro Crew desktop automation (macOS, opt-in)",
-      "version": "0.3.0",
+      "description": "Kiro Crew desktop automation (macOS/Windows, opt-in)",
+      "version": "0.8.0",
       "packages": [
         {
           "registryType": "pypi",
@@ -150,13 +154,47 @@ process, reached through subcommands (`kirocrew mcp-core`, `mcp-cron`,
 A registry-type entry hands the launch decision to the catalog: the client
 resolves the package and, when a locally installed server's version differs from
 the registry's, relaunches it at the registry's version. For a `pypi` entry that
-means `uvx` fetching Kiro Crew from PyPI into its own ephemeral environment — so
-the process serving your MCP tools can be a *different* Kiro Crew from the
-gateway serving your dashboard. Your `env` overrides (including `KIROCREW_HOME`)
-do flow through, which keeps the data home aligned, but the code does not.
+means `uvx` fetching Kiro Crew into its own ephemeral environment from its
+configured Python index. Because the project is not on public PyPI, that route
+works only when your organisation mirrors the wheel and version into an index
+visible to `uvx`. The process serving your MCP tools can then still be a
+*different* Kiro Crew from the gateway serving your dashboard. Your `env`
+overrides (including `KIROCREW_HOME`) do flow through, which keeps the data home
+aligned, but the code does not.
 
 Keep the registry `version` in step with your fleet's installed version. If your
 organisation pins Kiro Crew centrally, that pin now governs the MCP side too.
+
+## Known limitation: registry mode cannot work on the KAS backend
+
+Everything above is about Kiro CLI, which reads your agent spec off disk and so
+sees the `"type": "registry"` marker Kiro Crew writes into it. The KAS backend
+(`kiro-agent`) reads no spec: Kiro Crew projects the agent over the wire on
+`session/new`, and that wire schema has no slot for `type`. The marker is dropped
+in transit, the host therefore sees every server as unmarked, and in registry
+access mode it filters all of them out — Kiro Crew's own control plane included.
+
+What you see is a session that starts and chats normally with no MCP tools at
+all: no `spawn_run`, no `cron_add`, no `learn_add`, no artifacts, knowledge or
+monitoring, and no error from the host explaining it. Declaring registry mode
+does not fix it there, because the marker it writes cannot reach the filter.
+
+Kiro Crew makes the failure visible rather than silent. Projecting an agent onto
+that backend under registry mode logs a warning naming exactly this, and the
+servers your spec declares are withheld with a line each instead of being sent to
+be dropped downstream. Until the wire schema carries `type`:
+
+- run a registry-governed profile on Kiro CLI, where the marker is read from disk
+  and the servers survive;
+- or, on an install whose profile is not actually registry-governed, turn the
+  declaration off with `kirocrew config set agent.mcp_registry_mode false` — the
+  filter only runs when the administrator has set a registry URL, so a host
+  outside that profile loses nothing by not claiming to be governed.
+
+A muted server is dropped on the same wire for a similar reason: the schema
+accepts `"disabled": true` and then discards it, so Kiro Crew does not declare a
+muted server to that backend at all. The mute is honoured; it is simply honoured
+by omission.
 
 ## Version floor
 
@@ -187,10 +225,21 @@ Two properties to internalise before you design a rollout:
   instantly, and a host that is off takes it when it next starts. The poller waits
   a full interval before its first run, since boot has just fetched from the same
   source — so a fleet restarting together does not stampede your endpoint.
-- **The document is the whole ceiling, not a patch.** The fetched policy replaces
-  the local one outright; there is no merge with `~/.kiro/crew/security_policy.json`
-  and no per-host addendum. Anything a host needs must be in the published
-  document (or in a narrower per-surface profile, which can only tighten).
+- **The document is the whole ceiling, not a patch — but it is one rung of a
+  ladder.** The fetched policy replaces the *previously fetched* one outright; there
+  is no merge of two central documents and no per-host addendum that can loosen what
+  you published. What it does not replace is the rung below it: a local
+  `security_policy.json` still tightens it. That holds identically at boot and on
+  every refresh, because both run the same composition — so a host you tightened
+  locally does not quietly lose that tightening at its next successful poll.
+- **The fetched document outranks every local file.** A local policy — including one
+  named by `KIROCREW_SECURITY_POLICY` — can only *tighten* what you published; it
+  cannot loosen a single clause. That reverses the older behaviour, where a local
+  file beat the central one and the fleet ceiling was therefore advisory: anyone who
+  could set an environment variable could point it at a permissive file. It is the
+  top rung: no local file can override rather than narrow — there is no such channel.
+  Recovery from a bad push is by republishing a good document at the source; see
+  [Rolling back a bad push](#rolling-back-a-bad-push).
 
 ### The two ways to point a host at a source
 
@@ -205,6 +254,41 @@ The two compose, and the environment wins **per setting** — so a host can be
 redirected to a canary endpoint, or have its interval lengthened during an
 incident, without editing (and re-signing) the document the rest of the fleet is
 reading.
+
+Both of these say *where the document comes from*, not *whether it binds*. Neither
+is a channel a standard user cannot touch: an environment variable is per-process
+and redefinable by whoever launches the process, and a bootstrap policy file lives
+in a directory the user may own. What they cannot do is loosen the fetched document —
+every local tier only tightens it.
+
+The full order Kiro Crew loads in, highest first:
+
+| Tier | Where | Role |
+|---|---|---|
+| 1 | the centrally distributed document | **authority** — one document, every host |
+| 2 | `KIROCREW_SECURITY_POLICY` | subordinate — tightens only |
+| 3 | a companion edition's packaged policy | subordinate — tightens only |
+| 4 | `~/.kiro/crew/security_policy.json` | subordinate — tightens only |
+
+A `distribution` block is read from the first of the local tiers that supplies one —
+`KIROCREW_SECURITY_POLICY`, then a companion's packaged policy, then
+`~/.kiro/crew/security_policy.json` — so naming a source in the file
+`KIROCREW_SECURITY_POLICY` points at works exactly as naming it in any other tier's
+file.
+
+Tiers 2–4 are mutually exclusive (the first one present is used) and the result is
+the authority narrowed by it: allow-lists intersect, deny-lists union, a strictness
+level takes the stricter value. A subordinate cannot repeal by omission either — a
+scope it simply leaves out keeps the authority's value.
+
+Two values a subordinate sets are kept only when the authority left them empty:
+`updates.source` (where both name one, the authority's glob stands — two globs have no
+expressible intersection) and `channels.posture` (the authority's posture wins; a
+subordinate posture is not yet folded). A `min_version`
+floor does fold: the higher of the two wins. A
+`~/.kiro/crew/security_policy.json` that cannot be used (unreadable, not JSON, or
+a document the schema rejects) beneath a central document is skipped with one
+warning rather than refusing boot; the authority governs unchanged.
 
 ```bash
 KIROCREW_POLICY_URL=https://config.corp.example/kirocrew/security_policy.json
@@ -251,7 +335,7 @@ Kiro Crew runs as — the file *and* every directory above it**: a source that a
 write, and the refresher would install that ceiling without a restart. A `0444` file in a
 writable directory does not count: it can be replaced by unlink-and-recreate. Use a
 root-owned path or a read-only mount; if what you want is a local, editable policy file, that is
-`KIROCREW_SECURITY_POLICY` (tier 1), not this channel. The validator is a content digest,
+`KIROCREW_SECURITY_POLICY`, not this channel. The validator is a content digest,
 so a host on a shared mount re-reads only when the bytes actually change — including the
 case where you replace the file with a same-size version and preserve its timestamp.
 Plain
@@ -300,11 +384,12 @@ A one-shot CLI run has no background poller, so it reports none even on a host
 whose gateway is polling happily; the live refresher's own state is on
 `GET /api/governance/policy` and in the dashboard's security panel.
 
-`kirocrew policy fetch` fetches now, validates the document, and on success
-installs it and records it as this host's last-known-good. Run from a shell, what
-outlives the command is the validation and the cache write — the install lands in
-that short-lived CLI process, and the running gateway takes the change on its own
-next poll, or immediately at its next start from the cache the fetch just wrote.
+`kirocrew policy fetch` fetches now, folds the document back into the tier ladder,
+validates that composed result, and on success installs it and records the fetched
+document as this host's last-known-good. Run from a shell, what outlives the command is
+the validation and the cache write — the install lands in that short-lived CLI process,
+and the running gateway takes the change on its own next poll, or immediately at its
+next start from the cache the fetch just wrote.
 The command says which of those applies, because with a **boot-only** source (no
 `refresh_interval_secs`) there is no next poll: a gateway already running keeps its
 ceiling until it is restarted. Set a refresh interval if a push has to bind
@@ -351,8 +436,10 @@ effect on the next start:
 
 - `KIROCREW_POLICY_ON_UNAVAILABLE=degrade` — boot, and report the degradation.
 - unset `KIROCREW_POLICY_URL` — stop fetching centrally on this host.
-- `KIROCREW_SECURITY_POLICY=/path/to/local.json` — govern from a local file,
-  which outranks the central tier entirely.
+- `KIROCREW_SECURITY_POLICY=/path/to/local.json` — supply a local ceiling so the
+  host has one. Note what this is **not**: a local file no longer outranks the
+  central tier, so on a host that *did* reach the endpoint it only tightens what you
+  published. It is a way to give a host a ceiling, not a way to escape one.
 
 A refusal to establish the ceiling aborts every `kirocrew` command on that host,
 `policy source` included, because each of them boots the same platform context.
@@ -369,11 +456,7 @@ host runs under whatever local policy it has, which may be none.
 One document governing every host is the widest blast radius in this model, so
 plan the retraction before the first rollout.
 
-`KIROCREW_SECURITY_POLICY` — an explicit **local** file path — outranks the
-central tier and is the retraction lever. It is reachable without fixing the
-endpoint, which is the point: an operator recovering from a bad push needs a
-channel that outranks the thing that broke. Keep a known-good policy on each host
-(or in your host image) so setting one variable is the whole recovery.
+A time-boxed local override (a dated `break_glass` grant an authority document could issue to a lower tier) was designed for this change and **withdrawn before merge**: a channel by which a local document outranks the fleet ceiling is the override this ladder exists to remove, and the reviewed design carried its own expiry-handling and cache-trust defects. Recovery from a bad central push is by re-publishing a good document at the source. The override is tracked as the follow-up issue [#9106](https://github.com/kirodotdev/KiroCrew/issues/9106), not shipped here.
 
 A running fleet is better protected than a restarting one, and the difference
 matters when you plan:
@@ -457,6 +540,6 @@ So you do not plan around capabilities that are not here:
   policy with a `distribution` block filled in, to copy from.
 - [../../src/kiro_crew/docs/troubleshooting.md](../../src/kiro_crew/docs/troubleshooting.md)
   — the user-facing "MCP tools not working" checklist.
-- Kiro's own documentation: `https://kiro.dev/docs/enterprise/governance/mcp/`
-  (administrator setup) and `https://kiro.dev/docs/mcp/registry/` (registry mode
-  and registry-type overrides).
+- Kiro's own documentation: [Enterprise MCP governance](https://kiro.dev/docs/enterprise/governance/mcp/)
+  (administrator setup) and [MCP registry mode](https://kiro.dev/docs/mcp/registry/)
+  (registry mode and registry-type overrides).

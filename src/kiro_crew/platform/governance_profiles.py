@@ -27,6 +27,7 @@ Resolution principles (from the design + the grounding analysis):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -253,7 +254,7 @@ def _dir_fingerprint(directory: Path) -> Tuple:
 
     Per file: ``st_mtime_ns + st_size + st_ctime_ns`` plus the name set, so a
     create / edit / truncate / delete all change the fingerprint. ``st_ctime_ns``
-    is included specifically so a ``chmod`` that makes a previously-UNREADABLE
+    is included specifically so a ``chmod`` that makes an unreadable
     profile readable busts the cache: chmod/chown/rename-in-place bump ctime but
     NOT mtime/size, so without ctime the unreadable fallback would stay cached
     forever after a permission fix and the profile's restrictions would remain
@@ -320,6 +321,139 @@ def _fallback_profile(name: str) -> Profile:
     except Exception:
         logger.debug("fallback profile lookup unavailable; using deny-all", exc_info=True)
     return deny_all_profile(name)
+
+
+# Monotonic counter of profile-layer RECOMPOSES, bumped by ``ProfileStore._ensure_fresh``
+# whenever the directory fingerprint missed and a reload actually published a new
+# snapshot.  Deliberately a MODULE global rather than instance state, for two reasons:
+#
+#   * ``reset_store()`` replaces the store, and an instance counter would restart at 0.
+#     A consumer comparing a combined token could then see it move BACKWARD, or — worse
+#     — not move at all when a ceiling bump and a profile reset cancel out.
+#   * it mirrors ``context._GOVERNANCE_GENERATION``, which is the sibling this pairs
+#     with and is a process-global for the same reason.
+#
+# NOT folded into ``_ceiling_token()``.  That is load-bearing, not an oversight: the
+# ceiling token is an INPUT to the store's own freshness key, so feeding this counter
+# back into it would make every reload invalidate the fingerprint it just committed
+# (``_ensure_fresh`` computes ``fp`` BEFORE ``_reload``, so the committed value is
+# pre-bump) and the store would reload on every single access forever — on the event
+# loop, since the synchronous PreToolUse gate reaches this path.  This counter is an
+# OUTPUT of the store and must never become an input to it.
+_PROFILE_GENERATION = 0
+_PROFILE_GENERATION_LOCK = threading.Lock()
+
+# How long an UNPRIMED OFF-LOOP caller waits for the thread that owns the cold load.
+# Bounded, and never awaited on the event loop; ``_ensure_fresh`` gates it.
+_COLD_LOAD_WAIT_S = 2.0
+
+
+def _on_event_loop() -> bool:
+    """True when the caller runs on an asyncio loop, so it must never block.
+
+    The cold-load barrier in ``_ensure_fresh`` is gated on this. A loop thread that
+    waited on another thread's filesystem I/O would stall every other task on that
+    loop, the synchronous tool-approval gate included, so only a caller holding its
+    own thread may wait. ``get_running_loop`` raises exactly when there is no loop
+    running in this thread, which is the condition being tested.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _profile_generation() -> int:
+    """Monotonic counter of how many profile snapshots have been published.
+
+    Opaque and comparison-only, exactly like ``context.governance_generation()``:
+    callers may test it for equality with a value they stored, never interpret its
+    magnitude.  Module-private on purpose: the public contract is the combined
+    :func:`governance_answer_generation`, and a bare generation accessor with no
+    consumer outside this module would be surface to honor forever.
+    """
+    with _PROFILE_GENERATION_LOCK:
+        return _PROFILE_GENERATION
+
+
+def _publish_snapshot(store: "ProfileStore", snap: "_Snapshot") -> None:
+    """Install a snapshot AND bump the generation under ONE hold of the reader lock.
+
+    The SOLE writer of ``_PROFILE_GENERATION`` on the reload path, so the generation
+    counts PUBLISHED snapshots rather than attempted reloads: a reload with nothing to
+    publish (the warm unreadable-profile arm) must not move a token senders compare
+    against.
+
+    Atomic on purpose: a reader could otherwise observe the NEW snapshot under the OLD
+    generation and re-confirm an authority already replaced. A reader taking neither
+    lock can still interleave, so this pairing is what senders compare tokens under
+    rather than a global guarantee.
+
+    Ordered under the reload lock, taken first and never while this is held; no I/O.
+    """
+    global _PROFILE_GENERATION
+    with _PROFILE_GENERATION_LOCK:
+        store._snap = snap
+        _PROFILE_GENERATION += 1
+
+
+def poll_profiles_fresh() -> None:
+    """Re-stat the profiles directory and reload if it changed.  MAY BLOCK.
+
+    This is the filesystem half of the notification edge, kept SEPARATE from
+    :func:`governance_answer_generation` so the read is never accidentally coupled to
+    a directory walk.  ``_dir_fingerprint`` runs ``iterdir`` plus a ``stat`` per file,
+    which is exactly the "large synchronous file IO or filesystem walks" that
+    AUTOSDE's ``no-blocking-call-on-event-loop`` prohibits, so an async caller MUST
+    offload it::
+
+        await asyncio.to_thread(poll_profiles_fresh)
+
+    Measured on one host: 57us at 5 profile files, 107us at 15, 303us at 50, 1.12ms
+    at 200.  Small at a realistic count and unbounded in principle, which is why it
+    is offloaded rather than defended by the measurement.
+
+    Best-effort: a failure here leaves the last published snapshot and its generation
+    in place, so a consumer sees a stale-but-coherent token rather than an exception
+    on a status tick.
+    """
+    try:
+        _STORE._ensure_fresh()
+    except Exception:  # pragma: no cover - defensive; freshness is best-effort here
+        logger.debug("profile freshness poll failed; serving last token", exc_info=True)
+
+
+def governance_answer_generation() -> int:
+    """One opaque token covering BOTH layers that can change a governance answer.
+
+    ``GET /api/dashboard/config`` derives fields (``social_share_enabled``) from the
+    ceiling ∩ profile intersection, so a consumer watching for "the answer may have
+    changed" has to watch both layers.  Watching the ceiling counter alone misses a
+    profile-layer tightening: it is enforced on the next decision but never reaches
+    the dashboard's cache invalidation, so the UI keeps offering an entry policy has
+    withdrawn.
+
+    Both components are monotonic non-decreasing for the life of the process, so
+    their sum is too, and the sum therefore changes if and only if at least one
+    component changed.  That is all a consumer needs: the wire field is documented
+    opaque and comparison-only, so combining is not a change of meaning.
+
+    PURE READ - two locked integer reads, NO filesystem access, safe to call on the
+    event loop.  Detecting a profile edit needs :func:`poll_profiles_fresh`, which is
+    the caller's job precisely because only the caller knows whether it can block;
+    the periodic watcher offloads that to a thread, while the synchronous slots
+    broadcast does not poll at all and simply reads what has been published.
+
+    Re-entrancy: a bump can cause the watcher to call ``push_slots_update()``, whose
+    broadcast reads this token again.  That read touches no filesystem and cannot
+    bump anything, so the cycle terminates immediately.  No listener writes profiles
+    on notify either: the only consumer is a client-side ``dashboardConfig``
+    invalidation, which issues a GET.
+    """
+    from kiro_crew.platform.context import governance_generation
+
+    return governance_generation() + _profile_generation()
 
 
 def _ceiling_token() -> Tuple[bool, int]:
@@ -431,7 +565,7 @@ class ProfileStore:
             fp = (_dir_fingerprint(directory), _ceiling_token())
             if fp == self._fingerprint:
                 return True
-        # NEVER block: this is reachable on the event loop (the synchronous PreToolUse
+        # NEVER block on the event loop: this is reachable there (the synchronous
         # gate), and waiting on another thread's filesystem I/O there would wedge the
         # gateway — a first profile load in a worker on a slow FS, plus a concurrent
         # dashboard tool approval, is exactly that stall.
@@ -443,11 +577,19 @@ class ProfileStore:
             # configured" host, so the caller would resolve ``profile=None`` and
             # ``governance_permits`` would hand back its ``ungoverned`` default-PERMIT:
             # a fail-OPEN that ``fail_closed=True`` cannot catch (the default-permit is
-            # a normal return, not an exception). So report UNRESOLVED and let the
-            # caller fail closed. Concurrent first-touch is the EXPECTED case, not an
+            # a normal return, not an exception). So an unprimed OFF-LOOP caller waits
+            # below for that load. Concurrent first-touch is the EXPECTED case, not an
             # exotic one: nothing primes the store on the ungoverned / profile-only
             # boot path, so a startup burst across the transports puts several threads
             # here at once.
+            if (
+                not self._snap.loaded
+                and not _on_event_loop()
+                and self._lock.acquire(timeout=_COLD_LOAD_WAIT_S)
+            ):
+                # Acquired purely as a BARRIER: the owner published under this lock, so
+                # the point is to read its result rather than repeat its work.
+                self._lock.release()
             return self._snap.loaded
         try:
             # Re-stat under the lock only when we did not already do it above (an
@@ -533,11 +675,14 @@ class ProfileStore:
                 return
             # COLD: publish an empty index but flag it (one atomic snapshot) so a
             # governed boot aborts rather than run with zero profiles.
-            self._snap = _Snapshot(
-                by_name={},
-                by_bind={},
-                unrecoverable=(f"<dir:{directory}>",),
-                loaded=True,
+            _publish_snapshot(
+                self,
+                _Snapshot(
+                    by_name={},
+                    by_bind={},
+                    unrecoverable=(f"<dir:{directory}>",),
+                    loaded=True,
+                ),
             )
             return
         # Pass 1: parse each file independently; an invalid one becomes deny-all.
@@ -706,12 +851,15 @@ class ProfileStore:
         # governed fleet boot-aborts via ``assert_profiles_within_ceiling``; a
         # standalone host tolerates it. A directory that could not be enumerated
         # already returned early above, leaving the prior snapshot fully intact.
-        self._snap = _Snapshot(
-            by_name=by_name,
-            by_bind=by_bind,
-            unrecoverable=unrec,
-            fallback_profiles=frozenset(fallback_stems),
-            loaded=True,
+        _publish_snapshot(
+            self,
+            _Snapshot(
+                by_name=by_name,
+                by_bind=by_bind,
+                unrecoverable=unrec,
+                fallback_profiles=frozenset(fallback_stems),
+                loaded=True,
+            ),
         )
         # Runtime observability for a POST-BOOT unrecoverable file. The boot floor
         # (``assert_profiles_within_ceiling``) only runs once; a governed RUNNING
@@ -908,8 +1056,12 @@ def any_configured_profile_governs(ref: str) -> bool:
 
 def reset_store() -> None:
     """Test helper — drop the cached profiles so the next access reloads."""
-    global _STORE
-    _STORE = ProfileStore()
+    global _PROFILE_GENERATION, _STORE
+    # One critical section for the same reason a publication is: a reader must not
+    # see the fresh store's answers carrying the old generation.
+    with _PROFILE_GENERATION_LOCK:
+        _STORE = ProfileStore()
+        _PROFILE_GENERATION += 1
 
 
 def get_store_profile(name: str) -> Optional[Profile]:

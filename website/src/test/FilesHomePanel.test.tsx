@@ -41,6 +41,7 @@ vi.mock('../pierre/tree', () => ({
 }))
 
 import FilesHomePanel from '../pages/chat/FilesHomePanel'
+import { consumeChatHandoff, recordError, __resetErrorJournalForTests } from '../utils/errorReport'
 
 const DIR = '/repo/my-project'
 
@@ -48,14 +49,26 @@ const DIR = '/repo/my-project'
  *  scoped to the header rather than the whole panel. */
 const header = () => screen.getByText('Files').parentElement as HTMLElement
 
-function mount(dir = DIR, onFileOpen: (p: string, d: boolean) => void = vi.fn()) {
+function mount(
+  dir = DIR,
+  onFileOpen: (p: string, d: boolean) => void = vi.fn(),
+  onOpenTerminal?: () => void,
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const utils = render(
     <QueryClientProvider client={qc}>
-      <FilesHomePanel projectDir={dir} onFileOpen={onFileOpen} />
+      <FilesHomePanel projectDir={dir} onFileOpen={onFileOpen} onOpenTerminal={onOpenTerminal} />
     </QueryClientProvider>,
   )
   return { qc, onFileOpen, ...utils }
+}
+
+/** Open the header's `Project actions` overflow. Radix opens on keyboard
+ *  activation — the path jsdom handles, unlike the PointerEvent mouse open. */
+function openProjectActions() {
+  const trigger = within(header()).getByLabelText('Project actions')
+  fireEvent.keyDown(trigger, { key: 'Enter' })
+  return trigger
 }
 
 beforeEach(() => {
@@ -131,12 +144,80 @@ describe('FilesHomePanel header', () => {
   })
 })
 
+describe('FilesHomePanel per-project quick actions', () => {
+  it('spawns a terminal in the project directory from the actions menu', async () => {
+    // The point of the affordance: a shell already `cd`'d into the project,
+    // reachable without knowing that a side-panel tab kind spawns one.
+    const onOpenTerminal = vi.fn()
+    mount(DIR, vi.fn(), onOpenTerminal)
+    openProjectActions()
+    fireEvent.click(await screen.findByText('Open terminal in the project directory'))
+    expect(onOpenTerminal).toHaveBeenCalledTimes(1)
+  })
+
+  it('withholds the terminal action when the host serves no terminal', async () => {
+    // No callback = the terminal feature is off or the host withdrew the view.
+    // Offering the row anyway would promise a shell that never starts, and with
+    // nothing left to hold the trigger goes too rather than opening an empty menu.
+    mount(DIR)
+    await waitFor(() => expect(screen.getByTestId('tree')).toBeInTheDocument())
+    expect(within(header()).queryByLabelText('Project actions')).toBeNull()
+  })
+
+  it('says what the action IS, in the menu, not what it avoids', async () => {
+    // A first-time reader identified the terminal row correctly and would not
+    // click it, so the row has to answer "what is this" without being clicked.
+    // The wording states the value: an earlier attempt reassured instead
+    // ("Nothing runs until you type") and the same reader read the reassurance
+    // as a warning, so the negative framing is pinned OUT here, not just the
+    // positive one in.
+    mount(DIR, vi.fn(), vi.fn())
+    openProjectActions()
+    expect(await screen.findByText('A command line that starts in this project’s folder.')).toBeInTheDocument()
+    expect(screen.queryByText(/Nothing runs until you type/)).toBeNull()
+  })
+
+  it('keeps the header at two controls, with the action inside the menu', async () => {
+    // `max-two-buttons-per-row` caps the row. The action is a menu ROW rather
+    // than a second button because it carries a one-line explanation, and a 26px
+    // icon button has nowhere to put one. Held pending as well as settled, so the
+    // assertion covers the in-flight state the old (unreachable) Refresh branch
+    // claimed for itself.
+    H.api.projectTree.mockReturnValue(new Promise(() => {}))
+    mount(DIR, vi.fn(), vi.fn())
+    expect(within(header()).getAllByRole('button').map(b => b.getAttribute('aria-label'))).toEqual([
+      'Show in file manager', 'Project actions',
+    ])
+    openProjectActions()
+    expect(await screen.findByText('Open terminal in the project directory')).toBeInTheDocument()
+  })
+
+  it('offers no header Refresh, whose branch could never render', async () => {
+    // With a project directory set, `useTreeState` answers only `ready` or
+    // `error` (`ready` covers in-flight on purpose), so the header's old
+    // `!treeAvailable && treeState !== 'error'` Refresh was dead in every state.
+    // The reachable refreshes are the rail's own and the tree-error state's.
+    H.api.projectTree.mockReturnValue(new Promise(() => {}))
+    mount(DIR, vi.fn(), vi.fn())
+    expect(within(header()).queryByLabelText('Refresh')).toBeNull()
+    openProjectActions()
+    expect(await screen.findByText('Open terminal in the project directory')).toBeInTheDocument()
+    expect(screen.queryByText('Refresh')).toBeNull()
+  })
+
+  it('drops the actions menu entirely when no directory is set', () => {
+    mount('', vi.fn(), vi.fn())
+    expect(within(header()).queryByLabelText('Project actions')).toBeNull()
+  })
+})
+
 describe('FilesHomePanel tree availability', () => {
-  it('mounts the rail and points at it while the tree endpoint answers', async () => {
+  it('gives the tree the whole tab while the tree endpoint answers', async () => {
     mount()
     expect(await screen.findByTestId('tree')).toBeInTheDocument()
-    expect(screen.getByText('Select a file from the tree to open it in a new tab')).toBeInTheDocument()
-    expect(screen.getByRole('separator')).toBeInTheDocument()
+    // No preview pane beside it, so no hint and no resize grip between the two.
+    expect(screen.queryByText('Select a file from the tree to open it in a new tab')).toBeNull()
+    expect(screen.queryByRole('separator')).toBeNull()
   })
 
   it('names the FETCH as the failure, not the setting, once the tree endpoint errors', async () => {
@@ -163,6 +244,91 @@ describe('FilesHomePanel tree availability', () => {
     expect(screen.getAllByRole('button', { name: 'Refresh' })).toHaveLength(1)
   })
 
+  it.each([
+    ['a deadline', Object.assign(new Error('deadline'), { name: 'TimeoutError' }), "Couldn't load the file tree"],
+    ['a refused root', { code: 'unknown_project_dir' }, 'Folder not found'],
+  ])('takes the same error arm on %s as on any other failed read', async (_label, failure, copy) => {
+    // `useTreeState` splits failures into `recoverable` and `error` for FolderPanel's
+    // tree notice over its listing; this panel must not inherit that split. Whatever the cause, the directory IS set,
+    // so the answer is the fetch notice with its Refresh -- never the no-directory hint, and
+    // never a rail with nothing to show. Only the COPY follows the cause (see the next test).
+    const err = failure instanceof Error
+      ? failure
+      : new (await import('../api/apiError')).ApiError(404, 'nope', JSON.stringify(failure))
+    H.api.projectTree.mockRejectedValue(err)
+    const { qc } = mount()
+    await waitFor(() =>
+      expect(qc.getQueryState(['project-tree', DIR])?.status).toBe('error'))
+
+    expect(await screen.findByText(copy)).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: 'Refresh' })).toHaveLength(1)
+    expect(screen.queryByText('No project directory is set for this chat')).toBeNull()
+    expect(screen.queryByText('Select a file from the tree to open it in a new tab')).toBeNull()
+    expect(screen.queryByTestId('tree')).toBeNull()
+  })
+
+  it.each([
+    ['a missing root', 'unknown_project_dir', 404, 'Folder not found'],
+    ['a refusal', 'access_denied', 403, 'No access to this folder'],
+  ])('names %s in the notice, not just by withholding the remedy', async (_l, code, status, copy) => {
+    // Every cause wore the one generic line here, so a refused or missing root read as an outage
+    // -- the reason had to be inferred from the rail's absence. The copy now comes from the cause
+    // map the rail and the folder panel share, so one failed read is named the same way on every
+    // surface. The labelled Refresh stays: this surface's remedy is its own control, not a clause.
+    const { ApiError: RealApiError } = await import('../api/apiError')
+    H.api.projectTree.mockRejectedValue(new RealApiError(status, 'nope', JSON.stringify({ code })))
+    mount()
+
+    // Re-queried each attempt: the settling query re-renders and detaches an earlier reference.
+    await waitFor(() => expect(screen.getByText(copy)).toBeInTheDocument())
+    expect(screen.queryByText(/Couldn't load the file tree/)).toBeNull()
+    expect(screen.getAllByRole('button', { name: 'Refresh' })).toHaveLength(1)
+  })
+
+  it('keeps the generic line for a failure that names no cause, the control for the map above', async () => {
+    // Without this a map answering `root_missing` for EVERY failure would pass the cases above
+    // while destroying the generic arm.
+    const { ApiError: RealApiError } = await import('../api/apiError')
+    H.api.projectTree.mockRejectedValue(new RealApiError(500, 'boom', JSON.stringify({ error: 'boom' })))
+    mount()
+
+    await waitFor(() => expect(screen.getByText("Couldn't load the file tree")).toBeInTheDocument())
+    expect(screen.queryByText('Folder not found')).toBeNull()
+    expect(screen.queryByText('No access to this folder')).toBeNull()
+  })
+
+  it('hands the agent the refused tree read\'s journaled report, not the translated line', async () => {
+    // The notice's text is catalog copy, which is NOT the journal key: the API layer journals
+    // the failure under the error's own message with the endpoint, status and backend code.
+    // The rail and the folder tab already pass the read's report; without it here the hand-off
+    // carried a sentence that named nothing.
+    __resetErrorJournalForTests()
+    sessionStorage.clear()
+    recordError({
+      source: 'api',
+      message: 'nope',
+      status: 403,
+      code: 'access_denied',
+      endpoint: '/api/project/tree',
+    })
+    const { ApiError: RealApiError } = await import('../api/apiError')
+    H.api.projectTree.mockRejectedValue(new RealApiError(403, 'nope', JSON.stringify({ code: 'access_denied' })))
+    mount()
+
+    // The file rail shows this same bare permanent-cause copy before FilesHome switches to
+    // its own error arm. Target the settled FilesHome notice through its labelled Refresh sibling
+    // so a detached transient rail notice cannot receive the click.
+    const refresh = await screen.findByText('Refresh')
+    const notice = refresh.previousElementSibling as HTMLElement
+    expect(notice).toHaveAttribute('role', 'alert')
+    fireEvent.click(within(notice).getByRole('button', { name: /ask the agent/i }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).toContain('/api/project/tree')
+    expect(prompt).toContain('403')
+    expect(prompt).toContain('access_denied')
+    expect(prompt).not.toContain('No access to this folder')
+  })
+
   it('shows no rail at all without a project directory', async () => {
     mount('')
     expect(await screen.findByText('No project directory is set for this chat')).toBeInTheDocument()
@@ -174,8 +340,8 @@ describe('FilesHomePanel tree availability', () => {
     mount(DIR, onFileOpen)
     fireEvent.click(await screen.findByTestId('tree'))
     expect(onFileOpen).toHaveBeenCalledWith(H.OPENED, false)
-    // Still the empty preview pane: this tab never renders the file itself.
-    expect(screen.getByText('Select a file from the tree to open it in a new tab')).toBeInTheDocument()
+    // Still just the tree: this tab never renders the file itself.
+    expect(screen.getByTestId('tree')).toBeInTheDocument()
   })
 
   it('probes under the tree component\'s own query key, so the probe costs no extra request', async () => {

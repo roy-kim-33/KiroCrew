@@ -14,16 +14,93 @@
  *
  * The characterization net (ChatPage.scrollShell.recipe.test.tsx, the golden
  * frames, and the mutation harness) pins this file's tokens byte-for-byte;
- * fadeClearance geometry stays with the page, which supplies its clearance
- * padding via `scrollerStyle`.
+ * dockClearance geometry stays with the page, which supplies the floating
+ * dock's clearance padding via `scrollerStyle`.
  */
-import React from 'react'
+import React, { useCallback, useLayoutEffect, useState } from 'react'
 import { Loader } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
+
+/** Inherited custom property carrying the scroller's usable width in px, so a
+ *  descendant that may outgrow the reading column (a top-level assistant table,
+ *  see `.markdown-table` in index.css) can size against the pane it is in.
+ *
+ *  Invariant: publish the width WITHOUT making the scroller a containing block
+ *  that can trap `position: fixed` descendants — so no query container or
+ *  `contain` on it. McpAppFrame promotes its full-screen sheet IN PLACE (it
+ *  must not portal: reparenting the iframe reloads the app), and a scroller
+ *  that contained it would centre the sheet on itself and clip its backdrop. */
+export const PANE_WIDTH_PROPERTY = '--chat-pane-width'
+
+/** Publish the scroller's `clientWidth` as PANE_WIDTH_PROPERTY on itself.
+ *  `clientWidth` nets out the reserved scrollbar gutter, so it is the width a
+ *  child can actually paint into. The measure farm renders inside this same
+ *  element, so off-screen rows inherit the identical width. Undebounced: the
+ *  tables must reflow with the pane, like the prose column does; the hosts'
+ *  own 200ms-settled width buckets scope the height cache, not layout. */
+function usePaneWidthProperty(scrollerRef: React.RefObject<HTMLDivElement | null>): void {
+  useLayoutEffect(() => {
+    const el = scrollerRef.current
+    if (!el) return
+    const publish = () => { el.style.setProperty(PANE_WIDTH_PROPERTY, `${el.clientWidth}px`) }
+    publish()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(publish)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [scrollerRef])
+}
+
+const WIDTH_BUCKET_STEP = 16
+const WIDTH_SETTLE_MS = 200
+const bucketWidth = (px: number) => Math.round(px / WIDTH_BUCKET_STEP) * WIDTH_BUCKET_STEP
+
+/** One width scope for both transcript hosts. Layout stays live during a drag,
+ * but a height may enter the settled cache only when BOTH the pane and its
+ * published table width belong to that scope. Reading both at write time makes
+ * this independent of which ResizeObserver callback the browser delivers first.
+ *
+ * Element-bound, not ref-bound: a host can mount before its shell (the main
+ * page's welcome hero) and replace the shell on the same stable ref, so the
+ * shell binds its live element here on mount and unbinds on unmount. */
+export function useTranscriptWidth() {
+  const [scroller, bindScroller] = useState<HTMLDivElement | null>(null)
+  const [widthBucket, setWidthBucket] = useState(() =>
+    bucketWidth(typeof window !== 'undefined' ? window.innerWidth : 944))
+  useLayoutEffect(() => {
+    if (!scroller) return
+    const measure = () => setWidthBucket(bucketWidth(scroller.clientWidth))
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const observer = new ResizeObserver(() => {
+      clearTimeout(timer)
+      timer = setTimeout(measure, WIDTH_SETTLE_MS)
+    })
+    observer.observe(scroller)
+    return () => {
+      observer.disconnect()
+      clearTimeout(timer)
+    }
+  }, [scroller])
+  // No bound element means no settled scope to measure against.
+  const canMeasure = useCallback(() => {
+    if (!scroller || scroller.clientWidth <= 0) return false
+    const published = Number.parseFloat(scroller.style.getPropertyValue(PANE_WIDTH_PROPERTY))
+    return bucketWidth(scroller.clientWidth) === widthBucket && bucketWidth(published) === widthBucket
+  }, [scroller, widthBucket])
+  return { widthBucket, canMeasure, bindScroller }
+}
 
 export interface TranscriptVirtWiring {
   topSentinelRef: React.MutableRefObject<HTMLDivElement | null>
   bottomSentinelRef: React.MutableRefObject<HTMLDivElement | null>
+  /** The virtualizer's ref for the wrapper around `belowRows`: its
+   *  ResizeObserver watches that wrapper so chrome mounting or growing below
+   *  the rows (the working footer under a reply gone quiet) is followed like
+   *  tail growth. Optional so a wiring that predates it (tests, a host with no
+   *  trailing chrome) still type-checks; the wrapper renders either way. */
+  trailingRef?: React.MutableRefObject<HTMLDivElement | null>
   offsetBefore: number
   offsetAfter: number
 }
@@ -35,8 +112,10 @@ export default function TranscriptScrollShell({
   loadingOlder,
   spinnerNearTop,
   scrollerStyle,
+  headerSpacer = true,
   aboveRows,
   belowRows,
+  onScrollerElement,
   children,
 }: {
   /** The single scroll controller's element ref (owned by the host's virtualizer). */
@@ -51,12 +130,26 @@ export default function TranscriptScrollShell({
   spinnerNearTop?: boolean
   /** Host-owned geometry merged onto the scroller (e.g. the fade-band clearance padding). */
   scrollerStyle?: React.CSSProperties
+  /** Reserve the main chat's overlay-header band (h-16) above the rows. On by
+   *  default — the page contract. A host whose scroller sits directly under
+   *  its own title bar (a split pane, the side panel, an embed) turns it off;
+   *  its padding travels through `scrollerStyle` instead. */
+  headerSpacer?: boolean
   /** Page content above the rows (the earlier-messages paging bar). */
   aboveRows?: React.ReactNode
   /** Page content below the rows (footer, survey, tail spacer). */
   belowRows?: React.ReactNode
+  /** Receives this shell's scroller element on mount and `null` on unmount
+   *  (`useTranscriptWidth`'s `bindScroller`), after the pane width is published. */
+  onScrollerElement?: (el: HTMLDivElement | null) => void
   children: React.ReactNode
 }) {
+  usePaneWidthProperty(scrollerRef)
+  useLayoutEffect(() => {
+    if (!onScrollerElement) return
+    onScrollerElement(scrollerRef.current)
+    return () => onScrollerElement(null)
+  }, [scrollerRef, onScrollerElement])
   return (
     <div
       ref={scrollerRef}
@@ -107,7 +200,7 @@ export default function TranscriptScrollShell({
       onScroll={onScroll}
     >
       {/* Header spacer */}
-      <div className="h-16" />
+      {headerSpacer && <div className="h-16" />}
       {aboveRows}
       {/* Top sentinel: drives upward window expansion via virtualizer's IO. */}
       <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
@@ -148,7 +241,14 @@ export default function TranscriptScrollShell({
       <div aria-hidden className="vc-spacer-skeleton mx-auto w-full" style={{ height: virt.offsetAfter, maxWidth: 'var(--mc-content-width, 900px)', overflowAnchor: 'none' }} />
       {/* Bottom sentinel: drives downward window expansion when in jump mode. */}
       <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
-      {belowRows}
+      {/* Trailing chrome, in one block so the virtualizer can OBSERVE it: the
+          footer that mounts here when a reply goes quiet grows the content
+          under a bottom-pinned reader with no row resize and no viewport
+          change to announce it. A plain block wrapper, no class of its own,
+          so the slot content keeps its width and the theming contract. */}
+      <div ref={virt.trailingRef} data-vc-trailing="">
+        {belowRows}
+      </div>
     </div>
   )
 }

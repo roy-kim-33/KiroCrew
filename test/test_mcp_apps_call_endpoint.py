@@ -132,19 +132,35 @@ async def _spawn_pooled_server() -> _LivePool:
         last_used_at=now,
     )
     pump = asyncio.get_running_loop().create_task(backend.run_stdout_pump())
-    pool = BackendPool(max_backends=4)
-    await pool.add(key, backend)
+    # Build the owner of aclose() BEFORE the first await that can fail. The
+    # handshake below can raise (asyncio.TimeoutError from the bounded
+    # inbox.get() on a loaded shard, BackendGone from forward_from_stub if the
+    # child died during startup), and every one of this file's callers only
+    # reaps through the `finally: await live.aclose()` around the value we
+    # return — so a raise from inside the helper strands the real python MCP
+    # server unless this reaps it, and that server blocks on
+    # `for line in sys.stdin` and therefore lives
+    # until the xdist worker exits and the kernel closes its pipe, plus the
+    # never-cancelled pump task and an unreaped child watcher thread.
+    live = _LivePool(BackendPool(max_backends=4), backend, process, pump)
+    try:
+        await live.pool.add(key, backend)
 
-    # Handshake once through a normal stub so _init_state is "ready" — the
-    # state a pooled backend that already served an app is guaranteed to be in.
-    inbox = await backend.attach_stub("chat-stub")
-    await backend.forward_from_stub("chat-stub", {
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                   "clientInfo": {"name": "kiro-cli", "version": "0"}},
-    })
-    await asyncio.wait_for(inbox.get(), timeout=10)
-    return _LivePool(pool, backend, process, pump)
+        # Handshake once through a normal stub so _init_state is "ready" — the
+        # state a pooled backend that already served an app is guaranteed to be in.
+        inbox = await backend.attach_stub("chat-stub")
+        await backend.forward_from_stub("chat-stub", {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "kiro-cli", "version": "0"}},
+        })
+        await asyncio.wait_for(inbox.get(), timeout=10)
+    except BaseException:
+        # BaseException, not Exception: a CancelledError delivered at the
+        # wait_for (timeout teardown, worker shutdown) must reap the child too.
+        await live.aclose()
+        raise
+    return live
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +411,31 @@ async def test_app_call_rejects_unknown_spool_id(apps_flag_on, spool_tmp):
         assert "unknown or expired" in reply["reason"]
     finally:
         await live.aclose()
+
+
+@pytest.mark.parametrize(
+    "forged",
+    ["\u00e9" * 8, "\u4e2d\u6587", chr(0xDCFF), "x" + chr(0xD800)],
+    ids=["non_ascii", "cjk", "lone_surrogate", "high_surrogate"],
+)
+async def test_app_call_non_ascii_secret_takes_the_audited_deny(apps_flag_on, spool_tmp, forged):
+    """`hmac.compare_digest` raises TypeError on non-ASCII str; the bytes
+    comparison keeps a forged capability carrying one non-ASCII character on the
+    audited deny path instead of an unaudited dropped connection.
+
+    The capability gate runs before any backend work, so no live server is
+    needed — a spare pool is enough, exactly as for the other pre-forward deny
+    tests. The sibling endpoint (``/api/mcp-apps/message``) pins the same shape
+    at ``test_mcp_apps_message_endpoint.py``.
+    """
+    pool = BackendPool(max_backends=2)
+    spool_id = _spool_record()
+    reply = await handle_app_call(pool, {
+        "type": "app-call", "spool_id": spool_id, "callback_secret": forged,
+        "tool": "save_state", "arguments": {},
+    })
+    assert reply["type"] == "app-call-rejected"
+    assert reply["reason"] == "invalid app callback capability"
 
 
 async def test_app_call_rejects_when_no_backend(apps_flag_on, spool_tmp):
@@ -796,3 +837,46 @@ async def test_app_call_requires_callback_secret(apps_flag_on, spool_tmp):
         assert "callback capability" in missing["reason"]
     finally:
         await live.aclose()
+
+
+class _InboxBackend:
+    """Just the four calls ``_roundtrip`` makes, over a pre-filled inbox."""
+
+    def __init__(self, *lines: bytes) -> None:
+        self.inbox: asyncio.Queue[bytes] = asyncio.Queue()
+        for line in lines:
+            self.inbox.put_nowait(line)
+        self.detached: list[str] = []
+
+    async def attach_stub(self, stub_uuid: str) -> "asyncio.Queue[bytes]":
+        return self.inbox
+
+    async def forward_from_stub(self, stub_uuid: str, frame: dict, **kwargs) -> None:
+        return None
+
+    async def cancel_in_flight_for_stub(self, stub_uuid: str) -> None:
+        return None
+
+    async def detach_stub(self, stub_uuid: str) -> None:
+        self.detached.append(stub_uuid)
+
+
+@pytest.mark.asyncio
+async def test_the_round_trip_skips_stray_frames_to_its_own_response():
+    """``RecursionError`` is not a ``ValueError``: unlisted, a frame nested past
+    the decoder's ceiling failed the app call instead of costing one frame."""
+    from stray_line_helpers import STRAY_LINES
+
+    from kiro_crew.mcp_gateway import app_call as app_call_mod
+
+    reply = {"jsonrpc": "2.0", "id": 4, "result": {"ok": True}}
+    backend = _InboxBackend(
+        *(make() for make in STRAY_LINES.values()),
+        (json.dumps(reply) + "\n").encode("utf-8"),
+    )
+    got = await asyncio.wait_for(
+        app_call_mod._roundtrip(backend, {"id": 4, "method": "tools/call"}, caller=None, timeout=10),
+        timeout=10,
+    )
+    assert got == reply
+    assert len(backend.detached) == 1

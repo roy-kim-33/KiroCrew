@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useDragControls } from 'framer-motion'
 import type { DragControls } from 'framer-motion'
 import type React from 'react'
+import { haptic } from '../lib/haptic'
 
 /**
  * How long a finger must rest on a chip before it arms a reorder drag. Long
@@ -56,7 +57,9 @@ export interface LongPressReorderItemProps {
  *
  * Returns `dragging` so the caller can show that the hold registered — with a
  * long press the reader gets no feedback until they move, and without a cue a
- * successful arm is indistinguishable from a failed one.
+ * successful arm is indistinguishable from a failed one. The arm also taps the
+ * device (where it can), for the same reason: the finger has not moved yet, so
+ * nothing on screen tells it the hold took.
  */
 export function useLongPressReorder(): { itemProps: LongPressReorderItemProps; dragging: boolean } {
   const dragControls = useDragControls()
@@ -81,13 +84,15 @@ export function useLongPressReorder(): { itemProps: LongPressReorderItemProps; d
   useEffect(() => {
     if (!dragging) return
     const blockPan = (e: TouchEvent) => e.preventDefault()
+    // A release lands the chip; a cancel (the OS took the touch) landed nothing.
     const stop = () => setDragging(false)
+    const drop = () => { haptic('light'); stop() }
     document.addEventListener('touchmove', blockPan, { passive: false })
-    window.addEventListener('pointerup', stop)
+    window.addEventListener('pointerup', drop)
     window.addEventListener('pointercancel', stop)
     return () => {
       document.removeEventListener('touchmove', blockPan)
-      window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointerup', drop)
       window.removeEventListener('pointercancel', stop)
     }
   }, [dragging])
@@ -95,6 +100,16 @@ export function useLongPressReorder(): { itemProps: LongPressReorderItemProps; d
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     clearPending()
     if (e.pointerType !== 'touch') {
+      // A precise pointer starts the drag on press — but only the primary
+      // button. Arming a reorder on button 1 or 2 is meaningless: there is no
+      // middle- or right-drag gesture, so a non-primary press has nothing to
+      // reorder and must fall through untouched. This was also a suspect for
+      // the side-panel middle-click-to-close report — the theory being that
+      // starting the drag here swallowed the chip's auxclick — but a real-
+      // browser test ruled that out: with this guard removed, a middle-click
+      // (clean and past the pan threshold) still closed the tab. The guard is
+      // a correctness fix on its own, not a fix for that symptom.
+      if (e.button !== 0) return
       setDragging(true)
       dragControls.start(e)
       return
@@ -121,6 +136,7 @@ export function useLongPressReorder(): { itemProps: LongPressReorderItemProps; d
     timerRef.current = setTimeout(() => {
       timerRef.current = null
       clearPending()
+      haptic('medium')
       setDragging(true)
       dragControls.start(origin)
     }, LONG_PRESS_MS)

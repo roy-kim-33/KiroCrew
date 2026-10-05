@@ -26,6 +26,8 @@ from unittest.mock import patch
 
 import pytest
 
+from kiro_crew import platform_compat
+
 _POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX process-management semantics only; see issue #2041"
 )
@@ -263,7 +265,7 @@ class TestOrphanMcpSubtreeReap:
 class TestPidRecycleGuard:
     """A recycled PID must never inherit a doomed descendant's verdict.
 
-    Regression for a reachable crash: the root's ``killpg`` reaps a descendant,
+    The crash this rules out: the root's ``killpg`` reaps a descendant,
     the kernel hands that PID to a NEW Kiro-Crew-spawned worker, and the stale
     entry SIGKILLs a live process that passes every other gate.
     """
@@ -468,9 +470,9 @@ class TestOrphanDescendantWalk:
 class TestGatewaySubtreePrune:
     """A peer gateway under an orphan root keeps its WHOLE subtree.
 
-    Regression for a reachable crash: the walk is flat, so excluding a peer
-    gateway by its own argv still enumerated its live workers. Those carry
-    KIROCREW_SPAWNED and no gateway marker of their own, so each passed the
+    The crash this rules out: the walk is flat, so excluding a peer
+    gateway by its own argv still enumerates its live workers. Those carry
+    KIROCREW_SPAWNED and no gateway marker of their own, so each passes the
     per-member gate and would be SIGKILLed -- crashing that pod's sessions.
     """
 
@@ -562,7 +564,7 @@ class TestPidCmdline:
 class TestStaleMapEdge:
     """A snapshot edge must be re-verified against the LIVE parent.
 
-    Regression for a reachable crash the start token alone could not catch: the
+    A crash the start token alone cannot catch: the
     token pins identity between enumeration and kill, but `child_map` is built
     once per sweep and reused across candidate roots, so an edge can go stale
     BEFORE the walk reads it. The child exits, its PID is reused by a new marked
@@ -662,63 +664,51 @@ class TestPidParentAndToken:
 
     # "pid (comm) state ppid ..." -- comm here contains a space AND parens, the
     # case that breaks a naive whitespace split.
-    _STAT = "801 (my (odd) proc) S 800 " + " ".join(str(n) for n in range(5, 23))
+    _STAT = b"801 (my (odd) proc) S 800 " + b" ".join(b"%d" % n for n in range(5, 23))
 
-    def test_reads_ppid_and_starttime_from_one_stat(self) -> None:
+    @pytest.fixture()
+    def linux(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(platform_compat.sys, "platform", "linux")
+
+    @staticmethod
+    def _table(root: Path, stat: bytes) -> Path:
+        (root / "801").mkdir()
+        (root / "801" / "stat").write_bytes(stat)
+        return root
+
+    def test_reads_ppid_and_starttime_from_one_stat(self, tmp_path: Path, linux: None) -> None:
         from kiro_crew.session_pid import _pid_parent_and_token
 
-        with (
-            patch("kiro_crew.session_pid.sys") as mock_sys,
-            patch.object(Path, "read_text", lambda self, *a, **k: self._STAT_DATA),
-        ):
-            mock_sys.platform = "linux"
-            Path._STAT_DATA = self._STAT  # type: ignore[attr-defined]
-            try:
-                ppid, token = _pid_parent_and_token(801)
-            finally:
-                del Path._STAT_DATA  # type: ignore[attr-defined]
-
-        assert ppid == 800
+        root = self._table(tmp_path, self._STAT)
         # field 22 (starttime) is the 20th token after the last ')'
-        assert token == "22"
+        assert _pid_parent_and_token(801, root) == (800, "22")
 
-    def test_off_linux_is_unproven(self) -> None:
+    def test_off_linux_is_unproven(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew.session_pid import _pid_parent_and_token
 
-        with patch("kiro_crew.session_pid.sys") as mock_sys:
-            mock_sys.platform = "darwin"
-            assert _pid_parent_and_token(801) == (None, None)
+        monkeypatch.setattr(platform_compat.sys, "platform", "darwin")
+        assert _pid_parent_and_token(801) == (None, None)
 
-    def test_vanished_pid_is_unproven(self) -> None:
+    def test_vanished_pid_is_unproven(self, tmp_path: Path, linux: None) -> None:
         from kiro_crew.session_pid import _pid_parent_and_token
 
-        with (
-            patch("kiro_crew.session_pid.sys") as mock_sys,
-            patch.object(Path, "read_text", side_effect=ProcessLookupError),
-        ):
-            mock_sys.platform = "linux"
-            assert _pid_parent_and_token(999999) == (None, None)
+        assert _pid_parent_and_token(801, tmp_path) == (None, None)
 
-    def test_malformed_stat_is_unproven(self) -> None:
+    def test_malformed_stat_is_unproven(self, tmp_path: Path, linux: None) -> None:
         from kiro_crew.session_pid import _pid_parent_and_token
 
-        with (
-            patch("kiro_crew.session_pid.sys") as mock_sys,
-            patch.object(Path, "read_text", lambda self, *a, **k: "no parens here"),
-        ):
-            mock_sys.platform = "linux"
-            assert _pid_parent_and_token(801) == (None, None)
+        root = self._table(tmp_path, b"no parens here")
+        assert _pid_parent_and_token(801, root) == (None, None)
 
 
 @_POSIX_ONLY
 class TestRootRecycleGuard:
     """The ROOT is under the same PID-recycle invariant as its descendants.
 
-    Regression for the third instance of this defect class. The root's cmdline
-    re-read used to sit adjacent to its signal, when the branch only called
-    `getpgid` in between. Enumerating the subtree put a full `/proc` pass plus a
-    `stat` per member in that gap, so the root can exit mid-scan and its PID be
-    reused by an ACTIVE MCP process that the `killpg` would then terminate.
+    The root's cmdline re-read is separated from its signal by the subtree
+    enumeration -- a full `/proc` pass plus a `stat` per member -- so the root
+    can exit mid-scan and its PID be reused by an ACTIVE MCP process that the
+    `killpg` would then terminate.
     """
 
     def _sweep(
@@ -895,11 +885,11 @@ class TestDescendantsBeforeRoot:
 class TestBudgetExhaustionSparesRoot:
     """When the subtree spends the whole budget the root must SURVIVE.
 
-    Regression for a defect that re-created this PR's own bug: the root died
-    first, the descendants got what budget remained, and when the tree exceeded
-    the cap the survivors could include the UNMARKED intermediate -- which
-    reparents to init, is not sweepable, and hides its marked children behind a
-    non-init ppid. Leaving the root alive keeps the remainder discoverable.
+    Killing the root first is the hazard: the descendants get what budget
+    remains, and when the tree exceeds the cap the survivors can include the
+    UNMARKED intermediate -- which reparents to init, is not sweepable, and
+    hides its marked children behind a non-init ppid. Leaving the root alive
+    keeps the remainder discoverable.
     """
 
     def _run_with(self, descendant_count: int) -> dict[str, list[object]]:

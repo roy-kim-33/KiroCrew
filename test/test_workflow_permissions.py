@@ -144,12 +144,20 @@ class TestNightlyPermissions:
             "contents": "read",
             "attestations": "write",
         }
+        # The two single-arch macOS legs call the same reusable workflow and
+        # need the same three grants (the notarize job attests their DMG too).
+        for job in ("  sign-and-notarize-arm64:", "  sign-and-notarize-x64:"):
+            assert _permission_block(lines, job) == {
+                "id-token": "write",
+                "contents": "read",
+                "attestations": "write",
+            }
 
 
 class TestReleasePermissions:
     def test_release_jobs_follow_least_privilege_split(self) -> None:
         """The signing caller holds AWS creds (id-token) but must not hold
-        contents:write; the GitHub-Release job holds contents:write but must
+        contents:write; the two release-page jobs hold contents:write but must
         not hold AWS creds. Keeping the two capabilities in separate jobs
         means a compromise of either job cannot both exfiltrate via AWS and
         tamper with the repo/release."""
@@ -202,12 +210,26 @@ class TestReleasePermissions:
             "id-token": "write",
             "attestations": "write",
         }
-        assert _permission_block(lines, "  sign-and-notarize:") == {
-            "id-token": "write",
-            "contents": "read",
-            "attestations": "write",
-        }
+        # The three macOS callers (universal + one per single arch) grant the
+        # same three: each notarize job attests its own shipping DMG.
+        for job in (
+            "  sign-and-notarize:",
+            "  sign-and-notarize-arm64:",
+            "  sign-and-notarize-x64:",
+        ):
+            assert _permission_block(lines, job) == {
+                "id-token": "write",
+                "contents": "read",
+                "attestations": "write",
+            }
         assert _permission_block(lines, "  github-release:") == {
+            "contents": "write",
+        }
+        # The stable completion job edits that release (marker asset, then draft
+        # -> published). Same single grant, and nothing else: it holds no AWS
+        # identity and no package scope, so the split above still holds with two
+        # writers rather than one.
+        assert _permission_block(lines, "  record-stable-promotion:") == {
             "contents": "write",
         }
 
@@ -271,8 +293,8 @@ class TestReusableWorkflowPermissions:
         """The shared sign/notarize workflow needs OIDC (AWS signing role)
         and attestations (provenance for the artifacts + shipping DMG) --
         and nothing else. contents:write in particular must never appear
-        here (least-privilege split: the GitHub-Release job in release.yml
-        is the only writer)."""
+        here (least-privilege split: the two release-page jobs in release.yml
+        are the only writers)."""
         assert _workflow_permissions("sign-and-notarize.yml") == {
             "contents": "read",
             "id-token": "write",

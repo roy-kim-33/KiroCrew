@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 
 import pytest
@@ -22,14 +23,76 @@ def _init_repo(path) -> None:
     )
 
 
+def _pin_probe_git(monkeypatch, tmp_path):
+    """Resolve the worktree probe's git to a fake under ``tmp_path``.
+
+    ``update_capability._git_toplevel`` finds git through ``trusted_system_bin``
+    (fixed system directories, never PATH) and asks ``rev-parse --show-toplevel``
+    about the install root. Left alone, that is the HOST's git running from the
+    test process -- and on a host that keeps git outside those directories the
+    probe silently degrades to the on-disk fallback, so which branch a test
+    exercised depended on the machine. The fake answers the one question the
+    probe asks the way git does: the ``-C`` root itself when it carries ``.git``,
+    exit 128 otherwise. Every argv it sees is appended to ``git-calls.log``
+    beside it. The probe's own reading of real repositories is covered in
+    ``test_update_capability.py``; here the install shape is a precondition.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = bin_dir / "git-calls.log"
+    if os.name == "nt":
+        fake = bin_dir / "git.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'echo %* >> "{log}"\r\n'
+            ":loop\r\n"
+            'if "%~1"=="" goto miss\r\n'
+            'if "%~1"=="-C" (\r\n'
+            '  if exist "%~2\\.git" (echo %~2& exit /b 0)\r\n'
+            "  goto miss\r\n"
+            ")\r\n"
+            "shift\r\n"
+            "goto loop\r\n"
+            ":miss\r\n"
+            "echo fatal: not a git repository 1>&2\r\n"
+            "exit /b 128\r\n",
+            encoding="utf-8",
+        )
+    else:
+        fake = bin_dir / "git"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$*" >> "{log}"\n'
+            "root=\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = "-C" ]; then root=$2; shift; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -n "$root" ] && [ -e "$root/.git" ]; then printf \'%s\\n\' "$root"; exit 0; fi\n'
+            "echo 'fatal: not a git repository' >&2\n"
+            "exit 128\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.trusted_system_bin", lambda _name: str(fake)
+    )
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def _probe_git_is_a_fake(monkeypatch, tmp_path):
+    """Every test here classifies ``KIROCREW_PROJECT_DIR``; none is about the probe."""
+    _pin_probe_git(monkeypatch, tmp_path)
+
+
 class TestUpdateCheckGitGuard:
     """A non-git project dir must never invoke git — it takes the feed path instead.
 
-    The guard itself is unchanged (no "not a git repository" spam from the poller);
-    what changed is where control goes afterwards. A tarball/wheel install used to
-    return early and leave the cache reporting "up to date"; it now compares against
-    its release-channel feed, so these tests stub that seam and assert git stayed
-    out of it.
+    The guard raises no "not a git repository" spam from the poller. A
+    tarball/wheel install does not return early leaving the cache reporting "up
+    to date"; it compares against its release-channel feed, so these tests stub
+    that seam and assert git stays out of it.
     """
 
     @staticmethod
@@ -72,7 +135,10 @@ class TestUpdateCheckGitGuard:
 
     def test_apply_rejects_non_git_checkout(self, monkeypatch, tmp_path):
         # POST /api/update on a tarball install must 409 with a clear
-        # "redeploy" message instead of running git status/pull and failing.
+        # "run `kirocrew update`" message instead of running git status/pull
+        # and failing. `kirocrew update` (unlike this endpoint) dispatches on
+        # install layout and handles wheel/cli.sh installs correctly, so it is
+        # the right redirect — see cli_server.py::_update().
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
 
         def _boom(*a, **k):  # pragma: no cover - must not be called
@@ -80,12 +146,12 @@ class TestUpdateCheckGitGuard:
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _boom)
 
-        class _Req:
+        class _Req(dict):
             app = {"state": None}
 
-        resp = asyncio.run(updates.api_update_apply(_Req()))
+        resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
-        assert b"redeploy" in resp.body
+        assert b"kirocrew update" in resp.body
 
     def test_apply_refuses_a_diverged_checkout_before_pulling(self, monkeypatch, tmp_path):
         # The render-site guards only cover clients that ran a fresh check; a
@@ -129,10 +195,10 @@ class TestUpdateCheckGitGuard:
             def push_refresh(self, kind: str) -> None:
                 pass
 
-        class _Req:
+        class _Req(dict):
             app = {"state": _State()}
 
-        resp = asyncio.run(updates.api_update_apply(_Req()))
+        resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
         body = json.loads(resp.body)
         assert body["code"] == "checkout_diverged"
@@ -183,10 +249,10 @@ class TestUpdateCheckGitGuard:
             def push_refresh(self, kind: str) -> None:
                 pass
 
-        class _Req:
+        class _Req(dict):
             app = {"state": _State()}
 
-        resp = asyncio.run(updates.api_update_apply(_Req()))
+        resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
         assert json.loads(resp.body)["code"] == "git_fetch_failed"
         assert not any("pull" in c for c in calls)
@@ -241,10 +307,10 @@ class TestUpdateCheckGitGuard:
             def push_refresh(self, kind: str) -> None:
                 pass
 
-        class _Req:
+        class _Req(dict):
             app = {"state": _State()}
 
-        resp = asyncio.run(updates.api_update_apply(_Req()))
+        resp = asyncio.run(updates.api_update_apply(_Req(app="", user="local-app")))
         assert resp.status == 409
         assert json.loads(resp.body)["code"] == "git_read_failed"
         assert not any("pull" in c for c in calls)

@@ -5,8 +5,8 @@ Two layers are under test:
 1. ``_resolve_session_key_strict`` — refuses PID-walked identities so a
    subagent cannot silently mutate its parent slot's project. This resolver
    still exists (other call sites use it) and its guarantees are unchanged.
-2. The stateless ``set_project`` path (#755). ``_call_tool_inner`` no longer
-   resolves session identity or POSTs to the gateway: it VALIDATES its input
+2. The stateless ``set_project`` path. ``_call_tool_inner`` does not resolve
+   session identity or POST to the gateway: it VALIDATES its input
    and returns a session directive (see ``kiro_crew.session_directive``). The
    session-aware consumer applies it via
    ``kiro_crew.dashboard.session_directive_apply.apply_session_directive``,
@@ -191,9 +191,9 @@ class TestResolveSessionKeyStrict:
 class TestSetProjectTool:
     """The stateless ``set_project`` dispatch branch in ``_call_tool_inner``.
 
-    The tool validates its input and returns a session DIRECTIVE — it no longer
-    resolves session identity, no longer refuses non-dashboard sessions, and no
-    longer POSTs to the gateway. Validation still runs at the boundary, so
+    The tool validates its input and returns a session DIRECTIVE — it does not
+    resolve session identity, refuse non-dashboard sessions, or POST to the
+    gateway. Validation still runs at the boundary, so
     malformed input is rejected before a directive is ever produced."""
 
     def test_returns_directive_with_validated_payload(self):
@@ -231,6 +231,90 @@ class TestSetProjectTool:
         assert "path" in schema["properties"]
         assert schema["properties"]["path"]["type"] == "string"
         assert schema["required"] == ["path"]
+
+
+# ───────────────────── set_project absolute-path shape gate ─────────────────
+
+
+class TestSetProjectAbsolutePathShapes:
+    """The shape gate admits POSIX and plain Windows drive roots, nothing more."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # POSIX, including a body colon the root-prefix match does not police.
+            "/tmp/foo",
+            "/",
+            "/home/u/my-project",
+            "/home/u/proj:v2",
+            # Drive root: both separators, either letter case.
+            r"C:\Work\my-project",
+            "C:/Work/my-project",
+            r"c:\work",
+            "z:/work",
+            "Z:\\",
+        ],
+    )
+    def test_absolute_path_accepted(self, path):
+        result = mcp_core._call_tool_inner("set_project", {"path": path})
+        assert session_directive.decode(result, "set_project") == {
+            "project": path,
+            "clear": False,
+        }
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Relative.
+            "foo",
+            "foo/bar",
+            "./x",
+            "../x",
+            # Drive-RELATIVE: no separator, so it names C:'s current directory.
+            "C:foo",
+            r"C:..\x",
+            # Not a root prefix at all.
+            "C:",
+            "C",
+            ":",
+            # A backslash-spelled share root; resolving one contacts the host.
+            r"\\server\share\proj",
+            "\\\\",
+            r"\x",
+            # Every backslash-spelled extended-length root, drive included: the
+            # fence's candidate forms do not fold a `\\?\` prefix away.
+            "\\\\?\\D:\\",
+            "\\\\?\\D:\\Work",
+            "\\\\?\\UNC\\server\\share",
+            "\\\\?\\GLOBALROOT\\Device\\X",
+            "\\\\?\\Volume{12345678-1234-1234-1234-123456789abc}\\",
+            "\\\\?\\",
+            "\\\\?\\D",
+            "\\\\?\\D:",
+            # ``~`` is not expanded at this layer, so it is not a root here.
+            "~/x",
+            "~",
+        ],
+    )
+    def test_non_absolute_path_still_rejected(self, path):
+        from kiro_crew.validation import ValidationError
+
+        with pytest.raises(ValidationError, match="invalid format"):
+            mcp_core._call_tool_inner("set_project", {"path": path})
+
+    def test_project_line_shape_round_trips(self):
+        """A path shaped like the one a session's own ``[PROJECT]`` line carries."""
+        reported = r"C:\Work"
+        result = mcp_core._call_tool_inner("set_project", {"path": reported})
+        assert session_directive.decode(result, "set_project")["project"] == reported
+
+    def test_clear_still_skips_the_shape_gate(self):
+        """An empty path with ``clear`` set bypasses the pattern check."""
+        result = mcp_core._call_tool_inner("set_project", {"path": "", "clear": True})
+        assert session_directive.decode(result, "set_project") == {
+            "project": "",
+            "clear": True,
+        }
 
 
 # ─────────────────────────── set_project applier ────────────────────────────
@@ -282,10 +366,10 @@ class TestSetProjectApplier:
     async def test_sensitive_path_denied_without_mutating_slot(self, tmp_path, monkeypatch):
         slot = _FakeSlot(project="/existing/project")
         state = _FakeState()
-        # _set_project imports is_sensitive_path lazily from kiro_crew.security,
+        # _set_project imports sensitive_path_refusal lazily from kiro_crew.security,
         # so patch it on the source module.
         monkeypatch.setattr(
-            "kiro_crew.security.is_sensitive_path", lambda *a, **k: True
+            "kiro_crew.security.sensitive_path_refusal", lambda *a, **k: "Blocked: x"
         )
         result = await apply_session_directive(
             state,
@@ -300,11 +384,32 @@ class TestSetProjectApplier:
         assert slot.project == "/existing/project"
 
     @pytest.mark.asyncio
+    async def test_a_resolver_stall_is_refused_with_the_stall_wording(self, tmp_path, monkeypatch):
+        from kiro_crew import security
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled("/x", "/x")
+
+        slot = _FakeSlot(project="/existing/project")
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        result = await apply_session_directive(
+            _FakeState(),
+            slot,
+            slot.key,
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
+        )
+        assert security.is_unverifiable_path_refusal(result.removeprefix("Error: "))
+        assert "sensitive path)" not in result
+        assert slot.project == "/existing/project"
+
+    @pytest.mark.asyncio
     async def test_data_home_overlap_refused_without_mutating_slot(self, tmp_path, monkeypatch):
-        """#7392 pre-flight on the directive path: set_project routes here
+        """Pre-flight on the directive path: set_project routes here
         in-process (never through the HTTP endpoint), so the overlap check
         must also live here or the refusal regresses to spawn time on every
-        channel surface (FP review round 1). Patched on the source module —
+        channel surface. The patch targets the source module because
         _set_project imports it lazily from kiro_crew.sandbox."""
         slot = _FakeSlot(project="/existing/project")
         state = _FakeState()
@@ -341,7 +446,7 @@ class TestSetProjectApplier:
         assert "cleared" in result.lower()
 
 
-# ────────────────── applier SEL audit + fail-soft (#755) ─────────────────────
+# ────────────────── applier SEL audit + fail-soft ──────────────────
 
 
 class _SelSpy:
@@ -373,7 +478,7 @@ class TestApplierAuditAndFailSoft:
     async def test_success_emits_one_mcp_directive_event(self, tmp_path, monkeypatch, sel_spy):
         """A valid set_project audits source='mcp-directive', the tool name, and
         outcome='success' — and the recent-projects offload actually fires."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         saved: list[str] = []
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers._save_recent_project",
@@ -400,7 +505,7 @@ class TestApplierAuditAndFailSoft:
     async def test_denied_path_audits_denied_and_returns_error(self, tmp_path, monkeypatch, sel_spy):
         """A sensitive-path block raises ``_DirectiveDenied`` internally; the
         wrapper audits outcome='denied' and returns the fixed error string."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: True)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: "Blocked: x")
         slot = _FakeSlot(project="/existing")
         state = _FakeState()
         result = await apply_session_directive(
@@ -451,7 +556,7 @@ class TestApplierAuditAndFailSoft:
         """A sensitive path is refused BEFORE it is resolved/stat'ed, so a
         nonexistent sensitive path cannot be probed via the not-a-directory
         error. Still audited denied, and never leaks the isdir outcome."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: True)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: "Blocked: x")
         probed: list[str] = []
 
         def _no_stat(p):
@@ -479,7 +584,7 @@ class TestApplierAuditAndFailSoft:
     ):
         """These two act on a dashboard SLOT card and require a connected
         dashboard tab. A cron / Slack / sub-agent caller should not get a card."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         slot = _FakeSlot(project="/original")
         state = _FakeState()
         args = {
@@ -502,7 +607,7 @@ class TestApplierAuditAndFailSoft:
         """set_project should apply its CWD effect on any user-facing surface
         (Telegram, Slack, Discord) — not just dashboard. Only suggest_followup
         and ask_question are dashboard-only (they render UI cards)."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         slot = _FakeSlot(project="/original")
         state = _FakeState()
         result = await apply_session_directive(
@@ -527,7 +632,7 @@ class TestApplierAuditAndFailSoft:
     ):
         """A cron/sub-agent turn borrows its destination slot and session key;
         producer provenance must still prevent it from retargeting that slot."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         slot = _FakeSlot(project="/original")
         result = await apply_session_directive(
             _FakeState(),
@@ -565,7 +670,7 @@ class TestApplierAuditAndFailSoft:
         project: a cron turn can run on a user's dashboard slot
         (session="origin" injection) and a sub-agent shares its parent's slot,
         so allowing them would silently repoint the user's own session."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         slot = _FakeSlot(project="/original")
         state = _FakeState()
         result = await apply_session_directive(
@@ -582,7 +687,7 @@ class TestApplierAuditAndFailSoft:
     ):
         """Some appliers RETURN a readable failure instead of raising (invalid
         project dir). The audit must reflect that, not blanket 'success'."""
-        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        monkeypatch.setattr("kiro_crew.security.sensitive_path_refusal", lambda *a, **k: None)
         slot = _FakeSlot(project="/original")
         state = _FakeState()
         missing = str(tmp_path / "definitely-not-a-directory")

@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers.security import (
     api_denied_command_builtin_toggle,
@@ -85,7 +86,11 @@ def _make_app() -> web.Application:
     app.router.add_post("/api/security/denied-commands/user", api_denied_command_user_add)
     app.router.add_patch("/api/security/denied-commands/user/{id}", api_denied_command_user_toggle)
     app.router.add_delete("/api/security/denied-commands/user/{id}", api_denied_command_user_delete)
-    return app
+    # The five mutating routes are owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``); ``as_owner`` supplies
+    # the claims the token-auth middleware normally publishes, so each test keeps
+    # exercising its own subject rather than the gate.
+    return as_owner(app)
 
 
 def _client() -> TestClient:
@@ -656,7 +661,7 @@ async def test_user_add_wrapped_builtin_fragment_rejection_names_the_trigger(
     # fragment verbatim; the fragment is exempt from the backtracking check only
     # as part of a complete built-in, so the tweaked copy is rejected. The
     # rejection must name the fragment so the dead end is self-explanatory
-    # instead of a generic "unsafe regex" (#5837).
+    # instead of a generic "unsafe regex".
     from kiro_crew.security import _DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN
 
     async with _client() as client:
@@ -679,7 +684,7 @@ async def test_user_add_fragment_hint_withheld_when_not_the_trigger(home: Path, 
     # carries its own catastrophic quantifier stays rejected after the fragment
     # is removed, so hinting at the fragment would send the user to an
     # identical 400. The hint is gated on the fragment-scrubbed residue
-    # actually passing (#5837).
+    # actually passing.
     from kiro_crew.security import _DANGEROUS_AWS_FLAG_RUN, _LINEARIZED_AWS_FLAG_RUN
 
     async with _client() as client:
@@ -878,8 +883,8 @@ async def test_api_security_stats_uses_effective_count(home: Path, config_file: 
     body = json.loads(resp.body.decode("utf-8"))
     assert body["denied_commands"] == _CATALOG_N - 1
     # The remaining counts are DERIVED from the controls they describe
-    # (security_posture), not literals — this used to assert a hardcoded 5 while
-    # the real number had grown to 16. Assert the derivation, not a magic number;
+    # (security_posture), not literals — a hardcoded 5 would drift as controls
+    # are added; the real number is 16. Assert the derivation, not a magic number;
     # test_security_posture pins the per-control derivation itself.
     from kiro_crew.security_posture import build_posture_snapshot
 
@@ -967,9 +972,9 @@ def test_write_denied_state_does_not_fall_back_to_chmod_safe(
     def _spy(path, *args, **kwargs):
         if Path(str(path)).resolve() == config_file.resolve():
             captured["called"] = True
-        # No-op: don't run real atomic_write (which would shell out to icacls
-        # on Windows and may fail in the test sandbox). The audit pin is on
-        # routing, not on the lockdown step itself.
+        # No-op: don't run real atomic_write (which would apply a real
+        # owner-only lockdown on Windows and may fail in the test sandbox).
+        # The audit pin is on routing, not on the lockdown step itself.
 
     import asyncio
 

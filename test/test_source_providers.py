@@ -21,11 +21,60 @@ from kiro_crew.dashboard.handlers import source_providers as source
 from kiro_crew.sandbox import spawn_shim_argv
 
 
+def _trust_ancestors_above(monkeypatch, base):
+    """Pin ancestor owners without changing fixture files or permission bits."""
+    ancestors = set(base.resolve().parents)
+    real_stat = pathlib.Path.stat
+
+    def fake_stat(self, **kwargs):
+        info = real_stat(self, **kwargs)
+        if self not in ancestors:
+            return info
+
+        class AncestorStat:
+            st_uid = 0
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        return AncestorStat()
+
+    monkeypatch.setattr(pathlib.Path, "stat", fake_stat)
+
+
 @pytest.fixture(autouse=True)
 def _mock_source_sel(monkeypatch):
     audit = MagicMock()
     monkeypatch.setattr(source, "_sel", lambda: audit)
     return audit
+
+
+@pytest.fixture(autouse=True)
+def _no_visibility_refresh_side_task(monkeypatch):
+    """Keep the repo-visibility refresh out of tests that are not about it.
+
+    A cache write-through schedules ``_refresh_repo_visibility`` as a detached
+    task; nothing in this module awaits it, so it ran on into the NEXT test and
+    past this one's pins. Its ``_run_provider`` resolves the provider CLI on a
+    worker thread, and that resolution reads ``workspace_root()``, which reached
+    ``config_dir()`` after ``KIROCREW_HOME`` had been unpinned and created the
+    operator's real ``~/.kiro/crew`` (third side-effect audit, four tests here).
+    No test in this module asserts anything about visibility
+    (``test_public_repo_chip_status.py`` owns that surface and drains the set
+    itself), so the scheduler is a recorder here: the calls are observable, the
+    task is never spawned, and nothing outlives the test.
+    """
+    scheduled: list[tuple] = []
+    monkeypatch.setattr(
+        source,
+        "schedule_visibility_refresh",
+        lambda urls, *a, **k: scheduled.append((tuple(urls), a, k)),
+    )
+    yield scheduled
+    for task in list(source._VISIBILITY_TASKS):
+        if not task.get_loop().is_closed():
+            task.cancel()
+    source._VISIBILITY_TASKS.clear()
 
 
 def test_parse_github_pull_request() -> None:
@@ -187,7 +236,7 @@ def test_github_checks_do_not_collapse_a_commit_status_into_a_check_run() -> Non
 
 def test_github_checks_classify_untyped_rows_by_shape_not_by_name() -> None:
     """A row without `__typename` must still be classified correctly. A status
-    row carrying both `context` and `name` used to be read as a check-run and
+    row carrying both `context` and `name` must not be read as a check-run and
     collide with a nameless check-run (both normalize to the `"Check"`
     placeholder), letting the status success hide the check-run failure."""
     rollup = [
@@ -360,6 +409,9 @@ def test_provider_executable_not_found_gives_install_guidance(monkeypatch) -> No
         "PROVIDER_EXECUTABLE_CANDIDATES",
         {"gh": ("/nonexistent-kirocrew/gh",), "glab": ("/nonexistent-kirocrew/glab",)},
     )
+    # Windows also scans the Program Files install dirs; a host with a real gh
+    # there (GitHub's own runners ship one) must still read as "not found".
+    monkeypatch.setattr(github_runner, "_wellknown_windows_dirs", lambda _executable: ())
 
     with pytest.raises(source.SourceProviderError) as excinfo:
         source._resolve_provider_executable("gh")
@@ -371,6 +423,54 @@ def test_provider_executable_not_found_gives_install_guidance(monkeypatch) -> No
     assert "sudo cp" not in message
     assert "KIROCREW_GH_BIN" in message
     assert "{executable}" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("missing", "executable_not_found"),
+        ("candidate_untrusted", "executable_untrusted"),
+        ("override_untrusted", "executable_untrusted"),
+    ],
+)
+async def test_run_json_audits_provider_resolution_failure_reason(
+    monkeypatch, tmp_path, _mock_source_sel, case: str, expected_reason: str
+) -> None:
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    candidate_dir = tmp_path / "provider-bin"
+    candidate_dir.mkdir()
+    candidate = candidate_dir / "gh"
+    monkeypatch.delenv("KIROCREW_GH_BIN", raising=False)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setenv("PATH", str(empty_path))
+    monkeypatch.setattr(
+        github_runner,
+        "PROVIDER_EXECUTABLE_CANDIDATES",
+        {"gh": (str(candidate),), "glab": (str(candidate_dir / "glab"),)},
+    )
+    monkeypatch.setattr(github_runner, "_wellknown_windows_dirs", lambda _executable: ())
+
+    if case != "missing":
+        candidate.write_text("#!/bin/sh\nexit 0\n")
+        candidate.chmod(0o755)
+
+        def reject_found(path: str) -> str:
+            assert pathlib.Path(path).is_file()
+            raise ValueError("executable parent is world-writable")
+
+        monkeypatch.setattr(source, "_validate_provider_executable", reject_found)
+    if case == "override_untrusted":
+        monkeypatch.setenv("KIROCREW_GH_BIN", str(candidate))
+
+    with pytest.raises(source.SourceProviderError):
+        await source._run_json("gh", "api", "repos/acme/repo")
+
+    call = _mock_source_sel.log_tool_invocation.call_args
+    assert call.kwargs["outcome"] == "denied"
+    assert call.kwargs["error"] == expected_reason
+    assert call.kwargs["metadata"]["reason"] == expected_reason
 
 
 def test_provider_executable_strict_mode_asks_for_a_root_owned_copy(monkeypatch) -> None:
@@ -415,13 +515,14 @@ _tmp_owner_ok = (
 @pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -> None:
     """The default policy accepts the user's own gh — the Homebrew case that
-    previously forced a `sudo cp` into a root-owned directory."""
+    would otherwise force a `sudo cp` into a root-owned directory."""
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(executable))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(executable.resolve())
 
@@ -442,6 +543,7 @@ def test_provider_executable_accepts_symlinked_install(monkeypatch, tmp_path) ->
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(link))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(target.resolve())
 
@@ -472,10 +574,15 @@ def test_provider_executable_strict_mode_rejects_symlink(monkeypatch, tmp_path) 
         source._resolve_provider_executable("gh")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises the POSIX uid branch")
 def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> None:
-    """A root gateway is refused in BOTH modes: every process it spawns (the
-    agent's own shell included) is root too, which makes the ownership and
-    agent-tree checks vacuous."""
+    """A root POSIX gateway is refused in BOTH modes. The sandbox masks the
+    credential homes from the agent's children but leaves the filesystem
+    writable, and a provider child runs unsandboxed with those credentials —
+    so a root agent could overwrite a root-owned `gh` and this walk could not
+    tell that write from the operator's install. The refusal keeps the mask a
+    boundary; the Windows elevated case has no such boundary and is not refused
+    (see the test below)."""
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
@@ -485,6 +592,46 @@ def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> No
 
     with pytest.raises(ValueError, match="disabled for a root gateway"):
         source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_elevated_windows_gateway_is_not_refused(
+    monkeypatch, tmp_path
+) -> None:
+    """On Windows the validator asks nothing about the token's elevation: the
+    built-in Administrator account (always elevated, no UAC split token) and a
+    "Run as administrator" launch both go through the same ACL walk as any user,
+    keyed on the gateway user's SID."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    checked: list[tuple[str, str]] = []
+
+    def fake_windows_check(path, *, label, me_sid, strict):
+        checked.append((label, me_sid))
+
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: "S-1-5-21-7-500")
+    monkeypatch.setattr(github_runner, "check_provider_path_component_windows", fake_windows_check)
+    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [])
+
+    assert github_runner.validate_provider_executable(str(executable)) == str(executable.resolve())
+    assert checked == [("executable", "S-1-5-21-7-500")]
+
+
+def test_provider_executable_windows_still_refuses_an_unverifiable_sid(
+    monkeypatch, tmp_path
+) -> None:
+    """The SID is the analog of ``uid``; without it the ACL walk cannot say
+    whose install this is, so that refusal stays."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: None)
+
+    with pytest.raises(ValueError, match="SID is unverifiable"):
+        github_runner.validate_provider_executable(str(executable))
 
 
 def test_provider_executable_rejects_binary_owned_by_another_user(
@@ -497,7 +644,6 @@ def test_provider_executable_rejects_binary_owned_by_another_user(
     foreign_stat = github_runner.os.stat_result([*list(real_stat)[:4], 4242, *list(real_stat)[5:]])
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [])
     monkeypatch.setattr(github_runner.Path, "stat", lambda _path: foreign_stat)
 
     with pytest.raises(ValueError, match="owned by another user"):
@@ -524,7 +670,7 @@ def test_provider_executable_rejects_world_writable_parent(monkeypatch, tmp_path
     parent.chmod(0o777)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     with pytest.raises(ValueError, match="executable parent is world-writable"):
         source._validate_provider_executable(str(executable))
@@ -545,7 +691,7 @@ def test_provider_executable_tolerates_a_sticky_world_writable_parent(
     parent.chmod(0o1777)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._validate_provider_executable(str(executable)) == str(executable.resolve())
 
@@ -571,12 +717,114 @@ def test_provider_executable_strict_mode_rejects_untrusted_ancestor(
         return real_stat(path)
 
     monkeypatch.setenv("KIROCREW_PROVIDER_BIN_STRICT", "1")
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    monkeypatch.setattr(
+        github_runner.platform_compat,
+        "traversed_components",
+        lambda _path: [parent, executable.resolve()],
+    )
     monkeypatch.setattr(github_runner.Path, "stat", fake_stat)
     monkeypatch.setattr(github_runner.os, "access", lambda _path, mode: mode == github_runner.os.X_OK)
 
     with pytest.raises(ValueError, match="executable parent is not root-owned"):
         source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_relaxed_mode_declines_a_writable_hop_in_the_middle_of_a_chain(
+    monkeypatch, tmp_path
+) -> None:
+    """``trusted/gh -> writable/hop -> trusted/real-gh``: the hop's directory decides.
+
+    Both ENDPOINTS' directory chains are tight, so two lexical chains over the
+    endpoints (the resolved path's parents, the original's parents) never name
+    ``writable`` and accept the chain end to end. The component walk reads
+    ``writable`` to follow the hop, so it is checked like any other parent.
+    """
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    target = trusted / "real-gh"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    middle = writable / "hop"
+    middle.symlink_to(target)
+    entry = trusted / "gh"
+    entry.symlink_to(middle)
+    writable.chmod(0o777)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="executable parent is world-writable"):
+        github_runner.validate_provider_executable(str(entry))
+
+
+def test_provider_executable_relaxed_mode_declines_a_writable_ancestor_of_a_symlinked_component(
+    monkeypatch, tmp_path
+) -> None:
+    """``prefix/bin -> holder/bin``: the target's own parent ``holder`` is checked.
+
+    The resolved path's own lexical chain names ``holder``, so this pins a
+    refusal the component walk must keep rather than a gap it closes.
+    """
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    real_bin = holder / "bin"
+    real_bin.mkdir()
+    leaf = real_bin / "gh"
+    leaf.write_text("#!/bin/sh\nexit 0\n")
+    leaf.chmod(0o755)
+    (prefix / "bin").symlink_to(real_bin)
+    holder.chmod(0o777)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="executable parent is world-writable"):
+        github_runner.validate_provider_executable(str(prefix / "bin" / "gh"))
+
+
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
+def test_provider_executable_relaxed_mode_still_accepts_a_chain_through_tight_directories(
+    monkeypatch, tmp_path
+) -> None:
+    """The widening is strictly a widening: the same hop chain through directories
+    that pass the policy is accepted, so an ordinary symlinked install (Homebrew's
+    ``bin/gh -> ../Cellar/...``, a ``/usr/local/bin`` link into ``/opt``) gains no
+    new refusal."""
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    hops = tmp_path / "hops"
+    hops.mkdir()
+    target = trusted / "real-gh"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    middle = hops / "hop"
+    middle.symlink_to(target)
+    entry = trusted / "gh"
+    entry.symlink_to(middle)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    assert github_runner.validate_provider_executable(str(entry)) == str(target.resolve())
+
+
+def test_provider_executable_refuses_a_chain_the_walk_cannot_enumerate(
+    monkeypatch, tmp_path
+) -> None:
+    """A walk that answers ``None`` is a refusal, never a shorter parent list."""
+    executable = tmp_path / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    monkeypatch.setattr(github_runner.platform_compat, "traversed_components", lambda _path: None)
+
+    with pytest.raises(ValueError, match="executable hierarchy is not accessible"):
+        github_runner.validate_provider_executable(str(executable))
 
 
 def test_redact_provider_data_recurses_through_external_strings() -> None:
@@ -1456,7 +1704,7 @@ async def test_run_json_kills_process_tree_when_stdout_exceeds_limit(monkeypatch
 
 @pytest.mark.asyncio
 async def test_run_json_on_windows_defers_to_the_sandbox_gate(monkeypatch) -> None:
-    """Windows is no longer refused by a platform check of its own.
+    """Windows is not refused by a platform check of its own.
 
     It has no OS sandbox backend, but neither does a backend-less Linux host, and
     both must reach the same gate: ``sandboxed_spawn_argv`` fail-closes unless the
@@ -2103,7 +2351,7 @@ async def test_fetch_github_marks_failed_secondary_endpoints_partial(
 
 @pytest.mark.asyncio
 async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch) -> None:
-    """The core `pr view` field set must not bundle `statusCheckRollup` (#5115).
+    """The core `pr view` field set must not bundle `statusCheckRollup`.
 
     `gh` resolves a `--json` field set atomically, so a bundled rollup made a
     fine-grained token without Checks read access fail the WHOLE panel read.
@@ -2147,7 +2395,7 @@ async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_fetch_github_core_payload_survives_rollup_failure(monkeypatch) -> None:
-    """A Checks-blind token costs the checks SECTION, never the panel (#5115)."""
+    """A Checks-blind token costs the checks SECTION, never the panel."""
 
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
@@ -2525,7 +2773,7 @@ async def test_github_check_status_omits_unsettled_merge_state(
 async def test_github_check_status_keeps_authorized_fields_when_rollup_fails(
     monkeypatch,
 ) -> None:
-    """The chip renders state/merge under a Checks-blind token (#5115).
+    """The chip renders state/merge under a Checks-blind token.
 
     Bundling `statusCheckRollup` into the chip read made the WHOLE read fail
     when the token lacked Checks access; the split keeps the fields the token
@@ -2682,7 +2930,7 @@ def test_status_from_full_payload_projects_the_merge_pair() -> None:
     If it dropped the pair, every full fetch would rewrite the chip entry without
     it, the next chip refresh would judge that a change and drop the full payload,
     and the write-through would strip it again — the repeating chip↔full
-    transition PR #443's flap damper exists to contain, spun by a projection gap.
+    transition the flap damper exists to contain, spun by a projection gap.
     """
     projected = source.status_from_full_payload(
         {
@@ -3313,7 +3561,7 @@ def test_gitlab_check_bucket_is_faithful() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_gitlab_full_jobs_page_keeps_aggregate_authoritative(monkeypatch) -> None:
-    """A truncated (full-page) job list must not poison the CI glyph (#1097).
+    """A truncated (full-page) job list must not poison the CI glyph.
 
     When the jobs list comes back as a full page it may be truncated — a failed
     job on a later page would be invisible. The glyph is projected from the
@@ -3360,7 +3608,7 @@ async def test_fetch_gitlab_full_jobs_page_keeps_aggregate_authoritative(monkeyp
 
 
 def test_record_full_payload_clears_flap_tracker_on_change() -> None:
-    """An authoritative full-payload write resets the chip flap counter (#2079).
+    """An authoritative full-payload write resets the chip flap counter.
 
     The flap damper counts *consecutive identical* chip transitions. A
     full-payload write that changes the status between chip refreshes is a real,
@@ -3388,7 +3636,7 @@ def test_record_full_payload_clears_flap_tracker_on_change() -> None:
 
 @pytest.mark.asyncio
 async def test_forced_refresh_inflight_not_floored_and_requeues(monkeypatch) -> None:
-    """An already-in-flight URL is not floor-stamped and gets one follow-up (#2333).
+    """An already-in-flight URL is not floor-stamped and gets one follow-up.
 
     A TTL-paced chip fetch may be in flight when the turn boundary fires. Its
     result can predate the turn's final push, so the forced call must NOT record
@@ -3420,7 +3668,7 @@ async def test_forced_refresh_inflight_not_floored_and_requeues(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_refresh_check_status_issues_pending_follow_up_force(monkeypatch) -> None:
-    """When a fetch completes for a URL with a queued force, one follow-up fires (#2333)."""
+    """When a fetch completes for a URL with a queued force, one follow-up fires."""
     url = "https://github.com/acme/repo/pull/92"
     source._check_cache.clear()
     source._check_inflight.clear()
@@ -3494,7 +3742,7 @@ async def test_chip_refresh_damps_projection_flap(monkeypatch) -> None:
         assert invalidate.await_count == source._CHECK_FLAP_DAMP_THRESHOLD - 1
         assert sink.call_count == source._CHECK_FLAP_DAMP_THRESHOLD - 1
         # The chip cache still tracks the latest projection (glyph stays live,
-        # just no longer drives the loop).
+        # just does not drive the loop).
         assert source.get_cached_check_status(url) == {"state": "draft"}
         # A genuinely different transition clears the damp.
         source._check_cache[url] = (source.time.monotonic(), {"state": "draft"})
@@ -3758,7 +4006,7 @@ async def test_full_fetch_coalesces_concurrent_forced_refreshes(monkeypatch) -> 
 async def test_full_fetch_projects_chip_status_under_cache_lock(monkeypatch) -> None:
     """The write-through projection must run inside ``_CACHE_LOCK``.
 
-    Regression for the TOCTOU where a provider mutation landing between the
+    Guards the TOCTOU where a provider mutation landing between the
     passing generation check and the chip projection could republish
     pre-mutation status into the chip cache — a stale ``source_status`` delta the
     full-cache invalidation cannot undo. Keeping the projection in the same
@@ -5577,7 +5825,7 @@ async def test_local_token_uses_local_owner_subject_without_configured_owner(mon
 
 @pytest.mark.parametrize("subject", ["local-app", "local-startup"])
 @pytest.mark.asyncio
-async def test_local_dashboard_subjects_can_read_without_configured_owner(
+async def test_local_dashboard_subjects_can_act_without_configured_owner(
     monkeypatch, subject
 ) -> None:
     pull = {"url": "https://github.com/acme/repo/pull/12", "checks": []}
@@ -5603,11 +5851,14 @@ async def test_local_dashboard_subjects_can_read_without_configured_owner(
         assert await detail_response.json() == pull
         assert checks_response.status == 200
         assert await checks_response.json() == {"checks": []}
-        assert resolve_response.status == 403
+        # The mutation passes on the same identity the reads did: with no owner
+        # configured, a signed machine-local subject IS the owner.
+        assert resolve_response.status == 200
+        assert (await resolve_response.json())["resolved"] is True
 
     fetch_pull.assert_awaited_once_with(pull["url"], refresh=False)
     fetch_checks.assert_awaited_once_with(pull["url"])
-    resolve.assert_not_awaited()
+    resolve.assert_awaited_once_with(pull["url"], "PRRT_thread1")
 
     request = _ResolveRequest()
     request.app["state"].owner_id = ""
@@ -5707,27 +5958,30 @@ async def test_read_handler_denies_non_local_subject_when_no_owner(
 
 
 @pytest.mark.asyncio
-async def test_resolve_handler_denies_local_token_when_no_owner(
-    monkeypatch, _mock_source_sel
-) -> None:
-    """The local no-owner fallback is scoped to reads: the resolve *mutation*
-    stays owner-only, so a local-app token with no owner still fails closed —
-    but the refusal names the remedy with a machine-readable code, because this
-    caller class saw live buttons whose reads already succeeded."""
-    resolve = AsyncMock()
+async def test_resolve_handler_allows_local_token_when_no_owner(monkeypatch) -> None:
+    """The resolve mutation runs for a signed local subject with no owner, and
+    the audit records it as completed under that subject rather than denied."""
+    resolve = AsyncMock(return_value=None)
+    audit = MagicMock()
     monkeypatch.setattr(source, "resolve_pull_request_thread", resolve)
+    monkeypatch.setattr(source, "_sel", lambda: audit)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(
             "/api/source/pull-request/resolve",
             json={"url": "https://github.com/acme/repo/pull/1", "threadId": "PRRT_1"},
         )
-        assert response.status == 403
-        body = await response.json()
-        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
-        assert "Owner Slack member ID" in body["error"]
+        assert response.status == 200
+        assert (await response.json())["resolved"] is True
 
-    resolve.assert_not_awaited()
+    resolve.assert_awaited_once_with("https://github.com/acme/repo/pull/1", "PRRT_1")
+    audit.log_api_access.assert_called_once_with(
+        caller="local-app",
+        operation="source.pull_request.resolve",
+        outcome="completed",
+        source="dashboard",
+        error="",
+    )
 
 
 @pytest.mark.parametrize(
@@ -5982,23 +6236,24 @@ async def test_resolve_handler_audits_provider_failure_without_provider_text(mon
         ("/api/source/pull-request/ready", "mark_pull_request_ready"),
     ],
 )
-async def test_action_handlers_deny_local_token_when_no_owner(
+async def test_action_handlers_allow_local_token_when_no_owner(
     monkeypatch, _mock_source_sel, path: str, action_name: str
 ) -> None:
-    """The local no-owner fallback is scoped to reads: these mutations stay
-    owner-only, so a local-app token with no owner still fails closed — with
-    the coded, actionable body reserved for signed local dashboard sessions."""
-    action = AsyncMock()
+    """A signed machine-local subject is the owner when none is configured.
+
+    The negative control is
+    ``test_no_owner_mutation_denies_non_local_subjects``: the allowance is the
+    local dashboard identity, not the absence of an owner.
+    """
+    action = AsyncMock(return_value=None)
     monkeypatch.setattr(source, action_name, action)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(path, json={"url": "https://github.com/acme/repo/pull/1"})
-        assert response.status == 403
-        body = await response.json()
-        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
-        assert "Owner Slack member ID" in body["error"]
+        assert response.status == 200
 
-    action.assert_not_awaited()
+    # Auto-merge carries the consent flag, ready does not; both must have run.
+    assert action.await_args.args == ("https://github.com/acme/repo/pull/1",)
 
 
 @pytest.mark.asyncio
@@ -6013,12 +6268,14 @@ async def test_action_handlers_deny_local_token_when_no_owner(
         {"owner_id": "", "user": "", "app_name": ""},
     ],
 )
-async def test_no_owner_mutation_code_reserved_for_signed_local_subjects(
+async def test_no_owner_mutation_denies_non_local_subjects(
     monkeypatch, _mock_source_sel, app_kwargs: dict
 ) -> None:
-    """The ``owner_not_configured`` discriminator is scoped exactly like
-    ``stale_owner_session_response``: every caller that is not a signed
-    machine-local dashboard session keeps the generic body."""
+    """The no-owner allowance is the signed machine-local dashboard identity.
+
+    Every other caller keeps the generic forbidden body, which is also what
+    stops the response from disclosing the install's owner state.
+    """
     action = AsyncMock()
     monkeypatch.setattr(source, "enable_pull_request_auto_merge", action)
 
@@ -6291,11 +6548,11 @@ async def test_resolve_handler_rejects_bad_thread_id(monkeypatch) -> None:
 def test_forced_refresh_over_cap_stays_eligible(monkeypatch) -> None:
     """A turn-boundary force deferred by the pending cap must not be locked out.
 
-    Regression for the review finding: recording ``_check_forced_at`` (and
-    renewing the cache timestamp) *before* admission meant a URL the pending cap
-    rejected was both marked "just forced" (10s floor) and had its TTL renewed —
-    so the next turn boundary AND the periodic sweep both skipped it, making the
-    chip staler in exactly the contention case force exists for.
+    Recording ``_check_forced_at`` (and renewing the cache timestamp) *before*
+    admission would mark a URL the pending cap rejected as "just forced" (10s
+    floor) and renew its TTL — so the next turn boundary AND the periodic sweep
+    both skip it, making the chip staler in exactly the contention case force
+    exists for.
     """
     url = "https://github.com/acme/repo/pull/77"
     source._check_cache.clear()
@@ -6484,8 +6741,8 @@ def test_record_full_payload_clears_ci_when_checks_genuinely_empty() -> None:
     """The guard must be scoped to PARTIAL checks, not merely-empty ones.
 
     A PR with no CI configured returns ``checks: []`` and NO ``partialSections``
-    entry for checks. That is authoritative "there is no CI", so a previously
-    known glyph should clear rather than linger forever.
+    entry for checks. That is authoritative "there is no CI", so an already-known
+    glyph should clear rather than linger forever.
     """
     url = "https://github.com/acme/repo/pull/35"
     source._check_cache.clear()
@@ -6622,7 +6879,7 @@ def test_self_hosted_jira_rejected_when_allowlist_empty(monkeypatch) -> None:
 class TestSourceRefLabel:
     """``source_ref_label`` -- what a sidebar chip is CALLED.
 
-    These assertions were previously spread across the sidebar's own render
+    These assertions gather what was spread across the sidebar's own render
     fixtures, where each provider's punctuation was rebuilt by a template
     string. They live here now because this is the side that knows the
     convention, and the renderer prints whatever it is handed.
@@ -8541,10 +8798,11 @@ class TestAdfToMarkdown:
 
     def test_folding_a_long_whitespace_run_is_linear(self):
         """A provider-controlled newline-FREE whitespace run, bounded only by the
-        8MiB fetch cap, used to be folded by a pattern whose whitespace runs and
-        newline anchor competed for the same characters: 200k spaces took ~45s of
-        backtracking, per heading and per table cell. The budget is ~100x the
-        linear cost, so this fails only on a return to quadratic scanning."""
+        8MiB fetch cap, must fold in linear time. A pattern whose whitespace runs
+        and newline anchor compete for the same characters backtracks
+        quadratically — 200k spaces cost seconds per heading and per table cell.
+        The budget is ~100x the linear cost, so this fails only on a return to
+        quadratic scanning."""
         payload = " " * 200_000 + "x"
         start = time.monotonic()
         assert source._md_one_line(payload) == "x"
@@ -9009,7 +9267,7 @@ class TestAdfToMarkdown:
         """`_URL_RE` stops at `)`, so a paren in the path puts the whole query
         outside every exfiltration check. The href is scanned paren-encoded and
         the link is dropped rather than emitted partly redacted."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         href = f"https://evil.example.com/a)b?data={blob}"
         adf = self._doc(
             self._para(self._text("click", [{"type": "link", "attrs": {"href": href}}]))
@@ -9096,7 +9354,7 @@ class TestAdfToMarkdown:
         conventional unless something checks it, so the node types and attribute
         names are read back OUT of the module and every combination is tried:
         a type added later is covered without anyone remembering this test."""
-        src = inspect.getsource(source)
+        src = inspect.getsource(inspect.getmodule(source._adf_to_markdown))
         body = src[src.index("def _adf_block_to_markdown") : src.index("def _adf_plain_text")]
         attr_names = set(re.findall(r'attrs\.get\("([a-zA-Z]+)"\)', body))
         node_types = set(source._ADF_BLOCK_TYPES) | set(
@@ -9272,7 +9530,7 @@ class TestAdfToMarkdown:
         so a space does not end the URL there. All ten characters are therefore
         sealed on this path -- each one measured as leaking before.
         """
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         for ch in (")", "'", '"', ">", " ", "\t", "\n", "\r", "\v", "\f"):
             href = f"https://evil.example.com/a{ch}b?data={blob}"
             adf = self._doc(
@@ -9398,7 +9656,7 @@ class TestAdfToMarkdown:
         mention label, an inline card and a media URL each still leaked a
         high-entropy query -- measured one by one. All of them now go through the
         one redaction primitive."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         url = f"https://evil.example.com/a)b?data={blob}"
         sites = {
             "expand title": self._doc(
@@ -9440,7 +9698,7 @@ class TestAdfToMarkdown:
         renderer: bare text `https://host/a)b?data=<blob>` becomes an anchor whose
         href carries the paren AND the whole query, so the truncated scan has to
         be corrected here or a fetchable address reaches the panel."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         text = f"look at https://evil.example.com/a)b?data={blob} please"
         rendered = source._adf_to_markdown(self._doc(self._para(self._text(text))))
         assert blob not in rendered
@@ -9461,7 +9719,7 @@ class TestAdfToMarkdown:
         Credentials are still covered: the payload-level pass is token-shaped, so
         it catches `ghp_...` inside a code block regardless of any URL truncation.
         """
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         url = f"https://api.example.com/v1)x?token={blob}"
         adf = self._doc(
             {"type": "codeBlock", "content": [{"type": "text", "text": f"curl {url}"}]}
@@ -9471,11 +9729,10 @@ class TestAdfToMarkdown:
     def test_a_credential_split_across_a_media_alt_is_redacted(self):
         """This supersedes an earlier, narrower claim of mine.
 
-        In round 16 I rebutted this by showing the emitted `[alt](url)` brackets
-        the alt, so the halves cannot form one token. That was true of the code at
-        the time. Round 17 then added a path where a URL failing the destination
-        scan drops the link and emits the LABEL ALONE -- no brackets -- and the
-        rebuttal quietly stopped holding. Measured on that path, the output was
+        The emitted `[alt](url)` form brackets the alt, so its halves cannot form
+        one token. But on the path where a URL failing the destination scan drops
+        the link and emits the LABEL ALONE -- no brackets -- that bracketing is
+        gone. Measured on that path, the output is
         `ghp\\_Ab3Df6Hj9Kl2Np5Qr8TvWx4Yz7Bc0Ef3`: one recoverable credential, with
         the backslash from escaping `ghp_` defeating the payload-level pass.
 
@@ -9486,7 +9743,7 @@ class TestAdfToMarkdown:
         """
         head = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv"
         tail = "Wx4Yz7Bc0Ef3"
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         for url in (
             "https://ex.com/a.png",
             # Fails the destination scan (whitespace is encoded there), so the
@@ -10052,6 +10309,52 @@ class TestGetJiraAuth:
         result = source._get_jira_auth("acme.atlassian.net")
         assert result == ("dev@acme.com", "env-override")
 
+    def test_catalog_slots_match_runtime_precedence(self, monkeypatch):
+        """Catalog output names the same vault slot the runtime resolves."""
+        from kiro_crew.dashboard.handlers.secrets import _managed_secret_catalog
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+        host_name = source.jira_host_token_name(FakeEntry.host)
+        cases = (
+            ([host_name], {host_name: "host-value"}, host_name),
+            ([], {"JIRA_API_TOKEN": "global-value"}, "JIRA_API_TOKEN"),
+        )
+        for stored_names, vault_values, expected_name in cases:
+            monkeypatch.setattr(
+                source,
+                "_resolve_jira_token_from_vault",
+                lambda name, values=vault_values: values.get(name, ""),
+            )
+            assert source._get_jira_auth(FakeEntry.host) == (
+                FakeEntry.email,
+                vault_values[expected_name],
+            )
+            catalog = _managed_secret_catalog(
+                stored_names,
+                [FakeEntry.host],
+                jira_global_applicable=True,
+                wakatime_enabled=False,
+            )
+            assert expected_name in {entry["name"] for entry in catalog}
+
     def test_migrated_secret_ref_in_env_resolves_from_vault_not_uri(self, monkeypatch):
         """After `secrets import --apply`, the .env line is
         `JIRA_API_TOKEN=secret://JIRA_API_TOKEN` and `load_credentials`
@@ -10266,7 +10569,7 @@ def test_parse_jira_self_hosted_url(monkeypatch) -> None:
     assert ref.number == 99
 
 
-# --- Jira linked issues (issue #2584) ---
+# --- Jira linked issues ---
 
 
 class TestJiraLinkedChanges:
@@ -10415,7 +10718,7 @@ class TestJiraLinkedChanges:
         assert result[1]["state"] == "closed"
 
 
-# --- Jira fix versions as the milestone equivalent (issue #2585) ---
+# --- Jira fix versions as the milestone equivalent ---
 
 
 class TestJiraFixVersionMilestone:
@@ -10442,7 +10745,7 @@ class TestJiraFixVersionMilestone:
         assert source._jira_fix_version_milestone(version)["state"] == "closed"
 
     def test_archived_version_maps_to_closed(self) -> None:
-        """An archived version no longer takes work, so it is not open."""
+        """An archived version takes no work, so it is not open."""
         version = {"name": "1.0.0", "released": False, "archived": True}
         assert source._jira_fix_version_milestone(version)["state"] == "closed"
 
@@ -10504,7 +10807,7 @@ class TestJiraFixVersionMilestone:
 
 
 class TestJiraPickFixVersion:
-    """Tests for _jira_pick_fix_version (issue #7595)."""
+    """Tests for _jira_pick_fix_version."""
 
     def test_mixed_versions_prefer_the_unreleased_one(self) -> None:
         """A pending release wins over an already-shipped one ahead of it."""
@@ -10642,7 +10945,7 @@ class TestJiraFixVersionInPayload:
 
     @pytest.mark.asyncio
     async def test_pending_version_wins_over_a_shipped_one(self, monkeypatch) -> None:
-        """A released version ahead of a pending one does not steal the chip (#7595)."""
+        """A released version ahead of a pending one does not steal the chip."""
         issue, _seen = await _jira_fetch(
             monkeypatch,
             {
@@ -10671,9 +10974,9 @@ class TestJiraFixVersionInPayload:
 class _ReapProbe:
     """A PIPE-stdio child double that records how it is reaped.
 
-    A killed child blocked writing into a full pipe -- or a surviving
+    A killed child blocking on a write into a full pipe -- or a surviving
     descendant still holding the pipes open -- makes a bare ``await
-    proc.wait()`` hang the caller forever (#6005). The bounded reap must
+    proc.wait()`` hang the caller forever. The bounded reap must
     therefore drain the pipes via ``communicate()`` and must never touch
     ``wait()``.
     """
@@ -10702,7 +11005,7 @@ class _ReapProbe:
 async def test_terminate_process_reaps_via_communicate_not_wait(monkeypatch):
     """``_terminate_process`` must route through the bounded, pipe-draining
     ``kill_and_reap`` -- a bare ``await proc.wait()`` here can hang the gateway
-    task forever when the child is killed with a full pipe (#6005)."""
+    task forever when the child is killed with a full pipe."""
     from kiro_crew import platform_compat
 
     proc = _ReapProbe()

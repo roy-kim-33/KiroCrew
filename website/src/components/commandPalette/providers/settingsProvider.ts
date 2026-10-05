@@ -1,5 +1,6 @@
 import { createElement } from 'react'
 import { useMemo } from 'react'
+import { useSettingsSearchGovernance } from '../useSettingsSearchGovernance'
 import { useNavigate } from 'react-router-dom'
 import { Settings } from 'lucide-react'
 import type { NavigateFunction } from 'react-router-dom'
@@ -8,7 +9,12 @@ import { makeScoreThenNameComparator } from '../../../utils/fuzzyMatch'
 import { i18nT } from '../../../i18n/t'
 import type { ResourceProvider, Result } from '../types'
 import { SETTINGS_REGISTRY } from '../settingsRegistry.gen'
-import { localizedSettingLabel, scoreSettingEntry } from '../settingsSearchCore'
+import {
+  localizedSettingLabel,
+  scoreSettingEntry,
+  settingEntryOffered,
+  type SettingsSearchGovernance,
+} from '../settingsSearchCore'
 import { settingsRoute } from '../settingsRoute'
 import { settingsTabLabel } from '../settingsTabLabel'
 import type { SettingEntry } from '../settingsTypes'
@@ -128,9 +134,18 @@ function buildResult(
 /**
  * Create a Settings provider bound to a router `navigate` function.
  * Pure (no hooks) — unit-testable with a stub navigate.
+ *
+ * *governance* carries the answers that decide whether an entry may be offered at
+ * all. It is passed in rather than read here because `search` is SYNCHRONOUS: the
+ * hook below subscribes to the answer and rebuilds the provider when it lands.
  */
-export function createSettingsProvider(navigate: NavigateFunction): ResourceProvider {
-  // Precompute tab keys from the registry
+export function createSettingsProvider(
+  navigate: NavigateFunction,
+  governance: SettingsSearchGovernance,
+): ResourceProvider {
+  // Tab keys stay derived from the FULL registry: they name the tabs a query may
+  // scope to, and a governed entry does not remove its tab (the developer tab has
+  // many others). Only the entries themselves are filtered.
   const tabKeys = [...new Set(SETTINGS_REGISTRY.map((e) => e.tab))]
 
   return {
@@ -154,19 +169,29 @@ export function createSettingsProvider(navigate: NavigateFunction): ResourceProv
         const [, prefix, remainder] = filterMatch
         const resolvedTab = resolveTabPrefix(prefix, tabKeys)
         if (resolvedTab) {
-          return searchWithinTab(resolvedTab, remainder.trim(), navigate)
+          return searchWithinTab(resolvedTab, remainder.trim(), navigate, governance)
         }
         // Ambiguous or unknown — fall through to normal search
       }
 
-      return searchFullCorpus(q, navigate)
+      return searchFullCorpus(q, navigate, governance)
     },
   }
 }
 
 /** Search within a single tab. Empty remainder lists all entries in that tab. */
-function searchWithinTab(tab: string, remainder: string, navigate: NavigateFunction): Result[] {
-  const tabEntries = SETTINGS_REGISTRY.filter((e) => e.tab === tab)
+function searchWithinTab(
+  tab: string,
+  remainder: string,
+  navigate: NavigateFunction,
+  governance: SettingsSearchGovernance,
+): Result[] {
+  // Filtered here as well as in the full corpus: the empty-remainder branch below
+  // LISTS a tab wholesale, which is the one path that would surface a withdrawn
+  // entry without anyone typing its name.
+  const tabEntries = SETTINGS_REGISTRY.filter(
+    (e) => e.tab === tab && settingEntryOffered(e, governance),
+  )
 
   if (remainder.length === 0) {
     // List all entries in this tab, sorted alphabetically by the DISPLAYED
@@ -191,9 +216,14 @@ function searchWithinTab(tab: string, remainder: string, navigate: NavigateFunct
 }
 
 /** Normal full-corpus search (existing behavior). */
-function searchFullCorpus(q: string, navigate: NavigateFunction): Result[] {
+function searchFullCorpus(
+  q: string,
+  navigate: NavigateFunction,
+  governance: SettingsSearchGovernance,
+): Result[] {
   const results: Result[] = []
   for (const entry of SETTINGS_REGISTRY) {
+    if (!settingEntryOffered(entry, governance)) continue
     const s = scoreSettingEntry(q, entry)
     if (!s) continue
     results.push(buildResult(entry, s.score, s.indices, navigate, s.localizedLabel))
@@ -204,9 +234,11 @@ function searchFullCorpus(q: string, navigate: NavigateFunction): Result[] {
 }
 
 /**
- * React hook: a Settings provider wired to the app router.
+ * React hook: a Settings provider wired to the app router and to the shared
+ * search governance (`useSettingsSearchGovernance`).
  */
 export function useSettingsProvider(): ResourceProvider {
   const navigate = useNavigate()
-  return useMemo(() => createSettingsProvider(navigate), [navigate])
+  const governance = useSettingsSearchGovernance()
+  return useMemo(() => createSettingsProvider(navigate, governance), [navigate, governance])
 }

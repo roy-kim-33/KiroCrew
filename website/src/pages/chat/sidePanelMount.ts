@@ -1,4 +1,4 @@
-import type { TargetAndTransition } from 'framer-motion'
+import type { TargetAndTransition, Transition } from 'framer-motion'
 
 /**
  * When the tabbed side panel must stay MOUNTED.
@@ -6,10 +6,15 @@ import type { TargetAndTransition } from 'framer-motion'
  * An MCP App tab hosts a null-origin iframe (`sandbox="allow-scripts
  * allow-forms"`, no `allow-same-origin`) with no storage. Unmounting it reloads
  * the app and destroys whatever the user has drawn — there is nothing to restore
- * from. See `src/kiro_crew/docs/dashboard-iframe-hosts.md`.
+ * from. See `docs/architecture/dashboard-iframe-hosts.md`.
+ *
+ * An app-contributed tab (`contributes.panelTabs`) is the same class of loss for
+ * a different reason: it mounts the app's bundle in-process through `AppHost`, so
+ * an unmount discards the app component's own in-body state — an unsaved form, a
+ * scroll position, an editor buffer — which nothing outside the component holds.
  *
  * The panel is normally render-gated on `activityOpen`, so closing it unmounts
- * the whole subtree. While an app tab is live we keep the subtree mounted and
+ * the whole subtree. While such a tab is live we keep the subtree mounted and
  * hide it instead, matching the hide-not-unmount rule SidePanel already applies
  * to its own tab bodies and `InstancesViewport` applies to instance frames.
  *
@@ -19,12 +24,16 @@ import type { TargetAndTransition } from 'framer-motion'
 export interface SidePanelMountInput {
   /** User-facing open/closed state of the panel. */
   activityOpen: boolean
-  /** True while at least one `app` tab exists in the current slot's strip. */
+  /** True while at least one body-owning app tab exists in ANY slot's strip: an
+   *  MCP `app` render, or an app-contributed tab (`app:<appName>:<id>`) whose
+   *  `AppHost` holds the app component's own in-body state. */
   hasLiveAppTab: boolean
   /** True while a `browser` tab is live. Its Electron WebContentsView is
    *  destroyed on unmount, so — like an app tab — closing the panel must hide,
    *  not unmount, or the loaded page is lost. */
   hasBrowserTab: boolean
+  /** Authored dashboard document and answer drafts survive hiding the panel. */
+  hasTaskDashboard?: boolean
   /** The find pane takes the dock slot exclusively. */
   searchOpen: boolean
 }
@@ -40,8 +49,8 @@ export interface SidePanelMountInput {
  *
  *  With no app tab, behaviour is exactly as before: the find pane takes the dock
  *  exclusively and closing the panel unmounts it, preserving the exit animation. */
-export function shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen }: SidePanelMountInput): boolean {
-  if (hasLiveAppTab || hasBrowserTab) return true
+export function shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen }: SidePanelMountInput): boolean {
+  if (hasLiveAppTab || hasBrowserTab || hasTaskDashboard) return true
   if (searchOpen) return false
   return activityOpen
 }
@@ -55,6 +64,43 @@ export function shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTa
 export function isSidePanelHidden(input: SidePanelMountInput): boolean {
   if (!shouldMountSidePanel(input)) return false
   return input.searchOpen || !input.activityOpen
+}
+
+/**
+ * The panel's open/close timing, defined ONCE.
+ *
+ * Two different mechanisms animate the same edge and a person reads them as one
+ * motion: the dock wrapper grows `width: 0 -> auto` with framer
+ * (`SIDE_PANEL_DOCK_TRANSITION`), while the panel itself eases between two
+ * chats' remembered widths with a CSS transition (`sidePanelDimTransition`).
+ * A framer tween and a CSS transition cannot share a code path, so they share
+ * these constants instead; otherwise the two curves drift apart in two files
+ * and opening the panel stops matching switching chats inside it.
+ */
+export const SIDE_PANEL_MOTION_MS = 180
+/** House easing, the same curve the shell uses for its own column and rail. */
+export const SIDE_PANEL_MOTION_EASE: [number, number, number, number] = [0.2, 0, 0, 1]
+
+/** The tween as framer's own transition, for the dock wrapper's grow/collapse. */
+export const SIDE_PANEL_DOCK_TRANSITION: Transition = {
+  duration: SIDE_PANEL_MOTION_MS / 1000,
+  ease: SIDE_PANEL_MOTION_EASE,
+}
+
+/**
+ * The same tween as a CSS `transition` declaration for one property.
+ *
+ * Derived from the constants rather than written out, so the CSS curve is the
+ * framer curve by construction and a reviewer does not have to compare two
+ * bezier literals by eye.
+ *
+ * Returns the declaration rather than a bare string so the duration stays in a
+ * `transition` position: `180ms` is a stylesheet token the browser's CSS parser
+ * reads, never copy a person reads, and the i18n unit-literal check recognizes
+ * that only from the key the value sits under. Spread it into a style object.
+ */
+export function sidePanelDimTransition(prop: 'width' | 'height'): { transition: string } {
+  return { transition: `${prop} ${SIDE_PANEL_MOTION_MS}ms cubic-bezier(${SIDE_PANEL_MOTION_EASE.join(', ')})` }
 }
 
 /** One axis of the open/close animation, plus the cross axis held at its

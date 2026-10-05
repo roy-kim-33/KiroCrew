@@ -1,8 +1,8 @@
-"""Tests for the prepare-pr monitor_armed.py loop-arming check.
+"""Tests for the kirocrew-prepare-pr monitor_armed.py loop-arming check.
 
 ``monitor_start`` is a stateless session directive: the MCP tool returns "Monitor
 loop requested" and the loop is armed later, when the turn's tool result is
-consumed. Every drop on that path is silent to the model, so prepare-pr Phase 3
+consumed. Every drop on that path is silent to the model, so kirocrew-prepare-pr Phase 3
 verifies arming against the loop store instead of the reply text -- and these
 tests pin the two properties that verification depends on:
 
@@ -29,7 +29,7 @@ MONITOR_ARMED = str(
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "monitor_armed.py"
 )
@@ -40,7 +40,7 @@ CANARY = "LEAK-CANARY-b3f1"
 
 
 def _store(**overrides: object) -> dict:
-    """A loop store holding one active loop for PR 6712 and one stopped loop."""
+    """A loop store holding one active loop for a PR and one stopped loop."""
     active = {
         "id": "loop-1",
         "slot_key": "chat-1",
@@ -90,7 +90,7 @@ class TestTheExitContract:
         assert "ARMED" in out
 
     def test_a_shorter_number_does_not_match_a_longer_one(self, tmp_path: Path) -> None:
-        # Without word-boundary anchoring, --pr 671 would match "PR #6712" and
+        # Without word-boundary anchoring, --pr 671 would match a loop numbered 6712 and
         # report a loop that is driving a different PR.
         _write_store(tmp_path, _store())
         rc, _ = _run(tmp_path, "--pr", "671")

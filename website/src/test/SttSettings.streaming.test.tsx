@@ -16,6 +16,7 @@ import { store } from '../store'
 import { initI18n } from '../i18n'
 import SttSettings from '../pages/settings/SttSettings'
 import { api } from '../api/client'
+import { getPreferredMicId, setPreferredMicId } from '../hooks/mic'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -70,8 +71,27 @@ function mount(over: Record<string, unknown> = {}) {
   )
 }
 
-/** The Streaming row, identified by its description copy. */
-const streamingRow = () => screen.queryByText(/show the transcript in the input box/i)
+/**
+ * The Streaming row, identified by its LABEL and reached through the Fine-tuning
+ * disclosure that now holds it.
+ *
+ * Two consequences of the panel keeping only the necessary decisions on its surface:
+ * the row lives inside a collapsed group, so it has to be opened before it exists in
+ * the DOM at all, and its explanation lives in a "?" tip, so the description copy is
+ * not a way to find it.
+ */
+async function openFineTuning() {
+  const header = await screen.findByRole('button', { name: /fine-tuning/i })
+  if (header.getAttribute('aria-expanded') !== 'true') fireEvent.click(header)
+}
+
+/** Present only when this provider can stream; null when the group is empty. */
+async function streamingRow() {
+  const header = screen.queryByRole('button', { name: /fine-tuning/i })
+  if (!header) return null
+  await openFineTuning()
+  return screen.queryByText('Streaming')
+}
 
 /**
  * The provider `<select>`, located by its accessible name rather than by index —
@@ -102,16 +122,47 @@ describe('SttSettings streaming gate', () => {
   })
   afterEach(() => cleanup())
 
+  it('keeps one system default when an unnamed microphone has no device id', async () => {
+    const previousMic = getPreferredMicId()
+    setPreferredMicId('')
+    const enumerate = vi.spyOn(navigator.mediaDevices, 'enumerateDevices').mockResolvedValue([
+      { deviceId: '', groupId: '', kind: 'audioinput', label: '', toJSON: () => ({}) },
+      { deviceId: 'mic-usb', groupId: 'usb', kind: 'audioinput', label: 'USB microphone', toJSON: () => ({}) },
+    ])
+    try {
+      mount()
+      const microphone = await screen.findByRole('combobox', { name: 'Microphone' })
+      fireEvent.click(microphone)
+      // The named option proves the asynchronous device enumeration reached the UI.
+      await screen.findByRole('option', { name: 'USB microphone' })
+      expect(microphone.textContent).toBe('System default')
+      expect(screen.getAllByRole('option').map(option => option.textContent)).toEqual([
+        'System default', 'USB microphone',
+      ])
+      fireEvent.click(screen.getByRole('option', { name: 'USB microphone' }))
+      expect(getPreferredMicId()).toBe('mic-usb')
+      expect(microphone.textContent).toBe('USB microphone')
+      fireEvent.click(microphone)
+      fireEvent.click(await screen.findByRole('option', { name: 'System default' }))
+      expect(getPreferredMicId()).toBe('')
+      expect(microphone.textContent).toBe('System default')
+    } finally {
+      enumerate.mockRestore()
+      setPreferredMicId(previousMic)
+    }
+  })
+
   it('offers the streaming toggle for the on-device apple provider', async () => {
     mount({ provider: 'apple' })
-    await waitFor(() => expect(streamingRow()).toBeTruthy())
+    await waitFor(() => expect(screen.queryByRole('button', { name: /fine-tuning/i })).toBeTruthy())
+    expect(await streamingRow()).toBeTruthy()
   })
 
   it('hides the streaming toggle for a provider that cannot stream', async () => {
     mount({ provider: 'local' })
     await waitFor(() => expect(mockApi.sttConfig).toHaveBeenCalled())
     await waitFor(() => expect(providerSelect()).toBeTruthy())
-    expect(streamingRow()).toBeNull()
+    expect(await streamingRow()).toBeNull()
   })
 
   it('turns streaming on when moving to a streaming-capable provider', async () => {
@@ -139,6 +190,7 @@ describe('SttSettings streaming gate', () => {
     // must not lose the toggle. The fallback used to be transcribe-only, which
     // would now hide the DEFAULT provider's own toggle.
     mount({ provider: 'local', streaming_providers: undefined })
-    await waitFor(() => expect(streamingRow()).toBeTruthy())
+    await waitFor(() => expect(screen.queryByRole('button', { name: /fine-tuning/i })).toBeTruthy())
+    expect(await streamingRow()).toBeTruthy()
   })
 })

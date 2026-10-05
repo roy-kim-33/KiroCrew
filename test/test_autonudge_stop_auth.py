@@ -1,6 +1,6 @@
-"""Contract tests for the stateless session-directive tools (issue #755).
+"""Contract tests for the stateless session-directive tools.
 
-``monitor_start`` / ``monitor_update`` / ``autonudge_stop`` no longer resolve a
+``monitor_start`` / ``monitor_update`` / ``autonudge_stop`` do not resolve a
 session identity or make HTTP calls. Each VALIDATES its arguments and returns a
 DIRECTIVE string — a human-readable confirmation plus an opaque marker carrying
 the validated payload (and NO session key). The session-aware consumer
@@ -18,13 +18,13 @@ The tests split along that seam:
   resolver returns ``""`` and the tool DOES emit a directive.
 * **Applier invariants** — call ``apply_session_directive`` with a fake
   AutoNudge service and fake state/slot, preserving the security invariants
-  that used to live inside the tool: capped-loop refusal, paused-loop
+  enforced in the applier: capped-loop refusal, paused-loop
   protection, and ownership by the session binding key (never a caller-supplied
   loop id).
 
-The former mock-dashboard HTTP server, user-token handshake, and
-arm-failure/lost-response recheck tests are gone: that logic no longer exists —
-the tools are stateless and the loop mutation happens in-process in the applier.
+The tools carry no mock-dashboard HTTP server, user-token handshake, or
+arm-failure/lost-response recheck: they are stateless and the loop mutation
+happens in-process in the applier.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from kiro_crew.autonudge import (
     binding_key_for,
 )
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
-from kiro_crew.mcp_core import _call_tool_inner
+from kiro_crew.mcp_core import _call_tool, _call_tool_inner
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
 from kiro_crew.validation import ValidationError
 
@@ -66,7 +66,7 @@ def default_install(monkeypatch):
 def test_monitor_start_returns_directive_with_validated_payload(default_install, gateway_posts):
     """A valid call returns a directive decoding to the validated payload with
     interval_secs mapped to idle_secs."""
-    result = _call_tool_inner(
+    result = _call_tool(
         "monitor_start",
         {"message": "check PR #1 until green", "interval_secs": 300, "max_cycles": 5},
     )
@@ -75,7 +75,7 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install,
         "message": "check PR #1 until green",
         "idle_secs": 300,
         "max_cycles": 5,
-        "max_runtime_secs": 0,
+        "max_runtime_secs": 14_400,
         # Whether the loop may be observation-gated. Always present and True
         # unless the caller opted out, so whichever surface applies this
         # directive reads the same decision the ack reported.
@@ -83,12 +83,24 @@ def test_monitor_start_returns_directive_with_validated_payload(default_install,
     }
     # BOTH halves of the delivery contract: the marker above, and the
     # out-of-band record parked for a consumer that never sees the marker.
-    assert gateway_posts == [("/api/session-directive", {"kind": "monitor_start", "args": args})]
+    assert gateway_posts == [
+        (
+            "/api/session-directive",
+            {
+                "tool": "monitor_start",
+                "raw_args": {
+                    "message": "check PR #1 until green",
+                    "interval_secs": 300,
+                    "max_cycles": 5,
+                },
+            },
+        )
+    ]
 
 
 def test_monitor_start_runtime_budget_passes_through(default_install):
     """An explicit wall-clock budget lands in the directive payload and is
-    echoed in the confirmation; omitting it defaults to 0 (unlimited)."""
+    echoed in the confirmation."""
     result = _call_tool_inner(
         "monitor_start",
         {"message": "watch CI", "max_runtime_secs": 7200},
@@ -109,12 +121,10 @@ def test_monitor_start_defaults_interval_300_and_bounded_cap(default_install):
     assert "no cycle cap" not in result.lower()
 
 
-def test_monitor_start_explicit_zero_cap_stays_zero(default_install):
-    """An explicit 0 means the caller really wants unlimited — 0 stays 0 and the
-    confirmation says so."""
-    result = _call_tool_inner("monitor_start", {"message": "watch PR", "max_cycles": 0})
-    assert session_directive.decode(result, "monitor_start")["max_cycles"] == 0
-    assert "no cycle cap" in result.lower()
+@pytest.mark.parametrize("field", ["max_cycles", "max_runtime_secs"])
+def test_monitor_start_rejects_unbounded_zero_limits(default_install, field):
+    with pytest.raises(ValidationError):
+        _call_tool_inner("monitor_start", {"message": "watch PR", field: 0})
 
 
 def test_monitor_start_interval_maps_to_idle_secs(default_install):
@@ -211,11 +221,14 @@ def test_monitor_update_short_circuits_for_non_nudgeable_session(monkeypatch, ga
 
 
 def test_autonudge_stop_returns_directive_with_stripped_reason(default_install, gateway_posts):
-    result = _call_tool_inner("autonudge_stop", {"reason": "  PR is green  "})
+    result = _call_tool("autonudge_stop", {"reason": "  PR is green  "})
     assert session_directive.decode(result, "autonudge_stop") == {"reason": "PR is green"}
-    # The published record carries the same stripped reason as the marker.
+    # The CALL is reported raw; the gateway re-runs the tool and strips it again.
     assert gateway_posts == [
-        ("/api/session-directive", {"kind": "autonudge_stop", "args": {"reason": "PR is green"}})
+        (
+            "/api/session-directive",
+            {"tool": "autonudge_stop", "raw_args": {"reason": "  PR is green  "}},
+        )
     ]
 
 
@@ -235,8 +248,8 @@ def test_autonudge_stop_short_circuits_for_non_nudgeable_session(monkeypatch, ga
 
 # ── Applier invariants (dashboard.session_directive_apply) ────────────────────
 #
-# These preserve the security invariants that used to live inside the tool,
-# moved to the consumer that actually mutates loop state. The applier resolves
+# These preserve the security invariants enforced in the consumer that actually
+# mutates loop state. The applier resolves
 # the loop by ``svc.get_by_slot(binding_key_for(session_key))`` and calls the
 # authz cores; the fakes below record those calls without touching a real
 # AutoNudge service. The authz helpers are imported LAZILY inside the applier
@@ -303,6 +316,7 @@ class _FakeSvc:
         self.get_by_slot_keys: list[str] = []
         self.removed: list[str] = []
         self.updated: list[tuple[str, dict]] = []
+        self.notes: list[tuple[str, str, str]] = []
 
     def get_by_slot(self, key):
         self.get_by_slot_keys.append(key)
@@ -311,10 +325,12 @@ class _FakeSvc:
     def list_all(self):
         return list(self._all)
 
-    async def remove(self, loop_id):
+    async def remove(self, loop_id, *, stop_reason="", stop_detail="", on_absent=None):
         self.removed.append(loop_id)
+        self.notes.append((loop_id, stop_reason, stop_detail))
+        return True
 
-    async def update(self, loop_id, **patch):
+    async def update(self, loop_id, on_absent=None, **patch):
         self.updated.append((loop_id, patch))
         return self._loop
 
@@ -397,7 +413,8 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
-    assert "only when it changes" in result, "the ack must state the gated cadence"
+    assert "only when the tick needs you" in result, "the ack must state the gated cadence"
+    assert "wake criteria" in result, "and say what decides a wake"
     assert "acme/widgets#42" in result, "and name the subject it is watching"
     assert "message re-injects every 300s" not in result, "not the plain promise"
 
@@ -420,7 +437,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
         )
     )
     assert "re-injects every 300s" in result
-    assert "only when it changes" not in result
+    assert "only when the tick needs you" not in result
 
 
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
@@ -565,7 +582,7 @@ def test_applier_monitor_update_revives_a_capped_loop_only_when_cap_is_raised(mo
 
 
 def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(monkeypatch):
-    """PAUSED-LOOP symmetry (design-review on #2116): a loop stopped by its
+    """PAUSED-LOOP symmetry: a loop stopped by its
     wall-clock budget gets the SAME agent-side recovery as a cap-stopped one —
     raising the budget above the loop's elapsed age revives it. Keyed on the
     persisted stopped_reason, not elapsed-time inference."""
@@ -599,7 +616,7 @@ def test_applier_monitor_update_revives_a_budget_stopped_loop_on_budget_raise(mo
 
 
 def test_applier_manual_pause_is_never_revived_by_a_budget_raise(monkeypatch):
-    """GPT P1 repro on #2116: pause a loop manually, let wall-clock pass its
+    """Pause a loop manually, let wall-clock pass its
     budget, then raise max_runtime_secs — the loop must STAY paused. Elapsed
     time cannot distinguish a pause from an expiry; only the persisted
     stopped_reason can, and 'manual' never auto-resumes."""
@@ -934,6 +951,8 @@ def test_applier_autonudge_stop_removes_ordinary_monitor_loop(monkeypatch):
     assert svc.get_by_slot_keys == [binding_key_for(_SESSION)]
     assert svc.removed == ["loop-ordinary"]
     assert svc.updated == []
+    # The removal leaves no row, so the agent's reason must reach the stop record.
+    assert svc.notes == [("loop-ordinary", "autonudge_stop", "done")]
     assert "stopped" in result.lower()
 
 
@@ -1221,3 +1240,106 @@ def test_autonudge_stop_directive_does_not_read_as_confirmation(default_install)
     assert "REQUESTED" in result
     assert "not confirmation" in result.lower()
     assert "nothing was stopped" in result.lower()
+
+
+# ── The wake judge at the tool surface ────────────────────────────────────────
+#
+# These exist because the feature was unreachable while every Python-level test
+# passed. The handler read ``args.get("judge")`` and the applier stored it, so a
+# test that called the tool with a judge argument went green -- but the field was
+# absent from the model-facing ``inputSchema``, so no agent could ever send one.
+# QA found a real agent arming a loop with ``judge == {}`` and the criteria pasted
+# into ``message`` as prose. The schema assertion below is the one that fails
+# without the fix; the payload assertion guards the hop after it.
+
+
+def _schema_for(tool_name: str) -> dict:
+    """One tool's model-facing inputSchema, as advertised to the agent."""
+    from kiro_crew.mcp_tools import control
+
+    entry = next(s for s in control.schemas() if s["name"] == tool_name)
+    return entry["inputSchema"]
+
+
+@pytest.mark.parametrize("tool_name", ["monitor_start", "monitor_update"])
+def test_the_judge_is_advertised_to_the_model_on_both_monitor_tools(tool_name: str) -> None:
+    """A field the schema does not list cannot be sent, whatever the handler reads.
+
+    Asserted against the SCHEMA rather than a call, because a call-level test
+    passes while the field is invisible -- which is exactly how this shipped
+    unreachable.
+    """
+    props = _schema_for(tool_name)["properties"]
+    assert "judge" in props, f"{tool_name} does not advertise `judge`, so no agent can send one"
+    judge = props["judge"]
+    # Both shapes, because the field carries two kinds of answer: an object is the
+    # owner's own brief, and `false` is the bypass. A schema listing only the object
+    # makes the bypass unsendable, which is the same way the field itself once shipped
+    # unreachable.
+    assert judge["type"] == ["object", "boolean"]
+    assert judge.get("description", "").strip(), "an undescribed object tells the model nothing"
+    assert "false" in judge["description"], "the bypass is unusable if the model is not told"
+    assert set(judge["properties"]) == {"wake_when", "quiet_when", "targets"}
+    for field in ("wake_when", "quiet_when"):
+        assert judge["properties"][field]["type"] == "string"
+        assert judge["properties"][field].get("description", "").strip()
+    targets = judge["properties"]["targets"]
+    assert targets["type"] == "array"
+    assert targets["items"]["type"] == "string"
+    assert targets.get("description", "").strip()
+
+
+def test_monitor_start_carries_a_judge_into_the_directive_payload(default_install):
+    """The hop after the schema: a sent brief reaches the validated payload."""
+    brief = {
+        "wake_when": "a worker line starts with RULING or BLOCKED",
+        "quiet_when": "workers report WORKING with no new status",
+    }
+    result = _call_tool_inner(
+        "monitor_start",
+        {"message": "patrol chat-1751-1790052364", "judge": brief},
+    )
+    args = session_directive.decode(result, "monitor_start")
+    assert args["judge"] == brief
+
+
+def test_monitor_start_without_a_judge_emits_no_judge_key(default_install):
+    """Negative control: the payload shape is asserted by exact equality
+    elsewhere, so an unconditional ``judge`` key would break every other loop's
+    contract and give a plain timer a judge it never asked for."""
+    result = _call_tool_inner("monitor_start", {"message": "watch CI"})
+    assert "judge" not in session_directive.decode(result, "monitor_start")
+
+
+def test_monitor_start_refuses_a_malformed_judge_naming_the_field(default_install):
+    """A refusal has to name a field the owner can fix, and arm nothing."""
+    out = _call_tool_inner(
+        "monitor_start",
+        {"message": "watch", "judge": {"wake_when": "x", "not_a_real_key": "y"}},
+    )
+    assert "not_a_real_key" in out
+    assert out.startswith("monitor_start:")
+    assert (
+        session_directive.decode(out, "monitor_start") is None
+    ), "a refused brief still emitted an arming directive"
+
+
+def test_monitor_update_carries_a_judge_into_the_patch(default_install):
+    """Revising a live loop's brief reaches the patch rather than being dropped."""
+    brief = {"wake_when": "CI turns red", "quiet_when": "checks are still running"}
+    result = _call_tool_inner("monitor_update", {"judge": brief})
+    assert session_directive.decode(result, "monitor_update")["patch"]["judge"] == brief
+
+
+def test_monitor_update_can_clear_a_judge_with_an_empty_object(default_install):
+    """An empty object REMOVES the brief, which the schema promises.
+
+    ``{}`` has to survive as an explicit patch value: dropping it because it is
+    falsy would make the documented way to remove a judge silently do nothing, and
+    would also make ``judge`` alone read as an empty patch and answer "nothing to
+    change".
+    """
+    result = _call_tool_inner("monitor_update", {"judge": {}})
+    patch = session_directive.decode(result, "monitor_update")["patch"]
+    assert patch["judge"] == {}
+    assert "judge" in patch, "an empty brief was dropped, so a judge cannot be removed"

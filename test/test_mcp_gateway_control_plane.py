@@ -17,21 +17,44 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from body_stream_helpers import attach_body
+from dashboard_owner_helpers import owner_claims
 
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.slack.gateway import GatewayOrchestrator
+
+
+def _prime_refresh_window(monkeypatch: pytest.MonkeyPatch, hours: int) -> None:
+    """Put ``mcp_gateway.resolve_once_refresh_hours`` on a test-scoped watcher.
+
+    The prefetch loop reads the window from the live snapshot, so a test that
+    wants a specific cadence primes one. Scoped with ``monkeypatch`` so the
+    process singleton is restored and no poll task is ever armed.
+    """
+    from kiro_crew.config import live
+    from kiro_crew.config.live import ConfigWatch
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    watch = ConfigWatch()
+    monkeypatch.setattr(live, "_WATCH", watch)
+    cfg = KiroCrewConfig()
+    cfg.mcp_gateway.resolve_once_refresh_hours = hours
+    watch.prime(cfg)
 
 
 def _make_request(state: object, body: dict) -> web.Request:
     req = MagicMock(spec=web.Request)
     attach_body(req, body)
     req.app = {"state": state}
-    req.get = lambda key, default=None: default
-    return req
+    # The enable and stub routes are owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``). Every ``state`` here
+    # is a ``SimpleNamespace`` with no ``owner_id``, which the predicate reads as
+    # the standalone-local shape, so the signed local bootstrap subject
+    # ``owner_claims`` installs IS the owner.
+    return owner_claims(req)
 
 
 def test_wire_publishes_manager_and_callbacks_onto_dashboard_state() -> None:
-    """The wiring must land all three attrs on the DashboardState the handlers
+    """The wiring must land all four attrs on the DashboardState the handlers
     read from — not leave the manager on the orchestrator."""
     ds = SimpleNamespace()
     orch = SimpleNamespace(
@@ -40,6 +63,7 @@ def test_wire_publishes_manager_and_callbacks_onto_dashboard_state() -> None:
         _apply_mcp_gateway_enabled="ENABLE_CB",
         _apply_mcp_stub="POOLABLE_CB",
         _refresh_mcp_resolutions="RESOLVE_CB",
+        _stop_mcp_broker="STOP_CB",
     )
     GatewayOrchestrator._wire_mcp_gateway_dashboard(orch)  # type: ignore[arg-type]
     assert ds._mcp_gateway_manager == "MGR"
@@ -48,6 +72,9 @@ def test_wire_publishes_manager_and_callbacks_onto_dashboard_state() -> None:
     # The pre-resolve refresh is wired the same way: the handler reads it off
     # DashboardState, so leaving it on the orchestrator makes the endpoint 503.
     assert ds._mcp_resolve_refresh == "RESOLVE_CB"
+    # The restart handler stops the broker through this seam before its exec;
+    # unwired, a restart leaves a daemon this pid owns for the successor to meet.
+    assert ds._mcp_gateway_stop == "STOP_CB"
 
 
 def test_wire_is_noop_when_dashboard_absent() -> None:
@@ -84,10 +111,14 @@ async def test_pre_resolve_pass_runs_on_a_clock_not_only_at_boot(monkeypatch) ->
 
     monkeypatch.setattr(_asyncio, "sleep", fake_sleep)
     orch = SimpleNamespace(
-        _cfg=SimpleNamespace(mcp_gateway=SimpleNamespace(resolve_once_refresh_hours=24)),
         _prefetch_mcp_resolutions=fake_pass,
+        _mcp_resolve_refresh_secs=GatewayOrchestrator._mcp_resolve_refresh_secs,
         _MCP_RESOLVE_MIN_SLEEP_SECS=GatewayOrchestrator._MCP_RESOLVE_MIN_SLEEP_SECS,
     )
+    # The window is read from the live snapshot, not the boot copy, so a reload
+    # moves the cadence without a broker restart. No `_cfg` on the fake proves it.
+    _prime_refresh_window(monkeypatch, 24)
+    orch._mcp_resolve_refresh_secs = lambda: GatewayOrchestrator._mcp_resolve_refresh_secs(orch)
     with pytest.raises(_Stop):
         await GatewayOrchestrator._mcp_resolve_prefetch_loop(orch, {"A": "b"})  # type: ignore[arg-type]
     # More than once is the whole point; one pass is the bug being fixed.
@@ -114,10 +145,11 @@ async def test_a_zero_refresh_window_does_not_spin_the_pre_resolve_loop(monkeypa
 
     monkeypatch.setattr(_asyncio, "sleep", fake_sleep)
     orch = SimpleNamespace(
-        _cfg=SimpleNamespace(mcp_gateway=SimpleNamespace(resolve_once_refresh_hours=0)),
         _prefetch_mcp_resolutions=fake_pass,
         _MCP_RESOLVE_MIN_SLEEP_SECS=GatewayOrchestrator._MCP_RESOLVE_MIN_SLEEP_SECS,
     )
+    _prime_refresh_window(monkeypatch, 0)
+    orch._mcp_resolve_refresh_secs = lambda: GatewayOrchestrator._mcp_resolve_refresh_secs(orch)
     with pytest.raises(_Stop):
         await GatewayOrchestrator._mcp_resolve_prefetch_loop(orch, {})  # type: ignore[arg-type]
     assert slept == [GatewayOrchestrator._MCP_RESOLVE_MIN_SLEEP_SECS]

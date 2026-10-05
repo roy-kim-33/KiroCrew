@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
+import reducer, { appendMessage, confirmOptimisticSend, selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
+import { slotIsRemoteBound } from '../store/dashboardSlice'
 import type { ChatMessage } from '../types'
 
 /**
@@ -20,7 +21,7 @@ import type { ChatMessage } from '../types'
 const msg = (role: string, content = 'x', meta?: Record<string, unknown>): ChatMessage =>
   ({ role, content, cls: '', ...(meta ? { meta } : {}) }) as ChatMessage
 
-const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; orchestrating?: boolean; subagents_running?: boolean }> = []) =>
+const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; orchestrating?: boolean; subagents_running?: boolean; executor?: 'local' | 'remote' }> = []) =>
   ({
     chat: {
       messages: [],
@@ -34,6 +35,37 @@ const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; sl
   }) as never
 
 describe('selectContinuable', () => {
+  it('allows retry of an interrupted legacy turn carrying old setup metadata', () => {
+    const blocked = state({ messages: [msg('user'), msg('error', 'owner setup required', {
+      code: 'memory_unavailable',
+      recovery: { kind: 'initialize_member_memory', member: 'reviewer' },
+    })] })
+    expect(selectContinuable(blocked)).toBe(true)
+    expect(selectTurnInterrupted(blocked)).toBe(true)
+  })
+
+  it.each([
+    undefined,
+    { code: 'memory_unavailable' },
+    { code: 'memory_unavailable', recovery: { kind: 'initialize_member_memory', member: '' } },
+    { code: 'other_error', recovery: { kind: 'initialize_member_memory', member: 'reviewer' } },
+  ])('does not infer setup from error prose or malformed metadata: %j', meta => {
+    expect(selectContinuable(state({ messages: [msg('user'), msg('error',
+      'memory_unavailable: Create private memory', meta,
+    )] }))).toBe(true)
+  })
+
+  it.each(['user', 'assistant'])('ignores a prior setup refusal after a later %s turn', role => {
+    expect(selectContinuable(state({ messages: [
+      msg('user'),
+      msg('error', 'owner setup required', {
+        code: 'memory_unavailable',
+        recovery: { kind: 'initialize_member_memory', member: 'reviewer' },
+      }),
+      msg(role, 'the next turn'),
+    ] }))).toBe(true)
+  })
+
   it('is false for a brand-new chat with no messages', () => {
     // The composer's send button must stay disabled exactly as it is today —
     // there is no conversation to hand back.
@@ -122,6 +154,34 @@ describe('selectContinuable', () => {
 
   it('is unaffected by another slot orchestrating', () => {
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', orchestrating: true }]))).toBe(true)
+  })
+
+  it('is false on a crew-bound slot — the server refuses Continue there', () => {
+    // `remote_bound_refusal` answers 409 `remote_action_unsupported` for
+    // `executor == "remote"`, so an offer here is a button that cannot work.
+    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', executor: 'remote' }]))).toBe(false)
+  })
+
+  it('is false on a crew-bound slot whose relayed turn died mid-stream', () => {
+    // The reported shape, and the reason the guard is not merely defensive:
+    // `relay_remote_turn`'s failure path appends this trailing `error` row, so
+    // without the guard a dropped tunnel leaves the composer offering a
+    // guaranteed-409 Resume. `selectTurnInterrupted` still reads it as
+    // interrupted — that half is true and unchanged; only availability moves.
+    const bound = state({ messages: [
+      msg('user', 'what shall we do?'),
+      msg('assistant', 'I’ll check whether the retrospective is still active'),
+      msg('error', 'The crew running this session stopped responding.'),
+    ] }, [{ key: 'slot-1', executor: 'remote' }])
+    expect(selectTurnInterrupted(bound)).toBe(true)
+    expect(selectContinuable(bound)).toBe(false)
+  })
+
+  it('still offers Continue on a local slot while another slot is crew-bound', () => {
+    expect(selectContinuable(state({ messages: [msg('user')] }, [
+      { key: 'other', executor: 'remote' },
+      { key: 'slot-1', executor: 'local' },
+    ]))).toBe(true)
   })
 
   it('is false when a queued message is waiting — the runner will resume on its own', () => {
@@ -216,9 +276,200 @@ describe('selectTurnInterrupted', () => {
     }))).toBe(true)
   })
 
-  it('reads past an injected recovery row to the real floor beneath it', () => {
+  // The completed-/compact shapes, mirroring `is_turn_interrupted` in
+  // `src/kiro_crew/dashboard/state.py` (test_is_interrupted.py pins the same
+  // five tails). Only the PAIR -- a /compact user row whose compaction result
+  // row is present -- reads as finished; the tag alone must not decide (the
+  // auto-compaction case above is a real interruption carrying the same row).
+  it('is FALSE when /compact is answered by its compaction notice (case A)', () => {
     expect(selectTurnInterrupted(state({
-      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume')],
+      messages: [
+        msg('user', 'q'), msg('assistant', 'a'),
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+      ],
+    }))).toBe(false)
+  })
+
+  it('already reads an untagged lookalike reply as the floor (case B)', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact'), msg('assistant', 'Conversation compacted: summary')],
+    }))).toBe(false)
+  })
+
+  it('is true when /compact got nothing back (case C)', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'q'), msg('assistant', 'a'), msg('user', '/compact')],
     }))).toBe(true)
+  })
+
+  it('matches /compact on its first whitespace token, arguments included', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact focus on tests'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+      ],
+    }))).toBe(false)
+  })
+
+  it('does not let a stale completed /compact mask a later unanswered turn', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+        msg('user', 'next request'),
+      ],
+    }))).toBe(true)
+  })
+
+  it('stays true when an error row trails the compaction notice', () => {
+    // Same evidence rule as the plain-assistant branch: a completed compaction
+    // followed by an error ended badly; hiding Resume there strands the user.
+    expect(selectTurnInterrupted(state({
+      messages: [
+        msg('user', '/compact'),
+        msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' }),
+        msg('error', 'Connection lost -- please retry.'),
+      ],
+    }))).toBe(true)
+  })
+
+  it("matches the first token by Python's whitespace rule, not JS \\s", () => {
+    // The backend rule is content.split()[0]: U+0085 separates tokens, U+FEFF
+    // does not, and trim() must not eat a leading BOM. test_is_interrupted.py
+    // pins the same three tails so the mirrors cannot diverge on them.
+    const notice = msg('assistant', 'Conversation compacted: summary', { kind: 'compaction' })
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact\u0085focus'), notice],
+    }))).toBe(false)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '/compact\uFEFFcontinue'), notice],
+    }))).toBe(true)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', '\uFEFF/compact'), notice],
+    }))).toBe(true)
+  })
+
+  it('does not let a borrowed-tag notice (stuck turn, recycle) complete a /compact', () => {
+    // Those writers reuse kind="compaction" for the follow-up scan's skip and
+    // mark themselves with meta.notice; a stuck /compact stays interrupted.
+    for (const noticeKind of ['stuck_turn', 'session_recycled']) {
+      expect(selectTurnInterrupted(state({
+        messages: [
+          msg('user', '/compact'),
+          msg('assistant', 'notice text', { kind: 'compaction', notice: noticeKind }),
+        ],
+      }))).toBe(true)
+    }
+  })
+
+  it('reads an injected recovery row as a turn opener', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume', { injectKind: 'recovery' })],
+    }))).toBe(true)
+  })
+
+  it('does not let an older Stop mask a newer interrupted inject turn', () => {
+    for (const injectKind of ['cron', 'recovery', 'user_replay', 'synthesis']) {
+      expect(selectTurnInterrupted(state({
+        messages: [
+          msg('user', 'first'),
+          msg('system', 'Stopped', { kind: 'stop_event' }),
+          msg('inject', 'continue queued work', { injectKind }),
+          msg('tool', 'read complete'),
+        ],
+      }))).toBe(true)
+    }
+  })
+
+  it('treats an answered dispatching inject as finished', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user'), msg('inject', 'go on', { injectKind: 'user_replay' }), msg('assistant', 'done')],
+    }))).toBe(false)
+  })
+
+  it('looks through an untagged inject (note, hook halt, refusal notice) to the real floor', () => {
+    // These rows dispatch nothing, so a trailing one is not an unanswered turn
+    // and a deliberately halted run must not offer Resume.
+    for (const meta of [undefined, { noteSession: 'dashboard:front' }, { injectKind: 'unknown' }, { injectKind: 7 }]) {
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('inject', 'halted', meta)],
+      }))).toBe(false)
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('inject', 'halted', meta)],
+      }))).toBe(true)
+    }
+  })
+
+  // The composer mints its bubble with `meta.optimistic`, and only the send's
+  // own receipt or a correlated echo clears it. Until one does, nothing proves
+  // the server ever received the text, so no turn was opened and none was
+  // interrupted: a Resume offered here posts a bare continue against a
+  // transcript that never held this message, and the agent answers the
+  // request before it. The flag is client-minted and never sent, so the
+  // backend mirror `is_turn_interrupted` never sees a row carrying it and
+  // needs no matching branch.
+  it('is false while the trailing user row is an unconfirmed optimistic send', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+  })
+
+  it('does not let a send-failure error row behind the unconfirmed send read as an interruption', () => {
+    // A `transport-error` appends its error row after the bubble and leaves the
+    // bubble standing; the error is about the send, not about a reply that died.
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' }), msg('error', 'Connection error')],
+    }))).toBe(false)
+  })
+
+  it('reads the same row as an interrupted turn once confirmOptimisticSend clears the flag', () => {
+    // The receipt path of a delivered send: the flag goes, the row is the
+    // server's, and an unanswered one is an interruption exactly as before.
+    let chat = { ...reducer(undefined, { type: '@@INIT' }), activeSlot: 'slot-1' }
+    chat = reducer(chat, appendMessage({ role: 'user', content: 'did this arrive?', cls: '', meta: { sendId: 's-1' } }))
+    expect(chat.messages[0].meta?.optimistic).toBe(true)
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(false)
+
+    chat = reducer(chat, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-1' }))
+    expect(chat.messages[0].meta?.optimistic).toBeUndefined()
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(true)
+  })
+})
+
+/**
+ * The shared crew-bound predicate. `selectContinuable` (above) and ChatPage's
+ * regenerate / edit-resend gates both route through this ONE spelling, so the
+ * two client surfaces cannot drift from each other or from the server's
+ * `remote_bound_refusal`. The `selectContinuable` cases above already exercise
+ * it end-to-end (executor: 'remote' -> not continuable); these pin the predicate
+ * itself, including the keying that a slot-object test could otherwise leave
+ * ambiguous.
+ */
+describe('slotIsRemoteBound', () => {
+  it('is true only when executor is "remote"', () => {
+    expect(slotIsRemoteBound({ executor: 'remote' })).toBe(true)
+  })
+
+  it('is false for a local slot', () => {
+    expect(slotIsRemoteBound({ executor: 'local' })).toBe(false)
+  })
+
+  it('is false when executor is absent — an older gateway still ships it, so an absent one is a missing lookup, not a bound slot', () => {
+    expect(slotIsRemoteBound({})).toBe(false)
+  })
+
+  it('is false for a missing slot (null / undefined)', () => {
+    expect(slotIsRemoteBound(undefined)).toBe(false)
+    expect(slotIsRemoteBound(null)).toBe(false)
+  })
+
+  it('keys on executor, not instance_id — a half-open binding (instance named, executor not yet remote) is NOT bound', () => {
+    // The server refuses this same half-open shape; the predicate must agree by
+    // reading `executor` alone, never the presence of an `instance_id`.
+    expect(slotIsRemoteBound({ instance_id: 'nobita' } as { executor?: string })).toBe(false)
   })
 })

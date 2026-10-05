@@ -1,6 +1,6 @@
 """Dashboard endpoints for the Weixin (iLink) QR-login setup flow.
 
-Two routes back the Settings > Channels > WeChat "Connect via QR" flow:
+Two routes back the Settings > Messaging Channels > WeChat "Connect via QR" flow:
 
   POST /api/channels/weixin/qr/start   -> start an iLink QR session, return the
                                           QR image + a server-side session id.
@@ -35,14 +35,23 @@ from aiohttp import web
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import CRED_WEIXIN_TOKEN, KiroCrewConfig, config_path, env_path
+from kiro_crew.config.loader import (
+    CRED_WEIXIN_TOKEN,
+    KiroCrewConfig,
+    config_path,
+    env_bom_prefix,
+    env_path,
+    read_config_text,
+    read_env_text,
+)
 from kiro_crew.dashboard.channel_folders import (
-    LIVE_RELOAD_FIELDS,
+    channel_restart_required,
     clean_session_folder,
     ensure_channel_folder,
     stored_folder_name,
 )
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
+from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.handlers.messaging import is_direct_local_request
 from kiro_crew.weixin.client import ILINK_BASE_URL, WeixinClient
 
@@ -120,7 +129,7 @@ def _write_env_secret(key: str, value: str) -> None:
     lines: list[str] = []
     found = False
     if ep.exists():
-        for line in ep.read_text(encoding="utf-8").splitlines():
+        for line in read_env_text(ep, encoding="utf-8").splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
                 k = stripped.split("=", 1)[0].strip()
@@ -131,7 +140,7 @@ def _write_env_secret(key: str, value: str) -> None:
             lines.append(line)
     if not found:
         lines.append(f"{key}={value}")
-    _atomic_write(ep, "\n".join(lines) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(lines) + "\n", secret=True)
 
 
 def _read_env_value(key: str) -> Optional[str]:
@@ -143,7 +152,7 @@ def _read_env_value(key: str) -> Optional[str]:
     ep = env_path()
     if not ep.exists():
         return None
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             k, _, value = stripped.partition("=")
@@ -158,13 +167,13 @@ def _delete_env_key(key: str) -> None:
     if not ep.exists():
         return
     kept: list[str] = []
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             if stripped.split("=", 1)[0].strip() == key:
                 continue
         kept.append(line)
-    _atomic_write(ep, "\n".join(kept) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(kept) + "\n", secret=True)
 
 
 def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None:
@@ -241,7 +250,7 @@ def _stage_weixin_config(*, account_id: str, base_url: str) -> tuple[Path, str]:
     cp = config_path()
     data: Dict[str, Any] = {}
     if cp.exists():
-        data = json.loads(cp.read_text(encoding="utf-8"))
+        data = json.loads(read_config_text(cp))
         if not isinstance(data, dict):
             raise ValueError("config.json is not a JSON object")
     weixin = data.get("weixin")
@@ -443,7 +452,7 @@ async def weixin_config_save(request: web.Request) -> web.Response:
         cp = config_path()
 
         def _read_config() -> Dict[str, Any]:
-            return json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
+            return json.loads(read_config_text(cp)) if cp.exists() else {}
 
         # Off-loop read: a large or slow config.json must not stall the gateway
         # event loop. Reading under the lock keeps the snapshot current relative
@@ -482,12 +491,16 @@ async def weixin_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in body,
                 )
 
-    # Every weixin field is read once in the orchestrator's constructor —
-    # except session_folder, which the channel-slot reconciler re-reads live, so
-    # a save that only changes it does not ask the user to restart.
+    # Answer only after the watcher applied the write: this save carries the
+    # allow-list, so a removed sender must be unauthorized on the running
+    # transport before the caller sees "saved", not one poll interval later.
+    await _hot_apply_after_write()
+    # Per field: session_folder is re-read live by the channel-slot reconciler,
+    # and the connection fields (token, account_id, base_url, enabled) are what a
+    # restart is actually for.
     return web.json_response(
         {
             "ok": True,
-            "restart_required": bool(set(body) - LIVE_RELOAD_FIELDS),
+            "restart_required": channel_restart_required("weixin", body.keys()),
         }
     )

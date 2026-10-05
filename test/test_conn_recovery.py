@@ -74,6 +74,30 @@ def test_requeue_before_output_preserves_original_request(cause: ResetCause) -> 
     ) == (original, RecoveryPayload.ORIGINAL)
 
 
+@pytest.mark.parametrize("cause", list(ResetCause))
+def test_ambiguous_delivery_continues_without_replaying_even_before_output(
+    cause: ResetCause,
+) -> None:
+    """A request-frame drain stall may have delivered the buffered prompt to a
+    kiro-cli that resumed reading, with no host-visible output -- so ``turn_emitted``
+    is False yet replaying the prompt verbatim would run its tools a second time.
+    ``ambiguous_delivery`` must force the same continuation an emitted turn takes."""
+    original = "Build and deploy the service"
+
+    requeued, payload = build_recovery_requeue(
+        original,
+        turn_emitted=False,
+        cause=cause,
+        message_is_synthetic=False,
+        ambiguous_delivery=True,
+    )
+
+    assert payload is RecoveryPayload.CONTINUATION
+    expected = _CONN_RECOVER_MSG if cause is ResetCause.CONNECTION_LOST else _BUSY_RECOVER_MSG
+    assert requeued == expected
+    assert original not in requeued
+
+
 def test_connection_recovery_uses_structural_system_injection_provenance() -> None:
     item = {
         "content": _CONN_RECOVER_MSG,
@@ -108,12 +132,22 @@ async def test_queue_dispatch_preserves_recovery_provenance(
     assert slot.task is not None
     await slot.task
 
+    _expected_kwargs = {
+        "_current_message": slot.messages[-1],
+        "_synthetic_payload": expected_recovery,
+        "_directive_user_origin": False,
+        "_directive_channel_origin": False,
+    }
+    if expected_recovery:
+        # A recovery-kind entry also tells the runner it IS a recovery
+        # dispatch, structurally — the refusal-retry allowance must not
+        # re-arm on a requeue of the user's own words.
+        _expected_kwargs["_synthetic_recovery_turn"] = True
     mock_run.assert_awaited_once_with(
         state,
         slot,
         _CONN_RECOVER_MSG,
-        _synthetic_payload=expected_recovery,
-        _directive_user_origin=False,
+        **_expected_kwargs,
     )
     assert slot.messages[-1]["role"] == expected_role
 
@@ -218,8 +252,13 @@ async def test_dispatch_classifies_the_payload_not_the_recovery(
         state,
         slot,
         "Build and deploy the service",
+        _current_message=slot.messages[-1],
         _synthetic_payload=expected_synthetic,
+        # Recovery-ness is its own structural signal, independent of the
+        # payload classification this test pins down.
+        _synthetic_recovery_turn=True,
         _directive_user_origin=False,
+        _directive_channel_origin=False,
     )
     # Provenance is unchanged by the split: either payload still renders as an
     # inject row, which is what stops the duplicate user bubble.

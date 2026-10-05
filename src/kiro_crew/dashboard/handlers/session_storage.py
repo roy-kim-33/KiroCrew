@@ -109,6 +109,32 @@ def _build_index(state: DashboardState | None = None) -> SessionIndex:
     )
 
 
+def _activation(state: DashboardState) -> "tuple[Any, Any] | None":
+    """The lock a resume maps a session under, and a read of the LIVE map it guards.
+
+    ``SessionMap.set`` runs under ``session_map._MAP_LOCK``, and the live map applies a
+    mapping at once while its file write is deferred, so this read sees a resume the
+    file does not show yet. ``None`` when the gateway has no live map to read.
+    """
+    from kiro_crew.session_map import _MAP_LOCK
+
+    live = getattr(getattr(state, "sessions", None), "_session_map", None)
+    if live is None or not callable(getattr(live, "mapped_sids_by_key", None)):
+        return None
+
+    def live_index() -> SessionIndex:
+        mapping = live.mapped_sids_by_key()
+        return SessionIndex(
+            stem_to_sid={
+                stem: sid for key, sid in mapping.items() for stem in transcript_stems(key)
+            },
+            active_sids=frozenset(mapping.values()),
+            live_sids=frozenset(),
+        )
+
+    return _MAP_LOCK, live_index
+
+
 def _map_token() -> tuple[int, int, int] | None:
     """Identity of the session map file, or ``None`` when it cannot be read.
 
@@ -128,10 +154,9 @@ class _MapBackedRefresh:
     """A ``refresh`` for :func:`move_to_trash` that is cheap to call repeatedly.
 
     ``move_to_trash`` calls ``refresh`` once per selected session, because the
-    index is the only place a resume that merely READS an old transcript shows up
-    (#7118): such a resume writes nothing, so the mtime guard inside the move loop
-    cannot see it, and the session's history would be staged out from under a live
-    slot.
+    index is the only place a resume that merely READS an old transcript shows up:
+    such a resume writes nothing, so the mtime guard inside the move loop cannot see
+    it, and the session's history would be staged out from under a live slot.
 
     Rebuilding per session cannot be paid for directly. :func:`_build_index` reads
     and parses the whole session map — about 0.26 ms even for a 100-entry map,
@@ -359,6 +384,7 @@ async def api_session_storage_cleanup(request: web.Request) -> web.Response:
             # request — a shared one would serve a later request an index built
             # before it started.
             refresh=_MapBackedRefresh(),
+            activation=_activation(state),
         )
     except SessionStorageError as exc:
         return _refused(exc, "cleanup_refused")
@@ -629,8 +655,8 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
     )
     _empty_job = job
     # Resolve WHICH batches this destroys now, and UNDER the storage mutation lock.
-    # Both halves came from a finding: resolving it here at all (rather than letting
-    # the worker enumerate when it runs) is what stops a batch staged after the click
+    # Both halves matter: resolving it here at all (rather than letting the worker
+    # enumerate when it runs) is what stops a batch staged after the click
     # from being destroyed, and resolving it under the lock is what stops a batch that
     # is still being staged from being selected mid-write - which would make the delete
     # wait for staging and then destroy the finished batch, sessions and all. The byte
@@ -638,16 +664,16 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
     # the batches that will be deleted.
     #
     # It can also refuse - a named id that is not a batch, or one no longer staged -
-    # and an exception escaping here after the slot was claimed used to 500 the POST
+    # and an exception escaping here after the slot was claimed would 500 the POST
     # and leave a job that never finishes, making every later attempt a 409 for the
     # life of the process.
     try:
         targets, job.total_bytes, identities = await asyncio.to_thread(staged_targets, requested)
     except SessionStorageError as exc:
-        # A named id that is not a batch. Answered as the 400 it always was rather
-        # than as a job, because nothing was dispatched and the caller can fix the
-        # argument — and the slot goes back to whatever it held, so a refusal cannot
-        # discard an outcome the screen is still showing.
+        # A named id that is not a batch. Answered as a 400 rather than as a job,
+        # because nothing was dispatched and the caller can fix the argument — and
+        # the slot goes back to whatever it held, so a refusal cannot discard an
+        # outcome the screen is still showing.
         _empty_job = previous
         return _refused(exc, "empty_refused")
     except Exception:
@@ -666,11 +692,8 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
         job.done = True
         # Audited HERE because this return is the only outcome this request will have.
         # Every other path through this endpoint reaches the audit inside
-        # `_run_empty_job`, and before this PR an explicit selection reached it too --
-        # it dispatched on a failed snapshot rather than refusing. Failing closed is
-        # the right call, but it moved the request off the audited path, and an
-        # irreversible operation that leaves no record of having been ATTEMPTED is a
-        # worse hole than the one it closed.
+        # `_run_empty_job`. This leg refuses before dispatch, so without an audit here
+        # an irreversible operation would leave no record of having been ATTEMPTED.
         _sel().log_api_access(
             caller=_read_session_key(request),
             operation="session_storage.empty",
@@ -1039,6 +1062,7 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             # a shared one would serve a later request an index built before it
             # started.
             refresh=_MapBackedRefresh(),
+            activation=_activation(state),
         )
     except SessionStorageError as exc:
         # Audited before returning. A refusal from inside the move is the same

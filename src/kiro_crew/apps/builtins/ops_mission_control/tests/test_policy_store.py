@@ -154,9 +154,8 @@ class TestOutboundDestinationsAreOperatorOnly(_HomeIsolated):
       `POST /ledger/hygiene` (which the agent's own hygiene cron calls) performs the push.
     - `slack_channel` — where every incident title, diagnosis and resource name is mirrored.
 
-    Verified before fixing: writing `config.json` moved both, and `config.json` is neither
-    path-fenced (`is_sensitive_path`) nor shell-write-blocked
-    (`is_sensitive_bash_command("echo x > …")`).
+    Verified before fixing: writing `config.json` moved both, and `config.json` is not
+    path-fenced (`is_sensitive_path`).
     """
 
     def test_an_agent_write_cannot_move_the_ledger_remote(self):
@@ -501,14 +500,6 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
             "other's key, which on this file can restore a disabled autonomy ceiling",
         )
 
-    @unittest.skipUnless(
-        platform_compat.IS_POSIX,
-        "The observable invariant depends on the file lock actually excluding, and on Windows "
-        "`platform_compat.acquire_lock` is documented best-effort — `msvcrt.locking` failures "
-        "are swallowed — so two threads in one process are not reliably serialized there. The "
-        "single-acquisition property this test exists to protect is asserted "
-        "platform-independently by `test_the_ceiling_is_written_in_one_acquisition` below.",
-    )
     def test_the_two_halves_of_the_ceiling_commit_together(self):
         """`mode` and `autonomy_rules` are ONE decision, so a reader must never see a mix.
 
@@ -518,13 +509,27 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
         broader rules and authorize a provider write neither operator asked for. Each call was
         individually atomic, which is what made the gap read as safe. Found in review (GPT 5.6).
 
-        Asserted as an INVARIANT over observed states rather than by trying to hit the
-        interleaving: two writers alternate between two coherent (mode, rules) pairs, and every
-        snapshot a reader takes must be one of those two pairs — never a cross. Measured against
-        the split-write shape: 6751 torn reads, versus 0 here.
+        Asserted where the states become visible: the observation is taken INSIDE the write,
+        at each publish, so a published state cannot go unobserved. `atomic_write` replaces the
+        file by rename, so a published state is the ONLY thing an unsynchronised reader can
+        ever see — a reader either gets the old inode or the new one, never a half-written
+        document, which is why the reader below can be the publish hook itself. Every state
+        one `set_ceiling` publishes must therefore be one of the two coherent pairs, and the
+        two halves are atomic exactly when that holds for every publish.
+
+        This asserts the property for EVERY schedule rather than sampling schedules: a torn
+        read requires a published cross, so no arrangement of concurrent readers and writers
+        can observe one that this test does not see. The sibling
+        `test_the_ceiling_is_written_in_one_acquisition` counts lock ACQUISITIONS; this counts
+        published CONTENT, and a single acquisition that published twice would satisfy that one
+        and fail this one.
+
+        Runs on every platform: the property holds without the file lock having to exclude,
+        which is the one thing a POSIX-only skip here would be protecting — on Windows
+        `platform_compat.acquire_lock` is documented best-effort, because `msvcrt.locking`
+        failures are swallowed.
         """
         import json
-        import threading
 
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
 
@@ -534,44 +539,39 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
         pair_a = ("observe", narrow)
         pair_b = ("act", broad)
 
-        stop = threading.Event()
-        crosses: list[tuple] = []
-
-        def _writer(mode, rules):
-            while not stop.is_set():
-                policy_store.set_ceiling(mode=mode, rules=rules)
-
-        def _reader():
-            while not stop.is_set():
-                try:
-                    data = json.loads(policy_store.policy_path().read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue  # mid-replace; atomic_write means this is transient
-                observed = (data.get("mode"), data.get("autonomy_rules"))
-                if observed not in (pair_a, pair_b):
-                    crosses.append(observed)
-
         policy_store.set_ceiling(mode=pair_a[0], rules=pair_a[1])
-        threads = [
-            threading.Thread(target=_writer, args=pair_a),
-            threading.Thread(target=_writer, args=pair_b),
-            threading.Thread(target=_reader),
-        ]
-        for th in threads:
-            th.start()
-        # Bounded by ITERATIONS, not by a sleep: a fixed wall-clock window is the flake class
-        # `testing-conventions.md` warns about. 300 write rounds is ample to expose a torn pair.
-        for _ in range(300):
-            policy_store.set_ceiling(mode=pair_b[0], rules=pair_b[1])
-        stop.set()
-        for th in threads:
-            th.join(timeout=10)
 
+        published: list[tuple] = []
+        real_atomic_write = policy_store.atomic_write
+
+        def _observe_each_publish(path, content, **kwargs):
+            real_atomic_write(path, content, **kwargs)
+            # Read the FILE, not `content`: what a reader can see is whatever is at
+            # `policy_path()` once the rename has landed, which is the state under test.
+            data = json.loads(policy_store.policy_path().read_text(encoding="utf-8"))
+            published.append((data.get("mode"), data.get("autonomy_rules")))
+
+        with mock.patch.object(policy_store, "atomic_write", _observe_each_publish):
+            policy_store.set_ceiling(mode=pair_b[0], rules=pair_b[1])
+
+        # An empty list is a hook that never ran, not a ceiling that published nothing:
+        # without this the two assertions below both pass vacuously.
+        self.assertTrue(
+            published,
+            "no publish was observed at all — the hook never ran, so the assertions below "
+            "would pass without the write under test having happened",
+        )
+        crosses = [observed for observed in published if observed not in (pair_a, pair_b)]
         self.assertEqual(
-            crosses[:3],
+            crosses,
             [],
-            "a reader observed a mode/rules pair no writer ever committed — the two halves of "
-            f"the ceiling are not atomic ({len(crosses)} torn reads)",
+            "a published state is a mode/rules pair no caller ever committed — the two halves "
+            f"of the ceiling are not atomic (published {published})",
+        )
+        self.assertEqual(
+            published[-1],
+            pair_b,
+            "the ceiling this call asked for is not what the file ended up holding",
         )
 
     def test_the_ceiling_is_written_in_one_acquisition(self):
@@ -657,13 +657,12 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
 class TestPolicyLockdownOrdering(_HomeIsolated):
     """The ceiling's write must never publish a file it has not protected.
 
-    Ports the previous-store-survival recipe from
+    Ports the prior-store-survival recipe from
     ``test/test_aws_consent.py::TestGrantIsOnTheKeystoneFloor``: every failure
     inside ``atomic_write`` happens BEFORE the rename, so a transient lockdown
-    or write failure can no longer reach — let alone delete — the previous,
-    healthy ceiling (the old post-publish ``restrict_to_owner`` + unlink-on-
-    OSError shape silently reset the operator's autonomy policy on one lockdown
-    failure).
+    or write failure cannot reach — let alone delete — the healthy ceiling
+    already on disk (a post-publish ``restrict_to_owner`` plus unlink-on-OSError
+    silently resets the operator's autonomy policy on one lockdown failure).
     """
 
     def test_write_lockdown_precedes_content(self):
@@ -851,10 +850,10 @@ class TestTheCeilingIsNeverPublishedOverAFailedRead(_HomeIsolated):
         self.assertEqual(policy_store.read_mode("observe"), "act")
 
     def test_a_corrupt_ceiling_refuses_the_write_and_is_left_intact(self):
-        """#7805: a corrupt policy file is refused, never rewritten.
+        """A corrupt policy file is refused, never rewritten.
 
-        The old tolerance read an unparseable document as empty and let the
-        write publish over it -- and for THIS file a rewrite-from-empty reverts
+        Reading an unparseable document as empty and letting the write publish
+        over it is worse here than anywhere -- a rewrite-from-empty reverts
         every fenced key to a value the constrained party can influence, which
         is the exact bypass the keystone floor exists to prevent. A truncated
         document still holds the operator's keys verbatim; refusing keeps them
@@ -917,13 +916,11 @@ class TestTheCeilingIsNeverPublishedOverAFailedRead(_HomeIsolated):
         """A corrupt policy file must never GRANT prune authority.
 
         ``PRIMARY_KEY`` is the one operator-only key whose default is
-        permissive (True), so the lenient gate read turned a truncated policy
+        permissive (True), so a lenient gate read turns a truncated policy
         file into granted ledger-prune authority -- the corrupt file becoming
-        the key that unlocks destroying shared knowledge, the exact
-        corruption-enables-destruction failure #7805 removes. Found in review
-        (GPT 5.6), two rounds. Authority decisions now go through the STRICT
-        :func:`policy_store.read_authority`, and ``rotation.is_primary``
-        answers False when it cannot read its input.
+        the key that unlocks destroying shared knowledge. Authority decisions
+        go through the STRICT :func:`policy_store.read_authority`, and
+        ``rotation.is_primary`` answers False when it cannot read its input.
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import (
             policy_store,

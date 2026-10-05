@@ -10,10 +10,13 @@ had failed once on a cold cache or forty times in a row.
 This module is the missing durable fact: a per-server count of CONSECUTIVE
 failed probes, which the row then reports.
 
-It does NOT unmount the failing server -- see issue #6171. Three levers for that
-were implemented and each shown unsafe, because the generated agent config is
-simultaneously the mount decision and the only home for agent-scope MCP
-configuration. Nothing here writes any config file.
+``mcp_discovery.probe_all`` reads that count and stops spawning a server whose
+streak has crossed the threshold, so one wedging server is not re-started by
+every later discovery pass.
+
+It does NOT unmount the failing server. Every lever for that is unsafe, because
+the generated agent config is simultaneously the mount decision and the only home
+for agent-scope MCP configuration. Nothing here writes any config file.
 
 Nor does it ever write ``disabled``. That key is the USER's choice, living in
 ``~/.kiro/settings/mcp.json``; a count that flipped it would be
@@ -273,12 +276,12 @@ def _read() -> tuple[dict[str, dict[str, Any]], str]:
     try:
         raw = json.loads(data)
     except Exception:
-        # Deliberately NOT a list of exception types. Four review rounds found
-        # four different ones escaping successively wider tuples --
-        # ``JSONDecodeError``, then ``UnicodeDecodeError`` (a ValueError from the
-        # strict decode), then a plain ``ValueError`` from the scanner's own
-        # ``int()`` past ``sys.get_int_max_str_digits()``, then ``RecursionError``
-        # (a RuntimeError, not a ValueError at all) from a deeply nested
+        # Deliberately NOT a list of exception types. Successively wider tuples
+        # each leave one more escaping -- ``JSONDecodeError``, then
+        # ``UnicodeDecodeError`` (a ValueError from the strict decode), then a
+        # plain ``ValueError`` from the scanner's own ``int()`` past
+        # ``sys.get_int_max_str_digits()``, then ``RecursionError`` (a
+        # RuntimeError, not a ValueError at all) from a deeply nested
         # document. The classification here is a fact about the FILE, not about
         # which Python error happened to surface, so enumerating them is the bug.
         #
@@ -307,10 +310,12 @@ def _read() -> tuple[dict[str, dict[str, Any]], str]:
 def _load() -> dict[str, dict[str, Any]]:
     """Return the per-server records, or ``{}`` for any unreadable store.
 
-    Fails OPEN on purpose, and only READERS may use it. The records only ever ADD
-    a diagnostic to a row, so a store we cannot read must not be able to mislabel
-    anything -- an empty record set renders exactly as a fleet that has never
-    failed a probe.
+    Fails OPEN on purpose, and only READERS may use it. A store we cannot read must
+    not be able to mislabel anything -- an empty record set renders exactly as a
+    fleet that has never failed a probe. Failing open matters more now that a
+    record also keeps a server out of ``probe_all``'s spawn set: the open
+    direction is to probe everything, so an unreadable file cannot suppress the
+    whole fleet's probes.
 
     A mutation must NOT come through here: folding "cannot read" into "no records"
     and then saving replaces history with whatever this round happened to see. Use
@@ -353,9 +358,10 @@ def record_verdicts(verdicts: Iterable[tuple[str, str, str]]) -> None:
     disproves it. A status outside ``FAILING_STATUSES`` and not ``ok`` carries no
     verdict and is skipped, so it neither advances nor clears the count.
 
-    Returns nothing. Nothing acts on a crossing: this records a reading and the
-    row reports it. (An earlier revision returned the names whose MOUNT state
-    changed, for an unmount that is now issue #6171.)
+    Returns nothing, and changes no configuration. The crossing is acted on by
+    ``mcp_discovery.probe_all``, which stops spawning a crossed server's probe
+    (see ``docs/system-specs/modules/mcp-probe-quarantine.md`` §3); the server
+    stays mounted either way.
     """
     limit = threshold()
     if limit <= 0:

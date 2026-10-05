@@ -6,7 +6,7 @@
  * their current equivalents; unknown/current ids pass through unchanged.
  */
 import { describe, it, expect } from 'vitest'
-import { resolveLegacyHighlightId } from '../hooks/useSettingHighlight'
+import { LEGACY_EXACT_HIGHLIGHT_IDS, resolveLegacyHighlightId } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 
 describe('resolveLegacyHighlightId', () => {
@@ -46,6 +46,26 @@ describe('resolveLegacyHighlightId', () => {
     expect(resolveLegacyHighlightId('chat.pin-the-latest-prompt')).toBe('chat.pin-the-latest-turn')
   })
 
+  // The peer-session preview card was relabeled from "Remote instance sessions"
+  // back to "Remote crew sessions" when the remote-crew vocabulary was restored;
+  // registry ids derive from the label, so a bookmark saved against the old id
+  // would silently stop highlighting.
+  it('maps the peer-session preview id to its restored crew form', () => {
+    expect(resolveLegacyHighlightId('developer.remote-instance-sessions'))
+      .toBe('developer.remote-crew-sessions')
+  })
+
+  // The two About update switches were relabelled by what each one does.
+  it('maps the update switch ids to their current labels', () => {
+    expect(resolveLegacyHighlightId('about.auto-update-on-restart')).toBe('about.install-app-updates-automatically')
+    expect(resolveLegacyHighlightId('about.update-notifications')).toBe('about.update-the-gateway-automatically')
+  })
+
+  it('rewrites no id a registry row has now', () => {
+    const ids = new Set(SETTINGS_REGISTRY.map(e => e.id))
+    expect(LEGACY_EXACT_HIGHLIGHT_IDS.filter(id => ids.has(id))).toEqual([])
+  })
+
   it('every migrated target exists in the generated registry', () => {
     const ids = new Set(SETTINGS_REGISTRY.map(e => e.id))
     for (const legacy of [
@@ -53,6 +73,8 @@ describe('resolveLegacyHighlightId', () => {
       'voice.aws-profile', 'voice.aws-profile-2', 'voice.aws-region', 'voice.aws-region-2',
       'voice.aws-profile-polly', 'voice.aws-region-polly',
       'chat.pin-the-latest-prompt',
+      'developer.remote-instance-sessions',
+      'about.auto-update-on-restart', 'about.update-notifications',
     ]) {
       const target = resolveLegacyHighlightId(legacy)
       expect(ids.has(target), `${legacy} -> ${target} missing from registry`).toBe(true)
