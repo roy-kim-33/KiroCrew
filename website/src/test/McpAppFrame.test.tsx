@@ -5,6 +5,7 @@ import McpAppFrame from '../components/McpAppFrame'
 import type { McpAppRenderPayload } from '../lib/mcpAppSrcdoc'
 import { __resetRevealedForTests } from '../components/mcpAppReveal'
 import { useTheme } from '../hooks/useTheme'
+import { COLOR_TOKEN_MAP, readMcpAppStyleVariables } from '../lib/mcpAppTheme'
 
 function payload(over: Partial<McpAppRenderPayload> = {}): McpAppRenderPayload {
   return {
@@ -392,6 +393,79 @@ describe('McpAppFrame', () => {
       const reply = win.postMessage.mock.calls[0][0]
       expect(reply.id).toBe(9)
       expect(reply.error).toEqual({ code: -32602, message: 'missing tool name' })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('declares the message capability in ui/initialize', () => {
+    const { container } = renderWithProviders(<McpAppFrame payload={payload()} />)
+    const iframe = container.querySelector('iframe')!
+    const win = stubContentWindow(iframe)
+
+    dispatchFromApp({ jsonrpc: '2.0', id: 1, method: 'ui/initialize' }, win)
+
+    const reply = win.postMessage.mock.calls[0][0]
+    // A spec-conformant app gates sendMessage on this declaration, so it must
+    // say exactly what the backend accepts: text content blocks only.
+    expect(reply.result.hostCapabilities.message).toEqual({ text: {} })
+  })
+
+  it('relays ui/message to POST /api/mcp-apps/message and posts back the result', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ result: { isError: false } }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const { container } = renderWithProviders(<McpAppFrame payload={payload({ spool_id: 'b'.repeat(32), callback_secret: 'sekret-cap' })} />)
+      const iframe = container.querySelector('iframe')!
+      const win = stubContentWindow(iframe)
+
+      const content = [{ type: 'text', text: 'user clicked Acknowledge' }]
+      dispatchFromApp({ jsonrpc: '2.0', id: 11, method: 'ui/message', params: { role: 'user', content } }, win)
+      await vi.waitFor(() => expect(win.postMessage).toHaveBeenCalledTimes(1))
+
+      const relayCall = fetchMock.mock.calls.find((c) => c[0] === '/api/mcp-apps/message')!
+      const sent = JSON.parse((relayCall[1] as { body: string }).body)
+      // The callback capability is forwarded — the endpoint (not a gateway
+      // leg) authorizes on it, so the model-visible spool_id alone must
+      // never deliver.
+      expect(sent).toEqual({ spool_id: 'b'.repeat(32), callback_secret: 'sekret-cap', role: 'user', content })
+      const headers = (relayCall[1] as { headers: Record<string, string> }).headers
+      expect(headers['X-Session-Key']).toBe('slot-1')
+      const reply = win.postMessage.mock.calls[0][0]
+      expect(reply.id).toBe(11)
+      expect(reply.result).toEqual({ isError: false })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('maps a failed ui/message delivery to the in-band isError result, not a protocol error', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: 'session is closed' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const { container } = renderWithProviders(<McpAppFrame payload={payload()} />)
+      const iframe = container.querySelector('iframe')!
+      const win = stubContentWindow(iframe)
+
+      dispatchFromApp({ jsonrpc: '2.0', id: 12, method: 'ui/message', params: { role: 'user', content: [{ type: 'text', text: 'hi' }] } }, win)
+      await vi.waitFor(() => expect(win.postMessage).toHaveBeenCalledTimes(1))
+
+      const reply = win.postMessage.mock.calls[0][0]
+      expect(reply.id).toBe(12)
+      // The spec's sendMessage contract reports delivery failure via
+      // { isError: true } — the app can surface it — not a JSON-RPC error.
+      // The backend's reason rides along as a text block so the app can show
+      // the user WHY ("session is closed"), not just that it failed.
+      expect(reply.result).toEqual({ isError: true, content: [{ type: 'text', text: 'session is closed' }] })
+      expect(reply.error).toBeUndefined()
     } finally {
       vi.unstubAllGlobals()
     }
@@ -1142,5 +1216,278 @@ describe('McpAppFrame — host theme', () => {
     // (what a first-run boolean flag would produce under StrictMode's double
     // effect invocation) would show up here.
     expect(win.postMessage).not.toHaveBeenCalled()
+  })
+
+  // ── styles.variables on the wire (Tasks 5.1 / 5.2) ────────────────────────
+  //
+  // happy-dom resolves NO cascade (the sibling mcpAppTheme.test.ts documents
+  // this): getComputedStyle(documentElement) only reads back a custom property
+  // set INLINE on that same element. So to make the resolver's --color-* group
+  // resolve in full, seed documentElement.style with a complete color-token set
+  // BEFORE rendering — the styleVars memo reads at mount. Clear the inline style
+  // between tests so no seed leaks. The localStorage polyfill stays on
+  // Storage.prototype (per website/docs/testing.md); we do not touch it.
+
+  /** Every dashboard token name a color key reads. Derived from the map so the
+   *  seed set can never drift from what the resolver actually reads. */
+  const COLOR_TOKEN_NAMES = [
+    ...new Set(Object.values(COLOR_TOKEN_MAP).map((s) => s.name)),
+  ]
+
+  /** A benign, sanitizer-surviving hex per (token, salt). The exact value never
+   *  matters; distinct salts are how two seedings differ. */
+  function hexFor(name: string, salt: number): string {
+    let h = salt & 0xffffff
+    for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) & 0xffffff
+    return '#' + h.toString(16).padStart(6, '0')
+  }
+
+  /** Seed a complete valid color-token set inline on documentElement so the
+   *  resolver's color group resolves in full. */
+  function seedColorTokens(salt = 0) {
+    for (const name of COLOR_TOKEN_NAMES) {
+      document.documentElement.style.setProperty(name, hexFor(name, salt))
+    }
+  }
+
+  beforeEach(() => {
+    // A single wipe clears every seeded custom property before each test.
+    document.documentElement.removeAttribute('style')
+  })
+
+  // Property 9 (resolve path): the initialize reply's styles.variables equals
+  // readMcpAppStyleVariables() when the tokens resolve. Property 10: theme is
+  // still correct alongside styles. Validates: Requirements 1.1, 1.2, 6.1.
+  it('carries the resolved styles.variables (and the theme) in the initialize reply', () => {
+    localStorage.setItem('mc-theme', 'dark')
+    seedColorTokens()
+    const expected = readMcpAppStyleVariables()
+    expect(expected).not.toBeNull()
+
+    const { container } = renderWithProviders(<McpAppFrame payload={payload()} />)
+    const win = stubContentWindow(container.querySelector('iframe')!)
+    const ctx = initReply(win).result.hostContext
+
+    expect(ctx.styles.variables).toEqual(expected)
+    // Property 10: mode survives alongside the palette.
+    expect(ctx.theme).toBe('dark')
+  })
+
+  // Property 9 (omission path) + Property 10: when the color group cannot
+  // resolve AND getComputedStyle yields nothing usable, styles is absent, yet
+  // theme is still reported. Validates: Requirements 1.6, 1.2.
+  it('omits styles when variables do not resolve, keeping theme', () => {
+    localStorage.setItem('mc-theme', 'light')
+    // Force the resolver down its null path so `styles` is fully absent. A throw
+    // is used rather than simply leaving the document unseeded because it is the
+    // one input that makes the resolver return null regardless of which tokens
+    // happen to resolve.
+    const spy = vi
+      .spyOn(window, 'getComputedStyle')
+      .mockImplementation(() => {
+        throw new Error('boom')
+      })
+    try {
+      expect(readMcpAppStyleVariables()).toBeNull()
+      const { container } = renderWithProviders(<McpAppFrame payload={payload()} />)
+      const win = stubContentWindow(container.querySelector('iframe')!)
+      const ctx = initReply(win).result.hostContext
+
+      expect(ctx.styles).toBeUndefined()
+      // Property 10: theme is reported whether or not styles is present.
+      expect(ctx.theme).toBe('light')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // Property 15: styles.css is NEVER present on any payload — not the initialize
+  // reply, not a notification. Validates: Requirements 5.3.
+  it('never sends a styles.css key on any payload', () => {
+    localStorage.setItem('mc-theme', 'dark')
+    seedColorTokens()
+    function ThemeFlip() {
+      const { setTheme } = useTheme()
+      return <button onClick={() => setTheme('light')}>flip</button>
+    }
+    const { container, getByText } = renderWithProviders(
+      <><ThemeFlip /><McpAppFrame payload={payload()} /></>,
+    )
+    const win = stubContentWindow(container.querySelector('iframe')!)
+    initReply(win)
+    // Also drive a notification so both send sites are covered.
+    act(() => { getByText('flip').click() })
+
+    for (const [msg] of win.postMessage.mock.calls) {
+      const styles = msg?.result?.hostContext?.styles ?? msg?.params?.styles
+      if (styles) expect(styles.css).toBeUndefined()
+    }
+  })
+
+  // Property 17: a throwing getComputedStyle still yields a well-formed reply —
+  // styles omitted, but theme / displayMode / availableDisplayModes /
+  // containerDimensions all present. Validates: Requirements 6.4.
+  it('degrades to a well-formed reply when getComputedStyle throws', () => {
+    localStorage.setItem('mc-theme', 'dark')
+    const spy = vi
+      .spyOn(window, 'getComputedStyle')
+      .mockImplementation(() => {
+        throw new Error('boom')
+      })
+    try {
+      // The resolver takes its null path.
+      expect(readMcpAppStyleVariables()).toBeNull()
+      const { container } = renderWithProviders(<McpAppFrame payload={payload()} />)
+      const win = stubContentWindow(container.querySelector('iframe')!)
+      const ctx = initReply(win).result.hostContext
+
+      expect(ctx.styles).toBeUndefined()
+      // The rest of the hostContext is intact — the throw did not corrupt it.
+      expect(ctx.theme).toBe('dark')
+      expect(ctx.displayMode).toBe('inline')
+      expect(ctx.availableDisplayModes).toEqual(['inline', 'fullscreen'])
+      expect(ctx.containerDimensions.maxHeight).toBe(1200)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // Property 20: the mode and the palette are NEVER posted out of step.
+  //
+  // `applyTheme` writes `data-theme` / `data-mode` in a ThemeProvider EFFECT,
+  // while `theme` changes during RENDER — and React flushes child effects before
+  // parent ones. So a frame that derived its palette from `theme` re-read
+  // getComputedStyle one commit too early and posted the NEW mode beside the OLD
+  // palette, which the app painted for a frame. Keying the snapshot on
+  // `themeVersion` (bumped by the same effect, after the write) is what closes it.
+  //
+  // happy-dom resolves no cascade, so the mock below IS the cascade: it answers
+  // from whatever `data-mode` is on the element at the moment of the read, which
+  // makes an early read observable as a mismatched pair rather than invisible.
+  // Validates: Requirements 4.2, 1.2.
+  it('never pairs a new mode with the previous palette on a mode switch', async () => {
+    localStorage.setItem('mc-theme', 'dark')
+    const saltFor = (mode: string) => (mode === 'light' ? 1 : 0)
+    const spy = vi.spyOn(window, 'getComputedStyle').mockImplementation(((el: Element) => {
+      if (el === document.documentElement) {
+        const salt = saltFor(document.documentElement.dataset.mode ?? 'dark')
+        return {
+          getPropertyValue: (n: string) => hexFor(n, salt),
+        } as unknown as CSSStyleDeclaration
+      }
+      return { getPropertyValue: () => '' } as unknown as CSSStyleDeclaration
+    }) as typeof window.getComputedStyle)
+    try {
+      function ThemeFlip() {
+        const { setTheme } = useTheme()
+        return <button onClick={() => setTheme('light')}>flip</button>
+      }
+      const { container, getByText } = renderWithProviders(
+        <><ThemeFlip /><McpAppFrame payload={payload()} /></>,
+      )
+      const win = stubContentWindow(container.querySelector('iframe')!)
+      initReply(win)
+
+      await act(async () => { getByText('flip').click() })
+
+      // Every payload that carries both halves must carry them in agreement:
+      // --color-background-primary reads --bg, so its value pins which palette
+      // the variables were resolved from.
+      const pairs = win.postMessage.mock.calls
+        .map(([m]) => m)
+        .map((m) => ({
+          theme: m?.result?.hostContext?.theme ?? m?.params?.theme,
+          vars: m?.result?.hostContext?.styles?.variables ?? m?.params?.styles?.variables,
+        }))
+        .filter((p) => p.theme && p.vars)
+      expect(pairs.length).toBeGreaterThan(0)
+      for (const { theme: sentTheme, vars } of pairs) {
+        expect(
+          vars['--color-background-primary'],
+          `theme "${sentTheme}" was sent with the other mode's palette`,
+        ).toBe(hexFor('--bg', saltFor(sentTheme)))
+      }
+      // Not vacuous: the switch really did reach the app.
+      expect(pairs.some((p) => p.theme === 'light')).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  // ── live palette updates ─────────────────────────────────────────
+  //
+  // A color-theme switch at constant mode bumps `themeVersion` (setColorTheme →
+  // colorTheme state change → the apply effect calls bumpThemeVersion), which
+  // re-runs the styleVars memo. Under happy-dom the memo re-reads the INLINE
+  // seeds, so re-seeding to different values before the setter runs is what makes
+  // the resolved palette actually differ — which is what the gate
+  // (themeContextKey over theme+styleVars) compares.
+
+  /** Sibling consumer that flips the color theme through the real setter. */
+  function PaletteFlip({ to }: { to: string }) {
+    const { setColorTheme } = useTheme()
+    return <button onClick={() => setColorTheme(to)}>palette</button>
+  }
+
+  // Property 12: a palette change reaches a mounted app — exactly one
+  // host-context-changed carrying the NEW palette. Validates: Requirements 4.2.
+  it('posts exactly one host-context-changed carrying the new palette on a color-theme switch', () => {
+    localStorage.setItem('mc-theme', 'dark')
+    seedColorTokens(0)
+    const before = readMcpAppStyleVariables()!
+
+    const { container, getByText } = renderWithProviders(
+      <><PaletteFlip to="monokai" /><McpAppFrame payload={payload()} /></>,
+    )
+    const win = stubContentWindow(container.querySelector('iframe')!)
+    initReply(win)
+    win.postMessage.mockClear()
+
+    // Re-seed to a DIFFERENT palette, then flip the color theme at the SAME mode.
+    // The color-theme change bumps themeVersion, re-running the memo against the
+    // new inline seeds so the resolved palette genuinely differs.
+    const after = (() => {
+      seedColorTokens(0x555555)
+      return readMcpAppStyleVariables()!
+    })()
+    expect(after).not.toEqual(before) // the seeding actually changed the palette
+    // Re-seed inside act as well, so the memo's read during the re-render sees
+    // the new values regardless of batching.
+    act(() => {
+      seedColorTokens(0x555555)
+      getByText('palette').click()
+    })
+
+    const notes = win.postMessage.mock.calls
+      .map(([m]) => m)
+      .filter((m) => m?.method === 'ui/notifications/host-context-changed')
+    expect(notes.length).toBe(1)
+    expect(notes[0].params.styles.variables).toEqual(after)
+    // The mode did not change with the palette.
+    expect(notes[0].params.theme).toBe('dark')
+  })
+
+  // Property 13: an identical palette posts nothing — themeVersion bumps (a
+  // color-theme switch) but every resolved value is unchanged, so the
+  // sentThemeKeyRef gate suppresses the notification. Validates: Requirements 4.5.
+  it('posts nothing when the palette is unchanged despite a themeVersion bump', () => {
+    localStorage.setItem('mc-theme', 'dark')
+    seedColorTokens(0)
+
+    const { container, getByText } = renderWithProviders(
+      <><PaletteFlip to="monokai" /><McpAppFrame payload={payload()} /></>,
+    )
+    const win = stubContentWindow(container.querySelector('iframe')!)
+    initReply(win)
+    win.postMessage.mockClear()
+
+    // Flip the color theme WITHOUT re-seeding: themeVersion bumps and the memo
+    // re-runs, but it reads the same inline values, so styleVars is identical.
+    act(() => { getByText('palette').click() })
+
+    const notes = win.postMessage.mock.calls
+      .map(([m]) => m)
+      .filter((m) => m?.method === 'ui/notifications/host-context-changed')
+    expect(notes).toEqual([])
   })
 })

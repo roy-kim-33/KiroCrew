@@ -77,6 +77,13 @@ class FakeSessions:
         self.opted_out: dict = {}
         self.mirror_links: dict = {}
         self.origin_links: dict = {}
+        self.reserved_generations: list[str] = []
+
+    def reserve_generation(self, session_key: str) -> None:
+        self.reserved_generations.append(session_key)
+
+    async def aflush(self) -> None:
+        return None
 
     def is_busy(self, key) -> bool:
         return self._busy
@@ -201,7 +208,7 @@ class TestCommandCatalogue:
 
     def test_the_help_card_does_not_promise_queueing(self) -> None:
         # WeCom cannot hold a message: a reply is addressed by the inbound req_id.
-        # The card used to advertise "answered after the current turn", which the
+        # The card must not advertise "answered after the current turn", which the
         # busy dispatcher then refuses.
         card = build_help_text()
         assert "/queue" in card, "the prefix is still worth documenting"
@@ -474,6 +481,50 @@ class TestStop:
         assert any("已停止" in s for s in client.said)
 
     @pytest.mark.asyncio
+    async def test_stop_is_declined_while_the_session_compacts(self) -> None:
+        provider = FakeProvider()
+        client = FakeClient()
+        sessions = FakeSessions(provider, busy=True)
+        sessions.is_compacting = lambda key: True
+        d = _dispatcher(sessions, client)
+
+        await d.handle_message(_inbound("/stop"))
+
+        assert provider.cancelled is False
+        assert any("nothing was stopped" in s for s in client.said)
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_stop_while_compacting_forces_through_the_queue_keeping_helper(
+        self, monkeypatch
+    ) -> None:
+        """Under a unified ``dm_scope`` the key is shared with channels that queue;
+        the second press forces through ``force_stop_keeping_others``."""
+        from kiro_crew import session_lifecycle as sl
+        from kiro_crew.wecom import transport_dispatch as td
+
+        sl._stop_declined_markers.clear()
+        provider = FakeProvider()
+        client = FakeClient()
+        sessions = FakeSessions(provider, busy=True)
+        sessions.is_compacting = lambda key: True
+        d = _dispatcher(sessions, client)
+        calls: list = []
+
+        async def _helper(sess, key, owned_by):
+            calls.append((key, owned_by))
+            return True
+
+        monkeypatch.setattr(td, "force_stop_keeping_others", _helper)
+
+        await d.handle_message(_inbound("/stop"))
+        assert calls == [], "first press is declined"
+        await d.handle_message(_inbound("/stop"))
+        assert len(calls) == 1
+        assert calls[0][1]({"queued_owner": "telegram-bob"}) is False
+        assert any(td._STOPPED_TEXT in s for s in client.said)
+        sl._stop_declined_markers.clear()
+
+    @pytest.mark.asyncio
     async def test_stop_with_nothing_running_says_so(self) -> None:
         client = FakeClient()
         d = _dispatcher(FakeSessions(FakeProvider(), busy=False), client)
@@ -585,11 +636,13 @@ class TestACaptionIsNeverACommand:
 
         monkeypatch.setattr("kiro_crew.wecom.transport_dispatch.drive_turn", fake_drive_turn)
         client = FakeClient()
-        d = _dispatcher(FakeSessions(), client)
+        sessions = FakeSessions()
+        d = _dispatcher(sessions, client)
 
         await d.handle_message(_inbound("/new"))
 
         assert client.said == ["✅ 已开始新对话"]
+        assert sessions.reserved_generations == [d._session_key("Wei")]
         assert not drove, "a bare command must not become a turn"
 
 

@@ -26,6 +26,7 @@ import http.server
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -175,8 +176,23 @@ async def _grant_internal_auth(request: web.Request, handler):
     return await handler(request)
 
 
+@web.middleware
+async def _owner_dashboard_identity(request: web.Request, handler):
+    """Stand in for the owner's dashboard cookie on the browser-called config route.
+
+    ``PUT /api/computer-use/config`` is owner-gated, so the Settings panel these
+    cases model carries ``app == ""`` and the owner's subject. With no
+    ``owner_id`` configured, the signed local bootstrap subject is the owner.
+    """
+    if request.path == "/api/computer-use/config":
+        request["user"] = "local-app"
+        request["app"] = ""
+    return await handler(request)
+
+
 def _make_app() -> web.Application:
-    app = web.Application(middlewares=[_grant_internal_auth])
+    app = web.Application(middlewares=[_grant_internal_auth, _owner_dashboard_identity])
+    app["state"] = SimpleNamespace(owner_id="")
     app.router.add_get("/api/computer-use/config", cu_api.api_computer_use_config_get)
     app.router.add_put("/api/computer-use/config", cu_api.api_computer_use_config_save)
     app.router.add_post("/api/computer-use/invoke", cu_api.api_computer_use_invoke)
@@ -855,22 +871,15 @@ class TestConfigSection:
         assert "computer_use" in KiroCrewConfig.load().to_dict()
 
     def test_state_path_is_on_the_keystone_floor(self):
+        from kiro_crew import sandbox
         from kiro_crew.config.loader import computer_use_state_path
-        from kiro_crew.security import (
-            _CREW_SECRET_LEAVES,
-            is_sensitive_bash_command,
-            is_sensitive_path,
-        )
+        from kiro_crew.security import _CREW_SECRET_LEAVES, is_sensitive_path
 
         assert "computer_use.json" in _CREW_SECRET_LEAVES
         assert computer_use_state_path().name == "computer_use.json"
         assert is_sensitive_path("~/.kiro/crew/computer_use.json") is True
-        for command in (
-            "cat ~/.kiro/crew/computer_use.json",
-            "echo x > ~/.kiro/crew/computer_use.json",
-            "tee ~/.kiro/crew/computer_use.json",
-        ):
-            assert is_sensitive_bash_command(command)
+        # The shell plane is sealed by the sandbox, not matched by text.
+        assert "computer_use.json" in sandbox._CREW_READONLY_LEAVES
 
 
 # ── POST /api/computer-use/frame — the live-view (PiP) ingress ──
@@ -1378,7 +1387,7 @@ class TestAnAppTokenCannotWriteTheKeystone:
     ``enable_state.save_state`` deliberately bypasses ``is_sensitive_path`` — that is
     what lets the operator's own Settings panel write a file the agent cannot read or
     write with a tool. So this handler is the only thing standing between an
-    App-Kit-scoped token and ``enabled: true``. It used to check nothing at all:
+    App-Kit-scoped token and ``enabled: true``. Checking nothing is unsafe:
     ``request["user"]`` is truthy for an app token too, and an app whose manifest
     declares ``permissions.api: ["/api/computer-use"]`` passes
     ``app_token_path_allowed`` (verified: a bare ``/api/computer-use`` pattern matches
@@ -1436,7 +1445,7 @@ class TestAnAppTokenCannotWriteTheKeystone:
 class TestMixedSaveIsAllOrNothing:
     """A mixed state+limits PUT must not half-apply (reviewer finding).
 
-    The keystone write lands first, so a corrupt ``config.json`` used to leave the
+    The keystone write lands first, so a corrupt ``config.json`` can leave the
     SECURITY state applied — the feature enabled, or the real-pointer opt-in set —
     while the response told the operator the save had failed. The ceiling had moved
     and nothing said so.
@@ -1736,7 +1745,7 @@ class TestEnableRestartsSessions:
 
         ``api_computer_use_config_save`` imports ``rebuild_agent_config`` inside the
         function. Hoisting it to module scope would bind the name at import time,
-        so patching ``kiro_crew.agent`` would no longer reach this call site — and
+        so patching ``kiro_crew.agent`` would not reach this call site — and
         the guard above would keep passing while every enable-flipping test wrote
         the operator's real ``~/.kiro/agents`` again.
 
@@ -1938,7 +1947,7 @@ class TestErrorCodes:
 
     @pytest.mark.asyncio
     async def test_an_integer_limit_out_of_range_is_a_different_code(self, home: Path) -> None:
-        """The distinction a caller could not previously make without matching English.
+        """The distinction a caller cannot make without matching English.
 
         A value of the right type that is simply too large is a different refusal
         from a value of the wrong type, and only the code separates them.

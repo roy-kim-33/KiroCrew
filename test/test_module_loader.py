@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from skill_script_helpers import no_bytecode
 
 from kiro_crew.apps.module_loader import (
     _module_namespace,
@@ -39,6 +40,56 @@ def _explicit_third_party_execution_admission(monkeypatch) -> None:
     """Most loader tests exercise isolation, so opt them in explicitly."""
     monkeypatch.setattr(
         "kiro_crew.apps.execution.third_party_execution_allowed", lambda: True
+    )
+
+
+@pytest.fixture(autouse=True)
+def _throwaway_modules_leave_no_bytecode(tmp_path: Path):
+    """The app modules these tests write under ``tmp_path`` compile to NO ``.pyc``.
+
+    ``load_app_module`` imports through a ``SourceFileLoader``, which persists
+    bytecode at ``importlib.util.cache_from_source()``. The rootdir conftest
+    points that at a per-user cache (``sys.pycache_prefix``) so the checkout
+    stays clean -- but the prefix MIRRORS the source's absolute path, and a
+    ``tmp_path`` module's absolute path is unique per run (``pytest-<n>`` rotates),
+    so every run left one more dead mirror tree on the operator's disk: 100
+    ``pytest-<n>`` trees and 14,816 orphaned ``.pyc`` files, 5.3 GB, measured on
+    one developer host. Nothing ever removes them because nothing owns them.
+
+    ``sys.dont_write_bytecode`` is the interpreter seam the loader reads, and it
+    is what the suite already uses for by-path imports of the checkout's own
+    scripts (``skill_script_helpers.no_bytecode``). A per-test ``pycache_prefix``
+    under ``tmp_path`` would also work here but doubles the path length of every
+    cached module, which the Windows shard's 260-character cap does not absorb.
+
+    The teardown asserts the property rather than trusting the flag: a ``.pyc``
+    for a ``tmp_path`` source that is NEWER than this test started means bytecode
+    was persisted somewhere, so a regression is a red test and not a directory
+    growing on someone's disk. Mtime-gated because a stale mirror entry from an
+    EARLIER run can legitimately sit at the same cache path.
+    """
+    import importlib.util
+    import time
+
+    # Two seconds of slack for filesystems that store mtime at whole-second
+    # granularity; a stale entry from an earlier run is minutes older than that.
+    started_ns = time.time_ns() - 2_000_000_000
+    with no_bytecode():
+        yield
+    persisted = []
+    for source in tmp_path.rglob("*.py"):
+        cached = Path(importlib.util.cache_from_source(str(source)))
+        if cached.is_relative_to(tmp_path):
+            continue  # pytest owns it; it dies with the test's directory
+        try:
+            fresh = cached.stat().st_mtime_ns >= started_ns
+        except OSError:
+            continue
+        if fresh:
+            persisted.append(str(cached))
+    assert not persisted, (
+        "bytecode for a throwaway tmp_path module was persisted outside tmp_path: "
+        f"{persisted}"
     )
 
 
@@ -340,6 +391,7 @@ class TestModuleUnload:
     def test_reload_after_unload_gets_fresh_code(self, tmp_path: Path) -> None:
         """After unload, re-loading gets fresh module code."""
         import importlib
+        import importlib.util
         import uuid
         work_dir = tmp_path / uuid.uuid4().hex
         work_dir.mkdir()
@@ -351,13 +403,13 @@ class TestModuleUnload:
 
         unload_app_modules("test-app-reload")
 
-        # Update the file — also invalidate any bytecode cache
+        # Update the file: also invalidate any bytecode cache. Located through
+        # cache_from_source, which honours sys.pycache_prefix (the suite redirects
+        # bytecode off the checkout), rather than assuming a sibling __pycache__/.
         mod_path.write_text("def func(ctx): return 'v2'")
-        # Remove __pycache__ if it exists
-        pycache = work_dir / "__pycache__"
-        if pycache.exists():
-            import shutil
-            shutil.rmtree(pycache)
+        cached = Path(importlib.util.cache_from_source(str(mod_path)))
+        if cached.exists():
+            cached.unlink()
         # Invalidate importlib caches
         importlib.invalidate_caches()
 
@@ -368,7 +420,7 @@ class TestModuleUnload:
 
 
 # ---------------------------------------------------------------------------
-# Issue #6078: a multi-module app backend must be able to import its own siblings
+# A multi-module app backend must be able to import its own siblings
 # ---------------------------------------------------------------------------
 
 
@@ -704,13 +756,13 @@ def test_deploy_skill_install_replaces_managed_dir(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# resolve_loaded_callable — gone-app shutdown (issue #7880 reconciler teardown)
+# resolve_loaded_callable — gone-app shutdown (reconciler teardown)
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_loaded_callable_survives_deleted_files(tmp_path, monkeypatch):
     """GPT [BLOCKING]: CLI uninstall deletes an app's files, so the disk loader
-    can no longer resolve its on_shutdown -- yet the module the gateway imported
+    cannot resolve its on_shutdown -- yet the module the gateway imported
     is still resident in sys.modules and a task its on_startup spawned is still
     live. resolve_loaded_callable resolves the callable from that cached module
     so trust revocation can still run on_shutdown, where load_app_module (disk)
@@ -776,10 +828,10 @@ def test_cached_shutdown_callable_survives_uninstall_of_uncached_module():
 
 
 def test_clear_all_shutdown_callables_drops_the_whole_cache():
-    """GPT round-9: the gateway teardown sweep does not go through per-app
+    """The gateway teardown sweep does not go through per-app
     unload_app_modules, so it must drop the whole shutdown cache -- otherwise a
-    callable captured this generation survives into an in-process restart and is
-    used to stop a NEWLY loaded worker."""
+    callable captured this generation survives into an in-process restart and
+    could stop a NEWLY loaded worker."""
     import kiro_crew.apps.module_loader as ml
 
     ml._shutdown_callables.clear()

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { render, screen, act, fireEvent } from '@testing-library/react'
 import ChatFooter, { pickDistinct, resolveLoader, resolveLoaderIcons, SwapCarousel, STREAM_IDLE_MS } from '../pages/chat/ChatFooter'
 import { GHOST_POSE_ICONS, GHOST_POSE_URLS } from '../components/GhostPoses'
 import { registerThemeBranding } from '../themeBranding'
@@ -80,6 +80,51 @@ describe('ChatFooter', () => {
   it('shows compacting indicator', () => {
     render(<ChatFooter {...base} running={true} state="compacting" lastRole="user" />)
     expect(screen.getByText(/Compacting…/)).toBeInTheDocument()
+  })
+
+  // #13779: the plain running state must be readable to assistive tech and must
+  // never be a row of broken-image glyphs. The ghosts are the visible indicator;
+  // "Thinking…" is visually hidden and shows only when the art cannot paint.
+  it('keeps a localized "Thinking…" label for screen readers, visually hidden', () => {
+    render(<ChatFooter {...base} running={true} lastRole="user" />)
+    expect(screen.getByText('Thinking…')).toHaveClass('sr-only')
+  })
+
+  it('exposes the running indicator as an accessible status', () => {
+    render(<ChatFooter {...base} running={true} lastRole="user" />)
+    // role=status carries an accessible name even though the pose art is
+    // aria-hidden, so a screen reader announces the turn is in progress.
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
+  })
+
+  it('shows the ghosts, not visible text, while the art loads', () => {
+    const { container } = render(<ChatFooter {...base} running={true} lastRole="user" />)
+    expect(container.querySelector('.csb4')).toBeInTheDocument()
+    expect(screen.getByText('Thinking…')).toHaveClass('sr-only')
+  })
+
+  it('swaps the ghosts for visible text when a pose image fails to load', () => {
+    const { container } = render(<ChatFooter {...base} running={true} lastRole="user" />)
+    const img = container.querySelector('.csb4 img')!
+    act(() => { fireEvent.error(img) })
+    expect(container.querySelector('.csb4')).toBeNull()
+    expect(screen.getByText('Thinking…')).not.toHaveClass('sr-only')
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
+  })
+
+  // A throwing theme loader renders nothing, and the emptied art wrapper unhides
+  // the label via peer-empty (jsdom has no Tailwind, so assert the wiring).
+  it('shows visible text when the theme artwork fails closed', () => {
+    const Boom = () => { throw new Error('theme loader exploded') }
+    registerThemeBranding({ 'seam-13779-boom': { loader: Boom } })
+    document.documentElement.setAttribute('data-theme', 'seam-13779-boom-dark')
+    render(<ChatFooter {...base} running={true} lastRole="user" />)
+    const label = screen.getByText('Thinking…')
+    expect(label).toHaveClass('peer-empty:not-sr-only')
+    const art = label.previousElementSibling
+    expect(art).toHaveClass('peer')
+    expect(art).toBeEmptyDOMElement()
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
   })
 
   it('renders 4 slots, each with both cross-fade layers', () => {
@@ -163,7 +208,7 @@ describe('loader — theme seam', () => {
 
   it('resolves stock symbols selected by an installed theme manifest', () => {
     const names = ['star', 'sparkles', 'moon', 'cloud'] as const
-    expect(resolveLoaderIcons('custom-pearce-crt', names)).toEqual(
+    expect(resolveLoaderIcons('custom-pearce-crt', { loaderIcons: names })).toEqual(
       names.map(name => THEME_LOADER_ICONS[name]),
     )
   })
@@ -173,13 +218,39 @@ describe('loader — theme seam', () => {
     ['too few symbols', ['star', 'sparkles', 'moon']],
     ['duplicate symbols', ['star', 'sparkles', 'moon', 'star']],
   ])('falls back safely for manifest pools with %s', (_case, names) => {
-    expect(resolveLoaderIcons('custom-broken', names)).toBe(GHOST_POSE_ICONS)
+    expect(resolveLoaderIcons('custom-broken', { loaderIcons: names })).toBe(GHOST_POSE_ICONS)
   })
 
   it('keeps a trusted compiled custom loader ahead of manifest symbols', () => {
     registerThemeBranding({ 'seam-manifest-precedence': { loader: CustomLoader } })
-    const got = resolveLoader('seam-manifest-precedence', ['star', 'sparkles', 'moon', 'cloud'])
+    const got = resolveLoader('seam-manifest-precedence', { loaderIcons: ['star', 'sparkles', 'moon', 'cloud'] })
     expect(got.kind).toBe('custom')
+  })
+
+  // Installed packs (this PR): custom loader images (one on its own, or cycled).
+  it('resolves an installed pack’s own raster loader images', () => {
+    const got = resolveLoaderIcons(
+      'custom-reef',
+      { loaderImages: ['loader/a.png', 'loader/b.webp', 'loader/c.png', 'loader/d.png'] },
+    )
+    expect(got.length).toBe(4)
+    const { container } = render(<>{got.map((Ic, i) => <Ic key={i} />)}</>)
+    const imgs = container.querySelectorAll('img')
+    expect(imgs.length).toBe(4)
+    expect(imgs[0].getAttribute('src')).toBe('/api/theme/reef/assets/loader/a.png')
+  })
+
+  it('renders an installed pack’s single loader image on its own (self-animating)', () => {
+    const got = resolveLoader('custom-reef', { loaderImages: ['loader/spin.webp'] })
+    expect(got.kind).toBe('image')
+    expect(got.kind === 'image' && got.src).toBe('/api/theme/reef/assets/loader/spin.webp')
+  })
+
+  it('cycles an installed pack’s multiple loader images through the carousel', () => {
+    const got = resolveLoader('custom-reef', {
+      loaderImages: ['loader/a.svg', 'loader/b.gif', 'loader/c.png', 'loader/d.webp'],
+    })
+    expect(got.kind).toBe('icons')
   })
 
   it('renders a registered theme’s icons in the footer', () => {

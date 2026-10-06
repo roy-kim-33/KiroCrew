@@ -6,12 +6,18 @@ created: 2026-07-29
 last-audited: 2026-08-19
 audited-at: cdd8b301
 doc-pr: 807
-implementation-prs: []
+implementation-prs: [2961, 3235, 3258, 3386, 3659, 3779, 4574, 4587]
 tracking-issues: [581]
 supersedes: []
 superseded-by: []
 ---
 # RFC: Official App Registry + Editorial Feed
+
+> **Current behaviour: see [`../system-specs/modules/app-kit-platform.md`](../system-specs/modules/app-kit-platform.md)**
+> for the official-catalog and editorial surface that ships. Signature
+> verification and tombstone resolution are deliberately absent and fail
+> closed. §4 carries its own revision note naming the four category decisions
+> reversed in the sibling `KiroCrewApps` repo.
 
 **Author:** KiroCrew contributors
 **Date:** 2026-07-29
@@ -28,7 +34,7 @@ release. Two concrete gaps:
 
 1. **No first-party remote registry.** The curated catalog is the bundled
    `kiro_crew/apps/app-registry.json`, compiled into the wheel next to
-   `registry.py` (`_REGISTRY_FILE`). Changing the catalog — adding an app,
+   `registry.py` (read through `_REGISTRY_FILE`, `apps/registry_pipeline/sources.py`). Changing the catalog — adding an app,
    fixing a repo URL, pulling a broken one — requires shipping a new app
    release. User-configured *external* registries exist
    (`ExternalRegistryConfig`: `name`/`repo`/`branch`, git-clone based) but are

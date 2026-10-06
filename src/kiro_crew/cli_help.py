@@ -44,6 +44,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("logs", "Show gateway logs"),
             ("token", "Print a dashboard access URL with auth token"),
             ("logout", "Revoke all active dashboard sessions"),
+            ("ledger-sweep", "List finished session/work ledgers; --purge deletes them"),
             ("update", "Update Kiro Crew to the latest version"),
         ),
     ),
@@ -89,6 +90,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("secrets", "Migrate .env credentials into the encrypted secret vault"),
             ("security", "Security audit and deny list"),
+            ("file-delivery", "Approve delivery of scanner-flagged files (host step-up)"),
             ("policy", "Inspect the governance security policy + profiles"),
             ("telemetry", "Inspect or disable anonymous usage telemetry"),
         ),
@@ -146,9 +148,10 @@ gateway vs. service -- the same server, two lifetimes:
                             `kirocrew restart`, `kirocrew logs`.
   Run only one of them at a time -- both bind the same port.
 
-Ports: the dashboard is the only port Kiro Crew opens, and it binds loopback
-  only -- http://localhost:{_DEFAULT_PORT_TEXT}. Messaging channels (Slack, Discord, ...)
-  connect outbound, so nothing else needs to be reachable. Override the port
+Ports: the dashboard is the only port a client needs, and by default it binds
+  loopback only -- http://localhost:{_DEFAULT_PORT_TEXT}. App backends listen on local
+  loopback ports (9100-9199). Messaging channels (Slack, Discord, ...) connect
+  outbound, so nothing else needs to be reachable. Override the port
   with `kirocrew gateway --port N`, KIROCREW_PORT=N, or the `dashboard.url`
   config value; for the service, set KIROCREW_PORT when you run
   `service install` (later, edit /etc/kirocrew/kirocrew.env and restart)."""

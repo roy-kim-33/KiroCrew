@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import type { ArtifactComment } from '../types'
 import Clickable from './Clickable'
+import ErrorNotice from './ErrorNotice'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 
@@ -94,7 +95,7 @@ export function ReplyBox({ onSubmit, onCancel }: { onSubmit: (text: string) => v
           }
           if (e.key === 'Escape') { e.preventDefault(); onCancel() }
         }}
-        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
       />
       <div className="flex items-center justify-end gap-1.5 mt-1">
         <button
@@ -137,7 +138,7 @@ export function EditBox({ initial, onSubmit, onCancel }: { initial: string; onSu
           }
           if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onCancel() }
         }}
-        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+        className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
       />
       <div className="flex items-center justify-end gap-1.5 mt-1">
         <button
@@ -315,6 +316,11 @@ export interface CommentsSidebarProps {
   loading?: boolean
   /** Remote-sync failure surfaced from the GET response. */
   remoteSyncError?: string | null
+  /** The comments read itself failed (useQuery error), so the list may be stale or empty. */
+  loadError?: string | null
+  /** The most recent comment write (post / reply / resolve / edit / delete) was rejected. */
+  mutationError?: string | null
+  onDismissMutationError?: () => void
   /** Doc-level add (no anchor). Anchored adds happen via the inline popover. */
   onAdd: (text: string) => void
   onReply: (parentId: string, text: string) => void
@@ -324,6 +330,13 @@ export interface CommentsSidebarProps {
   onRefresh: () => void
   /** Optional "ask agent to address comments" — secondary, opens a chat. */
   onAskAgent?: () => void
+  /** Optional batch-submit bar for the footer, so a host with a chat to send to
+   *  can offer "send every pending comment as one message" from the sidebar
+   *  itself. Rendered as handed over: the bar is `ArtifactPanel`'s `SubmitBar`,
+   *  and the HOST renders it because this sidebar is one of that panel's own
+   *  children — importing it here would close an import cycle. Hosts without a
+   *  send path omit it and the footer is unchanged. */
+  submitBar?: React.ReactNode
   onClose: () => void
   /** Hide Resolve/Review/Delete (e.g. a fully read-only view). */
   restrictActions?: boolean
@@ -374,8 +387,8 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const isMobile = useIsMobile()
   const {
-    comments, loading, remoteSyncError, onAdd, onReply, onResolve,
-    onMarkReview, onDelete, onRefresh, onAskAgent, onClose, restrictActions, hideResolve, hideDelete,
+    comments, loading, remoteSyncError, loadError, mutationError, onDismissMutationError, onAdd, onReply, onResolve,
+    onMarkReview, onDelete, onRefresh, onAskAgent, submitBar, onClose, restrictActions, hideResolve, hideDelete,
     onCommentClick, onReopen, activeCommentId, flashCommentId,
     containerClassName, containerStyle, onEditComment,
   } = props
@@ -485,11 +498,35 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
         </div>
       </div>
 
-      {/* remote sync error */}
+      {/* No hand-off on any of these: the sidebar's comment composer draft
+          (the textarea at the bottom, plus any in-place edit) is unsaved. */}
       {remoteSyncError && (
-        <div className="px-3 py-2 border-b border-warn/30 bg-warn-subtle text-[11px] text-warn flex items-start gap-1.5 shrink-0">
-          <AlertTriangle size={12} className="shrink-0 mt-0.5" />
-          <span>{i18nT('components.commentsSidebar.remote_comment_sync_unavailable')} {remoteSyncError}</span>
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-sync-error"
+            title={i18nT('components.commentsSidebar.remote_comment_sync_unavailable')}
+            message={remoteSyncError}
+          />
+        </div>
+      )}
+      {loadError && (
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-load-error"
+            message={loadError}
+          />
+        </div>
+      )}
+      {mutationError && (
+        <div className="px-3 py-2 border-b border-border shrink-0">
+          <ErrorNotice
+            variant="inline"
+            testId="comments-sidebar-mutation-error"
+            message={mutationError}
+            onDismiss={onDismissMutationError}
+          />
         </div>
       )}
 
@@ -561,8 +598,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
         )}
       </div>
 
-      {/* footer: doc-level add + optional ask-agent */}
+      {/* footer: optional batch submit + doc-level add + optional ask-agent */}
       <div className="border-t border-border p-2 shrink-0 space-y-2">
+        {submitBar}
         {adding ? (
           <div>
             <textarea
@@ -578,7 +616,7 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
                 }
                 if (e.key === 'Escape') { e.preventDefault(); setAdding(false); setAddText('') }
               }}
-              className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+              className="w-full bg-bg-elevated border border-border rounded-md px-2 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
             />
             <div className="flex items-center justify-end gap-1.5 mt-1">
               <button

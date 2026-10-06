@@ -38,6 +38,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import (
     ActionResult,
     TruncatedSignals,
 )
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import (
     create_subprocess_limited,
@@ -86,7 +87,7 @@ async def _run_gh(args: list[str]) -> tuple[int, str, str]:
         # ASYNC spawn a preexec_fn forces a plain fork() of the threaded gateway and runs
         # Python in the child before exec, which can wedge the event loop and leak every
         # inherited fd. The shim applies the same limits post-exec. See
-        # `test/test_spawn_preexec_guard.py` (issue #935) and the fuller note on
+        # `test/test_spawn_preexec_guard.py` and the fuller note on
         # `ledger_sync._git`.
         proc = await create_subprocess_limited(
             *argv,
@@ -154,7 +155,12 @@ class GitHubIssuesAdapter:
 
         rc, stdout, stderr = await _run_gh(args)
         if rc != 0:
-            raise RuntimeError(f"gh issue list failed: {stderr.strip()[:200]}")
+            # Redact the FULL stream, then keep the TAIL: `gh` prints its error
+            # last, and a bound applied before redaction can cut a credential
+            # into a fragment no redaction regex matches. The context shim, not
+            # `security.redact`, so a loaded companion's extra patterns apply on
+            # this dashboard-bound text (same as `routes._safe_outbound`).
+            raise RuntimeError(f"gh issue list failed: {redact_via_context(stderr.strip())[-200:]}")
         try:
             issues = json.loads(stdout or "[]")
         except json.JSONDecodeError as exc:
@@ -231,5 +237,7 @@ class GitHubIssuesAdapter:
 
         rc, _stdout, stderr = await _run_gh(args)
         if rc != 0:
-            return ActionResult(ok=False, action=action, error=stderr.strip()[:200])
+            return ActionResult(
+                ok=False, action=action, error=redact_via_context(stderr.strip())[-200:]
+            )
         return ActionResult(ok=True, action=action, detail=f"github {action} {repo}#{number}")

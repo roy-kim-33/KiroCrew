@@ -10,7 +10,7 @@ refusal surfaces as an approval prompt that times out instead of an error
 anybody can act on.
 
 The invariant these tests pin: every subagent path handed to a reader as TEXT
-carries the declared home spelling, while the paths used to actually open files
+carries the declared home spelling, while the paths that actually open files
 stay symlink-resolved so the traversal check remains sound.
 
 Each test asserts an observable emission, not an internal call, so reverting
@@ -118,8 +118,7 @@ class TestEmittedResultPointersAreReadable:
             SubagentManager._notify_orphan(
                 stub,
                 agent_id,
-                {"task": "summarize the diff", "parent_session": ""},
-                recovery="undeliverable",
+                {"task": "summarize the diff", "parent_session": "", "result_complete": True},
                 has_result=True,
             )
         )

@@ -21,6 +21,30 @@ from kiro_crew.platform import build_default_context
 from kiro_crew.platform.context import reset_context, set_context
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 
+
+def _provider_mock() -> AsyncMock:
+    """A stand-in for the ACP session provider a chat turn drives.
+
+    The turn surface (``stream``, ``shutdown``, ``approve_tool`` ...) is async,
+    so the double is an ``AsyncMock``. The telemetry accessors the runner reads
+    after every turn -- ``context_usage_pct``, ``context_window_tokens``,
+    ``context_used_tokens``, ``mcp_session_report``, ``available_models``, and the
+    inner client's ``pop_pending_oauth_requests`` -- are SYNCHRONOUS on the real
+    provider and are called without ``await``. Left as
+    ``AsyncMock`` children each call would hand back a coroutine nobody awaits,
+    which the interpreter reports at garbage collection against whichever later
+    test happens to trigger it. Tests override any accessor they assert on.
+    """
+    client = AsyncMock()
+    client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_window_tokens = MagicMock(return_value=0)
+    client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
+    client.available_models = MagicMock(return_value=[])
+    client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+    return client
+
+
 _SECRET_PROMPT = "please summarize my very private prompt text"
 
 
@@ -84,7 +108,7 @@ def _assert_metadata_only(payload: dict, surface: str) -> None:
 class TestDashboardInteractionTelemetry:
     @staticmethod
     def _make_client(events):
-        client = AsyncMock()
+        client = _provider_mock()
         client.context_usage_pct = MagicMock(return_value=10.0)
         client._client = MagicMock()
         # AcpSessionProvider (post-startup client._client) exposes the model via
@@ -216,7 +240,7 @@ class _FakeSessionManager:
         self.success_calls: list[str] = []
         self._is_new = True
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         was_new = self._is_new
         self._is_new = False
         return self._provider, was_new, False
@@ -281,7 +305,7 @@ class _FakeSessionManager:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
     async def stop_turn(self, key, *, force=False, on_soft=None, on_hard=None):

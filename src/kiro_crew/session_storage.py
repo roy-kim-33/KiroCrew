@@ -6,9 +6,18 @@ Kiro Crew and kiro-cli each own:
 
 * ``<data home>/sessions/<stem>.jsonl`` plus its rotated
   ``sessions/archive/<stem>__<stamp>.jsonl`` segments — the transcript, read by
-  dashboard history, search and memory consolidation.
+  dashboard history, search and memory consolidation — and
+  ``sessions/<stem>.attachments/`` — the images its messages show, which
+  ``/api/file-raw`` serves by the paths the transcript holds
+  (:mod:`kiro_crew.chat_attachments`) — and ``sessions/.threads/<stem>.json``,
+  the reply threads on its messages (``dashboard/chat_threads.py``).
 * ``<kiro home>/sessions/cli/<sid>.json`` + ``<sid>.jsonl`` — kiro-cli's replay
   log, read to resume the session.
+
+A session that recorded a crew log also owns ``<data home>/crew-log/sessions/<unit>/``
+directories, one per ACP session id it ran under. They are measured with the session
+and reclaimed with it, but staged inside the crew-log tree rather than the batch (see
+:func:`_stage_crew_logs`).
 
 That split is an implementation detail and never surfaces in a report: callers get
 one total and one session count.
@@ -64,6 +73,7 @@ home isolated from the store it reads (see :func:`reclaim_block_reason`).
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -76,13 +86,14 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any
 
 from kiro_crew import hooks, pinned_fs, platform_compat
 from kiro_crew.atomic_write import atomic_write, fsync_dir, replace_with_retry
+from kiro_crew.chat_attachments import ATTACHMENTS_DIR_SUFFIX, attachments_dir
 from kiro_crew.config.paths import (
     CONFIG_DIR_LEAF,
     KIRO_BASE_DIR_NAME,
@@ -91,7 +102,18 @@ from kiro_crew.config.paths import (
     kiro_sessions_dir,
     legacy_home,
 )
-from kiro_crew.history import ARCHIVE_DIR_NAME, ARCHIVE_SEGMENT_DELIMITER, SESSIONS_DIR_NAME
+from kiro_crew.history import (
+    ARCHIVE_DIR_NAME,
+    ARCHIVE_SEGMENT_DELIMITER,
+    SESSIONS_DIR_NAME,
+    THREADS_DIR_NAME,
+    THREADS_SIDECAR_SUFFIX,
+    ConversationLog,
+    HistoryLockTimeout,
+    threads_sidecar_for_stem,
+    transcript_lock_stems,
+)
+from kiro_crew.history_index import INDEX_FILENAME, SessionSearchIndex
 from kiro_crew.session_map import SESSION_MAP_FILENAME
 
 logger = logging.getLogger(__name__)
@@ -219,6 +241,8 @@ class SessionUnit:
     # tell "in use right now" apart from "idle but the product could resume it",
     # which is the difference between a hazard and a preference.
     live: bool = False
+    #: The crew-log units (ACP session ids) this session owns; see :func:`_crew_log_units`.
+    crew_units: tuple[str, ...] = ()
 
     def age_days(self, now: float) -> float:
         return max(0.0, (now - self.mtime) / _SECONDS_PER_DAY)
@@ -240,6 +264,7 @@ class _RawUnit:
     stems: tuple[str, ...]
     bytes: int
     mtime: float
+    crew_units: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -437,7 +462,9 @@ def invalidate_scan_cache() -> None:
         _cotenant_cache = None
 
 
-def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUnit]:
+def _scan_units(
+    index: SessionIndex, *, cached: bool = False, strict: bool = False
+) -> list[SessionUnit]:
     """Enumerate sessions across both stores, one entry per session.
 
     Two halves of the answer, deliberately separated. :func:`_scan_raw` does the
@@ -453,8 +480,12 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
     the result (the mutation gates, and the dashboard pre-classification that
     feeds one) leaves it False, and a reclaim must not select against a snapshot
     at all, so every mutation path leaves it False too.
+
+    *strict* is for the reclaim: a crew-log store that cannot be listed completely
+    raises :class:`SessionStorageError` instead of answering short, because a session
+    whose crew logs are missing from the answer would be staged without them.
     """
-    raw = _scan_raw(index.stem_to_sid, cached=cached)
+    raw = _scan_raw(index.stem_to_sid, cached=cached and not strict, strict=strict)
     active_stems = index.active_stems
     live_stems = index.live_stems
     # Sessions another instance sharing this replay store can still resume. Marked
@@ -469,8 +500,15 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
             entry.sid in index.active_sids
             or entry.sid in cotenant
             or any(stem in active_stems for stem in entry.stems)
+            # A crew-log unit is keyed by its ACP session id, so a unit whose id is still
+            # mapped belongs to a session the product can resume.
+            or any(unit in index.active_sids or unit in cotenant for unit in entry.crew_units)
         )
-        live = entry.sid in index.live_sids or any(stem in live_stems for stem in entry.stems)
+        live = (
+            entry.sid in index.live_sids
+            or any(stem in live_stems for stem in entry.stems)
+            or any(unit in index.live_sids for unit in entry.crew_units)
+        )
         units.append(
             SessionUnit(
                 uid=entry.uid,
@@ -480,12 +518,15 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
                 mtime=entry.mtime,
                 active=active,
                 live=live,
+                crew_units=entry.crew_units,
             )
         )
     return units
 
 
-def _scan_raw(sid_for_stem: Mapping[str, str], *, cached: bool = False) -> list[_RawUnit]:
+def _scan_raw(
+    sid_for_stem: Mapping[str, str], *, cached: bool = False, strict: bool = False
+) -> list[_RawUnit]:
     """Enumerate both stores: what each session is made of and what it costs.
 
     A session's age is the NEWEST mtime across every file it owns: a transcript is
@@ -500,13 +541,13 @@ def _scan_raw(sid_for_stem: Mapping[str, str], *, cached: bool = False) -> list[
         hit = _cached_scan(sid_for_stem)
         if hit is not None:
             return hit
-    result = _scan_raw_uncached(sid_for_stem)
+    result = _scan_raw_uncached(sid_for_stem, strict=strict)
     if cached:
         _store_scan(sid_for_stem, result)
     return result
 
 
-def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
+def _scan_raw_uncached(sid_for_stem: Mapping[str, str], *, strict: bool = False) -> list[_RawUnit]:
     sizes: dict[str, int] = {}
     mtimes: dict[str, float] = {}
     sids: dict[str, str] = {}
@@ -573,6 +614,43 @@ def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
     except OSError:
         logger.debug("transcript store unreadable", exc_info=True)
 
+    # Attachments half: ``<stem>.attachments/`` directories beside the transcripts.
+    # Their bytes are the session's, and a write into one is activity on the
+    # session, so both land on the same unit the transcript does.
+    try:
+        with os.scandir(_crew_sessions_dir()) as it:
+            adirs = [
+                entry.name
+                for entry in it
+                if entry.name.endswith(ATTACHMENTS_DIR_SUFFIX)
+                and entry.is_dir(follow_symlinks=False)
+            ]
+    except OSError:
+        adirs = []
+    for name in adirs:
+        stem = name[: -len(ATTACHMENTS_DIR_SUFFIX)]
+        if not _UNIT_ID_RE.match(stem):
+            continue
+        try:
+            files = _attachment_files(_crew_sessions_dir() / name)
+        except OSError:
+            logger.debug("attachments directory %r unreadable", name, exc_info=True)
+            continue
+        if not files:
+            continue
+        uid = attribute(stem)
+        if uid not in sizes and uid not in stems:
+            # Images outliving their transcript still cost space and still belong
+            # to a session, so they form a unit of their own, like segments do.
+            sids.setdefault(uid, "")
+        add_stem(uid, stem)
+        for path in files:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            record(uid, st.st_size, st.st_mtime)
+
     for stem, segments in archives.items():
         uid = attribute(stem)
         if uid not in sizes and uid not in stems:
@@ -583,6 +661,70 @@ def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
         for _path, size, mtime in segments:
             record(uid, size, mtime)
 
+    # Reply-thread half: ``.threads/<stem>.json`` beside the transcripts. One
+    # file per session; its bytes and its last write belong to the same unit. A
+    # reply writes ONLY this file, so a sidecar's mtime is what keeps a recently
+    # threaded session young: each entry is judged on its own, as the transcripts
+    # are above -- one sidecar renamed away by a concurrent delete must not cost
+    # every other session its freshness. An entry that is there but cannot be
+    # stat'ed, or a directory that cannot be listed, is read as "fresh now": the
+    # scan cannot say how old those sessions are, and the answer that cannot
+    # stage a live thread is the young one.
+    thread_entries: list[tuple[str, os.stat_result | None]] = []
+    threads_unreadable = False
+    try:
+        with os.scandir(_crew_sessions_dir() / THREADS_DIR_NAME) as it:
+            for entry in it:
+                if not entry.name.endswith(THREADS_SIDECAR_SUFFIX):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    thread_entries.append((entry.name, entry.stat(follow_symlinks=False)))
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logger.debug("thread sidecar %r unreadable", entry.name, exc_info=True)
+                    thread_entries.append((entry.name, None))
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        logger.warning("thread sidecar directory unreadable; ages read as now", exc_info=True)
+        threads_unreadable = True
+    scan_now = time.time()
+    for name, sidecar_st in thread_entries:
+        stem = name[: -len(THREADS_SIDECAR_SUFFIX)]
+        if not _UNIT_ID_RE.match(stem):
+            continue
+        uid = attribute(stem)
+        if uid not in sizes and uid not in stems:
+            # A thread file outliving its transcript still costs space and still
+            # belongs to a session, so it forms a unit of its own.
+            sids.setdefault(uid, "")
+        add_stem(uid, stem)
+        if sidecar_st is None:
+            record(uid, 0, scan_now)
+        else:
+            record(uid, sidecar_st.st_size, sidecar_st.st_mtime)
+    if threads_unreadable:
+        for uid in list(sizes):
+            record(uid, 0, scan_now)
+
+    # Crew-log half: attributed LAST, because the header's slot names a transcript
+    # and the transcripts above are what it is matched against.
+    stem_owner = {stem: uid for uid, owned in stems.items() for stem in owned}
+    crew_units: dict[str, list[str]] = {}
+    for unit_id, slot, crew_files in _crew_log_units(strict=strict):
+        uid = _crew_log_owner(unit_id, slot, stem_owner, sizes)
+        if not uid:
+            continue
+        sids.setdefault(uid, "")
+        stems.setdefault(uid, [])
+        crew_units.setdefault(uid, []).append(unit_id)
+        sizes.setdefault(uid, 0)
+        for size, mtime in crew_files:
+            record(uid, size, mtime)
+
     return [
         _RawUnit(
             uid=uid,
@@ -590,9 +732,429 @@ def _scan_raw_uncached(sid_for_stem: Mapping[str, str]) -> list[_RawUnit]:
             stems=tuple(stems.get(uid, [])),
             bytes=size,
             mtime=mtimes.get(uid, 0.0),
+            crew_units=tuple(crew_units.get(uid, ())),
         )
         for uid, size in sizes.items()
     ]
+
+
+def _crew_log_units(*, strict: bool = False) -> list[tuple[str, str, list[tuple[int, float]]]]:
+    """Every session crew-log unit as ``(unit id, header slot, [(size, mtime), ...])``.
+
+    Units come from the crew-log store's own header-proved listing, so a directory
+    whose header does not name it is not attributed to anyone. On a read path a unit
+    that cannot be walked is skipped: answering short costs a slightly low total.
+
+    With *strict* the answer must be complete, because the reclaim stages what it
+    lists: a store that cannot be listed, a unit directory that holds entries its
+    header cannot prove, or a unit that cannot be walked raises
+    :class:`SessionStorageError`. A store never created is an empty answer.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    try:
+        unit_ids = crew_store.unit_ids(KIND_SESSION)
+        slot_of = {
+            unit: slot
+            for slot, owned in crew_store.session_units_by_slot(strict=strict).items()
+            for unit in owned
+        }
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        if strict:
+            raise SessionStorageError(
+                "the crew logs could not all be listed, so no session was moved: a "
+                "session staged without them would leave its history behind"
+            ) from exc
+        logger.debug("crew log store unreadable", exc_info=True)
+        return []
+    found: list[tuple[str, str, list[tuple[int, float]]]] = []
+    for unit_id in unit_ids:
+        directory = crew_store.unit_dir_for(KIND_SESSION, unit_id)
+        if directory is None:
+            continue
+        try:
+            files = _tree_files(directory)
+        except OSError as exc:
+            if strict:
+                raise SessionStorageError(
+                    f"crew log {unit_id!r} could not be read, so no session was moved"
+                ) from exc
+            logger.debug("crew log %r unreadable", unit_id, exc_info=True)
+            continue
+        found.append((unit_id, slot_of.get(unit_id, ""), files))
+    return found
+
+
+def _crew_log_owner(
+    unit_id: str, slot: str, stem_owner: Mapping[str, str], units: Mapping[str, int]
+) -> str:
+    """The session a crew-log unit belongs to, or ``""`` when it cannot be named.
+
+    The header's slot is the conversation: a dashboard slot's transcript is
+    ``dashboard_<slot>`` and a channel slot's IS its stem, so every unit a reset left
+    behind joins the transcript it wrote beside. Without a matching transcript the
+    unit joins the replay log that shares its id, and otherwise it is a row of its own.
+    """
+    if slot:
+        for stem in (slot, f"dashboard_{slot}"):
+            owner = stem_owner.get(stem)
+            if owner:
+                return owner
+    if unit_id in units:
+        return unit_id
+    return unit_id if _UNIT_ID_RE.match(unit_id) else ""
+
+
+def _tree_files(directory: Path) -> list[tuple[int, float]]:
+    """``(size, mtime)`` of every regular file under *directory*, links not followed."""
+    found: list[tuple[int, float]] = []
+    pending = [directory]
+    while pending:
+        with os.scandir(pending.pop()) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    info = entry.stat(follow_symlinks=False)
+                    found.append((info.st_size, info.st_mtime))
+    return found
+
+
+def _tree_bytes(directory: Path) -> int:
+    """Total size of the regular files under *directory*; 0 when it cannot be read."""
+    try:
+        return sum(size for size, _mtime in _tree_files(directory))
+    except OSError:
+        return 0
+
+
+#: Lists, one per line, the units a failed restore left live and held for a session.
+_CREW_HOLDS_FILE = "held"
+
+
+def _crew_staging(batch_id: str, uid: str = "") -> Path:
+    """Where a batch (or one of its sessions) stages crew logs, inside the crew-log tree.
+
+    *uid* reaches here from a manifest, which is agent-writable, so it must be a bare
+    unit id before it becomes a path segment: a ``..`` would otherwise step out of the
+    hidden tree and let a restore publish an agent-written directory as a crew log.
+    """
+    from kiro_crew.crew_log.store import crew_log_trash_root
+
+    if uid and not _UNIT_ID_RE.match(uid):
+        raise SessionStorageError(f"not a valid session id: {uid!r}")
+    base = crew_log_trash_root() / batch_id
+    return base / uid if uid else base
+
+
+def _stage_crew_logs(batch_id: str, uid: str, unit_ids: tuple[str, ...]) -> tuple[bool, int]:
+    """Stage every crew-log unit of *uid* for *batch_id*: ``(all moved, bytes staged)``.
+
+    Not into the batch directory: that tree is agent-writable, the crew-log tree is
+    hidden from the sandbox, and a restore publishes staged files back into the live
+    tree -- so a crew log waiting in the batch could be edited into entries the
+    gateway later reads as its own. Each unit is renamed under its sole lease
+    (:func:`kiro_crew.crew_log.store.stage_unit`).
+
+    All or nothing, like the session's other halves: a unit a writer still holds
+    means the session is in use, so the units already staged are put back and the
+    caller leaves the whole session where it is. A unit already gone is not a
+    failure -- there is nothing of it left to split.
+    """
+    if not unit_ids:
+        return True, 0
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    base = _crew_staging(batch_id, uid)
+    staged = 0
+    for unit_id in unit_ids:
+        directory = crew_store.unit_dir_for(KIND_SESSION, unit_id)
+        if directory is None:
+            continue
+        size = _tree_bytes(directory)
+        try:
+            status = crew_store.stage_unit(KIND_SESSION, unit_id, base / directory.name)
+        except Exception:
+            logger.warning("could not stage crew log %r of %r", unit_id, uid, exc_info=True)
+            status = crew_store.REMOVE_FAILED
+        if status == crew_store.REMOVE_REMOVED:
+            staged += size
+        elif status != crew_store.REMOVE_ABSENT:
+            logger.warning(
+                "crew log %r of %r could not move (%s); leaving it", unit_id, uid, status
+            )
+            return False, 0
+    return True, staged
+
+
+def _put_back_crew_logs(manifest: IO[str], batch_id: str, uid: str) -> bool:
+    """Return *uid*'s staged crew logs to the live tree; False when some had to stay.
+
+    A unit stays staged when its name was taken while it was away -- a resume that
+    recreated it. The staged copy is then the only one of that earlier history, so it
+    is recorded in the manifest as a crew-log-only entry: listed, restorable, and
+    never removed except by an empty the user asks for. The caller reports it rather
+    than calling the session left in place.
+
+    The units that went back are live again with the whole session, so their restore
+    holds are released here, as a committed restore releases them.
+    """
+    restored = _restore_crew_logs(batch_id, uid)
+    if restored is not None:
+        _release_restored_holds(restored)
+        return True
+    try:
+        _append_entry(manifest, {"uid": uid, "files": []})
+    except OSError:
+        logger.error(
+            "could not record the staged crew logs of %r; they are in %s",
+            uid,
+            _crew_staging(batch_id, uid),
+            exc_info=True,
+        )
+    return False
+
+
+def _sync_batch_or_warn(
+    target: Path, staged_dirs: set[Path], manifest: IO[str], source_dirs: set[Path]
+) -> None:
+    """:func:`_sync_batch` on a path that is already failing: a sync error is logged.
+
+    The refusal that follows names where the staged units are, which is the pointer an
+    operator needs; replacing it with an ``OSError`` would lose that.
+    """
+    try:
+        _sync_batch(target, staged_dirs, manifest, source_dirs)
+    except OSError:
+        logger.warning("could not sync %s before refusing", target, exc_info=True)
+
+
+def _crew_logs_left_staged(uid: str, target: Path) -> SessionStorageError:
+    """The refusal for a session whose crew logs could not all be put back."""
+    return SessionStorageError(
+        f"session {uid!r} changed while being staged and some of its crew logs could "
+        f"not be put back; they are recorded in {target} and can be restored"
+    )
+
+
+def _staged_crew_dirs(batch_id: str, uid: str) -> list[Path]:
+    """The crew-log units staged for *uid* in *batch_id*, links never followed.
+
+    Empty for a *uid* that is not a bare unit id -- such a manifest entry names no
+    staging this module wrote -- and when no staging exists for it. A staging that
+    exists but cannot be listed raises ``OSError``: an unreadable directory may hold
+    the only copy of a session's crew logs, so no caller may read it as empty.
+    """
+    if not _UNIT_ID_RE.match(uid):
+        return []
+    base = _crew_staging(batch_id, uid)
+    try:
+        info = base.lstat()
+    except FileNotFoundError:
+        return []
+    if platform_compat.is_link_or_junction(base) or not stat.S_ISDIR(info.st_mode):
+        return []
+    return sorted(
+        child
+        for child in base.iterdir()
+        if child.is_dir() and not platform_compat.is_link_or_junction(child)
+    )
+
+
+def _has_staged_crew(batch_id: str, uid: str) -> bool:
+    """Whether *uid* has crew logs staged in *batch_id*; an unreadable staging counts."""
+    try:
+        return bool(_staged_crew_dirs(batch_id, uid))
+    except OSError:
+        logger.warning(
+            "cannot list the crew-log staging of %r in %r; treating it as holding units",
+            uid,
+            batch_id,
+            exc_info=True,
+        )
+        return True
+
+
+def _restore_crew_logs(batch_id: str, uid: str) -> list[tuple[str, Path]] | None:
+    """Put back every crew-log unit staged for *uid*: what went back, or None.
+
+    All or nothing: when one cannot go back -- its name is occupied by a unit created
+    since, which is newer -- the ones already restored are staged again and None is
+    returned, so the caller keeps the session in the batch with every half together.
+
+    Each unit is HELD before it is published, so a retention sweep running before the
+    rest of the session is back cannot expire it. The caller releases the holds with
+    :func:`_release_restored_holds` once the whole session has been restored.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    restored: list[tuple[str, Path]] = []
+    if not _UNIT_ID_RE.match(uid):
+        return restored
+    try:
+        staged_units = _staged_crew_dirs(batch_id, uid)
+    except OSError:
+        # Not knowing what is staged is not "nothing is staged": committing the rest
+        # of the session would leave its crew logs behind, unlisted and unrestorable.
+        logger.warning(
+            "cannot list the crew-log staging of %r; leaving the session staged",
+            uid,
+            exc_info=True,
+        )
+        return None
+    for staged in staged_units:
+        held = crew_store.hold_staged_unit(staged)
+        unit_id = crew_store.restore_staged_unit(KIND_SESSION, staged) if held else None
+        if unit_id is None:
+            logger.warning("crew log %r of %r could not be restored", staged.name, uid)
+            _return_crew_logs(batch_id, uid, restored)
+            return None
+        restored.append((unit_id, staged))
+    for directory in (_crew_staging(batch_id, uid), _crew_staging(batch_id)):
+        with suppress(OSError):
+            directory.rmdir()
+    return restored
+
+
+def _return_crew_logs(batch_id: str, uid: str, restored: list[tuple[str, Path]]) -> None:
+    """Stage again the crew-log units a failed restore had already put back.
+
+    A unit that cannot go back -- a resumed session now writes it, or a sync failed --
+    stays live while the rest of its session stays in the batch. It is HELD out of
+    retention (:func:`kiro_crew.crew_log.store.hold_unit`) and recorded beside the
+    session's staging, so the sweep cannot expire half of a session the user can still
+    restore; the hold is released when that session is restored or the batch emptied.
+    """
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    held: list[str] = []
+    for unit_id, staged in reversed(restored):
+        try:
+            status = crew_store.stage_unit(KIND_SESSION, unit_id, staged)
+        except Exception:
+            status = crew_store.REMOVE_FAILED
+        if status != crew_store.REMOVE_REMOVED:
+            logger.error(
+                "crew log %r was restored alone (%s); holding it out of retention until "
+                "session %r is restored or trash batch %r is emptied",
+                unit_id,
+                status,
+                uid,
+                batch_id,
+            )
+            if crew_store.hold_unit(KIND_SESSION, unit_id):
+                held.append(unit_id)
+    if held:
+        _record_crew_holds(batch_id, uid, held)
+
+
+def _release_restored_holds(restored: list[tuple[str, Path]]) -> None:
+    """Let the units a committed restore put back age out again."""
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    for unit_id, _staged in restored:
+        crew_store.release_unit_hold(KIND_SESSION, unit_id)
+
+
+def _crew_holds_path(batch_id: str, uid: str) -> Path:
+    """Where the units held for *uid* in *batch_id* are listed, inside the hidden tree."""
+    return _crew_staging(batch_id, uid) / _CREW_HOLDS_FILE
+
+
+def _read_crew_holds(path: Path) -> list[str]:
+    """The unit ids listed in *path*; empty when there is none or it is a link."""
+    try:
+        if platform_compat.is_link_or_junction(path):
+            return []
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        logger.warning("could not read the crew-log holds in %s", path, exc_info=True)
+        return []
+    return [line for line in text.splitlines() if _UNIT_ID_RE.match(line)]
+
+
+def _record_crew_holds(batch_id: str, uid: str, unit_ids: list[str]) -> None:
+    """Add *unit_ids* to the holds listed for *uid*. A unit whose listing fails stays held."""
+    path = _crew_holds_path(batch_id, uid)
+    listed = dict.fromkeys([*_read_crew_holds(path), *unit_ids])
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(path, "".join(f"{unit_id}\n" for unit_id in listed), fsync=True)
+    except OSError:
+        logger.error(
+            "could not record the crew-log holds of %r; %s stay held",
+            uid,
+            ", ".join(unit_ids),
+            exc_info=True,
+        )
+
+
+def _release_crew_holds(batch_id: str, uid: str) -> None:
+    """Release every hold recorded for *uid* in *batch_id*: its session is whole or gone."""
+    from kiro_crew.crew_log import store as crew_store
+    from kiro_crew.crew_log.schema import KIND_SESSION
+
+    if not _UNIT_ID_RE.match(uid):
+        return
+    path = _crew_holds_path(batch_id, uid)
+    for unit_id in _read_crew_holds(path):
+        crew_store.release_unit_hold(KIND_SESSION, unit_id)
+    with suppress(OSError):
+        path.unlink()
+    for directory in (path.parent, path.parent.parent):
+        with suppress(OSError):
+            directory.rmdir()
+
+
+def _unlisted_crew_staging(batch: Path) -> list[str]:
+    """The sessions with crew logs staged for *batch* that its manifest does not list.
+
+    The crew-log counterpart of :func:`_unlisted_files`: a unit staged for a session no
+    entry names is still the only copy of that history, so nothing that removes the
+    batch may remove it. An unreadable manifest lists nothing, the safe direction.
+    """
+    parsed = _read_manifest(batch)
+    listed = {str(entry.get("uid") or "") for entry in parsed[1]} if parsed else set()
+    base = _crew_staging(batch.name)
+    try:
+        if platform_compat.is_link_or_junction(base) or not base.is_dir():
+            return []
+        staged = sorted(child.name for child in base.iterdir())
+    except OSError:
+        return [base.name]
+    return [uid for uid in staged if uid not in listed]
+
+
+def _discard_crew_staging(batch_id: str) -> int:
+    """Remove a batch's crew-log staging for good; the bytes it held.
+
+    Called only for a batch the user selected and that was emptied without a skip.
+    Nothing else removes crew-log staging: the batch directory is agent-writable, so
+    its absence is no evidence the user approved deleting what it staged.
+    """
+    base = _crew_staging(batch_id)
+    try:
+        if platform_compat.is_link_or_junction(base) or not base.is_dir():
+            return 0
+        uids = [child.name for child in base.iterdir()]
+    except OSError:
+        return 0
+    size = _tree_bytes(base)
+    for uid in uids:
+        _release_crew_holds(batch_id, uid)
+    shutil.rmtree(base, ignore_errors=True)
+    return 0 if base.exists() else size
 
 
 def _cli_index() -> dict[str, list[Path]]:
@@ -651,7 +1213,56 @@ def _unit_paths(
         )
         for path, _size, _mtime in segments:
             found.append((path, f"{STAGE_CREW_LEAF}/{ARCHIVE_DIR_NAME}/{path.name}"))
+        # The images the transcript's rows reference. Regular files only, never
+        # followed: the directory is code-written and flat, so anything else in
+        # it is not this session's and is left where it is -- the owned files
+        # and the transcript still move, and the directory stays behind holding
+        # only the foreign entry (rmdir refuses a non-empty directory).
+        adir = attachments_dir(_crew_sessions_dir(), stem)
+        for path in _attachment_files(adir):
+            found.append((path, f"{STAGE_CREW_LEAF}/{adir.name}/{path.name}"))
+        # The reply threads on the transcript's messages: primary content, one
+        # file per session, so it travels with the transcript or the reclaim
+        # would leave the session's replies orphaned in the live store.
+        # A sidecar that is absent is a session with no threads; one that cannot
+        # be looked at (permission drift, a file where the `.threads` directory
+        # should be) RAISES, as `_attachment_files` does: answering "none" would
+        # let the transcript move and leave the replies behind.
+        sidecar = threads_sidecar_for_stem(_crew_sessions_dir(), stem)
+        if sidecar.parent.exists() and platform_compat.is_link_or_junction(sidecar.parent):
+            # A link where `.threads` should be points this scan -- and the move
+            # it feeds -- outside the session store. Refuse, as the write, delete
+            # and restore paths do; the reclaim then answers with the reason.
+            raise NotADirectoryError(
+                errno.ENOTDIR, "thread sidecar directory is a link", str(sidecar.parent)
+            )
+        try:
+            if stat.S_ISREG(os.lstat(sidecar).st_mode):
+                found.append((sidecar, f"{STAGE_CREW_LEAF}/{THREADS_DIR_NAME}/{sidecar.name}"))
+        except FileNotFoundError:
+            pass
     return found
+
+
+def _attachment_files(adir: Path) -> list[Path]:
+    """The regular files directly inside an attachments directory, sorted.
+
+    Empty for a MISSING directory only. Any other failure to read it RAISES: a
+    directory that exists but cannot be listed holds files this scan cannot see,
+    and answering "none" would let the transcript move without them -- the
+    orphaned, still-served images this half exists to take along. A link where
+    the directory should be is not entered, and a link or subdirectory inside it
+    is not listed.
+    """
+    try:
+        info = os.lstat(adir)
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(info.st_mode):
+        return []
+    with os.scandir(adir) as it:
+        entries = [e for e in it if e.is_file(follow_symlinks=False)]
+    return sorted((Path(e.path) for e in entries), key=lambda q: q.name)
 
 
 def _bucketize(reclaimable: list[SessionUnit], now: float) -> tuple[StorageBucket, ...]:
@@ -790,8 +1401,21 @@ def select_reclaimable(
 
 
 def _pod_root() -> Path:
+    """The host-side pod root, anchored the same way ``pod.config`` anchors it.
+
+    A SECOND reader of ``KIROCREW_POD_ROOT``, independent of :class:`PodConfig`
+    (this module must not import the pod package). It gets the same
+    ``expanduser`` + ``abspath`` treatment for the same reason: a relative
+    override resolved against this process's working directory, so a gateway
+    started from ``/`` scanned a different root than the CLI that wrote it and
+    the co-tenant probe below silently found nothing. See
+    ``pod.config._canonical_override`` for the full rationale; the two must not
+    drift, which is why the rule is restated rather than left implicit.
+    """
     raw = os.environ.get("KIROCREW_POD_ROOT")
-    return Path(raw).expanduser() if raw else Path.home() / ".kirocrew-pods"
+    if not raw:
+        return Path.home() / ".kirocrew-pods"
+    return Path(os.path.abspath(os.path.expanduser(raw)))
 
 
 def _replay_store_cotenants() -> list[str]:
@@ -1049,7 +1673,7 @@ def reclaim_block_reason(*, cached: bool = False) -> str:
                 # !r, not plain interpolation: the directory name is
                 # agent-influenced and passes no identifier gate, so a newline
                 # or ANSI payload in it would forge a second record the moment
-                # a caller logs this text (the #6281/#6371 forgery class).
+                # a caller logs this text (the log-forgery class).
                 listed = "; ".join(f"{name!r} — {why}" for name, why in refusals[:3])
                 return (
                     f"{len(refusals)} other instance(s) sharing this kiro-cli session "
@@ -1171,7 +1795,7 @@ def _open_source_no_follow(src: Path) -> IO[bytes]:
     return open(src, "rb", opener=lambda path, flags: os.open(path, flags | _O_NOFOLLOW))
 
 
-def _publish_then_drop(src: Path, dst: Path) -> None:
+def _publish_then_drop(src: Path, dst: Path, *, dst_dir_fd: int | None = None) -> None:
     """Make a just-created *dst* durable, then remove *src*. Both movers end here.
 
     One code path for both of :func:`_move_file_exclusive`'s branches, because they have
@@ -1203,10 +1827,21 @@ def _publish_then_drop(src: Path, dst: Path) -> None:
     duplicate — never lose the copy now at *dst*.
     """
     try:
-        fsync_dir(dst.parent)
+        if dst_dir_fd is not None:
+            # The destination directory is the one the leaf was created in --
+            # the pinned descriptor -- not whatever the path resolves to now:
+            # a directory swapped under the name after the open would otherwise
+            # be the one synced (and the source then dropped) while the leaf
+            # sits in the old one, unreachable.
+            os.fsync(dst_dir_fd)
+        else:
+            fsync_dir(dst.parent)
     except OSError:
         with suppress(OSError):
-            dst.unlink()
+            if dst_dir_fd is not None:
+                os.unlink(dst.name, dir_fd=dst_dir_fd)
+            else:
+                dst.unlink()
         raise
     # Propagates untouched on failure, leaving *dst* where it is. Withdrawing it would
     # be guessing: a filesystem can report a failure for an unlink that DID commit (a
@@ -1222,8 +1857,16 @@ def _publish_then_drop(src: Path, dst: Path) -> None:
     fsync_dir(src.parent, best_effort=True)
 
 
-def _move_file_exclusive(src: Path, dst: Path) -> bool:
+def _move_file_exclusive(src: Path, dst: Path, *, dst_dir_fd: int | None = None) -> bool:
     """Move *src* to *dst*, never replacing an existing *dst*. False if occupied.
+
+    With *dst_dir_fd* (POSIX), the destination is created relative to that
+    already-pinned directory descriptor -- ``dst.name`` under it -- so a parent
+    swapped for a link between the caller's check and this move cannot carry the
+    file elsewhere, and every later step (metadata, the directory sync, a
+    withdrawal) addresses that same descriptor, never the path, so a swap after
+    the open cannot make a sync of the swapped-in directory count for the one
+    the leaf landed in.
 
     Restore's preflight checks that the origin is free, but the session can be
     recreated in the interval before the move — and ``os.rename`` replaces the
@@ -1234,15 +1877,31 @@ def _move_file_exclusive(src: Path, dst: Path) -> bool:
     Both branches finish through :func:`_publish_then_drop`, which is where the
     durability ordering lives.
     """
+    # The plain ``link()`` call never dereferences *src*, but the descriptor-relative
+    # form is ``linkat`` and CPython hands that ``AT_SYMLINK_FOLLOW`` unless told
+    # otherwise -- a planted link in the staged trash would then be resolved and a
+    # hard link to its TARGET published under ``.threads``. Say so on both branches
+    # where the platform lets us, so the two halves mean the same thing.
+    link_kwargs: dict[str, Any] = {}
+    if os.link in os.supports_follow_symlinks:
+        link_kwargs["follow_symlinks"] = False
     try:
-        os.link(src, dst)
+        if dst_dir_fd is not None:
+            os.link(src, dst.name, dst_dir_fd=dst_dir_fd, **link_kwargs)
+        else:
+            os.link(src, dst, **link_kwargs)
     except FileExistsError:
         return False
     except OSError:
         # A different filesystem, or one without hard links: copy into a file that
         # must not already exist, which keeps the no-clobber guarantee.
         try:
-            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            if dst_dir_fd is not None:
+                fd = os.open(
+                    dst.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dst_dir_fd
+                )
+            else:
+                fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             return False
         try:
@@ -1257,16 +1916,47 @@ def _move_file_exclusive(src: Path, dst: Path) -> bool:
                 #
                 # copystat first so the fsync forces the metadata with the bytes.
                 out.flush()
-                shutil.copystat(src, dst)
+                if dst_dir_fd is not None:
+                    # Metadata onto the descriptor we wrote, not a path lookup.
+                    st = os.stat(src)
+                    os.utime(out.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+                else:
+                    shutil.copystat(src, dst)
                 os.fsync(out.fileno())
         except OSError:
             with suppress(OSError):
-                dst.unlink()
+                if dst_dir_fd is not None:
+                    os.unlink(dst.name, dir_fd=dst_dir_fd)
+                else:
+                    dst.unlink()
             raise
-        _publish_then_drop(src, dst)
+        _publish_then_drop(src, dst, dst_dir_fd=dst_dir_fd)
         return True
-    _publish_then_drop(src, dst)
+    _publish_then_drop(src, dst, dst_dir_fd=dst_dir_fd)
     return True
+
+
+def _move_sidecar_pinned(src: Path, dst: Path) -> bool:
+    """:func:`_move_file_exclusive` into a `.threads` directory pinned by descriptor.
+
+    Opens the parent ``O_DIRECTORY|O_NOFOLLOW`` (a link at that name is an
+    ``OSError`` the caller treats as "not taken") and publishes the leaf
+    relative to it. Windows has no descriptor-relative link; there the by-name
+    move runs after the preflight's link check, as the store's writer degrades.
+    """
+    if not platform_compat.IS_POSIX:
+        if platform_compat.is_link_or_junction(dst.parent):
+            raise NotADirectoryError(
+                errno.ENOTDIR, "thread sidecar directory is a link", str(dst.parent)
+            )
+        return _move_file_exclusive(src, dst)
+    dir_fd = os.open(
+        dst.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        return _move_file_exclusive(src, dst, dst_dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _move_file(src: Path, dst: Path) -> None:
@@ -1457,6 +2147,23 @@ def _canonical_origin(rel: str) -> Path | None:
             return _crew_sessions_dir() / name
         if len(parts) == 3 and parts[1] == ARCHIVE_DIR_NAME:
             return _crew_archive_dir() / name
+        if len(parts) == 3 and parts[1].endswith(ATTACHMENTS_DIR_SUFFIX):
+            # ``crew/<stem>.attachments/<image>``: the directory name IS the
+            # session's identity, so it is checked as one -- a name that is not
+            # a session id cannot have been staged from the attachments store.
+            stem = parts[1][: -len(ATTACHMENTS_DIR_SUFFIX)]
+            if not _UNIT_ID_RE.match(stem):
+                return None
+            return attachments_dir(_crew_sessions_dir(), stem) / name
+        if len(parts) == 3 and parts[1] == THREADS_DIR_NAME:
+            # ``crew/.threads/<stem>.json``: the file name IS the session's
+            # identity, checked as one, the way the transcript's is.
+            if not name.endswith(THREADS_SIDECAR_SUFFIX):
+                return None
+            stem = name[: -len(THREADS_SIDECAR_SUFFIX)]
+            if not _UNIT_ID_RE.match(stem):
+                return None
+            return threads_sidecar_for_stem(_crew_sessions_dir(), stem)
     return None
 
 
@@ -1518,19 +2225,70 @@ def _unlisted_files(batch: Path) -> list[Path]:
     listed: set[str] = set(_manifest_rels(batch))
     failures: list[OSError] = []
     unlisted = []
-    for root, _dirs, names in os.walk(batch, onerror=failures.append):
-        for name in names:
-            path = Path(root) / name
-            if name == MANIFEST_NAME:
-                continue
-            try:
-                if not path.is_file():
+    # os.fwalk where the platform has it: this guard must complete on trees
+    # whose component paths exceed the platform PATH_MAX (1024 on macOS, where
+    # a name-based walk dies with ENAMETOOLONG and permanently wedges the batch
+    # as ``unreadable_batch``). fwalk traverses and stats via directory
+    # descriptors, so only the MANIFEST-RELATIVE strings below ever use the
+    # textual path, and those are pure string operations with no length limit.
+    # This also matches the descriptor discipline of the approval scan,
+    # chain-open, and removal passes; the guard is otherwise the one name-based
+    # walk.
+    #
+    # CPython defines fwalk only where ``{open, stat} <= os.supports_dir_fd``
+    # — on native Windows it does not exist, mirroring this module's
+    # ``_FD_SAFE_DELETE`` coarse path. There the ORIGINAL name-based walk is
+    # used: Windows has no macOS 1024-byte wedge, and an unconditional fwalk
+    # would crash every Empty-Trash with an AttributeError no caller catches.
+    fwalk = getattr(os, "fwalk", None)
+    if fwalk is not None:
+        # Unlike os.walk, fwalk RAISES when the top itself cannot be statted or
+        # opened rather than routing that first error through ``onerror`` — catch
+        # it into the same failure list so an unopenable batch stays a refusal
+        # with a reason, never an escaping OSError. RecursionError is belt only:
+        # CPython's fwalk is iterative on every Python this package supports
+        # (>=3.12; verified at depth 5000 under the default 1000-frame limit),
+        # but the guard's contract is that NO traversal failure escapes as a
+        # crash, so the impossible case still lands in the failure list.
+        try:
+            for root, _dirs, names, rootfd in fwalk(batch, onerror=failures.append):
+                for name in names:
+                    if name == MANIFEST_NAME:
+                        continue
+                    try:
+                        # follow_symlinks=True mirrors the Path.is_file() this
+                        # replaces: a symlink to a regular file counts, a broken
+                        # link does not.
+                        st = os.stat(name, dir_fd=rootfd)
+                    except OSError as exc:
+                        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP):
+                            # The same cases Path.is_file() reports as False.
+                            continue
+                        failures.append(exc)
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    path = Path(root) / name
+                    if path.relative_to(batch).as_posix() not in listed:
+                        unlisted.append(path)
+        except OSError as exc:
+            failures.append(exc)
+        except RecursionError as exc:
+            failures.append(OSError(f"traversal exceeded the recursion limit: {exc}"))
+    else:
+        for root, _dirs, names in os.walk(batch, onerror=failures.append):
+            for name in names:
+                path = Path(root) / name
+                if name == MANIFEST_NAME:
                     continue
-            except OSError as exc:
-                failures.append(exc)
-                continue
-            if path.relative_to(batch).as_posix() not in listed:
-                unlisted.append(path)
+                try:
+                    if not path.is_file():
+                        continue
+                except OSError as exc:
+                    failures.append(exc)
+                    continue
+                if path.relative_to(batch).as_posix() not in listed:
+                    unlisted.append(path)
     if failures:
         raise SessionStorageError(
             f"could not read all of {batch.name!r}, so it is not known whether it "
@@ -1582,6 +2340,10 @@ def _discard_restored_batch(batch: Path, expect: tuple[int, int] | None) -> None
     except SessionStorageError as exc:
         # Not knowing is treated exactly like finding leftovers: keep the batch.
         logger.warning("keeping trash batch %r: %s", batch.name, exc)
+        return
+    if _unlisted_crew_staging(batch):
+        # Removing the batch would leave that staging to the prune, which deletes it.
+        logger.warning("keeping trash batch %r: it holds unlisted crew-log staging", batch.name)
         return
     if leftovers:
         logger.warning(
@@ -1718,7 +2480,7 @@ def _remove_emptied_batch(batch: Path, what: str, *, expect: tuple[int, int] | N
 
     Both callers reach this having already established that the batch holds no file the
     manifest does not list - a fully restored batch, and one no session was staged into.
-    What is left is the removal, and it used to be ``shutil.rmtree(batch)``: a PATH, which
+    What is left is the removal, and ``shutil.rmtree(batch)`` would take a PATH, which
     the kernel re-resolves component by component. The trash root and the directories above
     it are writable by the same user, which in this product includes an agent, so one of
     them swapped to a symbolic link after the caller's own read is followed and the removal
@@ -1757,11 +2519,11 @@ def _remove_emptied_batch(batch: Path, what: str, *, expect: tuple[int, int] | N
         # platform, from the same owner: the batch is renamed aside inside the trash root,
         # its identity is checked THERE, and only the staged name is removed.
         #
-        # Refusing outright was the earlier answer here, on the reasoning that nobody asked
-        # for these two removals so the safer half of the trade came free. It does not: this
+        # Refusing outright looks like the safer half of the trade, on the reasoning that
+        # nobody asked for these two removals. It is not: this
         # branch is the whole of Windows, so refusing leaves a batch behind after EVERY
         # restore and every rolled-back move, still listing the sessions it no longer holds.
-        # Five pre-existing tests read that as a failure and so would a user. The residual
+        # Tests read that as a failure and so would a user. The residual
         # accepted instead is the one `empty_trash` already accepts here and documents - an
         # actor who can observe the staging name inside the window can redirect the removal
         # through an ancestor swapped afterwards - and it is bounded by an identity check
@@ -1888,14 +2650,14 @@ class _OversizedManifestRecord(Exception):
 def _manifest_records(handle: IO[str], batch: Path) -> Iterator[dict[str, Any]]:
     """Yield each JSON object record of an open manifest, header first.
 
-    Record boundaries match ``str.splitlines`` — the previous whole-file reader —
-    so a manifest split on any unicode line boundary parses exactly as it always
-    did: reads are accumulated in a carry-over buffer and re-split per chunk, so a
+    Record boundaries match ``str.splitlines``, so a manifest split on any unicode
+    line boundary parses identically:
+    reads are accumulated in a carry-over buffer and re-split per chunk, so a
     cap-sized read ending mid-record never invents or destroys a boundary. Blank
     and non-dict lines are skipped silently. A record that fails to parse is
     skipped and counted: a trailing partial line (a crash mid-append) is expected
     and logged at debug, while any other unparseable record — mid-file corruption —
-    gets one aggregated warning per read (#6292 item 3). Either way every complete
+    gets one aggregated warning per read. Either way every complete
     record before it describes real moved files that must stay restorable, so a
     parse failure never fails the batch wholesale.
 
@@ -2169,6 +2931,42 @@ def _entry_bytes(entry: dict[str, Any]) -> int:
     return total
 
 
+def _purge_search_index(stems: list[str]) -> bool:
+    """Remove the search index's copy of *stems*' message text; report the verdict.
+
+    The index stores each indexed session's message text, keyed by transcript stem.
+    A session leaving live storage must not leave that copy behind: search cannot
+    reach it once the transcript is gone, but it stays READABLE on disk, so a later
+    empty-trash would report a purge it did not complete.
+
+    Returns ``False`` rather than raising, because the caller refuses ONE session at
+    a time and reports it: a session whose copy cannot be removed is left in place,
+    exactly where the caller left it, and named in the warning the move logs.
+
+    The caller holds that session's ``ConversationLog._locked`` across this call AND
+    its file moves. That is what makes the removal stick: the background indexer
+    takes the same per-session lock, so it cannot re-read a still-present transcript
+    and write the row back in between.
+
+    An index that does not exist is not created here -- a reclaim must not bring one
+    into being, and absent means there is no copy to remove. An index that exists but
+    cannot be opened is a refusal: the copy may be in it and nothing here can remove
+    it, so unprovable removal is not removal.
+    """
+    if not stems:
+        return True
+    db_path = _crew_sessions_dir() / ".index" / INDEX_FILENAME
+    if not db_path.exists():
+        return True
+    index = SessionSearchIndex(db_path)
+    try:
+        if not index.available:
+            return False
+        return index.drop(stems)
+    finally:
+        index.close()
+
+
 def move_to_trash(
     uids: list[str],
     *,
@@ -2176,6 +2974,7 @@ def move_to_trash(
     index: SessionIndex,
     now: float | None = None,
     refresh: Callable[[], SessionIndex] | None = None,
+    activation: "tuple[AbstractContextManager[Any], Callable[[], SessionIndex]] | None" = None,
 ) -> TrashBatch:
     """Stage whole sessions for deletion and return the batch that can undo it.
 
@@ -2186,6 +2985,13 @@ def move_to_trash(
     Refuses a session that is still mapped, and one touched within
     :data:`MIN_RECLAIM_AGE_DAYS`: a mapped session is resumable, and a fresh one
     may be running under a subsystem that never registered it.
+
+    *activation* is ``(lock, live_index)``: the lock a resume holds while it maps a
+    session, and a read of the index that lock guards. A session with crew logs has
+    that index re-read and its crew logs staged inside that one hold, so a resume --
+    including one that only reads its transcript and whose mapping has not reached the
+    file *refresh* reads -- either lands first and is seen, or waits until the units
+    have moved and finds the session gone.
 
     *refresh* re-reads the caller's index INSIDE the lock: once immediately before
     anything moves, and again before every session the loop reaches. Scanning a
@@ -2213,7 +3019,9 @@ def move_to_trash(
     """
     with _mutation_lock():
         try:
-            return _move_to_trash_locked(uids, reason=reason, index=index, now=now, refresh=refresh)
+            return _move_to_trash_locked(
+                uids, reason=reason, index=index, now=now, refresh=refresh, activation=activation
+            )
         finally:
             # In a finally, not after a success: a partially-completed batch has
             # already moved files, so a raised refusal still leaves any cached
@@ -2228,6 +3036,7 @@ def _move_to_trash_locked(
     index: SessionIndex,
     now: float | None = None,
     refresh: Callable[[], SessionIndex] | None = None,
+    activation: "tuple[AbstractContextManager[Any], Callable[[], SessionIndex]] | None" = None,
 ) -> TrashBatch:
     """Stage whole sessions for deletion and return the batch that can undo it.
 
@@ -2277,7 +3086,7 @@ def _move_to_trash_locked(
     if not requested:
         raise SessionStorageError("no sessions selected")
 
-    by_uid = {u.uid: u for u in _scan_units(index)}
+    by_uid = {u.uid: u for u in _scan_units(index, strict=True)}
 
     # The authority check runs AFTER the scan, not before it. Enumerating a
     # six-figure store is the slow part of this function, so an index read before
@@ -2322,7 +3131,7 @@ def _move_to_trash_locked(
         # name!r, not plain interpolation: the directory name is agent-influenced
         # and passes no identifier gate, so a newline or ANSI payload in it would
         # forge a second record the moment a caller logs str(exc) (the
-        # #6281/#6371 forgery class).
+        # log-forgery class).
         raise SessionStorageError(
             f"{len(refusals)} instance(s) sharing this session store make reclaiming "
             f"unsafe ({name!r} — {why}); nothing was moved"
@@ -2334,6 +3143,8 @@ def _move_to_trash_locked(
         if unit is None:
             return False
         if unit.active or (unit.sid and unit.sid in live_sids):
+            return True
+        if any(crew in live_sids for crew in unit.crew_units):
             return True
         return any(stem in live_stems for stem in unit.stems)
 
@@ -2383,12 +3194,19 @@ def _move_to_trash_locked(
     moved_bytes = 0
     moved_sessions = 0
     revived: list[str] = []
+    # Sessions left in place because the search index would not give up its copy
+    # of their text. Reported like ``revived``: doing less than the caller asked
+    # without saying so is a defect, and this refusal protects deleted content.
+    refused_index: list[str] = []
     refresh_failed = False
     staged_dirs: set[Path] = set()
     source_dirs: set[Path] = set()
     cli_files = _cli_index()
     with (target / MANIFEST_NAME).open("w", encoding="utf-8") as manifest:
         _write_header(manifest, batch_id, clock, reason)
+        # The indexer serializes on ConversationLog's per-session lock, so the
+        # reclaim borrows the same lock rather than inventing a second one.
+        log = ConversationLog(base_dir=_crew_sessions_dir())
         for uid in requested:
             unit = by_uid.get(uid)
             if unit is None:
@@ -2398,7 +3216,7 @@ def _move_to_trash_locked(
                 # check below is the only other per-unit signal and it sees writes
                 # only, so a resume that merely READS an old transcript to rebuild
                 # history — recording the turn that follows under a newly mapped
-                # sid — leaves every mtime days old and slips past it (#7118). The
+                # sid — leaves every mtime days old and slips past it. The
                 # index is where that resume IS visible, so it has to be consulted
                 # at the same cadence.
                 #
@@ -2438,82 +3256,155 @@ def _move_to_trash_locked(
                 # revival is.
                 revived.append(uid)
                 continue
-            files: list[dict[str, Any]] = []
-            done: list[tuple[Path, Path]] = []
-            failed = False
-            woke = False
-            for src, rel in _unit_paths(unit.sid, unit.stems, archives, cli_files):
+            # The index's copy of this session's text goes under the SAME lock that
+            # holds its files, and stays held across the move. A purge that merely
+            # preceded the move left a window: the background indexer re-reads a
+            # transcript that is still in place, so its write lands after the purge
+            # and the text is back in the index once the files are gone. The
+            # indexer takes this same per-session lock, so holding it here is what
+            # excludes it. Locks are taken in sorted order so two multi-stem
+            # reclaims cannot deadlock against each other.
+            with ExitStack() as unit_locks:
+                for stem in sorted(unit.stems):
+                    unit_locks.enter_context(log._locked(stem))
+                if not _purge_search_index(list(unit.stems)):
+                    logger.warning(
+                        "could not remove the search index copy for %r; not moving it", uid
+                    )
+                    refused_index.append(uid)
+                    continue
+                # The crew logs go FIRST: renaming a unit is refused while a writer
+                # holds it, which means the session is in use, and nothing else of the
+                # session has moved yet to put back. Every rollback below returns them.
+                # Under *activation* the final liveness read and the staging are one
+                # hold of the lock a resume maps under.
+                resumed = False
+                crew_ok, crew_bytes = True, 0
+                hold = activation[0] if activation and unit.crew_units else nullcontext()
+                with hold:
+                    if activation and unit.crew_units:
+                        try:
+                            now_index = activation[1]()
+                        except Exception:
+                            logger.warning(
+                                "could not read the live session index for %r; not moving it",
+                                uid,
+                                exc_info=True,
+                            )
+                            resumed = True
+                        else:
+                            live_sids = live_sids | now_index.active_sids
+                            live_stems = live_stems | now_index.active_stems
+                            resumed = is_live(uid)
+                    if not resumed:
+                        crew_ok, crew_bytes = _stage_crew_logs(batch_id, uid, unit.crew_units)
+                if resumed:
+                    revived.append(uid)
+                    continue
+                if not crew_ok:
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
+                    revived.append(uid)
+                    continue
+                files: list[dict[str, Any]] = []
+                done: list[tuple[Path, Path]] = []
+                failed = False
+                woke = False
                 try:
-                    size, mtime = _file_stamp(src)
+                    unit_files = _unit_paths(unit.sid, unit.stems, archives, cli_files)
                 except OSError:
-                    # A file that cannot be sized cannot be recorded, and a file
-                    # the manifest does not record is one restore cannot put back.
-                    # Skipping it here while moving the rest is precisely the split
-                    # this loop's rollback exists to prevent, so it is a failure.
-                    logger.warning("could not stat %s for staging", src, exc_info=True)
+                    # A half this session owns could not be enumerated (an
+                    # attachments directory that exists but will not list). Taking
+                    # the halves that did enumerate is the split this loop's
+                    # rollback exists to prevent, so the session is left whole.
+                    logger.warning("could not enumerate session %r for staging", uid, exc_info=True)
+                    unit_files = []
                     failed = True
-                    break
-                if mtime > validated_at:
-                    # Every authority check ran before the loop, and moving a
-                    # six-figure store is not instant, so a session can be resumed
-                    # between being certified retired and being reached here. Its
-                    # replay log is then written to, and this is the one signal of
-                    # that which costs nothing: the stat is already being taken for
-                    # the manifest.
-                    #
-                    # A candidate qualified by being untouched for
-                    # MIN_RECLAIM_AGE_DAYS, so an mtime newer than the instant we
-                    # certified it cannot be the same idle file — something has it
-                    # open. Leave the whole session alone rather than any part of
-                    # it: staging half is the split the rollback below exists to
-                    # prevent, and the half left behind would be the live half.
-                    woke = True
-                    break
-                dst = target / rel
-                if dst.parent not in staged_dirs:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    # Before anything moves INTO it, not with the batch at the end.
-                    # The same-filesystem move is a rename, which removes the file's
-                    # only other name in the same atomic step that creates this one:
-                    # if the rename reaches disk while the mkdir that created its
-                    # parent does not, the file has no reachable name left. Syncing
-                    # the chain here orders the two — the directory that will hold
-                    # the file is durable before the source entry can be given up.
-                    #
-                    # Cheap in the way the per-file case would not be: once per new
-                    # directory, not once per file, so the hot path stays a bare
-                    # rename (see :func:`_sync_batch` for the end-of-batch sync that
-                    # forces the entries those renames then add).
+                for src, rel in unit_files:
                     try:
-                        _fsync_tree(target, dst.parent)
+                        size, mtime = _file_stamp(src)
                     except OSError:
-                        # Same treatment as a file that would not move: nothing of
-                        # this session has entered this directory yet, so rolling it
-                        # back and leaving the rest of the batch to be recorded and
-                        # synced properly is strictly better than abandoning a batch
-                        # whose manifest has not been forced out.
-                        logger.warning(
-                            "could not sync the staging directory %s", dst.parent, exc_info=True
-                        )
+                        # A file that cannot be sized cannot be recorded, and a file
+                        # the manifest does not record is one restore cannot put back.
+                        # Skipping it here while moving the rest is precisely the split
+                        # this loop's rollback exists to prevent, so it is a failure.
+                        logger.warning("could not stat %s for staging", src, exc_info=True)
                         failed = True
                         break
-                    # Recorded only once the chain is durable. On the failure above
-                    # nothing was staged under it, so there is nothing for the
-                    # end-of-batch sync to force; a later session needing the same
-                    # directory re-runs the mkdir and retries the sync.
-                    staged_dirs.update(_levels_between(target, dst.parent))
-                try:
-                    _move_file(src, dst)
-                except OSError:
-                    logger.warning("could not move %s into the trash", src, exc_info=True)
-                    failed = True
-                    break
-                # The live-store directory this file just left. Synced once at the end
-                # rather than per file, because the same-filesystem path is a bare
-                # rename and this is the hot path (see :func:`_sync_batch`).
-                source_dirs.add(src.parent)
-                done.append((dst, src))
-                files.append({"rel": rel, "origin": str(src), "bytes": size})
+                    if mtime > validated_at:
+                        # Every authority check ran before the loop, and moving a
+                        # six-figure store is not instant, so a session can be resumed
+                        # between being certified retired and being reached here. Its
+                        # replay log is then written to, and this is the one signal of
+                        # that which costs nothing: the stat is already being taken for
+                        # the manifest.
+                        #
+                        # A candidate qualified by being untouched for
+                        # MIN_RECLAIM_AGE_DAYS, so an mtime newer than the instant we
+                        # certified it cannot be the same idle file — something has it
+                        # open. Leave the whole session alone rather than any part of
+                        # it: staging half is the split the rollback below exists to
+                        # prevent, and the half left behind would be the live half.
+                        woke = True
+                        break
+                    dst = target / rel
+                    if dst.parent not in staged_dirs:
+                        try:
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                        except OSError:
+                            # The crew logs are already staged, so an escape here would
+                            # leave them in the trash with no entry that restores them.
+                            # A failure instead, rolled back like a file that would not move.
+                            logger.warning(
+                                "could not create the staging directory %s",
+                                dst.parent,
+                                exc_info=True,
+                            )
+                            failed = True
+                            break
+                        # Before anything moves INTO it, not with the batch at the end.
+                        # The same-filesystem move is a rename, which removes the file's
+                        # only other name in the same atomic step that creates this one:
+                        # if the rename reaches disk while the mkdir that created its
+                        # parent does not, the file has no reachable name left. Syncing
+                        # the chain here orders the two — the directory that will hold
+                        # the file is durable before the source entry can be given up.
+                        #
+                        # Cheap in the way the per-file case would not be: once per new
+                        # directory, not once per file, so the hot path stays a bare
+                        # rename (see :func:`_sync_batch` for the end-of-batch sync that
+                        # forces the entries those renames then add).
+                        try:
+                            _fsync_tree(target, dst.parent)
+                        except OSError:
+                            # Same treatment as a file that would not move: nothing of
+                            # this session has entered this directory yet, so rolling it
+                            # back and leaving the rest of the batch to be recorded and
+                            # synced properly is strictly better than abandoning a batch
+                            # whose manifest has not been forced out.
+                            logger.warning(
+                                "could not sync the staging directory %s", dst.parent, exc_info=True
+                            )
+                            failed = True
+                            break
+                        # Recorded only once the chain is durable. On the failure above
+                        # nothing was staged under it, so there is nothing for the
+                        # end-of-batch sync to force; a later session needing the same
+                        # directory re-runs the mkdir and retries the sync.
+                        staged_dirs.update(_levels_between(target, dst.parent))
+                    try:
+                        _move_file(src, dst)
+                    except OSError:
+                        logger.warning("could not move %s into the trash", src, exc_info=True)
+                        failed = True
+                        break
+                    # The live-store directory this file just left. Synced once at the end
+                    # rather than per file, because the same-filesystem path is a bare
+                    # rename and this is the hot path (see :func:`_sync_batch`).
+                    source_dirs.add(src.parent)
+                    done.append((dst, src))
+                    files.append({"rel": rel, "origin": str(src), "bytes": size})
             if woke:
                 # Put back whatever already moved for this session: the point of
                 # leaving it alone is that it stays resumable, and half a session
@@ -2558,6 +3449,7 @@ def _move_to_trash_locked(
                     # where its fragment is; replacing that with an OSError would cost
                     # the operator the only pointer to the fragment in exchange for
                     # information the log line already carries.
+                    _put_back_crew_logs(manifest, batch_id, uid)
                     try:
                         _sync_batch(target, staged_dirs, manifest, source_dirs)
                     except OSError:
@@ -2573,6 +3465,9 @@ def _move_to_trash_locked(
                         f"not be fully put back; what is still staged is recorded in "
                         f"{target} and can be restored"
                     )
+                if not _put_back_crew_logs(manifest, batch_id, uid):
+                    _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                    raise _crew_logs_left_staged(uid, target)
                 revived.append(uid)
                 continue
             if failed:
@@ -2582,6 +3477,9 @@ def _move_to_trash_locked(
                 # the trash would destroy one half of a session nobody knew was
                 # split. Put back whatever moved and leave the session alone.
                 _rollback(done)
+                if not _put_back_crew_logs(manifest, batch_id, uid):
+                    _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                    raise _crew_logs_left_staged(uid, target)
                 continue
             if files:
                 # The manifest is what makes a move reversible, so a session that
@@ -2600,9 +3498,47 @@ def _move_to_trash_locked(
                     except OSError:
                         logger.warning("could not rewind the manifest", exc_info=True)
                     _rollback(done)
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
                     continue
                 moved_sessions += 1
-                moved_bytes += sum(int(record["bytes"]) for record in files)
+                moved_bytes += sum(int(record["bytes"]) for record in files) + crew_bytes
+                # The attachments directories this unit drained are now empty
+                # shells; a restore recreates one on demand. Removed under the
+                # unit's transcript locks, re-taken for this step: a writer that
+                # resumes this session creates the directory and lands its first
+                # image under that same lock, so an unlocked ``rmdir`` could take
+                # the directory between its ``mkdir`` and the file arriving and
+                # cost that row its image. ``rmdir`` refuses a non-empty
+                # directory, so anything this code did not stage (and so did not
+                # move), or a resumed writer's image that landed while the lock
+                # was free, keeps its home. Best-effort throughout: an empty shell
+                # left behind is a cosmetic leftover, not a broken session.
+                try:
+                    with ExitStack() as shell_locks:
+                        for stem in sorted(unit.stems):
+                            shell_locks.enter_context(log._locked(stem))
+                        for stem in unit.stems:
+                            try:
+                                os.rmdir(attachments_dir(_crew_sessions_dir(), stem))
+                            except OSError:
+                                pass
+                except Exception:
+                    logger.debug("could not take the lock to remove an empty attachments dir")
+            elif _has_staged_crew(batch_id, uid):
+                # A session made only of crew logs still needs its manifest entry: it
+                # is how restore finds the uid whose units to put back.
+                try:
+                    _append_entry(manifest, {"uid": uid, "files": []})
+                except OSError:
+                    logger.warning("could not record session %r; putting it back", uid)
+                    if not _put_back_crew_logs(manifest, batch_id, uid):
+                        _sync_batch_or_warn(target, staged_dirs, manifest, source_dirs)
+                        raise _crew_logs_left_staged(uid, target)
+                    continue
+                moved_sessions += 1
+                moved_bytes += crew_bytes
         # Inside the handle's scope, so the manifest can still be synced through the
         # descriptor that wrote it. Closing only flushes to the OS.
         _sync_batch(target, staged_dirs, manifest, source_dirs)
@@ -2616,6 +3552,14 @@ def _move_to_trash_locked(
             "left %d session(s) in place: resumed while staging (first: %r)",
             len(revived),
             revived[0],
+        )
+
+    if refused_index:
+        logger.warning(
+            "left %d session(s) in place: the search index would not release its copy "
+            "of their text (first: %r)",
+            len(refused_index),
+            refused_index[0],
         )
 
     if not moved_sessions:
@@ -2633,6 +3577,11 @@ def _move_to_trash_locked(
             raise SessionStorageError(
                 f"all {len(revived)} selected session(s) were resumed while being "
                 "staged; nothing was moved"
+            )
+        if refused_index:
+            raise SessionStorageError(
+                f"the search index would not release its copy of {len(refused_index)} "
+                "selected session(s)' text; nothing was moved"
             )
         raise SessionStorageError("none of the selected sessions were found on disk")
 
@@ -2703,7 +3652,7 @@ def list_trash() -> list[TrashBatch]:
                 created_at=float(created) if isinstance(created, (int, float)) else 0.0,
                 reason=str(header.get("reason") or ""),
                 sessions=sessions,
-                bytes=staged_bytes,
+                bytes=staged_bytes + _tree_bytes(_crew_staging(candidate.name)),
             )
         )
     batches.sort(key=lambda b: b.created_at, reverse=True)
@@ -2792,39 +3741,143 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                 blocked = True
                 break
             planned.append((src, origin))
+        if not blocked and not files and _has_staged_crew(batch_id, uid):
+            crew_only = _restore_crew_logs(batch_id, uid)
+            if crew_only is None:
+                remaining.append(entry)
+            else:
+                _release_restored_holds(crew_only)
+                _release_crew_holds(batch_id, uid)
+                restored += 1
+            continue
         if blocked or not planned:
             remaining.append(entry)
             continue
-        done: list[tuple[Path, Path]] = []
+        # The crew logs go back FIRST and are staged again if anything below fails,
+        # so a session is restored with all of its halves or left staged with all.
+        crew_back = _restore_crew_logs(batch_id, uid)
+        if crew_back is None:
+            remaining.append(entry)
+            continue
+        crew_sessions = _crew_sessions_dir()
+        threads_dir = crew_sessions / THREADS_DIR_NAME
+        live_transcripts: list[tuple[Path, Path]] = []
+        prelock_files: list[tuple[Path, Path]] = []
+        for item in planned:
+            _src, origin = item
+            if origin.parent == crew_sessions and origin.suffix == _TRANSCRIPT_SUFFIX:
+                live_transcripts.append(item)
+            elif origin.parent == threads_dir and origin.suffix == THREADS_SIDECAR_SUFFIX:
+                # The reply-thread sidecar is written under the transcript's lock
+                # (``append_thread_reply``), so it is published and rolled back
+                # under that same lock, beside the transcript: a reply a recreated
+                # chat commits between publish and a lost-race rollback would
+                # otherwise ride the sidecar back to trash.
+                live_transcripts.append(item)
+            else:
+                prelock_files.append(item)
+        if any(
+            platform_compat.is_link_or_junction(origin.parent)
+            for _src, origin in live_transcripts
+            if origin.parent == threads_dir and origin.parent.exists()
+        ):
+            # A link where the sidecar directory should be would carry the
+            # restore outside the session store; leave the batch staged.
+            _return_crew_logs(batch_id, uid, crew_back)
+            remaining.append(entry)
+            continue
+        done_prelock: list[tuple[Path, Path]] = []
+        done_transcripts: list[tuple[Path, Path]] = []
         try:
             lost_race = False
-            for src, origin in planned:
+            # Replay logs and archive segments can require unbounded
+            # cross-filesystem copies. Restore them first, with no history lock
+            # held; every failure rolls them back before the live transcript is
+            # published.
+            for src, origin in prelock_files:
                 origin.parent.mkdir(parents=True, exist_ok=True)
                 if not _move_file_exclusive(src, origin):
-                    # The session came back between the preflight and now. The
-                    # occupant is newer, so the whole session is put back and the
-                    # entry retained — restoring the rest would splice two
-                    # generations of one session together.
                     logger.warning(
-                        "session %r was recreated while being restored; leaving it " "staged",
+                        "session %r was recreated while being restored; leaving it staged",
                         uid,
                     )
                     lost_race = True
                     break
-                done.append((origin, src))
+                done_prelock.append((origin, src))
             if lost_race:
-                _rollback(done)
+                _rollback(done_prelock)
+                _return_crew_logs(batch_id, uid, crew_back)
                 remaining.append(entry)
                 continue
-        except OSError:
+
+            transcript_keys: set[str] = set()
+            for _src, origin in live_transcripts:
+                # A sidecar's stem IS its transcript's stem, so it takes the
+                # same lock aliases.
+                transcript_keys.update(transcript_lock_stems(origin.stem))
+            transcript_log = ConversationLog(base_dir=crew_sessions)
+            with transcript_log.locked_stems(transcript_keys):
+                # The original preflight ran before replay restoration and lock
+                # acquisition. Recheck every physical alias of each live
+                # transcript here; prelock origins now exist because this
+                # transaction restored them and are tracked separately for
+                # rollback. A sidecar takes the same recheck on ITS stem: its
+                # replies belong to the transcript that was deleted with it, so a
+                # transcript recreated under that stem since is a different chat,
+                # and the old thread must not be attached to it.
+                if any(
+                    (crew_sessions / f"{stem}{_TRANSCRIPT_SUFFIX}").exists()
+                    for _src, origin in live_transcripts
+                    for stem in transcript_lock_stems(origin.stem)
+                ):
+                    lost_race = True
+                else:
+                    try:
+                        for src, origin in live_transcripts:
+                            origin.parent.mkdir(parents=True, exist_ok=True)
+                            if origin.parent == threads_dir:
+                                # The sidecar is published relative to the pinned
+                                # `.threads` descriptor: a link swapped in for the
+                                # directory after preflight is refused by the open
+                                # (O_NOFOLLOW) and cannot redirect the publish.
+                                moved = _move_sidecar_pinned(src, origin)
+                            else:
+                                moved = _move_file_exclusive(src, origin)
+                            if not moved:
+                                logger.warning(
+                                    "session %r was recreated while being restored; "
+                                    "leaving it staged",
+                                    uid,
+                                )
+                                lost_race = True
+                                break
+                            done_transcripts.append((origin, src))
+                    except OSError:
+                        # Put any published live transcript back while its alias
+                        # locks are still held. Large replay files roll back only
+                        # after this scope exits.
+                        _rollback(done_transcripts)
+                        done_transcripts.clear()
+                        raise
+                if lost_race:
+                    _rollback(done_transcripts)
+                    done_transcripts.clear()
+            if lost_race:
+                _rollback(done_prelock)
+                _return_crew_logs(batch_id, uid, crew_back)
+                remaining.append(entry)
+                continue
+        except (OSError, HistoryLockTimeout):
             logger.warning("could not fully restore session %r", uid, exc_info=True)
-            # Without this the session is split *and* wedged: the files that did
-            # move are gone from the batch while the manifest still lists them, so
-            # every later retry fails its own "staged file present" check and the
-            # session can never be restored or cleanly emptied again.
-            _rollback(done)
+            # Live transcript rollback happens under its lock above. Replay and
+            # archive rollback stays outside that lock because it can copy
+            # unbounded files across filesystems.
+            _rollback(done_prelock)
+            _return_crew_logs(batch_id, uid, crew_back)
             remaining.append(entry)
             continue
+        _release_restored_holds(crew_back)
+        _release_crew_holds(batch_id, uid)
         restored += 1
 
     if remaining:
@@ -2881,11 +3934,11 @@ class BatchIdentity:
 
     ``files`` and ``links`` are the same argument one level down, and they are recorded for
     the same reason rather than as symmetry for its own sake. The delete checks each staged
-    file's identity, but it used to check against a map built by its OWN scan - which is
-    self-consistent and authorises nothing. A listed file replaced between the approval and
-    the delete had its replacement's inode recorded, matched, and was unlinked: an
-    unapproved file, whose only copy it may be, destroyed on consent given for a different
-    one. Both are None on the coarse platform for the reason ``dirs`` is.
+    file's identity against the APPROVAL's map, never against a map built by its OWN scan -
+    which is self-consistent and authorises nothing. A listed file replaced between the
+    approval and the delete would have its replacement's inode recorded, matched, and
+    unlinked: an unapproved file, whose only copy it may be, destroyed on consent given for
+    a different one. Both are None on the coarse platform for the reason ``dirs`` is.
     """
 
     dev: int
@@ -2954,8 +4007,8 @@ def _manifest_rels(batch: Path, *, dir_fd: int | None = None) -> list[str]:
 #: Windows has neither, so it takes the coarse path below.
 #:
 #: The pinned-walk half is asked of :mod:`kiro_crew.pinned_fs` rather than restated here.
-#: That module exists because two closed PRs (#2446, #2447) tried to spell this mechanism
-#: per call site and neither converged, so a second spelling is the failure it was created
+#: That module exists because spelling this mechanism per call site does not converge, so
+#: a second spelling is the failure it exists
 #: to end. What is added on top is only what THIS path needs beyond walking a tree: the
 #: three mutating calls it makes relative to a descriptor.
 _FD_SAFE_DELETE = (
@@ -2981,11 +4034,11 @@ _dir_open_flags = pinned_fs.dir_flags
 _close_all = pinned_fs.close_all
 _drain = pinned_fs.drain_verified_chain
 
-#: The pinned traversal and the verified chain-open used to be spelled here. They are
+#: The pinned traversal and the verified chain-open live in :mod:`kiro_crew.pinned_fs`
+#: with the rest of the mechanism, because they are
 #: consumer-agnostic - "walk a tree without ever re-resolving a name" and "open a
 #: component only as the inode a scan recorded" say nothing about batches, manifests or
-#: approval - so they now live in :mod:`kiro_crew.pinned_fs` with the rest of the
-#: mechanism, and what stays in this module is the trash-specific part: which map
+#: approval. What stays in this module is the trash-specific part: which map
 #: authorises the delete, and what a refusal means to the user.
 _scan_tree = pinned_fs.scan_tree_pinned
 _open_chain = pinned_fs.open_verified_chain
@@ -3194,7 +4247,7 @@ def _unlink_debris(parent_fd: int, debris: str, expect_ino: int | None) -> None:
     The debris name lives in the trash root, and by the time this runs the batch removal has
     either succeeded or failed - so time has passed in a directory an actor may be able to
     write to. Unlinking by name alone would destroy whatever answers to it by then, which is
-    the same trusted-a-name mistake every other removal on this path was rewritten to avoid.
+    the same trusted-a-name mistake every other removal on this path avoids.
     Best effort: a name that no longer holds the manifest is left alone, not chased.
     """
     if expect_ino is None:
@@ -3529,8 +4582,8 @@ def _delete_listed_files(
             # The files and links get the same treatment, and for a sharper reason than
             # symmetry: the per-file identity check further down compares each name against
             # the scan taken HERE, which is self-consistent and authorises nothing. A listed
-            # file replaced during the handoff had its replacement's inode recorded, matched,
-            # and was unlinked - an unapproved file destroyed on consent given for a
+            # file replaced during the handoff would have its replacement's inode recorded,
+            # matched, and unlinked - an unapproved file destroyed on consent given for a
             # different one. Comparing the whole map against the approval refuses the batch
             # instead. A concurrent restore that removed staged files lands here too, and
             # refusing is right for the same reason it is right for directories: the
@@ -3616,7 +4669,6 @@ def _delete_listed_files(
                 # closes the interval between that scan and this unlink, and leaves only
                 # the two syscalls between the stat above and the unlink below, plus a file
                 # substituted before the scan under a name the manifest already lists.
-                # Stated as a residual in the PR rather than implied to be closed.
                 seen = present.get(parts)
                 if seen is None or (info.st_dev, info.st_ino) != (device, seen):
                     logger.warning("refusing a staged file that is not the one that was scanned")
@@ -4151,6 +5203,16 @@ def _empty_trash_locked(
             )
             _skipped(SKIP_UNLISTED_FILES)
             continue
+        stray_crew = _unlisted_crew_staging(resolved)
+        if stray_crew:
+            logger.warning(
+                "refusing to empty %r: crew logs of %d session(s) are staged but absent "
+                "from its manifest, so this would delete the only copy",
+                target.name,
+                len(stray_crew),
+            )
+            _skipped(SKIP_UNLISTED_FILES)
+            continue
         # An approval map that was SUPPLIED and does not name this batch is not the same as
         # no approval at all. `staged_targets` leaves out a batch whose identity it could not
         # read, and treating that as "nothing to check" would delete it unverified - the one
@@ -4170,4 +5232,6 @@ def _empty_trash_locked(
         freed += deleted
         if skip is not None:
             _skipped(skip)
+        else:
+            freed += _discard_crew_staging(target.name)
     return freed

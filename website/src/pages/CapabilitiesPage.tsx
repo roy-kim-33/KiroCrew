@@ -1,34 +1,38 @@
-import { useMemo } from 'react'
+import { lazy, Suspense, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link2, BookOpen, Users, MessageSquareText, Webhook, LayoutTemplate, Compass, Workflow, Library } from 'lucide-react'
+import { Link2, BookOpen, Users, MessageSquareText, Webhook, Compass, Workflow, Library, FileCode2 } from 'lucide-react'
 import SidePanelLayout from '../components/SidePanelLayout'
 import ErrorBoundary from '../components/ErrorBoundary'
-import RestartButton from '../components/RestartButton'
+import { PinSurfaceButton } from '../components/PinSurfaceButton'
 import { useProvider } from '../providers'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
-import AgentsPage from './AgentsPage'
 import KiroCrewAgentsPage from './KiroCrewAgentsPage'
 import HooksPage from './HooksPage'
 import ConnectionsPage from './connections/ConnectionsPage'
 import KnowledgePage from './KnowledgePage'
 import { SkillsTab, PromptsTab, SteeringTab } from './overview'
 import WorkflowLibraryTab from './overview/WorkflowLibraryTab'
+import { ContentSkeleton } from '../components/ui'
+
+// The custom-agent editor is a drill-in most sessions never open; its chunk is
+// fetched on the first visit rather than riding in the dashboard shell.
+const AgentTemplatesTab = lazy(() => import('./overview/AgentTemplatesTab'))
 
 
 /**
- * Opt-in flag for the Connections services gallery.
+ * Escape hatch for the Connections services gallery.
  *
- * The Connections work (provider registry, OAuth relay, card gallery) is merged
- * on main but held for a later release, so the gallery must not be reachable in
- * a shipped build. When the flag is absent — the default for every install —
- * this tab renders the pre-existing MCP Servers table, exactly as it did before
- * the gallery landed.
+ * The Connections work (provider registry, OAuth relay, card gallery) ships ON:
+ * with no `connections_ui` key — the state of every install that never touched
+ * it — this tab's Services panel offers the launched provider cards. Setting
+ * `connections_ui: false` in the running instance's `$KIROCREW_HOME/config.json`
+ * empties that panel again, leaving the MCP Servers sub-tab as the only way to
+ * reach a server. Config is read live, so no gateway restart is needed either
+ * way.
  *
- * A flag rather than a revert because the team asked to keep the code on main
- * and test from there: set `connections_ui: true` in the running instance's
- * `$KIROCREW_HOME/config.json` to exercise the gallery locally. Config is read
- * live, so no gateway restart is needed. The predicate lives in
- * hooks/useConnectionsUi so chat's banner gate reads the same answer.
+ * The predicate lives in hooks/useConnectionsUi so chat's banner gate reads the
+ * same answer. WHICH providers a launched gallery offers is decided per provider
+ * in pages/connections/registry.ts, not here.
  */
 
 export default function CapabilitiesPage() {
@@ -46,7 +50,10 @@ export default function CapabilitiesPage() {
     const groupAutomation = t('pages.capabilitiesPage.group_automation')
     return [
       { key: 'crews', label: t('pages.capabilitiesPage.crews_label'), icon: <Users size={16} />, description: t('pages.capabilitiesPage.crews_description'), group: groupAgent },
-      { key: 'templates', label: t('pages.capabilitiesPage.templates_label'), icon: <LayoutTemplate size={16} />, description: t('pages.capabilitiesPage.templates_description'), group: groupAgent },
+      // The custom agents crewmates and chats run. Beside Crewmates because a
+      // crewmate is built from a custom agent; the tab manages the shared files
+      // themselves.
+      { key: 'templates', label: t('pages.capabilitiesPage.templates_label'), icon: <FileCode2 size={16} />, description: t('pages.capabilitiesPage.templates_description'), group: groupAgent },
       { key: 'skills', label: t('pages.capabilitiesPage.skills_label'), icon: <BookOpen size={16} />, description: t('pages.capabilitiesPage.skills_description'), group: groupAgent },
       // The label and description are deliberately unchanged. Substituting the
       // pre-gallery "MCP Servers" strings was tried and reverted: those keys were
@@ -74,10 +81,13 @@ export default function CapabilitiesPage() {
   }, [provider, t])
 
   return (
-    <SidePanelLayout title={t('pages.capabilitiesPage.agent_capabilities')} tabs={tabs} rememberKey="capabilities" headerRight={<RestartButton />}>
+    <SidePanelLayout title={t('pages.capabilitiesPage.agent_capabilities')} tabs={tabs} rememberKey="capabilities" headerRight={<PinSurfaceButton defaultTab={tabs[0]?.key} />}>
       {tab => <>
         {tab === 'crews' && <KiroCrewAgentsPage embedded />}
-        {tab === 'templates' && <AgentsPage embedded />}
+        {/* ErrorBoundary around the lazy chunk: a stale chunk request after a
+            deploy rejects the import, and without a local boundary that rejection
+            would replace the whole dashboard with the app-shell error screen. */}
+        {tab === 'templates' && <ErrorBoundary><Suspense fallback={<ContentSkeleton rows={6} />}><AgentTemplatesTab /></Suspense></ErrorBoundary>}
         {tab === 'mcp' && <ConnectionsPage servicesEnabled={connectionsUiEnabled} />}
         {tab === 'skills' && <SkillsTab />}
         {/* ErrorBoundary preserves the crash isolation the /knowledge route

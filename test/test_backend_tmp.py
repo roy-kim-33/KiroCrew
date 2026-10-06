@@ -1,4 +1,4 @@
-"""Tests for :mod:`kiro_crew.mcp_gateway.backend_tmp` (issue #5064).
+"""Tests for :mod:`kiro_crew.mcp_gateway.backend_tmp`.
 
 Everything runs against a monkeypatched data home under ``tmp_path``; the
 real ``<data home>/run`` is never touched.
@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import sandbox as sandbox_mod
 from kiro_crew.mcp_gateway import backend_tmp as bt
 
 
@@ -87,6 +88,72 @@ class TestTmpEnv:
     def test_triple_points_at_the_dir(self, tmp_path: Path) -> None:
         env = bt.tmp_env(tmp_path)
         assert env == {"TMPDIR": str(tmp_path), "TMP": str(tmp_path), "TEMP": str(tmp_path)}
+
+
+class TestDeclaredTempClassification:
+    def test_unsealed_keys_are_returned_in_canonical_order(self, monkeypatch) -> None:
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", lambda _path: None)
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"Temp": "/capacity/temp", "tmpdir": "/capacity/tmpdir"}
+        )
+
+        assert accepted == ("TMPDIR", "TEMP")
+        assert refused == {}
+        assert failure == ""
+
+    def test_one_refusal_drops_the_whole_declaration(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            sandbox_mod,
+            "classify_declared_temp_path",
+            lambda path: "sealed" if path.endswith("sealed") else None,
+        )
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"TMPDIR": "/runtime/sealed", "TMP": "/capacity/tmp"}
+        )
+
+        assert accepted == ()
+        assert refused == {"TMPDIR": ("/runtime/sealed", "sealed")}
+        assert failure == ""
+
+    def test_check_failure_refuses_every_declared_key(self, monkeypatch) -> None:
+        def _raise(_path: str) -> None:
+            raise OSError("classifier unavailable")
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _raise)
+
+        accepted, refused, failure = sandbox_mod.classify_declared_temp_env(
+            {"tmpdir": "/one", "TEMP": "/two"}
+        )
+
+        assert accepted == ()
+        assert refused == {
+            "TMPDIR": ("/one", "check-failed"),
+            "TEMP": ("/two", "check-failed"),
+        }
+        assert failure == "OSError: classifier unavailable"
+
+    def test_failure_reason_is_redacted_and_single_line(self) -> None:
+        refused = {"TMPDIR": ("/declared", "check-failed")}
+        failure = "RuntimeError: private-value\nFORGED"
+
+        reasons = sandbox_mod.declared_temp_refusal_reasons(
+            refused,
+            failure,
+            redactor=lambda text: text.replace("private-value", "[REDACTED]"),
+        )
+
+        assert len(reasons) == 1
+        assert "private-value" not in reasons[0]
+        assert "\\nFORGED" in reasons[0]
+        assert "\nFORGED" not in reasons[0]
+
+    def test_unclassifiable_reason_includes_relative_paths(self) -> None:
+        reasons = sandbox_mod.declared_temp_refusal_reasons({"TMPDIR": ("run/x", "unclassifiable")})
+        assert len(reasons) == 1
+        assert "relative" in reasons[0]
+        assert "working directories" in reasons[0]
 
 
 class TestSweepOne:
@@ -231,6 +298,48 @@ class TestBootSweep:
 
         assert bt.sweep_all_backend_tmp() == 0
         assert path.exists()
+
+    def test_out_of_range_owner_is_kept_without_blocking_later_cleanup(
+        self, tmp_root: Path, monkeypatch
+    ) -> None:
+        real_scandir = os.scandir
+        reaped: list[Path] = []
+        corrupt = bt.allocate_backend_tmp(DIGEST)
+        bt.record_owner(corrupt, 10**100)
+        _age(corrupt, 2 * bt._UNOWNED_GRACE_SECONDS)
+        _age(corrupt / bt.OWNER_FILENAME, 2 * bt._UNOWNED_GRACE_SECONDS)
+        dead = bt.allocate_backend_tmp("b" * 64)
+        bt.record_owner(dead, 2**22 - 1)  # almost surely dead
+        _age(dead, 2 * bt._UNOWNED_GRACE_SECONDS)
+        _age(dead / bt.OWNER_FILENAME, 2 * bt._UNOWNED_GRACE_SECONDS)
+
+        with monkeypatch.context() as ordered:
+            ordered.setattr(
+                os,
+                "scandir",
+                lambda path: sorted(real_scandir(path), key=lambda entry: entry.name),
+            )
+
+            # The sweep reaps through ``platform_compat.rmtree_force`` and only
+            # counts a directory it confirms is GONE afterwards, so a stub that
+            # merely records the path would read back as a failed delete and
+            # never be counted. Record what was reaped and perform the real
+            # removal (with the real ``os.scandir`` restored, since
+            # ``shutil.rmtree`` enters it as a context manager) so the
+            # production success contract is exercised.
+            def _record_and_remove(path, **_kwargs):
+                reaped.append(Path(path))
+                with monkeypatch.context() as unordered:
+                    unordered.setattr(os, "scandir", real_scandir)
+                    return real_rmtree_force(path)
+
+            real_rmtree_force = bt.platform_compat.rmtree_force
+            ordered.setattr(bt.platform_compat, "rmtree_force", _record_and_remove)
+            removed = bt.sweep_all_backend_tmp()
+
+        assert corrupt.exists(), "an invalid identity is not evidence that its owner is dead"
+        assert dead in reaped, "one corrupt marker must not abort cleanup of later entries"
+        assert removed == 1
 
     def test_crashed_probe_dir_is_reclaimed_when_dead_and_idle(self, tmp_root: Path) -> None:
         # A probe normally cleans its own dir in its finally; one whose

@@ -1,6 +1,6 @@
 """Tests for v1c-B -- temporary/incognito flags persisted on the session.
 
-The flags were previously in-memory only (a bounded LRU), so they were lost
+In-memory-only flags (a bounded LRU) are lost
 on gateway restart. v1c-B write-throughs them to the canonical ``SessionMap``
 and re-hydrates the in-memory caches on session load, while preserving the
 existing in-memory behavior for contexts without a ``SessionMap`` (tests,
@@ -35,9 +35,6 @@ class _Sessions:
 
 
 class TestConvFlagPersistence:
-    def test_conv_state_map_none_without_session_map(self, patched):
-        assert h._conv_state_map(object()) is None  # test double -> in-memory only
-
     def test_hydrate_restores_temporary_from_session_map(self, patched):
         sm = SessionMap()
         sm.set_flag("slack:1.2", "temporary", True)

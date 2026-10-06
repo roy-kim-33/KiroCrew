@@ -173,16 +173,15 @@ async def teardown_app_runtime(
     # before the backend process is stopped, because the script may need its own
     # backend alive to shut down cleanly.
     #
-    # This step used to live only in the disable HANDLER, which made trust
-    # revocation strictly WEAKER than an ordinary off-switch: `onEnable` can start
-    # something the gateway never tracked (a detached helper, a daemon it spawned),
-    # and `onDisable` is the only thing that knows how to stop it. Revoking trust
-    # stopped the tracked backend and hooks, returned 200, and left that helper
+    # Running this step only in the disable HANDLER would make trust revocation
+    # strictly WEAKER than an ordinary off-switch: `onEnable` can start something
+    # the gateway never tracked (a detached helper, a daemon it spawned), and
+    # `onDisable` is the only thing that knows how to stop it. Revoking trust would
+    # then stop the tracked backend and hooks, return 200, and leave that helper
     # running — third-party code still executing after its permission to execute was
     # withdrawn. An inversion, since revoke is the security operation and disable is
-    # merely lifecycle. Moving it into the ONE shared teardown is what the disable
-    # handler's own comment already asked for: a second copy is how the revoke path
-    # came to miss steps in the first place.
+    # merely lifecycle. It lives in the ONE shared teardown instead: a second copy
+    # is how a revoke path comes to miss steps.
     #
     # Classified as a WARNING, never a failure, for both callers — the same call as
     # ``hooks_shutdown`` below and for a sharper reason: this script is the app's own
@@ -465,8 +464,7 @@ def register_slot_close_undo_hook(app: str, hook: SlotCloseHook) -> None:
     atomic. So each committed step needs an inverse, or some ordering of the three
     always leaves a pair disagreeing when a later step fails: notify last leaves a
     live worker behind a dismissed tab, notify first leaves a stopped worker behind
-    a tab that came back. Only a compensating action closes both, which is the same
-    discipline the crew store's own ``commit_work_progress`` rollback uses.
+    a tab that came back. Only a compensating action closes both.
 
     Same contract as :func:`register_slot_close_hook`: idempotent by app name, and
     re-registered from the app's watchdog because this registry is process memory.
@@ -551,7 +549,7 @@ def forget_app_hooks(app: str) -> None:
     a false return. A slot belonging to an uninstalled app therefore becomes
     undismissable: the stale hook raises, the close is refused with
     ``app_close_hook_failed``, and the user is left with a tab they cannot get rid
-    of for an app that no longer exists. Dropping the entry restores the
+    of for an app that does not exist. Dropping the entry restores the
     no-hook-registered path, which returns True and lets the close proceed.
 
     DISABLE deliberately does not call this, and the asymmetry with the

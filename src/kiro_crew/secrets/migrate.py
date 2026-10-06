@@ -42,6 +42,7 @@ reconciles (idempotent, secret://-line-wins).
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import os
 from dataclasses import dataclass, field
@@ -49,7 +50,15 @@ from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import _JIRA_TOKEN_RE, CRED_JIRA_API_TOKEN, config_dir, env_path
+from kiro_crew.config.loader import (
+    _JIRA_TOKEN_RE,
+    CRED_JIRA_API_TOKEN,
+    EnvFileWideEncodingError,
+    config_dir,
+    env_path,
+    read_env_file,
+    warn_undecodable_env,
+)
 from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
 from kiro_crew.secrets import SecretVault
 
@@ -105,7 +114,7 @@ def _is_recognized_key(key: str) -> bool:
     the vault in this change: the global ``JIRA_API_TOKEN`` and the per-host
     ``JIRA_TOKEN_<HEX>`` tokens that ``_get_jira_auth`` reads vault-first.
 
-    Other ``_CREDENTIAL_KEYS`` (Slack, Discord, kiro-cli, …) are intentionally
+    Other ``CREDENTIAL_KEYS`` (Slack, Discord, kiro-cli, …) are intentionally
     NOT migrated: their consumers still read the literal ``.env`` value, so
     rewriting their line to a ``secret://`` reference would hand them the URI
     string instead of the secret and break auth. They migrate once their
@@ -196,7 +205,7 @@ def migrate_env_secrets(
     agent-influenced argument) can point the importer at an arbitrary file to
     read, nor at an arbitrary directory to write the vault key/entries into. For
     each line
-    whose key is recognized (:data:`_CREDENTIAL_KEYS` or a ``JIRA_TOKEN_<HEX>``)
+    whose key is recognized (:data:`CREDENTIAL_KEYS` or a ``JIRA_TOKEN_<HEX>``)
     and whose value is still plaintext, the value is stored in the vault under
     the same key and the line is queued for rewrite to ``KEY=secret://KEY``.
 
@@ -216,12 +225,21 @@ def migrate_env_secrets(
     ep = env_path()
     report = MigrationReport(env_file=ep, dry_run=dry_run)
 
+    # A UTF-8 BOM is dropped for parsing (left in, it would be read as part of
+    # the first key) and put back on the rewrite, which otherwise preserves the
+    # file byte-for-byte. A UTF-16 or UTF-32 file is not a supported .env:
+    # nothing in it parses as a key, so there is nothing to migrate. Reading
+    # through the loader also re-arms its undecodable-file warning once the
+    # file decodes again.
     try:
-        original_bytes = ep.read_bytes()
+        original_bytes, text = read_env_file(ep, "utf-8", errors="surrogateescape")
     except OSError:
         # No .env (or unreadable): nothing to migrate.
         return report
-    text = original_bytes.decode("utf-8", errors="surrogateescape")
+    except EnvFileWideEncodingError as exc:
+        warn_undecodable_env(ep, exc)
+        return report
+    bom = codecs.BOM_UTF8 if original_bytes.startswith(codecs.BOM_UTF8) else b""
 
     vault = SecretVault(config_dir())
     to_migrate: dict[str, str] = {}
@@ -248,9 +266,9 @@ def migrate_env_secrets(
             continue
         # Runtime override wins — but ONLY for keys that load_credentials
         # actually overlays from the process environment. That overlay is scoped
-        # to _CREDENTIAL_KEYS, of which our recognized set contains exactly the
+        # to CREDENTIAL_KEYS, of which our recognized set contains exactly the
         # GLOBAL `JIRA_API_TOKEN`. The per-host `JIRA_TOKEN_<HEX>` keys are NOT
-        # in _CREDENTIAL_KEYS, so the environment does NOT override them at
+        # in CREDENTIAL_KEYS, so the environment does NOT override them at
         # runtime — Jira reads the .env/vault value. Skipping a per-host key just
         # because a same-named env var happens to exist would leave the stale
         # file token unmigrated while Jira keeps using it, so restrict the skip
@@ -492,7 +510,7 @@ def migrate_env_secrets(
                 # or a future writer added without adopting the lock convention).
                 # `new_text` was built from `original_bytes`, so committing it now would
                 # CLOBBER that writer's change.  Re-read the bytes one last time and
-                # abort if they no longer match the snapshot: we never overwrite a .env
+                # abort if they do not match the snapshot: we never overwrite a .env
                 # that moved since we composed the rewrite.  This shrinks the clobber
                 # window to the atomic_write itself (an unavoidable last-writer race
                 # shared by any file writer), rather than the whole store+verify span.
@@ -509,7 +527,7 @@ def migrate_env_secrets(
                     )
                 atomic_write(
                     ep,
-                    new_text.encode("utf-8", errors="surrogateescape"),
+                    bom + new_text.encode("utf-8", errors="surrogateescape"),
                     mode=0o600,
                     fsync=True,
                     restrict_to_owner=True,

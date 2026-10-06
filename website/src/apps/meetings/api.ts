@@ -301,6 +301,11 @@ export const meetingsApi = {
   meetings: () => request<{ meetings: MeetingSummary[] }>('/meetings'),
   meeting: (id: string) =>
     request<{ meta: MeetingMeta; live: LiveStatus | null }>(`/meetings/${encodeURIComponent(id)}`),
+  renameMeeting: (id: string, title: string) =>
+    request<{ ok: boolean; meta: MeetingMeta }>(`/meetings/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
   deleteMeeting: (id: string) =>
     request<void>(`/meetings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   init: (id: string, title: string) =>
@@ -341,7 +346,7 @@ export const meetingsApi = {
     ),
   /** Discard the user's edit, so the agent's own output is shown again. */
   revertOutput: (id: string, agentId: string) =>
-    request<{ ok: boolean; agent_id: string; reverted: boolean }>(
+    request<{ ok: boolean; agent_id: string }>(
       `/meetings/${encodeURIComponent(id)}/outputs`,
       { method: 'DELETE', body: JSON.stringify({ agent_id: agentId }) },
     ),

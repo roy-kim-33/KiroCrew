@@ -311,6 +311,42 @@ def _server() -> McpServerInfo:
     return McpServerInfo(name="srv", command="/bin/true")
 
 
+#: Lost-run ceiling for a wait on a pass's own observable state. A pass reaches
+#: its first measurement after one off-loop hop (``_load_and_identify``), which a
+#: loaded runner stretched past 50 ms; with every executor job started 1 s late
+#: the waits below return in about 1 s. 30 s is far past that and a quarter of
+#: the suite's 120 s ``--timeout``, so only a wedged pass spends it, and it then
+#: fails here by name instead of as a killed worker.
+_PASS_STATE_CEILING_SECS = 30.0
+
+
+async def _await_pass_state(ready, describe, what: str) -> None:
+    """Return once ``ready()`` holds; past the ceiling, raise naming *what*."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while not ready():
+        elapsed = loop.time() - start
+        if elapsed > _PASS_STATE_CEILING_SECS:
+            raise AssertionError(f"{what}: not reached after {elapsed:.2f}s ({describe()})")
+        await asyncio.sleep(0.01)
+
+
+async def _finished(aw, what: str):
+    """Await *aw* within the ceiling; past it, raise naming *what* and the wait."""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    try:
+        return await asyncio.wait_for(aw, _PASS_STATE_CEILING_SECS)
+    except asyncio.TimeoutError:
+        raise AssertionError(f"{what}: still running after {loop.time() - start:.2f}s") from None
+
+
+def _pass_lock_waiters(lock) -> int:
+    """Acquirers parked on *lock* (``_PASS_LOCK``) on this test's loop."""
+    bound = lock._bound() if hasattr(lock, "_bound") else lock
+    return len(bound._waiters or ())
+
+
 class TestEvaluateOnlyWhatChanged:
     """The orchestration policy: pay for a measurement once, per identity."""
 
@@ -427,7 +463,7 @@ class TestEvaluateOnlyWhatChanged:
     async def test_a_divergence_is_reported_but_never_frozen(
         self, patch_probe, tmp_path
     ) -> None:
-        """The #4339 fix, and the reason it needs no expiry clock.
+        """A reported divergence is never frozen, and needs no expiry clock.
 
         Two spawns that disagree cannot say WHY they disagree: an answer computed
         from ``clientInfo`` and an answer that varies for the server's own reasons
@@ -715,7 +751,7 @@ class TestPreflight:
 class TestToolSurfaceIsCompared:
     """The tool list is a facet of its own, and the only one an old server has.
 
-    Tool ANNOTATIONS arrived in MCP 2025-03-26, so a server older than that can
+    Tool ANNOTATIONS arrived in a later MCP revision, so a server older than that can
     be measured on nothing else — these pin that it is measured at all, and that
     the three ways this comparison could produce a false positive do not.
     """
@@ -942,7 +978,7 @@ class TestAnnotationsAreNeverPairedWithATool:
         assert pf._tool_surface(a) == pf._tool_surface(b), "a reorder is not a divergence"
 
     def test_a_changed_claim_is_caught_even_when_the_tool_is_unknown(self) -> None:
-        """The signal the length guard used to throw away.
+        """The signal a length guard would throw away.
 
         The server told one caller ``readOnlyHint: true`` and the other ``false``.
         Which tool it was about is unknowable, and does not matter: a pooled backend
@@ -1008,13 +1044,24 @@ class TestOnePassAtATime:
         second = asyncio.create_task(
             ev.evaluate_new_servers([srv("other-mcp")], tmp_path, budget=None)
         )
-        await asyncio.sleep(0.05)
-
-        # The lock must keep the second pass out until the first has flushed.
-        assert started == ["slow-mcp"], started
-        release.set()
-        await first
-        await second
+        try:
+            # The first pass is measuring (it holds the lock and has read the
+            # file) and the second is queued on that same lock. A second
+            # measurement ends the wait early, so a broken lock fails on the
+            # assertion below rather than at the ceiling.
+            await _await_pass_state(
+                lambda: "slow-mcp" in started
+                and (_pass_lock_waiters(ev._PASS_LOCK) == 1 or len(started) > 1),
+                lambda: f"started={started} waiters={_pass_lock_waiters(ev._PASS_LOCK)}",
+                "the first pass measuring with the second parked on _PASS_LOCK",
+            )
+            # The lock must keep the second pass out until the first has flushed.
+            assert started == ["slow-mcp"], started
+            assert _pass_lock_waiters(ev._PASS_LOCK) == 1, "the second pass is not on the lock"
+        finally:
+            release.set()
+        await _finished(first, "the first pass after the release")
+        await _finished(second, "the second pass after the first flushed")
 
         stored = vc.VerdictCache(tmp_path / vc.VERDICT_CACHE_FILENAME)
         stored.load()
@@ -1051,14 +1098,17 @@ class TestProgressArrivesDuringThePass:
                 on_progress=lambda m, d, t: seen.append((m, d, t)),
             )
         )
-        # Give the fast one time to land while the slow one is still blocked.
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if seen:
-                break
-        assert seen == [(1, 1, 2)], f"progress did not arrive mid-pass: {seen}"
-        gate.set()
-        await task
+        # Wait for the fast one to land while the slow one is still gated.
+        try:
+            await _await_pass_state(
+                lambda: bool(seen),
+                lambda: f"seen={seen} task_done={task.done()}",
+                "progress for the first measurement while the last is gated",
+            )
+            assert seen == [(1, 1, 2)], f"progress did not arrive mid-pass: {seen}"
+        finally:
+            gate.set()
+        await _finished(task, "the pass after the last measurement was released")
         assert seen[-1] == (2, 2, 2), seen
 
 
@@ -1120,7 +1170,7 @@ class TestMeasuredIsCountedApartFromAttempted:
 
         This is not a corner -- the probe cannot spawn at all on some hosts, so
         every server in the configuration takes the ``ran=False`` branch and the
-        readout used to say it had measured all of them.
+        readout must not claim it measured all of them.
         """
         import kiro_crew.mcp_gateway.evaluate as ev
 
@@ -1245,9 +1295,42 @@ class TestOneServerCannotEndThePass:
     pass already paid two spawns each for.
     """
 
+    @pytest.fixture
+    def no_cyclic_gc_at_the_recursion_limit(self):
+        """Keep the cyclic collector out of the frames next to the recursion limit.
+
+        The deep-payload test below drives the projection to ``RecursionError`` on
+        purpose, so its innermost frames have no headroom left. A gen0 sweep that
+        lands there -- the allocation counter decides where, not the test -- runs
+        the finalizers of whatever cyclic garbage the worker is carrying. A pending
+        Task leaked by an earlier test reports itself through ``logger.error`` on
+        ``__del__``; at that depth the report itself raises ``RecursionError``, the
+        interpreter hands the escaped exception to ``sys.unraisablehook``, and
+        pytest's hook overflows in the same place, which it surfaces as
+        ``RuntimeError: Failed to process unraisable exception`` against THIS test
+        (3 unrelated heads, Linux and Windows). Reproduced on demand by planting
+        such garbage at every projection depth: every run.
+
+        Collect once at depth zero, so the inherited garbage pays its finalizers
+        where there is stack for them, then hold the collector off for the walk.
+        Reference counting still frees the projection's own dicts; only cycles
+        wait, and they are collected at teardown.
+        """
+        import gc
+
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+
     @pytest.mark.asyncio
     async def test_deep_annotations_do_not_discard_the_other_verdicts(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, no_cyclic_gc_at_the_recursion_limit
     ) -> None:
         """The exact trigger GPT named: nesting deep enough to exhaust the stack.
 
@@ -1312,6 +1395,40 @@ class TestOneServerCannotEndThePass:
                 [McpServerInfo(name="s", command="/bin/true")], tmp_path, budget=None
             )
 
+    @pytest.mark.asyncio
+    async def test_a_disabled_row_with_a_malformed_command_does_not_end_the_pass(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A disabled placeholder's config is the one nobody has exercised.
+
+        ``probe_all`` carries a disabled server as an unprobed placeholder, and
+        ``command`` is stored from the config JSON unvalidated, so a disabled row
+        can arrive here with a dict where a string belongs. Its identity hashes
+        that command, and identities were derived for EVERY row before the
+        disabled filter and outside the per-server boundary -- so one such row
+        raised ``AttributeError`` and Measure All measured nothing. The healthy
+        neighbour is measured and stored; the disabled row is neither spawned
+        nor given a verdict."""
+        import kiro_crew.mcp_gateway.evaluate as ev
+
+        spawned: list[str] = []
+
+        async def route(server):
+            spawned.append(server.name)
+            return SimpleNamespace(ran=True, caller_sensitive=False, reasons=())
+
+        monkeypatch.setattr(ev, "preflight", route)
+        servers = [
+            McpServerInfo(name="good-mcp", command="/bin/true"),
+            McpServerInfo(name="off-mcp", command={"not": "a string"}, disabled=True),
+        ]
+        out = await ev.evaluate_new_servers(servers, tmp_path, budget=None)
+        assert spawned == ["good-mcp"]
+        assert set(out) == {"good-mcp"}, out
+        stored = vc.VerdictCache(tmp_path / vc.VERDICT_CACHE_FILENAME)
+        stored.load()
+        assert stored.server_names() == {"good-mcp"}, stored.server_names()
+
 
 class TestSupersededRowIsNotReadable:
     """A row for replaced code must not survive where the dashboard can read it.
@@ -1319,7 +1436,7 @@ class TestSupersededRowIsNotReadable:
     ``get`` refusing to return a row is not enough on its own: the dashboard row
     builder reads through ``get_by_name``, which checks neither identity nor
     version. So a row left in place after the pre-flight fails to re-measure is
-    still rendered -- as evidence about code that no longer exists, and in the
+        still rendered -- as evidence about code that does not exist, and in the
     permissive direction.
     """
 
@@ -1347,7 +1464,7 @@ class TestSupersededRowIsNotReadable:
         assert cache.get_by_name("srv") is not None, "row should start present"
 
         assert cache.get("srv", ident, "2.0") is None, "the read must refuse it"
-        # The point of the fix: the dashboard's own reader can no longer see it.
+        # The dashboard's own reader cannot see it.
         assert cache.get_by_name("srv") is None
         assert "srv" not in cache.server_names()
 
@@ -1575,13 +1692,19 @@ class TestBudgetedPassYields:
             ev.evaluate_new_servers([srv], tmp_path, budget=None)
         )
         try:
-            # Let the task reach the lock, then confirm it is parked there.
-            for _ in range(5):
-                await asyncio.sleep(0)
+            # Park proof: the task is queued ON the lock, not merely still inside
+            # a thread hop, which a pass that skipped the lock would also be
+            # after a few turns. ``task.done()`` ends the wait early on that defect.
+            await _await_pass_state(
+                lambda: _pass_lock_waiters(ev._PASS_LOCK) == 1 or task.done(),
+                lambda: f"waiters={_pass_lock_waiters(ev._PASS_LOCK)} done={task.done()}",
+                "the uncapped pass parked on _PASS_LOCK",
+            )
             assert not task.done(), "an uncapped pass must block on the lock"
+            assert _pass_lock_waiters(ev._PASS_LOCK) == 1, "the pass is not queued on the lock"
         finally:
             ev._PASS_LOCK.release()
-        out = await task
+        out = await _finished(task, "the uncapped pass after the lock was released")
         assert "s" in out
 
     @pytest.mark.asyncio

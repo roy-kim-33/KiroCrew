@@ -1,7 +1,9 @@
 """HTTP handlers for /side: ephemeral Q&A attached to a parent slot.
 
 Sidecar buffer on ``slot._side``; isolated ``side:{slot.key}`` LLM session;
-tool calls hard-rejected via ``REJECT_ALL``. Side messages never enter
+read-only tool calls auto-approved and everything else hard-rejected via
+``READ_ONLY`` (the Reads approval mode's classifier with reject as the
+fallback instead of the approval card). Side messages never enter
 ``slot.messages`` or any persistent store.
 """
 
@@ -17,13 +19,16 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.acp.client import AcpAuthRequired
+from kiro_crew.acp_backends import ACP_BACKENDS_SIDE_READONLY
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     refresh_materialized_agents,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.side_context import build_side_message
+from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
 from kiro_crew.dashboard.side_state import (
     MAX_SIDE_QUEUE,
     STEER_CONSUMED,
@@ -31,9 +36,11 @@ from kiro_crew.dashboard.side_state import (
     STEER_REQUEUED,
     SideState,
 )
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.ws import broadcast_side_queue, broadcast_side_result
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.hooks import HookManager
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
@@ -41,22 +48,41 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.security import StreamRedactor, redact
 from kiro_crew.sel import sel
+from kiro_crew.start_priority import StartPriority
 
 logger = logging.getLogger(__name__)
 
 _MAX_QUESTION_BYTES = 32_768
+
+# How long the stop handler waits for a cancelled side turn's cleanup (session
+# release, queue hold, is_complete flip) to run before settling the client
+# anyway. Bounds a wedged ``finally`` so a stop never hangs the request.
+_STOP_CLEANUP_TIMEOUT = 5.0
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _side_session_key(slot_key: str) -> str:
-    """Return the isolated ACP session key for a side turn."""
-    return f"side:{slot_key}"
+def _side_session_key(slot_key: str, gen: str = "") -> str:
+    """Return the isolated ACP session key for a side turn.
+
+    ``side:<slot>:<gen>`` when the sidecar's generation is known (every live
+    path), so a sidecar that was closed and reopened never shares a session with
+    a turn still finishing on its predecessor: the old task can only destroy,
+    acquire or release ITS generation's key. The bare ``side:<slot>`` form is the
+    legacy spelling, kept for a caller with no sidecar in hand.
+    """
+    return f"side:{slot_key}:{gen}" if gen else f"side:{slot_key}"
 
 
-def _dispatch_side_turn(state: DashboardState, slot, question: str) -> str:
+def _dispatch_side_turn(
+    state: DashboardState,
+    slot,
+    question: str,
+    *,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
+) -> str:
     """Start a side turn for *question* and return its run_id.
 
     Callers must have established that no side turn is in flight; there is no
@@ -85,8 +111,13 @@ def _dispatch_side_turn(state: DashboardState, slot, question: str) -> str:
             run_id,
             question,
             is_first_turn=is_first_turn,
+            start_priority=start_priority,
         )
     )
+    # Store the handle on the sidecar so ``api_side_stop`` can cancel this turn
+    # by lookup; ``state._background_tasks`` has no per-slot key. The turn's
+    # finally clears it once this run is the sidecar's current one.
+    side.task = task
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
     return run_id
@@ -160,12 +191,16 @@ def _drain_side_queue(state: DashboardState, slot, run_id: str) -> None:
 
     ``run_id`` is identity-checked against the sidecar's current run so a stale
     task from a closed-and-reopened side can never dispatch onto the new state.
-    No-op when the side is closed, still busy, or the queue is empty.
+    No-op when the side is closed, still busy, STOPPING, or the queue is empty.
     """
     side = slot._side
     if side is None or not side.open:
         return
-    if side.last_run_id != run_id or not side.is_complete:
+    if side.last_run_id != run_id or not side.is_complete or side.is_stopping:
+        # ``is_stopping`` holds a deliberately-cancelled turn busy through the
+        # stop handler's cleanup even after its own ``finally`` flipped
+        # ``is_complete`` True; draining a successor in that window is the exact
+        # GPT F1 race (a replacement over the still-settling cancelled turn).
         return
     entry = side.queue_pop()
     if entry is None:
@@ -225,7 +260,10 @@ async def _try_side_steer(state: DashboardState, slot, question: str) -> str | N
     requeues it. The caller then reads its OWN entry's state, so it never has to
     infer an outcome from an absence.
     """
-    provider = state.sessions.get_provider(_side_session_key(slot.key))
+    side = slot._side
+    if side is None:
+        return None
+    provider = state.sessions.get_provider(_side_session_key(slot.key, side.gen))
     if provider is None or not getattr(provider, "supports_steer", False):
         return None
     steer = getattr(provider, "steer", None)
@@ -274,6 +312,7 @@ async def _run_side_turn(
     question: str,
     *,
     is_first_turn: bool,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> None:
     """Background task: drive one side turn and broadcast chunks over WS."""
     # Local import: chat_runner imports this package, so a module-level import
@@ -284,12 +323,18 @@ async def _run_side_turn(
         _recover_app_agent_binding,
     )
 
-    side_key = _side_session_key(slot.key)
     # The sidecar this turn belongs to. Every later mutation is gated on the slot
     # still pointing at THIS object, so a close+reopen part-way through can never
-    # have the old turn settle or requeue onto the replacement's state.
+    # have the old turn settle or requeue onto the replacement's state — and the
+    # ACP session is keyed by this sidecar's generation for the same reason.
     side_at_start = slot._side
-    message = build_side_message(slot, question, is_first_turn=is_first_turn)
+    if side_at_start is None:
+        logger.info("Side turn dropped: no sidecar on slot=%s run_id=%s", slot.key, run_id)
+        return
+    side_key = _side_session_key(slot.key, side_at_start.gen)
+    # The prompt envelope is built below, once the harness is known: the boundary
+    # it states (read-only allowance vs. no tools) follows the approval policy
+    # the turn will actually run under.
     chunks: list[str] = []
     # Rolling-buffer redactor for the live side stream. broadcast_side_result
     # already redacts each frame, but per-frame redaction alone misses a secret
@@ -342,6 +387,11 @@ async def _run_side_turn(
     provider = None
     acquired_key = ""
     auth_required = False
+    # A stop request cancels this task; the finally then holds the queue intact
+    # rather than draining the next question into a fresh turn — stopping means
+    # halt, not "run the next one". The requeue of unconsumed steers still runs,
+    # so nothing the user typed is lost.
+    cancelled = False
     try:
         # Resolve the KiroCrew slot agent name (e.g. "default") to the real
         # kiro-cli agent (e.g. "kirocrew") before creating the session. Passing
@@ -356,13 +406,45 @@ async def _run_side_turn(
         # after this block). Captured inside the try so the raise lives OUTSIDE
         # it and is not swallowed by the resolve except.
         _app_agent_unresolved = False
+        # ONE reading of the slot's project and agent for the whole turn. The
+        # derivation below is checked against a project (the shadow scan of its
+        # ``.kiro/agents``), the session is spawned in a project (kiro-cli
+        # resolves ``--agent`` against that scope first), and the binding names
+        # a project: all three must be the same one. Read live, a project change
+        # landing during an await would have the check run against the old
+        # project and the spawn happen in the new one, loading a file the check
+        # never saw. A change is picked up by the NEXT turn, whose binding then
+        # differs and cold-starts under its own derivation.
+        project: str | None = slot.project or None
+        slot_agent: str | None = slot.agent or None
+        # The READ_ONLY policy's classifier is the gateway's ONE live hook gate,
+        # the same object the main chat consults (``chat_runner`` reads
+        # ``state.context_builder.hooks``). Settings > Security hot-reloads that
+        # object (``handlers/security._reload_live_hooks``), so a deny added
+        # mid-turn binds an in-flight side turn exactly as it binds the parent
+        # slot, and no per-turn manager is built here — building one would read
+        # the keystone ``denied_commands.json`` synchronously on the event loop
+        # and freeze the opt-out state at turn start. A host with no context
+        # builder has no gate: READ_ONLY then fails closed and rejects every
+        # tool call (``read_only_policy_no_hooks``) rather than classifying
+        # against a default manager that carries none of the operator's rules.
+        side_hooks: HookManager | None = (
+            state.context_builder.hooks if state.context_builder is not None else None
+        )
+        # The selected harness, read from the same config load that resolves the
+        # agent. ``None`` when the load failed: the harness is then unknown, and
+        # the read-only allowance below is granted by positive membership only.
+        side_backend: str | None = None
         try:
             cfg = KiroCrewConfig.load()
+            side_backend = cfg.agent.acp_backend
             # Warm off-loop, resolve inline — same reasoning as the main chat path
             # (offloading the resolver itself would swallow a StopIteration into a
             # Future and hang the await).
-            await warm_project_agent_names(slot.project, operation="side_panel", source="dashboard")
-            bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
+            await warm_project_agent_names(
+                project or "", operation="side_panel", source="dashboard"
+            )
+            bindings = resolve_agent_bindings(cfg, slot_agent, project)
             kiro_agent = bindings.kiro_agent
             # SELF-HEAL an app-owned slot whose agent did not resolve, on the same
             # two escalating rungs `_run_chat` uses, for the same reason: an app's
@@ -386,12 +468,10 @@ async def _run_side_turn(
                         slot.key,
                         exc_info=True,
                     )
-                bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
+                bindings = resolve_agent_bindings(cfg, slot_agent, project)
                 kiro_agent = bindings.kiro_agent
                 if not bindings.requested_resolved:
-                    bindings = await _recover_app_agent_binding(
-                        cfg, slot, project=slot.project or None
-                    )
+                    bindings = await _recover_app_agent_binding(cfg, slot, project=project)
                     kiro_agent = bindings.kiro_agent
             _app_agent_unresolved = bool(slot._app) and not bindings.requested_resolved
         except Exception:
@@ -411,28 +491,151 @@ async def _run_side_turn(
         # turn aborts without ever creating a session or dispatching an agent.
         if _app_agent_unresolved:
             raise _AppAgentNotLoaded(
-                f"The app agent '{slot.agent or ''}' isn't loaded yet — "
+                f"The app agent '{slot_agent or ''}' isn't loaded yet — "
                 "try again in a moment, or restart the gateway."
             )
 
-        provider, _is_new, _resumed = await state.sessions.get_or_create(
+        # Whether this turn may EXECUTE read-only tools is a positive capability
+        # of the harness (``ACP_BACKENDS_SIDE_READONLY``, harness-parity H6),
+        # never a negation: the allowance rests on the derived kiro-cli agent
+        # spec below, and another backend's own pre-approval surface
+        # (claude-agent-acp ``permissions.allow`` / ``bypassPermissions``) is
+        # one neither the spec nor the gate can see, so a call it pre-approves
+        # would run with no READ_ONLY decision and no SEL row. Off the set — or
+        # with the harness unknown because the config never loaded — the turn
+        # runs the pre-allowance posture: the base agent under REJECT_ALL, and
+        # the prompt and fallback say tools are unavailable here.
+        tools_available = side_backend is not None and side_backend in ACP_BACKENDS_SIDE_READONLY
+        if tools_available:
+            # The side session runs under ``<agent>--readonly``: the resolved
+            # agent's spec with every backend-side grant emptied
+            # (``allowedTools: []``, no ``autoApprove``, no ``toolsSettings``
+            # ``allowed*``/``trusted*``/``auto*``, no ``includeMcpJson``, an
+            # empty KAS policy, no lifecycle hooks). kiro-cli approves a granted
+            # tool itself and never raises a permission request, so under the
+            # parent's own spec the READ_ONLY gate below would never see the
+            # user's main-chat grants — cron removals included. With the derived
+            # spec every call kiro-cli does not trust natively raises a request
+            # and the gate judges it (kiro-cli runs ``fs_read`` itself — a read,
+            # so the guarantee holds outside the gate). Derived
+            # from the live base spec on every turn (regenerated when the base
+            # changes, written only when the content differs) and published
+            # into the kiro agent registry, the only place kiro-cli loads agents
+            # from; see ``side_readonly_spec``. File I/O, so off the loop. FAIL
+            # CLOSED: a turn whose spec cannot be produced is refused below
+            # (``ReadOnlySpecError``) — it never runs under the base agent.
+            base_agent = kiro_agent or slot_agent or "kirocrew"
+            published = await asyncio.to_thread(publish_readonly_spec, base_agent, project)
+            side_agent: str | None = published.name
+            approval_policy = ToolApprovalPolicy.READ_ONLY
+            binding = (published.name, project or "", published.digest)
+        else:
+            side_agent = kiro_agent or slot_agent
+            approval_policy = ToolApprovalPolicy.REJECT_ALL
+            binding = (side_agent or "", project or "", "reject_all")
+
+        # The derivation suspended this task; a close (or close+reopen) may have
+        # landed meanwhile. A stale task must not touch any session: its own
+        # generation's session was destroyed by the close, and the replacement's
+        # lives under another key it must never acquire.
+        if slot._side is not side_at_start:
+            logger.info(
+                "Side turn dropped before acquisition: sidecar replaced for slot=%s run_id=%s",
+                slot.key,
+                run_id,
+            )
+            return
+
+        # ``get_or_create`` reuses a live session for this key whatever agent or
+        # cwd the call asks for, and kiro-cli read the spec at spawn. A session
+        # retained from an earlier turn on THIS sidecar may therefore be running
+        # under another agent (the slot's agent changed), in another project (its
+        # files, its governance profile), or under a derived spec whose content
+        # the base has since changed. None of those may serve this turn: when the
+        # binding recorded on the sidecar is not exactly this one — or a live
+        # session exists that no sidecar binding vouches for — the session is
+        # destroyed and the acquisition below cold-starts under the derived spec.
+        # The key is this sidecar's alone, so no other turn shares the session.
+        if state.sessions.get_provider(side_key) is not None and side_at_start.binding != binding:
+            logger.info(
+                "Side turn: rebinding side session for slot=%s (agent/cwd/spec changed); "
+                "cold-starting under %s",
+                slot.key,
+                side_agent,
+            )
+            await state.sessions.destroy(side_key)
+            # The destroy suspended this task too: a close landing meanwhile
+            # destroyed this same key, and acquiring it again would leave a
+            # session no sidecar owns.
+            if slot._side is not side_at_start:
+                logger.info(
+                    "Side turn dropped after rebind: sidecar replaced for slot=%s run_id=%s",
+                    slot.key,
+                    run_id,
+                )
+                return
+
+        provider, is_new, resumed = await state.sessions.get_or_create(
             side_key,
-            agent=kiro_agent or slot.agent or None,
+            agent=side_agent,
             # The session must run in the slot's project directory for a
             # project-scope agent resolved above to be loadable at all:
             # kiro-cli resolves --agent against $PWD/.kiro/agents, so creating
             # the side session without this cwd has set_mode reject the very
             # name resolve_agent_bindings just returned. Mirrors
             # chat_runner._run_chat, which passes the same cwd for the same
-            # reason.
-            cwd=slot.project or None,
+            # reason. The derived spec itself lives in the user-level registry,
+            # which kiro-cli searches after the project scope.
+            cwd=project,
+            start_priority=start_priority,
         )
         acquired_key = side_key
+        # ``get_or_create`` suspended this task as well. A close landing during
+        # it destroyed this key — before or after the creation completed — so
+        # the session just acquired belongs to no sidecar and nothing else will
+        # ever destroy it. The finally releases the lease; the session goes now.
+        if slot._side is not side_at_start:
+            logger.info(
+                "Side turn dropped after acquisition: sidecar replaced for slot=%s run_id=%s",
+                slot.key,
+                run_id,
+            )
+            await state.sessions.destroy(side_key)
+            return
+        side_at_start.binding = binding
+        # The full envelope (instructions, parent snapshot, side history, the
+        # boundary prompt) goes to a session that has no framing yet. That is
+        # the sidecar's first turn — and equally a session cold-started on a
+        # later turn: the rebind above, or an eviction after the provider died.
+        # A follow-up into a live session, or one kiro-cli resumed with its own
+        # history, gets the bare question. Judged on what ``get_or_create``
+        # actually did, not on the sidecar's transcript alone, so the model
+        # behind a fresh process is never handed a bare question with nothing
+        # telling it where it is or what it may do.
+        message = build_side_message(
+            slot,
+            question,
+            is_first_turn=is_first_turn or (is_new and not resumed),
+            tools_available=tools_available,
+        )
         try:
             response_text = await stream_and_collect(
                 provider,
                 message,
-                approval_policy=ToolApprovalPolicy.REJECT_ALL,
+                # Reads-mode semantics with reject as the fallback on kiro-cli:
+                # provably read-only calls run, everything else is refused (side
+                # chat has no approval card to fall back to); REJECT_ALL on any
+                # other harness (see ``tools_available`` above). The gate's
+                # identity is the SIDE key: ``sel._infer_source`` classifies
+                # ``side:*`` as the dashboard surface, so a dashboard-bound
+                # governance profile binds this turn exactly as it binds the
+                # parent slot, while SEL rows and the ACP session stay keyed to
+                # the side session rather than the parent's.
+                approval_policy=approval_policy,
+                hooks=side_hooks,
+                session_key=side_key,
+                agent=slot_agent or "kirocrew",
+                app=slot._app or "",
                 on_chunk=_on_chunk,
                 on_steer_consumed=_on_steer_consumed,
             )
@@ -463,9 +666,20 @@ async def _run_side_turn(
             return
 
         if not chunks:
+            # Same vocabulary as the composer footer
+            # (``pages.chat.sideChat.context_only_tools_unavailable`` on
+            # kiro-cli, ``…_backend`` elsewhere): the strings describe one
+            # boundary and must not drift.
             response_text = (
-                "Tool and MCP execution is intentionally unavailable in Side Chat. "
-                "Ask in the main chat if you want me to use tools or take action."
+                (
+                    "Side Chat is read-only: lookups work here, but changes don't. "
+                    "Use the main chat to take action."
+                )
+                if tools_available
+                else (
+                    "Side Chat can't use tools on this agent backend. "
+                    "Use the main chat to take action."
+                )
             )
             logger.info(
                 "Side turn produced no text (tool rejection): " "slot=%s run_id=%s",
@@ -486,6 +700,12 @@ async def _run_side_turn(
             final=True,
         )
     except asyncio.CancelledError:
+        # A stop request (``api_side_stop``) cancels this task. The terminal
+        # frame that clears the client's streaming/pending is broadcast by that
+        # handler, not here: a cancel can interrupt this task mid-await, and the
+        # handler is the one place that knows a cancel is deliberate rather than
+        # a shutdown. Mark it so the finally holds the queue instead of draining.
+        cancelled = True
         raise
     except AcpAuthRequired as exc:
         # A signed-out CLI is actionable, so surface its own message rather than
@@ -534,6 +754,41 @@ async def _run_side_turn(
             is_error=True,
             final=True,
         )
+    except ReadOnlySpecError as exc:
+        # Terminal for this turn, and never a fallback to the base agent: without
+        # the derived spec the READ_ONLY gate would not see the base agent's
+        # grants, so refusing is the only safe answer. No session was created, so
+        # there is nothing to release; the queue is not held, because the spec is
+        # re-derived per turn and the next question is a real retry. The stable
+        # code is for the operator: it goes in the log line, not in the panel,
+        # where a user's vocabulary belongs.
+        logger.warning(
+            "Side turn refused: read-only agent spec unavailable (%s) for slot=%s run_id=%s: %s",
+            exc.code,
+            slot.key,
+            run_id,
+            exc.detail,
+        )
+        try:
+            sel().log_api_access(
+                caller=slot._app or "dashboard",
+                operation="chat.side_turn",
+                outcome="denied",
+                source="dashboard",
+                resources=f"slot={slot.key} run_id={run_id} code={exc.code}",
+                error=f"read-only agent spec unavailable: {exc.detail}",
+            )
+        except Exception:  # noqa: BLE001 — the refusal must reach the panel regardless
+            logger.debug("SEL audit unavailable for side-turn refusal", exc_info=True)
+        broadcast_side_result(
+            state,
+            slot_key=slot.key,
+            run_id=run_id,
+            role="assistant",
+            content="Side Chat couldn't start. Try again, or use the main chat.",
+            is_error=True,
+            final=True,
+        )
     except Exception:
         logger.exception(
             "Side turn failed: slot=%s run_id=%s",
@@ -554,6 +809,12 @@ async def _run_side_turn(
         # side never flips is_complete on the new state's in-flight turn.
         if slot._side is not None and slot._side.last_run_id == run_id:
             slot._side.is_complete = True
+            # Drop the handle this run registered: it is done, and a stop
+            # request landing after this must not cancel a task that already
+            # finished (or, worse, the NEXT turn once the drain below starts
+            # one). The identity gate above already excludes a superseded
+            # sidecar, whose own task handle this task never owned.
+            slot._side.task = None
         if acquired_key:
             try:
                 state.sessions.release(acquired_key)
@@ -569,7 +830,7 @@ async def _run_side_turn(
         # Unconsumed steers are still requeued above — they were never delivered
         # either, and the head of the queue is where a resume should find them.
         # Only the DISPATCH is withheld, so nothing is lost, merely paused.
-        if not auth_required:
+        if not auth_required and not cancelled:
             _drain_side_queue(state, slot, run_id)
 
 
@@ -578,44 +839,14 @@ def _check_slot_ownership(
     slot,
     operation: str,
 ) -> web.Response | None:
-    """Return 403 if the request app can't access ``slot``; mirrors ``api_chat``.
+    """The uniform app-isolation 404 if the request app can't access ``slot``, else None.
 
     App Kit §5.2: dashboard users (empty ``request_app``) can access everything.
-    The auth gate is upstream in ``token_auth_middleware``; this is the
-    app-vs-dashboard scope check, matching ``chat_handlers.py`` and ``chat_fork.py``.
+    The auth gate is upstream in ``token_auth_middleware`` and the per-slot
+    checkpoint (``slot_ownership_middleware``) has already made this decision for
+    every /side route; this re-applies the same shared decision at the handler.
     """
-    request_app = request.get("app", "")
-    if not request_app:
-        return None
-    if not slot._app:
-        sel().log_api_access(
-            caller=request_app,
-            operation=operation,
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app cannot access unscoped slots",
-        )
-        return web.json_response(
-            {"error": "not found"},
-            status=404,
-        )
-    if slot._app != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation=operation,
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot",
-        )
-        # 404 (not 403) so a foreign/unscoped slot is indistinguishable from a
-        # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
-        return web.json_response(
-            {"error": "not found"},
-            status=404,
-        )
-    return None
+    return deny_app_slot_access(request.get("app", ""), slot, slot.key, operation)
 
 
 async def api_side_open(request: web.Request) -> web.Response:
@@ -624,7 +855,7 @@ async def api_side_open(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return slot_not_found()
 
     own = _check_slot_ownership(request, slot, "chat.side_open")
     if own is not None:
@@ -669,7 +900,21 @@ async def api_side_turn(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return slot_not_found()
+
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. An app token
+    # carries its app's name and keeps the slot scoping below unchanged.
+    if request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "chat.side_turn")
+        if owner_denied is not None:
+            return owner_denied
 
     own = _check_slot_ownership(request, slot, "chat.side_turn")
     if own is not None:
@@ -713,11 +958,16 @@ async def api_side_turn(request: web.Request) -> web.Response:
             status=409,
         )
 
-    if slot._side.last_run_id and not slot._side.is_complete:
+    if slot._side.last_run_id and (not slot._side.is_complete or slot._side.is_stopping):
         # A turn is in flight. Mirror the main chat: steer injects into the
         # RUNNING turn, queue defers it to the next one, and an unavailable
         # steer falls through to the queue so the text is NEVER dropped.
         #
+        # ``is_stopping`` is folded into "in flight" so a stop in progress keeps
+        # the turn busy through its cleanup: the cancelled turn's own ``finally``
+        # flips ``is_complete`` True as it unwinds, which lands during the stop
+        # handler's bounded await, and without this clause a successor could
+        # dispatch in that window before the stopped row is recorded (GPT F1).
         # Bind the commit to the sidecar OBJECT and run the steer was aimed at,
         # captured before the RPC suspends. Re-reading them afterwards would
         # attribute a steer to whatever is live now: a close+reopen swaps in a
@@ -759,12 +1009,9 @@ async def api_side_turn(request: web.Request) -> web.Response:
                             f"question_len={len(question)}"
                         ),
                     )
-                    return web.json_response(
-                        {"ok": True, "steered": True, "run_id": run_before}
-                    )
+                    return web.json_response({"ok": True, "steered": True, "run_id": run_before})
                 if ledger == STEER_PENDING and (
-                    side_before.last_run_id == run_before
-                    and not side_before.is_complete
+                    side_before.last_run_id == run_before and not side_before.is_complete
                 ):
                     # Genuinely in flight, consumption unproven. Report that
                     # instead of claiming delivery: the outcome arrives as a frame
@@ -916,7 +1163,11 @@ async def api_side_turn(request: web.Request) -> web.Response:
             }
         )
 
-    run_id = _dispatch_side_turn(state, slot, question)
+    # The owner asking is waiting on the panel; an app token is not. A queued
+    # question drains BACKGROUND, onto the side session the turn before it warmed.
+    run_id = _dispatch_side_turn(
+        state, slot, question, start_priority=owner_start_priority(request)
+    )
 
     sel().log_api_access(
         caller=request.get("app", "") or "dashboard",
@@ -938,19 +1189,257 @@ async def api_side_turn(request: web.Request) -> web.Response:
     )
 
 
+async def api_side_stop(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/side/stop — cancel the in-flight side turn.
+
+    The escape hatch for a hung side turn. ``/interrupt`` targets the slot's
+    MAIN run (``slot.running``); a side turn runs on a separate background
+    asyncio task whose handle lives on the sidecar (``slot._side.task``), so it
+    needs its own cancel path. Cancelling the task alone is not enough — the
+    client's ``streaming``/``pending`` only clears on a terminal frame — so a
+    terminal ``chat.side_result`` is broadcast here, where a cancel is known to
+    be deliberate (``_run_side_turn`` cannot tell a stop from a shutdown).
+
+    Idempotent: with no turn in flight (or a stop already claimed) it returns
+    ``{"ok": True}`` without settling. The SEL ``resources=`` line records the
+    ``stopped``/``settled`` disposition for audit; the wire body stays minimal
+    because the frontend fires the mutation and wires only ``onError``.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # Owner-dashboard gate, mirroring ``api_side_turn``: stopping a turn is a
+    # dashboard-user action, and an app token keeps the slot scoping below.
+    if request.get("app") == "":
+        # circular import: handlers._shared pulls in sibling handler modules in
+        # this package at import time, so a module-level import here risks closing
+        # the cycle; bind it at call time (mirrors api_side_turn above).
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "chat.side_stop")
+        if owner_denied is not None:
+            return owner_denied
+
+    own = _check_slot_ownership(request, slot, "chat.side_stop")
+    if own is not None:
+        return own
+
+    side = slot._side
+    if side is None or not side.open:
+        return web.json_response(
+            {"error": "side conversation is not open", "code": "side_not_open"},
+            status=409,
+        )
+
+    run_id = side.last_run_id
+    task = side.task
+    # Nothing to stop: no run id, the turn already settled, or no live handle.
+    # Report it rather than erroring — a stop pressed just as the turn finished
+    # is a race the UI must survive, not a failure.
+    if not run_id or side.is_complete or task is None or task.done():
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="chat.side_stop",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slot={slot.key},stopped=false",
+        )
+        return web.json_response({"ok": True})
+
+    # Atomically CLAIM the turn before the first await by clearing the HANDLE
+    # (not ``is_complete``). This runs synchronously after the early-out above
+    # with no await between the two, so in asyncio's single-threaded model the
+    # check-and-claim is atomic: a second concurrent stop (ordinary double-click,
+    # or two dashboard tabs) that races in while we are awaiting
+    # ``provider.cancel()`` / the task cleanup below re-reads ``side.task`` at the
+    # early-out, sees it is ``None``, and returns ``{ok}`` without settling — so
+    # only ONE request appends the stopped row and broadcasts the terminal frame.
+    #
+    # We MUST claim via ``side.task`` and NOT via ``is_complete``: a concurrent
+    # ``POST /side/turn`` suspended at ``await request.json()`` resumes to read
+    # the busy gate ``last_run_id and not is_complete`` — flipping
+    # ``is_complete`` True here would read as idle, dispatching a replacement R2
+    # over the still-cancelling R1, after which the stop handler sees the
+    # replacement and returns ``superseded``, leaving R1's user line unanswered
+    # in the history fed to the next turn (GPT F1 / Opus, security-class). Leaving
+    # ``is_complete`` False keeps both ``api_side_turn`` and ``_drain_side_queue``
+    # seeing the turn as in flight, so no replacement is dispatched during the
+    # cancel window. ``task`` is already captured above, so clearing the field
+    # does not lose the handle we still cancel+await.
+    #
+    # Clearing ``side.task`` is NOT sufficient on its own: the cancelled turn's
+    # own ``finally`` flips ``is_complete`` True synchronously as it unwinds, and
+    # that lands DURING the ``await`` of the task cleanup below — reopening the
+    # busy gate before this handler resumes to record the stopped row. So we also
+    # raise ``is_stopping``, which the busy gate honours as "in flight", holding
+    # the turn busy until we clear it in the ``finally`` after settling (GPT F1 /
+    # Opus, security-class). Both writes are a single synchronous claim with no
+    # await between them, so the check-and-claim stays atomic.
+    side.task = None
+    side.is_stopping = True
+
+    try:
+        return await _cancel_and_settle_side_turn(request, state, slot, side, task, run_id)
+    finally:
+        # Release the busy claim on EVERY exit path (settled, superseded,
+        # timeout, or an unexpected error): a stop that failed to clear it would
+        # wedge the sidecar busy forever, so no further turn could ever start —
+        # a worse hang than the one the endpoint exists to escape. By here the
+        # terminal row (if any) is already recorded, so admitting a successor is
+        # safe.
+        side.is_stopping = False
+
+
+async def _cancel_and_settle_side_turn(
+    request: web.Request,
+    state,
+    slot,
+    side,
+    task: asyncio.Task[None],
+    run_id: str,
+) -> web.Response:
+    """Cancel the in-flight side turn and settle the client with a terminal row.
+
+    Factored out of :func:`api_side_stop` so the caller can hold the
+    ``is_stopping`` busy claim across the whole cancel+settle in a ``try`` and
+    release it in a ``finally`` on every exit path. Assumes the caller has
+    already claimed the turn (``side.task = None``, ``side.is_stopping = True``).
+    """
+    # whose ``finally`` releases the lease but never sends ``session/cancel`` —
+    # so without this the stopped turn keeps generating (and billing) and the
+    # next side question pays the prompt-busy retry cycle. ``provider.cancel()``
+    # is the typed protocol cancel (AcpProvider.cancel routes it to the backend
+    # and swallows a dead-runtime error), so it cannot raise out of this handler.
+    provider = state.sessions.get_provider(_side_session_key(slot.key, side.gen))
+    if provider is not None:
+        await provider.cancel()
+
+    # Cancel the task, then AWAIT its cancellation cleanup before publishing
+    # idle. ``_run_side_turn`` re-raises CancelledError (marking the turn
+    # ``cancelled`` so its finally holds the queue) and its finally releases the
+    # session lease and flips ``is_complete``. Awaiting it here closes the race
+    # GPT flagged: a concurrent side-turn request that replaced ``last_run_id``
+    # before the cleanup ran would make the cancelled turn's identity-gated
+    # requeue skip, losing a pending steer. Awaiting (bounded, shielded from a
+    # cancel of THIS request) lets that cleanup finish first.
+    task.cancel()
+    timed_out = False
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_STOP_CLEANUP_TIMEOUT)
+    except asyncio.TimeoutError:
+        # The task's finally is wedged (cleanup did not finish within the
+        # budget). We must still settle the client regardless — leaving it
+        # unsettled is the exact deep-hang the endpoint exists to escape.
+        timed_out = True
+    except (asyncio.CancelledError, Exception):
+        # CancelledError is the task's own expected unwind; any other exception
+        # is the turn's own error, already surfaced on its frame.
+        pass
+
+    # Decide whether to settle with a stopped row. Two conditions must hold:
+    #
+    #   1. No genuine replacement took over. ``provider.cancel()`` can end the
+    #      prompt NORMALLY (no CancelledError); the turn's own finally then flips
+    #      ``is_complete`` and ``_drain_side_queue`` can dispatch the NEXT queued
+    #      turn onto the same ``side:<slot>:<gen>`` key during the awaits above.
+    #      If that happened, ``last_run_id`` now belongs to that replacement, so
+    #      settling here would erase its live handle. The cancelled turn's own
+    #      finally never changes ``last_run_id`` (and the drain that would start
+    #      a replacement is skipped only when ``cancelled`` is True), so a
+    #      changed ``last_run_id`` is the replacement signal. We also require the
+    #      same sidecar object.
+    #
+    #   2. The task was actually CANCELLED (or the cleanup WEDGED). If
+    #      ``provider.cancel()`` let the prompt finish normally before
+    #      ``task.cancel()`` landed, the turn took its SUCCESS path — the real
+    #      answer was appended and broadcast — and ``task.cancelled()`` is False
+    #      with the task genuinely done. Appending a ``(side response stopped)``
+    #      row on top of a delivered answer would corrupt the transcript (Opus
+    #      FINDING), so a genuinely-normal completion gets no row. But a TIMEOUT
+    #      is NOT a normal completion: the task is still running, its finally is
+    #      wedged, and ``task.cancelled()`` is also False — folding that into the
+    #      normal-completion branch would leave the panel streaming forever in
+    #      the exact deep-hang the endpoint exists to escape (Design FINDING). So
+    #      we settle the stopped row whenever the task was cancelled OR the
+    #      cleanup timed out, and skip it only on a genuine normal completion.
+    settled_as = None
+    if not (slot._side is side and side.last_run_id == run_id):
+        settled_as = "superseded"
+    elif timed_out:
+        # Wedged cleanup: fall through to settle the client with the stopped row
+        # below (do NOT classify as completed-normally). SEL records the wedge.
+        settled_as = None
+    elif not task.cancelled():
+        # Turn ended normally during the cancel window; its own answer already
+        # settled the row. Nothing to append — just report the stop as a no-op
+        # settle (the turn's own finally flips ``is_complete``, so the panel is
+        # consistent).
+        settled_as = "completed-normally"
+
+    if settled_as is not None:
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="chat.side_stop",
+            outcome="allowed",
+            source="dashboard",
+            resources=f"slot={slot.key},stopped=true,settled={settled_as}",
+        )
+        return web.json_response({"ok": True})
+
+    # Mark the turn settled. On a real cancel the task's own finally also flips
+    # this (idempotent); on a WEDGED timeout the finally never ran, so without
+    # this the panel's sidecar would stay ``is_complete=False`` after we settle
+    # the client, re-reading as busy. ``side.task`` was already cleared at the
+    # claim above.
+    side.is_complete = True
+
+    # Record the stop in the sidecar transcript so the next turn does not read
+    # the stopped question as an open, unanswered ``User:`` line. Without this
+    # ``side.messages`` ends ``[user: Q1]`` and ``_format_side_history`` hands
+    # the model Q1 as still-pending.
+    side.append_assistant("(side response stopped)")
+
+    # The terminal frame the client needs to clear streaming/pending. A fresh
+    # run_id would read as a new turn's answer; this one matches the row the
+    # hung turn was streaming into, so it settles that row.
+    broadcast_side_result(
+        state,
+        slot_key=slot.key,
+        run_id=run_id,
+        role="assistant",
+        content="(side response stopped)",
+        is_error=True,
+        final=True,
+    )
+
+    sel().log_api_access(
+        caller=request.get("app", "") or "dashboard",
+        operation="chat.side_stop",
+        outcome="allowed",
+        source="dashboard",
+        resources=(
+            f"slot={slot.key},run_id={run_id},stopped=true,"
+            f"settled={'timeout' if timed_out else 'cancelled'}"
+        ),
+    )
+    # The SEL ``resources=`` line above records ``run_id``/``stopped`` for
+    # audit; the frontend ignores the response body (fires the mutation,
+    # wires only ``onError``), so the success body is the minimal ``{ok}``.
+    return web.json_response({"ok": True})
+
+
 async def _read_side_queue_body(request: web.Request) -> str | web.Response:
     """Parse ``{"content": str}`` from a side-queue edit. Returns the trimmed
     content, or the error response to send."""
     if not request.body_exists:
-        return web.json_response(
-            {"error": "missing JSON body", "code": "missing_body"}, status=400
-        )
+        return web.json_response({"error": "missing JSON body", "code": "missing_body"}, status=400)
     try:
         body = await request.json()
     except Exception:
-        return web.json_response(
-            {"error": "invalid JSON body", "code": "invalid_body"}, status=400
-        )
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_body"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
             {"error": "body must be a JSON object", "code": "invalid_body"},
@@ -989,9 +1478,7 @@ def _resolve_side_queue_slot(
     state: DashboardState = request.app["state"]
     slot = state._slots.get(request.match_info["slot"])
     if not slot:
-        return None, web.json_response(
-            {"error": "not found", "code": "slot_not_found"}, status=404
-        )
+        return None, slot_not_found()
     own = _check_slot_ownership(request, slot, operation)
     if own is not None:
         return None, own
@@ -1109,16 +1596,20 @@ async def api_side_close(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return slot_not_found()
 
     own = _check_slot_ownership(request, slot, "chat.side_close")
     if own is not None:
         return own
 
     was_open = slot._side is not None and slot._side.open
+    # The key belongs to the sidecar being closed: read its generation before
+    # the sidecar is dropped, so a reopen (a new generation, a new key) that
+    # lands while the destroy below is in flight is never the one destroyed.
+    closing_gen = slot._side.gen if slot._side is not None else ""
     slot._side = None
 
-    side_key = _side_session_key(slot.key)
+    side_key = _side_session_key(slot.key, closing_gen)
     try:
         await state.sessions.destroy(side_key)
     except Exception:

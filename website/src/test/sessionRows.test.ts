@@ -12,7 +12,9 @@ import {
   heatLevel,
   rowName,
   sessionChatPath,
+  aggregateOncePerRuntime,
   sparklineBars,
+  sumOncePerRuntime,
   type SessionPayloadRow,
   type TaskPayloadRow,
 } from '../pages/system/sessionRows'
@@ -34,6 +36,7 @@ const session = (over: Partial<SessionPayloadRow> = {}): SessionPayloadRow => ({
   uptime_s: 60,
   credits: 5.2,
   turns: 3,
+  parent: null,
   ...over,
 })
 
@@ -229,12 +232,31 @@ describe('buildTree', () => {
   })
 
   it('marks a co-tenant of a multiplexed runtime as shared', () => {
-    const rows = buildTree([session({ owns_runtime: false })], [])
+    const rows = buildTree([session({ owns_runtime: false, sharers: 2 })], [])
     expect(rows[0].shared).toBe(true)
   })
 
-  it('gives only sessions a destination — a task has no chat window', () => {
-    const rows = buildTree([session()], [task()])
+  it('marks the FOUNDER of a multiplexed runtime as shared too', () => {
+    // owns_runtime is false only on the joiners, so reading it as "is this
+    // runtime shared?" leaves the founder's row claiming an exclusive process
+    // it does not have. The sharer count answers the question actually asked.
+    const rows = buildTree([session({ owns_runtime: true, sharers: 3 })], [])
+    expect(rows[0].shared).toBe(true)
+  })
+
+  it('leaves an exclusive runtime unshared', () => {
+    const rows = buildTree([session({ owns_runtime: true, sharers: 1 })], [])
+    expect(rows[0].shared).toBe(false)
+  })
+
+  it('treats a payload without a sharer count as exclusive', () => {
+    // An older gateway does not send it; a missing count must not badge every
+    // row as shared.
+    const rows = buildTree([session({ sharers: undefined })], [])
+    expect(rows[0].shared).toBe(false)
+  })
+
+  it('gives only sessions a destination — a task has no chat window', () => {    const rows = buildTree([session()], [task()])
     expect(rows[0].href).toBe('/chat?sid=chat-1')
     expect(rows[0].subRows![0].href).toBeNull()
   })
@@ -287,6 +309,99 @@ describe('buildTree', () => {
     expect(topLevel).toContain('t-stale')
     // The matched one stays nested under its session, not promoted.
     expect(rows.find(r => r.id === 'dashboard:a')?.subRows?.map(r => r.id)).toEqual(['t-child'])
+  })
+
+  const createdBy = (key: string) => ({ slot: key.replace('dashboard:', ''), key })
+
+  it('nests a created session under its running creator, the way a task nests', () => {
+    const rows = buildTree(
+      [
+        session({ key: 'dashboard:conductor', slot_key: 'conductor' }),
+        session({ key: 'dashboard:worker', slot_key: 'worker', parent: createdBy('dashboard:conductor') }),
+      ],
+      [],
+    )
+    expect(rows.map(r => r.id)).toEqual(['dashboard:conductor'])
+    const [conductor] = rows
+    expect(conductor.subRows?.map(r => [r.kind, r.id])).toEqual([['session', 'dashboard:worker']])
+    // The child keeps its own destination and its citation.
+    expect(conductor.subRows?.[0].href).toBe('/chat?sid=worker')
+    expect(conductor.subRows?.[0].parent).toEqual(createdBy('dashboard:conductor'))
+    // The placement is recorded on the row itself, so a renderer under a fold
+    // (where the parent row is a group row) can still tell nested from orphan.
+    expect(conductor.subRows?.[0].nested).toBe(true)
+    expect(conductor.nested).toBe(false)
+  })
+
+  it("puts a nested session's tasks under that session, not under the root", () => {
+    const rows = buildTree(
+      [
+        session({ key: 'dashboard:conductor' }),
+        session({ key: 'dashboard:worker', parent: createdBy('dashboard:conductor') }),
+      ],
+      [task({ id: 't-of-worker', parent: 'dashboard:worker' }), task({ id: 't-of-root', parent: 'dashboard:conductor' })],
+    )
+    const [conductor] = rows
+    const worker = conductor.subRows?.find(r => r.id === 'dashboard:worker')
+    expect(worker?.subRows?.map(r => r.id)).toEqual(['t-of-worker'])
+    expect(conductor.subRows?.filter(r => r.kind === 'task').map(r => r.id)).toEqual(['t-of-root'])
+  })
+
+  it('nests to whatever depth the creating went', () => {
+    const rows = buildTree(
+      [
+        session({ key: 'dashboard:a' }),
+        session({ key: 'dashboard:b', parent: createdBy('dashboard:a') }),
+        session({ key: 'dashboard:c', parent: createdBy('dashboard:b') }),
+      ],
+      [],
+    )
+    expect(rows.map(r => r.id)).toEqual(['dashboard:a'])
+    expect(rows[0].subRows?.[0].id).toBe('dashboard:b')
+    expect(rows[0].subRows?.[0].subRows?.[0].id).toBe('dashboard:c')
+  })
+
+  it('keeps a created session whose creator is not running as a top-level row with its citation', () => {
+    // The backend nulls `key` when the creator has no live row; the slot stays
+    // so the row can still say who opened it.
+    const orphan = session({
+      key: 'dashboard:worker',
+      parent: { slot: 'gone', key: null },
+    })
+    const rows = buildTree([orphan], [])
+    expect(rows.map(r => r.id)).toEqual(['dashboard:worker'])
+    expect(rows[0].nested).toBe(false)
+    expect(rows[0].parent?.slot).toBe('gone')
+    expect(rows[0].subRows).toBeUndefined()
+  })
+
+  it('does not follow a parent key that names no row in this payload', () => {
+    const rows = buildTree(
+      [session({ key: 'dashboard:worker', parent: createdBy('dashboard:not-here') })],
+      [],
+    )
+    expect(rows.map(r => r.id)).toEqual(['dashboard:worker'])
+  })
+
+  it('never loops on a cycle: its members become roots, a hanger-on keeps its edge', () => {
+    // The backend already breaks cycles; this is the table refusing to fail to
+    // paint on a payload it did not produce.
+    const rows = buildTree(
+      [
+        session({ key: 'dashboard:a', parent: createdBy('dashboard:b') }),
+        session({ key: 'dashboard:b', parent: createdBy('dashboard:a') }),
+        session({ key: 'dashboard:c', parent: createdBy('dashboard:a') }),
+        session({ key: 'dashboard:self', parent: createdBy('dashboard:self') }),
+      ],
+      [],
+    )
+    expect(rows.map(r => r.id).sort()).toEqual(['dashboard:a', 'dashboard:b', 'dashboard:self'])
+    expect(rows.find(r => r.id === 'dashboard:a')?.subRows?.map(r => r.id)).toEqual(['dashboard:c'])
+  })
+
+  it('a session nobody created carries a null parent', () => {
+    const [row] = buildTree([session()], [])
+    expect(row.parent).toBeNull()
   })
 })
 
@@ -439,5 +554,75 @@ describe('buildTree credits and turns', () => {
     const rows = buildTree([session()], [task()])
     expect(rows[0].subRows![0].credits).toBeNull()
     expect(rows[0].subRows![0].turns).toBeNull()
+  })
+})
+
+// ── sumOncePerRuntime ──
+
+describe('sumOncePerRuntime', () => {
+  const leaf = (pid: number | null, procs: number | null, mcp: number | null = 0) => ({
+    original: { pid, procs, mcp } as never,
+  })
+
+  it('adds a shared runtime once, not once per co-tenant', () => {
+    // Three sessions on one 9-process runtime. A plain sum reports 27 processes
+    // that do not exist.
+    const rows = [leaf(7, 9), leaf(7, 9), leaf(7, 9)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(9)
+  })
+
+  it('adds distinct runtimes normally', () => {
+    const rows = [leaf(1, 2), leaf(2, 3), leaf(3, 4)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(9)
+  })
+
+  it('is a plain sum when every row has its own runtime', () => {
+    // The 1:1 case must be indistinguishable from the aggregation it replaces.
+    const rows = [leaf(1, 5), leaf(2, 5)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(10)
+  })
+
+  it('counts rows with no pid separately — unmeasured is not shared', () => {
+    const rows = [leaf(null, 3), leaf(null, 4)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(7)
+  })
+
+  it('returns null when nothing carries the column, keeping it apart from zero', () => {
+    expect(aggregateOncePerRuntime('procs', [leaf(1, null), leaf(2, null)])).toBeNull()
+    expect(aggregateOncePerRuntime('procs', [])).toBeNull()
+  })
+
+  it('skips an unmeasured row without dropping its runtime for a measured one', () => {
+    const rows = [leaf(7, null), leaf(7, 9)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(9)
+  })
+
+  it('de-duplicates each column independently', () => {
+    const rows = [leaf(7, 9, 6), leaf(7, 9, 6)]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(9)
+    expect(aggregateOncePerRuntime('mcp', rows)).toBe(6)
+  })
+})
+
+describe('sumOncePerRuntime over payload pairs (the footer total)', () => {
+  it('counts a shared runtime once, so the footer matches the column', () => {
+    // The table footer reads the SAME figure as the procs column. Three
+    // co-tenants of one 9-process runtime plus one exclusive 4-process runtime
+    // is 13 real processes; summing per row reports 31.
+    const footer = sumOncePerRuntime([
+      [4242, 9], [4242, 9], [4242, 9], [5150, 4],
+    ])
+    expect(footer).toBe(13)
+  })
+
+  it('agrees with the column aggregate on the same rows', () => {
+    const rows = [
+      { original: { pid: 4242, procs: 9 } as never },
+      { original: { pid: 4242, procs: 9 } as never },
+      { original: { pid: 5150, procs: 4 } as never },
+    ]
+    expect(aggregateOncePerRuntime('procs', rows)).toBe(
+      sumOncePerRuntime([[4242, 9], [4242, 9], [5150, 4]]),
+    )
   })
 })

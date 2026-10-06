@@ -65,6 +65,59 @@ if TYPE_CHECKING:
 _SESSIONS_DIR: Path | None = None
 _HOME_TAB_SESSIONS_PER_KIND = 5
 
+# The words that ask the sessions list to include rows the user ended. THE one
+# vocabulary, shared by the keyword matcher (which must accept the argument or
+# the message never reaches a handler) and by the handlers that read it, so the
+# two cannot drift into a form that matches but does nothing.
+SESSIONS_INCLUDE_ENDED_ARGS = frozenset({"all", "ended"})
+
+
+def sessions_include_ended(text: str) -> bool:
+    """True when *text* asks for ended rows: ``sessions all`` / ``sessions ended``.
+
+    Accepts either the whole command (``"sessions all"``, from the DM keyword)
+    or just its argument (``"all"``, from the slash command's ``args``), because
+    the two surfaces hand over different halves of the same phrase and neither
+    should have to know what the other kept.
+    """
+    words = [w for w in text.strip().lower().split() if w != "sessions"]
+    return any(w in SESSIONS_INCLUDE_ENDED_ARGS for w in words)
+
+
+#: Slack rejects a ``chat.postMessage`` payload carrying more than 50 blocks, and
+#: the message layout costs 3 blocks per row less the trailing divider -- measured
+#: against :func:`_build_sessions_blocks`, not assumed: 17 rows render exactly 50
+#: blocks and 18 render 53. So however high ``slack.sessions_limit`` is set, the
+#: DM keyword and the slash command cannot ask for more rows than this.
+_SLACK_MESSAGE_BLOCK_LIMIT = 50
+_SLACK_BLOCKS_PER_SESSION_ROW = 3
+MAX_MESSAGE_SESSION_ROWS = (_SLACK_MESSAGE_BLOCK_LIMIT + 1) // _SLACK_BLOCKS_PER_SESSION_ROW
+
+
+def _message_surface_limit(configured: int) -> int:
+    """Clamp a configured list length to what one Slack message can render.
+
+    Only the UPPER bound lives here, because only the message surfaces have this
+    ceiling: the Home Tab posts through ``views.publish``, whose budget is
+    different, and a chat channel has no Block Kit at all. The lower bound stays
+    in the neutral collector, which every surface passes through.
+
+    A payload over the block limit is rejected WHOLE, so without this an operator
+    who sets ``slack.sessions_limit: 18`` gets no list at all -- which reads as
+    the feature being broken rather than as one number being too high. Clamping
+    renders the newest :data:`MAX_MESSAGE_SESSION_ROWS` instead, which is the
+    answer they were asking for, just truncated.
+
+    A non-integer value falls through to the collector's own guard rather than
+    raising here: this runs inside each surface's try, where an exception becomes
+    "Sessions unavailable" plus an error audit.
+    """
+    try:
+        value = int(configured)
+    except (TypeError, ValueError):
+        return _SESSIONS_DEFAULT_LIMIT
+    return min(value, MAX_MESSAGE_SESSION_ROWS)
+
 
 def _sessions_dir() -> Path:
     """Sessions directory, resolved against the live data home."""
@@ -81,6 +134,7 @@ def _collect_recent_sessions(
     *,
     limit: int = _SESSIONS_DEFAULT_LIMIT,
     kind: "str | Iterable[str] | None" = None,
+    include_ended: bool = False,
 ) -> list[dict]:
     """Slack's view of :func:`messaging.sessions_view._collect_recent_sessions`.
 
@@ -88,7 +142,13 @@ def _collect_recent_sessions(
     is what the read actually uses. Synchronous filesystem I/O — async callers
     MUST use :func:`_collect_recent_sessions_off_loop`.
     """
-    return _collect_neutral(sessions, limit=limit, kind=kind, sessions_dir=_sessions_dir())
+    return _collect_neutral(
+        sessions,
+        limit=limit,
+        kind=kind,
+        sessions_dir=_sessions_dir(),
+        include_ended=include_ended,
+    )
 
 
 async def _collect_recent_sessions_off_loop(
@@ -96,6 +156,7 @@ async def _collect_recent_sessions_off_loop(
     *,
     limit: int = _SESSIONS_DEFAULT_LIMIT,
     kind: "str | Iterable[str] | None" = None,
+    include_ended: bool = False,
 ) -> list[dict]:
     """Run :func:`_collect_recent_sessions` in a worker thread.
 
@@ -109,7 +170,13 @@ async def _collect_recent_sessions_off_loop(
     Dispatches through this module's own ``_collect_recent_sessions`` so a
     monkeypatch of that name (several Slack suites use one) is honored.
     """
-    return await asyncio.to_thread(_collect_recent_sessions, sessions, limit=limit, kind=kind)
+    return await asyncio.to_thread(
+        _collect_recent_sessions,
+        sessions,
+        limit=limit,
+        kind=kind,
+        include_ended=include_ended,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +216,12 @@ def _build_sessions_blocks(
         if for_home_tab:
             blocks.extend(_session_home_tab_blocks(row, safe_title, safe_agent))
         else:
-            status = "active" if row["active"] else "inactive"
+            if row["active"]:
+                status = "active"
+            elif row.get("ended"):
+                status = "ended"
+            else:
+                status = "inactive"
             blocks.extend(
                 session_task_card(
                     idx=i,
@@ -172,9 +244,16 @@ def _session_home_tab_blocks(
 
     Slack's ``views.publish`` API rejects ``task_card`` blocks, so the
     Home Tab uses a plain ``section`` with the same 🟢/⚫ status emoji
-    plus the canonical ``mc_session_resume_{key}`` button.
+    plus the canonical ``mc_session_resume_{key}`` button. A dismissed row
+    gets 🛑, matching :func:`kiro_crew.slack.blocks.session_task_card`, and
+    is only ever rendered when a caller asked for dismissed rows.
     """
-    emoji = "🟢" if row["active"] else "⚫"
+    if row["active"]:
+        emoji = "🟢"
+    elif row.get("ended"):
+        emoji = "🛑"
+    else:
+        emoji = "⚫"
     agent = safe_agent or "kirocrew"
     return [
         {

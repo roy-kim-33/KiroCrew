@@ -18,11 +18,12 @@ action items.
 | `.../backend/domain/dictionary.py` | speech-correction dictionary (TOML) |
 | `.../backend/domain/session.py` | batching dispatcher + meeting state machine |
 | `.../backend/domain/translate.py` | live per-line translation queue + its prompt |
+| `.../backend/domain/audio.py` | splitting an imported transcript into lines |
 | `.../backend/providers/tasks.py` | **task-provider seam** + the local ledger |
 | `.../backend/providers/calendar.py` | **calendar-provider seam** + the `.ics` reader |
 | `.../backend/calendar_sync.py` | one calendar sync (provider fetch → cache), shared by the route and the poller |
 | `.../backend/calendar_poller.py` | background calendar poll: keeps the cache fresh, pre-creates the meeting about to start |
-| `.../backend/routes/` | `_common` (gate + validation), `meeting_lifecycle`, `agents`, `tasks`, `calendar`, `settings` |
+| `.../backend/routes/` | `_common` (gate + validation + the dispatch transaction), `meeting_lifecycle`, `agents`, `audio_import`, `tasks`, `calendar`, `settings` |
 | `.../agents/*.json` | the three shipped agent specs |
 | `src/kiro_crew/builtin_skills/meetings/SKILL.md` | the bundled skill (data layout, lifecycle, provider config) |
 | `website/src/apps/meetings/` | `MeetingsPage` (list) → `MeetingView` → `TaskReviewView`, `SettingsView` |
@@ -55,11 +56,12 @@ GET    /task-providers              registered task providers + the active one
 GET    /meetings                    every meeting with metadata on disk
 GET    /meetings/{id}               one meeting's metadata + live status
 DELETE /meetings/{id}               permanently remove an inactive meeting's local data
+PATCH  /meetings/{id}               {title} — rename; trimmed, non-empty, ≤ MAX_TITLE_LEN
 POST   /meetings/{id}/init          create folder/metadata/tasks/outputs (idempotent)
 POST   /meetings/{id}/start         activate: seed outputs, spawn agent sessions
 POST   /meetings/{id}/status        {status} — active | paused | reviewing | ended
 POST   /meetings/{id}/stop          flush agents, send the finalize notice, mark ended
-GET    /meetings/{id}/transcript    finalized speech + typed broadcasts; optional cursor
+GET    /meetings/{id}/transcript    speech, typed broadcasts, system loss markers; optional cursor
 GET    /meetings/{id}/outputs       batch-read every agent output + tasks
 GET    /meetings/{id}/translations[?since=N]   translated lines, cursor-paged
 PUT    /meetings/{id}/outputs       replace one agent's minutes  {agent_id, content}
@@ -68,6 +70,7 @@ POST   /meetings/{id}/attachments   {action: add|remove, attachments[]|index}
 POST   /meetings/{id}/agents        {agent_id, enable} — toggle mid-meeting
 POST   /meetings/{id}/mute          {agent_id, muted}
 POST   /meetings/{id}/dispatch      {text, chat?} — persist then fan out one line
+POST   /meetings/{id}/import        {audio_path} — owner-only, safely snapshot and transcribe a file
 POST   /meetings/{id}/message       {agent_id, text} — one agent, flushed at once
 POST   /meetings/{id}/reset         reset tripped circuit breakers
 GET    /meetings/{id}/tasks         extracted action items
@@ -79,7 +82,22 @@ POST   /meetings/{id}/tasks/review  {id, review_status} — pending | archived
 ```
 
 Every handler is wrapped by `_common.route`, which applies the enable gate and
-turns validation failures into 4xx.
+turns validation failures into 4xx. `_common.error_response` maps an exception's
+status to a LITERAL `web.json_response(..., status=NNN)` per branch — repetitive on
+purpose, because the error-code contract scanner reads `status=exc.status` as
+`dynamic_status` and cannot prove the contract is met. **A status with no branch
+falls through to 400**, which was a live bug before the import route needed 403:
+`store.contain` raises `MeetingsPathError(status=403)` for a path escaping the data
+root, and that was reported as "bad request". A containment violation reported as
+400 reads like a typo the caller can fix by retrying.
+
+The two transcript PRODUCERS — `…/dispatch` and `…/import` — share
+`_common.dispatch_line`: the live-session check, the transcript append, and the
+synchronous queue fan-out as ONE transaction under the dispatch-admission lock,
+plus the expiry branch's SIDE EFFECTS (close admission, drain the queues, mark the
+meeting ended on disk). Shared rather than copied because a second copy of that
+transaction is a second thing that has to stay correct — and because a producer
+that skipped it would reopen the stop-versus-append race the lock closes.
 
 ## Data
 
@@ -92,7 +110,7 @@ calendar-cache.json              last calendar sync
 task-ledger.json                 tasks filed through the local task provider
 meetings/<safe_id>/session.json  per-meeting metadata
 meetings/<safe_id>/tasks.json    extracted action items
-meetings/<safe_id>/transcript.jsonl finalized speech + typed broadcasts
+meetings/<safe_id>/transcript.jsonl speech + typed broadcasts + system loss markers
 meetings/<safe_id>/<agent>.md    a markdown agent's output
 meetings/<safe_id>/<agent>.html  an HTML agent's output
 meetings/<safe_id>/translations.json  live translation, reset on language change
@@ -141,13 +159,40 @@ provider-to-local-record transaction.
 never overwrites, so user edits survive every restart. A second `on_startup`
 hook launches the calendar poller (below); its `on_cleanup` partner runs before
 the session teardown hook, so no poll tick can pre-create a meeting mid-shutdown.
+Startup also marks any persisted `active`, `paused`, or `reviewing` meeting as
+`ended`, because a fresh process cannot hold its live in-memory session. Graceful
+cleanup first drains the live queues and then makes the same metadata transition;
+the normal `ended` → `active` restart path is the recovery in both cases.
+
+An alias matches a standalone occurrence, case-insensitively, longest alias first.
+"Standalone" is asserted per edge: `\b` where the alias's own edge character is a
+word character, and a lookaround for a neighbouring word character where it is
+not. `\b` alone cannot express the second case — it asserts a word character on
+exactly one side, so `\b\.net\b` demands one before the dot, skipping the
+standalone ".net" and firing inside "asp.net" instead. Aliases like `c++`, `c#`
+and `.net` are ordinary dictionary entries and have to match what was said.
+
+Dictionary terms and aliases round-trip through UTF-8 TOML, including supplementary
+Unicode characters. Quotes, backslashes, and control characters remain escaped;
+the serializer does not emit JSON surrogate-pair escapes that TOML rejects.
+
+Writing those characters literally means a term has to BE encodable, so `add_term`
+refuses a code point in the surrogate range U+D800–U+DFFF — which a JSON request
+body can spell (`{"correct": "\ud800"}`) but UTF-8 cannot represent. The refusal
+sits next to the empty-term and length checks, BEFORE the process-wide dictionary
+is replaced, so a term the file can never hold does not become the one live
+transcript lines are corrected against. The route maps that `ValueError` to a 400
+like any other invalid term.
 
 ## Lifecycle
 
 ```
-idle ──start──> active ⇄ paused ──> reviewing ──> ended
-                  │                    ▲             │
-                  └────────────────────┘         restart
+idle ──start──> active
+active ⇄ paused
+active | paused ──> reviewing
+reviewing ──> paused | ended
+idle | active | paused | reviewing ──explicit POST …/stop──> ended
+ended ──restart──> active
 ```
 
 A meeting enters `idle` either when the dashboard opens its row (`POST …/init`)
@@ -155,10 +200,13 @@ or when the calendar poller pre-creates it ahead of its start; both run the same
 idempotent init, so the two paths cannot produce two folders for one event.
 Pre-creation never leaves `idle` — only a user's `start` does.
 
-`reviewing` is a **gate, not a state to pass through**: `ended` is reachable only
-from it, so no extracted action item is silently dropped. The UI's transition
-table (`useMeetingSession.ALLOWED_TRANSITIONS`) has a test asserting no other
-state can reach `ended`.
+The normal dashboard close path treats `reviewing` as a **gate**: it enables Close
+only after every extracted action item is filed or archived, and the shared status
+transition table permits `ended` only from `reviewing`. `POST …/stop` is the
+separate deliberate exit shown above; it can mark any initialized meeting
+`ended` directly. When a live session exists it first closes transcript admission,
+sends the finalize notice, and drains every queue. The route is therefore not
+evidence that every caller passed through action-item review.
 
 `MAX_CONCURRENT_MEETINGS == 1`: a second `start` for a different meeting answers
 409 while the first is live and unexpired. A session past
@@ -172,17 +220,41 @@ so an agent gets a paragraph of context rather than one interruption per
 utterance. Three consecutive dispatch failures trip a circuit breaker (backoff
 60s → 120s → stop); `POST …/reset` resumes.
 
+Each agent's first message carries the meeting context from
+`build_meeting_context`. The calendar and meeting metadata (title, description,
+attendees) and the "Attached documents:" list all sit inside a
+`<<<UNTRUSTED_CALENDAR_EVENT … >>>END_UNTRUSTED_CALENDAR_EVENT` fence with a
+line telling the model the block is data, never instructions. When documents
+are attached, one fixed line after the fence close tells the agent to read
+them, so no attachment text is placed where the model acts on it. Every field
+is collapsed to one line, redacted, then screened with `contains_injection`. A title may name the
+system prompt as a meeting topic: a title that as a whole matches the topic
+grammar (an optional short qualifier such as "Q3" or "Retro on", the phrase, a
+recognised topic noun and an optional second noun, so it carries no free text, as in
+"System prompt design review") has only its "system prompt" phrase exempted;
+the rest of the title is still screened. Any other field is screened as
+written, so a topic phrase with anything else attached is withheld, and every
+other pattern (including `<system>` tags and "ignore prior instructions")
+applies. A match is replaced by `[withheld: failed content screening]` and
+recorded with `audit_injection_dropped` under `meetings_calendar_<field>`.
+Calendar pre-creation writes an empty attachment list, and a test pins that.
+Other fields pass through `neutralize_untrusted_text`, which scrubs every
+untrusted fence marker and the primary prompt boundary markers, so no field can
+close or forge the fence. Transcript batches sent later by `dispatch_to_agent`
+are the meeting's working input and are not wrapped in this fence.
+
 `POST …/dispatch` first redacts and appends the finalized line to
 `transcript.jsonl`, then fans it out to the queues. The response carries the same
 stored record (`id`, UTC `timestamp`, `source`, `text`), so the dashboard can add
 it to its React Query cache immediately while polling remains the reload and
 disconnect recovery path. Polling sends the opaque byte cursor returned as
 `next_cursor`; the initial request returns the complete history and later requests
-read only appended bytes. `source` is `speech` for final STT segments and `typed`
-for the broadcast bar; the `[chat]` agent-context prefix is not stored as user
-text. Persist-before-fan-out is the data-integrity boundary: an accepted agent
-line cannot be absent from the transcript. A 16 MiB per-meeting ceiling fails the
-request with `413 transcript_too_large` before fan-out and never truncates an
+read only appended bytes. `source` is `speech` for final STT segments, `typed`
+for the broadcast bar, and `system` for an app-authored loss marker; the `[chat]`
+agent-context prefix is not stored as user text. Persist-before-fan-out is the
+data-integrity boundary: an accepted agent line cannot be absent from the
+transcript. A 16 MiB per-meeting ceiling fails the request with
+`413 transcript_too_large` before fan-out and never truncates an
 accepted row. The browser treats that code as terminal instead of retrying: it
 stops STT dispatch, disables typed broadcasts, and shows one persistent notice.
 Appends are serialized, flushed, and synced. An append following a crash tail
@@ -193,10 +265,53 @@ rows.
 Dispatch admission has its own short lock covering the live-session check,
 append, and synchronous queue fan-out. Lifecycle handlers wait for that
 transaction, close admission where necessary, and release the lock before slow
-agent flushes. Stop/review/delete therefore cannot detach agents mid-dispatch or
+agent flushes. Stop/pause/review/delete therefore cannot detach agents mid-dispatch or
 resurrect an orphan transcript directory, while a slow agent does not hold every
 later speech request behind its flush.
+
+Starting a meeting is the one closed-admission state that HOLDS speech instead of
+refusing it. Agent initialization can take tens of seconds, so finalized lines are
+persisted immediately and up to `MAX_INIT_BUFFER_LINES` (200) are retained with
+the recipients that were active when each line arrived. Initialization completion
+reopens admission and drains them in arrival order under the same lock. Overflow
+drops the oldest agent-bound lines, then sends the affected agents and the durable
+transcript a `source=system` marker naming the loss; the user's transcript remains
+complete because every held line was appended before it entered the buffer.
 Meetings created by an older version have no file and read as an empty transcript.
+
+Each kickoff message tells the agent to acknowledge readiness and end that turn;
+transcription arrives only in later messages. The independent agent slots are
+acquired concurrently. Once acquired, every kickoff has a bounded turn budget, so
+a harness that calls a wait tool or otherwise keeps that turn open is cancelled
+when the budget expires while the remaining agents continue. The stream consumer
+stays alive during native cancellation so it can observe the acknowledgement or
+terminal response; only then is any remaining consumer retired and its turn lease
+released. A cancellation that is not acknowledged resets the provider before its
+lease is released, so later transcript turns cannot collide with a remote kickoff
+that is still running. Because a cancelled native turn may be absent from the
+provider's conversation log, the affected queue retains the complete kickoff and
+delivers it as its own turn before the next transcript batch. That re-delivery
+starts at twice the base turn budget, doubles again after each timeout, and caps
+at four times the base. A failed retry stays pending, and a user Retry preserves
+the escalation. The queue publishes an initializing marker before dispatching the
+kickoff, so timer and direct-message flushes retain their lines until the kickoff
+resolves. Success, timeout, or another dispatch error then schedules those lines
+for the next event-loop turn; after a timeout the retained kickoff is delivered
+first. Session acquisition
+is outside this budget: cancelling a cold start before the kickoff arrives would
+leave later transcript batches in a
+session that never received its output-file contract. If speech accumulated during
+initialization, each queue schedules that opening for the next event-loop turn
+instead of waiting through the ordinary
+30-second batch interval. If another turn is already live, the queue remembers
+that request and skips the next delay after the live turn rather than treating
+`flush_soon()` as a no-op. The request flag is consumed even when that live turn
+emptied the queue, so it cannot make a later unrelated multi-batch flush skip an
+interval. The start handler does not await those ordinary agent turns while it
+owns the lifecycle lock.
+Forced drains for stop, pause, teardown, or a direct message never re-deliver a
+pending kickoff. The queue keeps its lines for the timer path; teardown drops
+them with a warning, while the human transcript is already durable on disk.
 
 A flush takes **whole lines up to `MAX_BATCH_CHARS` (60k)** and deletes exactly
 the lines it dispatched, so a queue that grew past the cap — a long pause, or a
@@ -208,11 +323,13 @@ Pinned by `test_meetings_session.py::TestAgentQueue`.
 
 Ending or pausing a meeting drains rather than interrupts. `flush_now` treats a
 pending flush task by state: still SLEEPING on its interval, it is cancelled (that
-is the point of flushing now); already inside `flush()` awaiting the agent, it is
-AWAITED. Cancelling an in-flight dispatch killed the live turn, and because `busy`
-was still set the follow-up flush then no-opped — so stopping a meeting mid-dispatch
-lost that batch and the finalization notice, at the one moment a meeting's notes
-matter most. `busy` is the discriminator. Pinned by
+is the point of flushing now); already inside an ordinary `flush()` dispatch, it
+is AWAITED. A kickoff re-delivery is cancelled instead, because lifecycle drains
+never spend its escalating budget. Cancelling an ordinary in-flight dispatch
+killed the live turn, and because `busy` was still set the follow-up flush then
+no-opped — so stopping a meeting mid-dispatch lost that batch and the finalization
+notice, at the one moment a meeting's notes matter most. `busy` plus the explicit
+kickoff re-delivery marker are the discriminators. Pinned by
 `::test_flush_now_waits_for_an_in_flight_dispatch` and
 `::test_flush_now_still_cancels_a_sleeping_timer`.
 
@@ -296,6 +413,65 @@ line number**, because a `queryFn` that runs twice for one cursor (React Strict 
 in dev) would otherwise duplicate every line. Stored `n` stays monotonic when the
 file is trimmed. A failed line is persisted with `text: ""` on purpose, so the panel
 marks it rather than leaving a gap indistinguishable from nobody speaking.
+
+## Importing a recording
+
+`POST …/{id}/import` (`backend/routes/audio_import.py`) takes a host path,
+transcribes it with the gateway's batch speech-to-text (`kiro_crew.transcribe`),
+and feeds the result into the meeting **as if it had been spoken**: every line goes
+through `_common.dispatch_line`, so it is appended to `transcript.jsonl` and only
+then fanned out — the same persist-before-fan-out boundary live speech crosses —
+and gets the same pipeline: domain-dictionary correction, the noise gate,
+per-agent batching, and the muted list, with nothing re-implemented and nothing
+that can drift. The consequence, the honest way round: **an import needs a LIVE
+meeting** — the agents are what turn transcript into minutes, and they only exist
+while one is running. The session is resolved FIRST so an hour of audio is not
+decoded on the way to an error that could be given immediately, and each line is
+re-admitted individually, so a meeting stopped or expired mid-import fails the
+loop with the same 409/410 a spoken line would get instead of writing into a
+torn-down meeting. The 16 MiB transcript ceiling applies per line exactly as it
+does to speech: 413, with everything already dispatched staying dispatched.
+
+`domain/audio.split_transcript` turns the one returned blob into lines in three
+tiers: the transcriber's own segments when it gave any (a whisper segment is the
+closest thing to one utterance), sentence boundaries when it returned a single
+paragraph (AWS Transcribe does), and a hard wrap at `MAX_TRANSCRIPT_CHARS` —
+wrapped rather than truncated, because truncating drops the tail of a long
+sentence. `MAX_IMPORT_LINES` (2000) caps the fan-out — an overflow refuses the
+entire import with a 413 rather than importing a truncated head, because a 200
+that silently dropped the recording's tail is data loss. A recording file above
+`MAX_IMPORT_AUDIO_BYTES` (512 MiB) is refused with a 413 before the decoder
+runs — decoding materializes PCM for the whole file, so the size gate is the
+only ceiling that fires while the memory cost is still zero. One import runs
+per meeting at a time; a second concurrent request answers 409
+(`import_in_progress`), because both would dispatch line-by-line into the same
+transcript and interleave.
+
+The route is owner-only and requires the platform's pinned directory walk
+(`dir_fd` plus `O_NOFOLLOW`); a platform without it answers 501 before touching
+the supplied path. `hooks.validate_file_path` first canonicalizes the source and
+enforces the shared `is_sensitive_path` gate. `_vet_audio_file` records that
+canonical file's device/inode identity, then `_snapshot_recording` opens its parent
+component by component, refuses links or an identity change, and copies the bytes
+into a request-private 0700 directory below the agent-denied voice-runtime root.
+The duration probe and transcriber consume one descriptor pinned to that copy, not
+the user-writable name, and cleanup joins any in-flight copy before closing the
+descriptor and removing the directory.
+
+The extension check runs on the canonical path — a symlink named `.mp3` cannot
+smuggle in a differently named target — and selects the forced decoder format. It
+is still a "did you mean this file" filter rather than content sniffing. For a
+provider with a batch-duration ceiling, an unverified duration is a retryable 503;
+the local provider splits an over-cap recording into bounded segments, while a
+provider that fails loudly at its ceiling returns 413 instead of silently importing
+a prefix.
+
+`lines` and `dispatched` are reported separately: the gap is what the noise gate
+dropped, and a recording that yields 400 lines of which 0 were dispatched (an
+empty room, filler) is a real outcome the user must be able to see.
+
+There is **no UI for this yet** — it is an API surface. A host-path picker in the
+meeting view is a separate UI decision.
 
 ## The two provider seams
 
@@ -467,9 +643,13 @@ default visual rhythm. Empty copy distinguishes an active meeting from review or
 ended states, and the durable list is not an ARIA live region because the compact
 caption already announces recognizer updates.
 
-Cloud transcription is optional (`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6,<1'`). When it
-is absent the endpoint answers a friendly WS error, the hook surfaces it as a
-toast, and the user can still type into the broadcast bar to feed the agents.
+The shared STT settings choose among `local` (resident whisper.cpp, the default),
+`apple` (on-device SpeechAnalyzer on supported macOS), and `transcribe` (paid AWS
+Transcribe with recorded operator consent). `/api/ws/stt` requires both
+`stt.enabled` and `stt.streaming`; a selected provider that is unavailable returns
+a coded WS error that the hook surfaces as a toast. The default local path needs
+neither an AWS account nor the optional `voice-aws` dependencies, and the typed
+broadcast bar remains available when speech input is unavailable.
 
 ## Security posture
 
@@ -546,15 +726,23 @@ toast, and the user can still type into the broadcast bar to feed the agents.
      Remote-URL *fetches* are left to the CSP rather than pattern-matched.
 
   Mermaid still renders, and this is what makes control 3 affordable: it is driven
-  by KiroCrew's own bootstrap from the declarative `div.mermaid` / fenced
+  by Kiro Crew's own bootstrap from the declarative `div.mermaid` / fenced
   ```mermaid markup the agent is instructed to emit, so the agent has no
   documented need to ship JS. Both directions are tested in
   `website/src/test/sketchSrcdoc.test.ts` — nothing executable survives, **and** a
   Mermaid diagram plus an inline-styled HTML table still render (the guards
   against over-stripping the panel into a blank).
+* **A client-supplied FILE path exists in exactly one place** — the audio import —
+  and that route is owner-only. It goes through `hooks.validate_file_path`, then
+  pins the validated device/inode while copying through a component-by-component
+  no-follow walk into an agent-denied snapshot. Both the duration probe and the
+  decoder consume one descriptor for that snapshot. Platforms without that
+  primitive fail closed with 501 before opening the client path. The format check
+  runs on the canonical source, so a symlink cannot use its own name to pass it.
 * **No blocking call on the loop.** The calendar fetch is aiohttp; transcript
   reads/appends, DNS validation, the local `.ics` read, the data-dir seed, the
-  enable check, the task-provider `create`, and every store read and the init
+  enable check, the task-provider `create`, the import's path vetting and
+  speech-to-text availability probe, and every store read and the init
   transaction inside a calendar-poller tick all run on an executor.
 
 ## What the port changed
@@ -562,13 +750,14 @@ toast, and the user can still type into the broadcast bar to feed the agents.
 See `ATTRIBUTION.md` for the table. In short: the internal task system became
 the task-provider seam, the internal calendar MCP became the calendar-provider
 seam, the second (separately built, internally sourced) speech-to-text daemon was
-deleted in favour of KiroCrew's own, the standalone server became in-gateway
+deleted in favour of Kiro Crew's own, the standalone server became in-gateway
 routes, the shell-blob self-heal cron became Python at startup, and the
 internal-git update-check cron was deleted (a builtin versions with the package).
 
 ## Tests
 
 `test/test_meetings_store.py` (containment, layout, config),
+`test_meetings_agent_names.py` (shipped agent names and references),
 `test_meetings_dictionary.py` (matching + hostile input),
 `test_meetings_session.py` (dispatcher, breaker, lifecycle, prompts),
 `test_meetings_providers.py` (both registries, the `.ics` parser,
@@ -577,18 +766,24 @@ validation, redaction, the enable gate), `test_meetings_calendar_poller.py` (the
 due-event rule, a tick against a real `.ics`, pre-creation as init-not-start, the
 loop surviving a bad tick, the settings round trip), `test_meetings_minutes.py` (the
 editable minutes: sidecar ownership, the read overlay, staleness, the widget
-gate, redaction asymmetry, body caps), and `test_meetings_translation.py` (the
-injection guard, the bounded queue, off-by-default), with the shared fixtures and
-fake session manager; no test spawns a process or opens a socket.
+gate, redaction asymmetry, body caps), `test_meetings_translation.py` (the
+injection guard, the bounded queue, off-by-default), and
+`test_meetings_audio_import.py` (the split's boundary rules, the refusals in
+ORDER, and the shared dispatch transaction), with the shared fixtures and the
+fake session manager in `test/meetings_helpers.py`. Every dispatch goes through
+that fake session manager; no test spawns a process, opens a socket, calls a
+model, or decodes audio.
 
-These live in the repo-level `test/` tree, not an in-package `tests/`:
-`setup.cfg` sets `testpaths = test transfer`, so a test under
-`src/kiro_crew/apps/builtins/...` is never collected by CI.
+The app's current tests live in the repo-level `test/` tree. `setup.cfg` sets
+`testpaths = test src/kiro_crew/apps/builtins`, so a future in-package Meetings
+suite would also be collected by CI; the second root already collects builtin-app
+suites that intentionally ship beside their code.
 
 Frontend: `website/src/test/MeetingsApiClient.test.ts` (fetch-boundary
 translation), `MeetingsSessionLogic.test.ts` (dedup, preset resolution, the
-transition table), `MeetingsAgentPillBar.test.tsx`, `MeetingsBroadcastBar.test.tsx`,
+transition table), `MeetingsPage.test.tsx` and `MeetingsPageCov80.test.tsx` (list,
+refresh, deletion, and calendar rows), `MeetingsSettingsViewCoverage.test.tsx`,
+`MeetingsAgentPillBar.test.tsx`, `MeetingsBroadcastBar.test.tsx`,
 `MeetingsAgentPanel.test.tsx` (including the iframe sandbox),
-`MeetingsTranslation.test.tsx`, and
-`MeetingsTranscriptPanel.test.tsx` (durable/live rows, follow mode, and the
-split-to-primary layout transition).
+`MeetingsTranslation.test.tsx`, and `MeetingsTranscriptPanel.test.tsx`
+(durable/live rows, follow mode, and the split-to-primary layout transition).

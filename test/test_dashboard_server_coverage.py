@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import logging
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,8 +31,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.dashboard import server as srv
+from kiro_crew.platform_compat import unlink_link_or_junction
 
 # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -200,15 +202,41 @@ class TestWindowEntryHandler:
     async def test_handler_serves_the_file_bound_at_registration(
         self, tmp_path
     ) -> None:
-        entry = tmp_path / "board.html"
+        entry = tmp_path / "src" / "apps" / "papyrus" / "board.html"
+        entry.parent.mkdir(parents=True)
         entry.write_text("<h1>board</h1>", encoding="utf-8")
         app = web.Application()
-        app.router.add_get("/w.html", srv._window_entry_handler(entry))
+        app.router.add_get("/w.html", srv._window_entry_handler(tmp_path, "papyrus/board.html"))
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/w.html")
             assert resp.status == 200
             assert await resp.text() == "<h1>board</h1>"
+
+    @pytest.mark.asyncio
+    async def test_handler_follows_a_re_pointed_dist(self, tmp_path) -> None:
+        """A window route resolves the served dist per request, not at registration.
+
+        Staging re-points ``static/dist`` at a fresh copy and sweeps the old one;
+        a route pinned to the old copy at startup would 404 from then on.
+        """
+        for name, body in (("old", "<h1>old</h1>"), ("new", "<h1>new</h1>")):
+            entry = tmp_path / name / "src" / "apps" / "papyrus" / "board.html"
+            entry.parent.mkdir(parents=True)
+            entry.write_text(body, encoding="utf-8")
+        served = tmp_path / "served"
+        make_dir_link(served, tmp_path / "old")
+        app = web.Application()
+        app.router.add_get("/w.html", srv._window_entry_handler(served, "papyrus/board.html"))
+
+        async with TestClient(TestServer(app)) as client:
+            assert await (await client.get("/w.html")).text() == "<h1>old</h1>"
+            unlink_link_or_junction(served)
+            make_dir_link(served, tmp_path / "new")
+            shutil.rmtree(tmp_path / "old")
+            resp = await client.get("/w.html")
+            assert resp.status == 200
+            assert await resp.text() == "<h1>new</h1>"
 
     @pytest.mark.asyncio
     async def test_app_window_entries_are_registered_as_get_routes(
@@ -234,12 +262,7 @@ class TestWindowEntryHandler:
         assert f"/{srv.APP_WINDOW_URL_PREFIX}/papyrus/editor.html" in canonical
         # App Store brand assets: without this mount the builtin app icons and
         # hero images fall through to the SPA shell and render as placeholders.
-        prefixes = {
-            r.get_info().get("prefix")
-            for r in app.router.resources()
-            if r.get_info().get("prefix")
-        }
-        assert "/app-assets" in prefixes
+        assert "/app-assets/{tail}" in canonical
 
 
 # ── _precompute_telemetry ────────────────────────
@@ -510,8 +533,66 @@ class TestConnectionsWarmLifecycle:
             assert kick in source
             # The kick must run strictly AFTER the listener binds: an on_startup hook (or
             # any pre-bind call) puts the scavenge's deferred import in front of the bind,
-            # which no-new-work-on-gateway-boot-path forbids.
-            assert source.index("_start_site(site, port)") < source.index(kick)
+            # which no-new-work-on-gateway-boot-path forbids. The serving step differs per
+            # entrypoint: start_dashboard listens on its pre-reserved socket via SockSite
+            # ("await site.start()"); start_api_server binds via _start_site.
+            serving = (
+                "_start_site(site, port)"
+                if "_start_site(site, port)" in source
+                else "await site.start()"
+            )
+            assert source.index(serving) < source.index(kick)
+
+
+# ── _register_browser_view_cleanup ──────────────────────────────────────
+
+
+class TestBrowserSessionsLifecycle:
+    @pytest.mark.asyncio
+    async def test_startup_reclaim_parks_in_the_state_background_tasks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reclaim runs off the boot path as a background task, and that task
+        lives in ``state._background_tasks`` with every other one ``server.py``
+        holds -- there is no second, module-global task set for it."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        def _reclaim() -> int:
+            calls.append("reclaim")
+            return 0
+
+        async def _to_thread(func: Any, *args: Any) -> Any:
+            started.set()
+            await release.wait()
+            return func(*args)
+
+        monkeypatch.setattr(srv.browser_cli_launcher, "reclaim_stranded", _reclaim)
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        app = web.Application()
+        state = _state()
+        srv._register_browser_view_cleanup(app, state)
+        startup = next(
+            hook for hook in app.on_startup if hook.__name__ == "_browser_sessions_startup"
+        )
+
+        await startup(app)
+        await started.wait()
+
+        assert calls == []  # still in flight: the hook did not wait on the CLI
+        assert len(state._background_tasks) == 1
+        assert not hasattr(srv, "_startup_tasks")
+
+        release.set()
+        await asyncio.gather(*state._background_tasks)
+        assert calls == ["reclaim"]
+        assert state._background_tasks == set()  # the done callback discards it
+
+    def test_the_gateway_passes_its_state_to_the_registration(self) -> None:
+        source = inspect.getsource(srv.start_dashboard)
+        assert "_register_browser_view_cleanup(app, state)" in source
 
 
 # ── _register_prevent_sleep_shutdown ────────────────────────────────────
@@ -733,6 +814,22 @@ class TestStartApiServerResidualPaths:
         monkeypatch.setattr(srv, "sel", MagicMock(return_value=audit))
         subagents = MagicMock()
         subagents.spawn.side_effect = RuntimeError("spawn exploded")
+        from kiro_crew.execution_context import bind_session_execution, execution_for_store
+
+        # Admit a real captured caller so the identity and privacy gates reach
+        # the crashing spawn; the body must claim that same authenticated caller.
+        session_key = "dashboard:audit-crash"
+        bind_session_execution(session_key, execution_for_store(""))
+        # The caller also has to PROVE the key it declares, the way its production
+        # counterpart does, or the identity gate answers ahead of the spawn and the
+        # crash under test never happens.
+        from kiro_crew import member_memory_auth
+
+        monkeypatch.setattr(
+            member_memory_auth,
+            "verify_session_token",
+            lambda token: token.removeprefix("signed:"),
+        )
 
         runner, _state_obj = await _start_api(
             tmp_path, monkeypatch, subagents=subagents
@@ -746,13 +843,18 @@ class TestStartApiServerResidualPaths:
             async with TestClient(TestServer(runner.app)) as client:
                 resp = await client.post(
                     "/api/spawn",
-                    json={"task": "noop"},
-                    headers={"X-Internal-Secret": secret},
+                    json={"task": "noop", "parent_session": session_key},
+                    headers={
+                        "X-Internal-Secret": secret,
+                        "X-Session-Key": session_key,
+                        "X-Session-Token": f"signed:{session_key}",
+                    },
                 )
                 assert resp.status == 500
         finally:
             await runner.cleanup()
 
+        subagents.spawn.assert_called_once()
         errors = [
             call.kwargs
             for call in audit.log_api_access.call_args_list
@@ -807,7 +909,7 @@ class TestSttHooks:
         """169 ms of numpy and native binding must not run inline on the loop.
 
         The boot delay was not enough on its own: it moved the import out of
-        ``runner.setup()`` (so it no longer delays the first socket bind) and left it
+        ``runner.setup()`` (so it does not delay the first socket bind) but leaves it
         running on the loop, where it stalls every socket and heartbeat the gateway is
         serving at that moment.
 

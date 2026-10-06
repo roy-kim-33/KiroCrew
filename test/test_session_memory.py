@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from kiro_crew import resource_status as sm_rs
 from kiro_crew.dashboard import session_memory as sm
 
 
@@ -37,9 +38,14 @@ class _FakeSubagents:
 
 
 def _row(
-    key: str, pid: int | None, *, owns: bool = True, created: float = 1000.0
+    key: str,
+    pid: int | None,
+    *,
+    owns: bool = True,
+    created: float = 1000.0,
+    sid: str | None = None,
 ) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "key": key,
         "agent": "kirocrew",
         "pid": pid,
@@ -47,6 +53,9 @@ def _row(
         "created_at": created,
         "prompts": 3,
     }
+    if sid is not None:
+        row["sid"] = sid
+    return row
 
 
 # ── session_title ──────────────────────────────────────────────────────────
@@ -125,7 +134,9 @@ def test_first_cpu_sample_reports_unknown_not_zero(monkeypatch: pytest.MonkeyPat
     """CPU is a rate: one observation cannot produce one, and reporting 0.0 would
     claim the session is idle."""
     monkeypatch.setattr(sm.sys, "platform", "linux")
-    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid: 100)
+    # ``**kw`` because the sampler hands the subtree it already walked over as
+    # ``pids=`` rather than letting the CPU reading enumerate the tree again.
+    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid, **kw: 100)
     sampler = sm.SessionMemorySampler()
     assert sampler._cpu_cores(42, 10.0) is None
 
@@ -133,7 +144,7 @@ def test_first_cpu_sample_reports_unknown_not_zero(monkeypatch: pytest.MonkeyPat
 def test_second_cpu_sample_uses_the_delta(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sm.sys, "platform", "linux")
     jiffies = iter([100, 100 + sm._CLK_TCK * 2])
-    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid: next(jiffies))
+    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid, **kw: next(jiffies))
     sampler = sm.SessionMemorySampler()
     sampler._cpu_cores(42, 10.0)
     # 2 core-seconds of CPU over 4 wall seconds = 0.5 cores.
@@ -153,10 +164,14 @@ def test_dead_pid_baselines_are_pruned() -> None:
 @pytest.fixture()
 def stub_proc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sm.sys, "platform", "linux")
-    monkeypatch.setattr(sm, "_get_rss_tree_mb", lambda pid: {7: 3238.0, 8: 843.0}.get(pid, 0.0))
-    monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid: [pid, pid + 100, pid + 200])
-    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: "python -m kiro_crew.mcp_gateway.stub")
-    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid: 0)
+    monkeypatch.setattr(
+        sm, "_get_rss_tree_mb", lambda pid, **kw: {7: 3238.0, 8: 843.0}.get(pid, 0.0)
+    )
+    monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid, **kw: [pid, pid + 100, pid + 200])
+    monkeypatch.setattr(sm, "process_matches", lambda pid, needles: True)
+    monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid, **kw: 0)
+    # The poll builds the host's parent map once; keep that off real /proc too.
+    monkeypatch.setattr(sm, "proc_child_map", lambda: {})
     monkeypatch.setattr(sm, "_get_static_system_info", lambda: {"mem_total_gb": 124.0})
 
 
@@ -221,6 +236,60 @@ async def test_co_tenants_split_the_shared_runtime_measurement(stub_proc: None) 
 
 
 @pytest.mark.asyncio
+async def test_co_tenant_rows_carry_the_sharer_count(stub_proc: None) -> None:
+    """Every row on a shared runtime says how many sessions are on it.
+
+    ``owns_runtime`` cannot answer this. It is false only on the JOINERS, so a
+    consumer reading it as "is this runtime shared?" misses the founder, and a
+    consumer aggregating per-runtime figures has no key to de-duplicate on
+    beyond the pid. The count is published because the sampler already computes
+    it to divide rss/cpu -- withholding it made each consumer re-derive it, or
+    guess.
+    """
+    sessions = _FakeSessions(
+        [
+            _row("dashboard:a", 7),
+            _row("dashboard:b", 7, owns=False),
+            _row("dashboard:solo", 9),
+        ]
+    )
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    assert rows["dashboard:a"]["sharers"] == 2  # the FOUNDER is on a shared runtime too
+    assert rows["dashboard:b"]["sharers"] == 2
+    assert rows["dashboard:solo"]["sharers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_procs_and_mcp_stay_the_runtimes_own_totals(stub_proc: None) -> None:
+    """``procs`` and ``mcp`` are counts of real objects on the runtime, so they
+    are reported whole on every co-tenant row -- unlike rss/cpu, which are
+    divided.
+
+    Dividing a count of 3 processes between 3 sessions yields 1 each, and
+    between 4 yields 0.75 of a process, which describes nothing. The row states
+    the runtime's true figure and carries ``sharers`` so an aggregate can add it
+    once per runtime instead of once per session.
+    """
+    sessions = _FakeSessions(
+        [
+            _row("dashboard:a", 7),
+            _row("dashboard:b", 7, owns=False),
+        ]
+    )
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    for key in ("dashboard:a", "dashboard:b"):
+        assert rows[key]["procs"] == 3, f"{key} procs divided"
+        assert rows[key]["mcp"] == 3, f"{key} mcp divided"
+        # The measurements ARE divided, which is what makes the pair asymmetric
+        # and worth pinning together.
+        assert rows[key]["rss_mb"] == pytest.approx(3238.0 / 2)
+
+
+@pytest.mark.asyncio
 async def test_an_exclusive_runtime_is_never_divided(stub_proc: None) -> None:
     """One row on a pid means no sharers -- the figure must pass through intact."""
     sessions = _FakeSessions([_row("dashboard:a", 7)])
@@ -268,7 +337,7 @@ async def test_tasks_are_passed_through_and_history_records_the_total(stub_proc:
 async def test_a_dying_pid_does_not_fail_the_whole_page(
     stub_proc: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def boom(pid: int) -> float:
+    def boom(pid: int, **kw: object) -> float:
         raise OSError("vanished")
 
     monkeypatch.setattr(sm, "_get_rss_tree_mb", boom)
@@ -322,9 +391,7 @@ def test_runtime_pids_resolves_both_provider_shapes() -> None:
 
     mgr = _manager()
     mgr._sessions["dashboard:nested"] = _Session(provider=_ClientShapedProvider(4242))
-    mgr._sessions["taskrunner:flat"] = _Session(
-        provider=_SelfShapedProvider(5353, owns=False)
-    )
+    mgr._sessions["taskrunner:flat"] = _Session(provider=_SelfShapedProvider(5353, owns=False))
 
     rows = {r["key"]: r for r in mgr.runtime_pids()}
 
@@ -448,7 +515,8 @@ def test_runtime_pids_skips_dead_manager_runtimes() -> None:
 
 
 def test_slot_spend_sums_credits_and_counts_turns(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """A slot with shard rows gets summed credits and a turns count."""
     import json as _json
@@ -482,7 +550,8 @@ def test_slot_spend_sums_credits_and_counts_turns(
 
 
 def test_slot_spend_returns_empty_for_no_shards(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """A slot with no rows means credits=None and turns=None in the payload."""
     from pathlib import Path
@@ -501,7 +570,8 @@ def test_slot_spend_returns_empty_for_no_shards(
 
 
 def test_slot_spend_drops_nan_and_infinity(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """NaN/Infinity in a shard row must not poison the slot total."""
     import json as _json
@@ -532,7 +602,8 @@ def test_slot_spend_drops_nan_and_infinity(
 
 
 def test_slot_spend_cache_expires_as_the_cutoff_moves(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """A row aging past the cutoff drops out even when no shard file changes.
 
@@ -553,12 +624,15 @@ def test_slot_spend_cache_expires_as_the_cutoff_moves(
     row_ts = real_now - timedelta(days=usage.SPEND_WINDOW_DAYS) + timedelta(seconds=30)
     shard = tmp / real_now.strftime("%Y-%m-%d.jsonl")
     shard.write_text(
-        _json.dumps({
-            "_type": "tokens",
-            "ts": row_ts.isoformat(),
-            "slot": "chat-9-777",
-            "credits": 4.0,
-        }) + "\n",
+        _json.dumps(
+            {
+                "_type": "tokens",
+                "ts": row_ts.isoformat(),
+                "slot": "chat-9-777",
+                "credits": 4.0,
+            }
+        )
+        + "\n",
     )
 
     # Pin the shard SET so this exercises the cache key alone; otherwise a clock
@@ -580,13 +654,14 @@ def test_slot_spend_cache_expires_as_the_cutoff_moves(
     # is untouched, so the signature is identical.
     clock["t"] += usage._SLOT_SPEND_TTL_S + 1
     second = usage.slot_spend()
-    assert "dashboard:chat-9-777" not in second, (
-        "row aged past the cutoff but the cache still served it"
-    )
+    assert (
+        "dashboard:chat-9-777" not in second
+    ), "row aged past the cutoff but the cache still served it"
 
 
 def test_slot_spend_excludes_non_session_slots(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """A non-session slot must not appear in the mapping."""
     import json as _json
@@ -615,7 +690,8 @@ def test_slot_spend_excludes_non_session_slots(
 
 
 def test_slot_spend_cache_invalidates_on_shard_growth(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """Cache returns the same object when shards unchanged, recomputes on growth."""
     import json as _json
@@ -628,8 +704,10 @@ def test_slot_spend_cache_invalidates_on_shard_growth(
     now = datetime.now(timezone.utc)
     shard = tmp / now.strftime("%Y-%m-%d.jsonl")
     shard.write_text(
-        _json.dumps({"_type": "tokens", "ts": now.isoformat(),
-                     "slot": "chat-7-333", "credits": 1.0}) + "\n"
+        _json.dumps(
+            {"_type": "tokens", "ts": now.isoformat(), "slot": "chat-7-333", "credits": 1.0}
+        )
+        + "\n"
     )
 
     monkeypatch.setattr(usage, "_TOKEN_USAGE_DIR", tmp)
@@ -644,8 +722,10 @@ def test_slot_spend_cache_invalidates_on_shard_growth(
     # Append a new row -> shard grows
     with shard.open("a") as fh:
         fh.write(
-            _json.dumps({"_type": "tokens", "ts": now.isoformat(),
-                         "slot": "chat-7-333", "credits": 2.0}) + "\n"
+            _json.dumps(
+                {"_type": "tokens", "ts": now.isoformat(), "slot": "chat-7-333", "credits": 2.0}
+            )
+            + "\n"
         )
 
     third = usage.slot_spend()
@@ -678,14 +758,14 @@ def test_slot_spend_window_matches_cost_breakdown_window() -> None:
 
 
 def test_slot_spend_applies_per_row_timestamp_cutoff(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: object,
 ) -> None:
     """A row inside the boundary shard but older than the cutoff is NOT counted.
 
-    Regression pin: the old _slot_spend in session_memory filtered by shard file
-    date only, not by each row's timestamp. A shard named 2026-08-01 (within
-    window) could contain rows timestamped 2026-07-25 (outside the per-row
-    cutoff) which were then over-counted.
+    Filtering by shard-file date alone would count a row timestamped before the
+    cutoff: a shard named for one day can hold rows from an earlier day, outside
+    the per-row cutoff.
     """
     import json as _json
     from datetime import datetime, timedelta, timezone
@@ -716,3 +796,369 @@ def test_slot_spend_applies_per_row_timestamp_cutoff(
     # Only the recent row is counted; the 100-credit old row is excluded.
     assert result["dashboard:chat-1-999"]["credits"] == pytest.approx(5.0)
     assert result["dashboard:chat-1-999"]["turns"] == 1
+
+
+# ── lineage: who opened whom ───────────────────────────────────────────────
+
+
+def tree_cap() -> int:
+    from kiro_crew.crew_log.session_tree import TREE_UNIT_CAP
+
+    return TREE_UNIT_CAP
+
+
+def _crew_log_with_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, *, creator_running: bool
+) -> None:
+    """A creator log and a child log whose session/opened cites it."""
+    from kiro_crew import crew_log as lg
+    from kiro_crew.crew_log import CrewLog
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+
+    def opened(handle: CrewLog, slot: str, parent: dict[str, str] | None = None) -> None:
+        data: dict[str, object] = {
+            "agent": "kirocrew",
+            "slot": slot,
+            "model": "opus",
+            "cwd": "/w",
+            "owner": "raymond",
+            "resumed": False,
+        }
+        if parent is not None:
+            data["parent"] = parent
+        handle.append("session/opened", data, src="gateway")
+
+    if creator_running:
+        creator = CrewLog.create(
+            lg.KIND_SESSION, "p-sid", owner="raymond", agent="kirocrew", slot="p"
+        )
+        opened(creator, "p")
+    child = CrewLog.create(lg.KIND_SESSION, "c-sid", owner="raymond", agent="kirocrew", slot="c")
+    opened(child, "c", parent={"slot": "p", "sid": "p-sid"})
+
+
+@pytest.mark.asyncio
+async def test_a_created_session_names_its_live_creator_as_parent(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _crew_log_with_parent(monkeypatch, tmp_path, creator_running=True)
+    sessions = _FakeSessions([_row("dashboard:p", 7), _row("dashboard:c", 8)])
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    # The child cites its creator; ``key`` is the creator's LIVE row, which is
+    # the edge the table nests on -- the same edge a task row carries. The
+    # entry's ``parent.sid`` stays in the log: the wire carries the slot only.
+    assert rows["dashboard:c"]["parent"] == {"slot": "p", "key": "dashboard:p"}
+    assert rows["dashboard:p"]["parent"] is None
+    # Two logs, far inside the cap: nothing went unread; the cap rides along so
+    # the page can say "N+" when something does.
+    assert out["totals"]["lineage_over_cap"] is False  # type: ignore[index]
+    assert out["totals"]["lineage_cap"] == tree_cap()  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_a_channel_bound_creator_is_found_through_its_slot_alias(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # A slot bound to a Slack or cron conversation runs under its
+    # linked_session_key while its crew log -- and any child citing it -- carries
+    # the dashboard slot key. The alias the handler supplies for spend is the
+    # same bridge, so the child nests under the bound row instead of staying a
+    # root with an absent creator.
+    _crew_log_with_parent(monkeypatch, tmp_path, creator_running=True)
+    sessions = _FakeSessions([_row("slack:C1:1.2", 7), _row("dashboard:c", 8)])
+    out = await sm.SessionMemorySampler().sample(
+        sessions, None, spend_slot_by_session={"slack:C1:1.2": "p"}
+    )
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    assert rows["dashboard:c"]["parent"] == {"slot": "p", "key": "slack:C1:1.2"}
+    assert rows["slack:C1:1.2"]["parent"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_creator_that_is_not_running_leaves_the_child_a_root_with_its_citation(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _crew_log_with_parent(monkeypatch, tmp_path, creator_running=False)
+    sessions = _FakeSessions([_row("dashboard:c", 8)])
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    [row] = out["sessions"]  # type: ignore[misc]
+    assert row["parent"] == {"slot": "p", "key": None}
+
+
+@pytest.mark.asyncio
+async def test_logs_past_the_scan_cap_are_counted_on_the_payload_not_dropped_silently(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # The cap is the scanner's count bound (a-bound rule). Past it a log is
+    # neither read nor cached, and the payload says how many, on every sample.
+    # The live rows' own logs are admitted first, so what goes unread is a
+    # closed session's log and every row on screen still folds.
+    from kiro_crew.crew_log import session_tree as tree_mod
+
+    _crew_log_with_parent(monkeypatch, tmp_path, creator_running=True)
+    # A third, closed session's log sorts first in the store: with a cap of two
+    # it is what goes unread, because the live rows name their own units.
+    from kiro_crew import crew_log as lg
+    from kiro_crew.crew_log import CrewLog
+
+    closed = CrewLog.create(
+        lg.KIND_SESSION, "a-closed", owner="raymond", agent="kirocrew", slot="z"
+    )
+    closed.append(
+        "session/opened",
+        {
+            "agent": "kirocrew",
+            "slot": "z",
+            "model": "opus",
+            "cwd": "/w",
+            "owner": "raymond",
+            "resumed": False,
+        },
+        src="gateway",
+    )
+    monkeypatch.setattr(tree_mod, "TREE_UNIT_CAP", 2)
+    sessions = _FakeSessions(
+        [_row("dashboard:p", 7, sid="p-sid"), _row("dashboard:c", 8, sid="c-sid")]
+    )
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+    assert out["totals"]["lineage_over_cap"] is True  # type: ignore[index]
+    assert out["totals"]["lineage_cap"] == 2  # type: ignore[index]
+    # Both rows on screen fold, closed log or not: the child still nests.
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    assert rows["dashboard:c"]["parent"] == {"slot": "p", "key": "dashboard:p"}
+    assert rows["dashboard:p"]["parent"] is None
+    assert all("log_skipped" not in r for r in out["sessions"])  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_without_a_crew_log_root_every_session_is_a_root(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+    sessions = _FakeSessions([_row("dashboard:a", 7), _row("slack:C1:1.2", 9)])
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+    assert [r["parent"] for r in out["sessions"]] == [None, None]  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_with_the_crew_log_off_no_scan_runs_and_no_row_has_a_parent(
+    stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # The store is optional and this module is on the boot path: with the flag
+    # off the scanner is never built, so the storage package is never loaded
+    # on its account (the launch-level pin is test_crew_log_emit's).
+    _crew_log_with_parent(monkeypatch, tmp_path, creator_running=True)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
+    sampler = sm.SessionMemorySampler()
+    sessions = _FakeSessions([_row("dashboard:p", 7), _row("dashboard:c", 8)])
+    out = await sampler.sample(sessions, None)
+    assert [r["parent"] for r in out["sessions"]] == [None, None]  # type: ignore[union-attr]
+    assert out["totals"]["lineage_over_cap"] is False  # type: ignore[index]
+    assert out["totals"]["lineage_cap"] == 0  # type: ignore[index]
+    assert sampler._tree is None
+
+
+# ── slice ownership SLI on the payload ──
+
+
+@pytest.mark.asyncio
+async def test_the_payload_publishes_the_slice_ownership_sli(stub_proc: None) -> None:
+    """The SLI rides this poll rather than a second one, so it must be on the
+    payload the page already reads."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert set(sli) == {
+        "unowned_alive",
+        "owned_dead",
+        "owned_alive",
+        "readable",
+        # `confirmed` is the alarm; `healthy` is its negation, kept so a reader
+        # of the older shape is not broken by the addition.
+        "confirmed",
+        "healthy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_every_claim_source_reaches_the_ownership_probe(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A claim source missing here reads as a LEAKED process.
+
+    The union must carry the session rows plus the warm pool plus in-flight
+    spawns plus companion runtimes -- the same four the sweep protects with.
+    Dropping one turns a well-owned runtime into a false alarm, which is how an
+    SLI whose whole point is "non-zero means investigate" becomes noise.
+    """
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    sessions._pool_pids = lambda: {101}  # type: ignore[attr-defined]
+    sessions._in_flight_pids = lambda: {102}  # type: ignore[attr-defined]
+    sessions._companion_runtime_pids = lambda: {103}  # type: ignore[attr-defined]
+    seen: dict[str, object] = {}
+
+    def _probe(claimed, **_kw):
+        seen["claimed"] = set(claimed)
+        return sm_rs.SliceOwnership(
+            unowned_alive=0, owned_dead=0, owned_alive=len(set(claimed)), readable=True
+        )
+
+    monkeypatch.setattr(sm_rs, "slice_ownership", _probe)
+    await sm.SessionMemorySampler().sample(sessions, None)
+
+    assert seen["claimed"] == {7, 101, 102, 103}
+
+
+@pytest.mark.asyncio
+async def test_a_failing_claim_source_does_not_fail_the_poll(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """An unreadable claim source is skipped, not fatal: the whole System page
+    must not go dark because one pid accessor raised."""
+
+    def _boom() -> set[int]:
+        raise RuntimeError("pool lock held")
+
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    sessions._pool_pids = _boom  # type: ignore[attr-defined]
+    seen: dict[str, object] = {}
+
+    def _probe(claimed, **_kw):
+        seen["claimed"] = set(claimed)
+        return sm_rs.SliceOwnership(unowned_alive=0, owned_dead=0, owned_alive=0, readable=True)
+
+    monkeypatch.setattr(sm_rs, "slice_ownership", _probe)
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    assert seen["claimed"] == {7}  # the row's own pid survived the failure
+    assert out["totals"]["slice_ownership"]["readable"] is True  # type: ignore[index]
+
+
+def test_the_claim_union_matches_the_sweeps_own_sources() -> None:
+    """The SLI and the periodic sweep must draw claims from the SAME sources.
+
+    A source the sweep protects with and this does not read turns a well-owned
+    runtime into a reported leak -- the exact noise mode that makes an alarm
+    whose contract is "non-zero means investigate" unusable. Read out of
+    ``_active_pids``'s source, so adding a fifth source there without adding it
+    to ``_CLAIM_SOURCES`` fails here rather than in production.
+    """
+    import inspect
+    import re
+
+    from kiro_crew import session_cleanup
+
+    body = inspect.getsource(session_cleanup.SessionCleanup._active_pids)
+    sweep_sources = set(re.findall(r"_owner\.(_\w+)\(\)", body))
+    # ``collect_active_pids`` is the sweep's per-session provider scan; the SLI
+    # covers that ground through ``runtime_pids()`` rows instead, so it is the one
+    # source that is legitimately reached differently.
+    assert "collect_active_pids" in body
+    assert sweep_sources == set(
+        sm._CLAIM_SOURCES
+    ), f"sweep reads {sorted(sweep_sources)}, SLI reads {sorted(sm._CLAIM_SOURCES)}"
+
+
+# ── the ownership SLI's single-sample reading is transient ──
+
+
+@pytest.mark.asyncio
+async def test_a_single_non_zero_ownership_reading_is_not_yet_an_alarm(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """The claim set and the slice are read at different instants, so ordinary
+    churn produces a one-sample fault.
+
+    A session spawning between the two reads is in the slice and not in the
+    claims (reads as leaked); one exiting between them is claimed and not alive
+    (reads as a stale claim). Neither is a fault. An alarm that fires on those
+    trains an operator to ignore the one signal built to mean "investigate", so a
+    single non-zero reading is reported as suspected, not confirmed.
+    """
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs,
+        "slice_ownership",
+        lambda claimed, **_kw: sm_rs.SliceOwnership(
+            unowned_alive=1, owned_dead=0, owned_alive=1, readable=True
+        ),
+    )
+    sampler = sm.SessionMemorySampler()
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["unowned_alive"] == 1  # the count is reported as measured
+    assert sli["confirmed"] is False  # but not yet an alarm
+    assert sli["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_fault_that_persists_across_samples_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A leak does not heal, so it survives the next poll. Churn does not."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs,
+        "slice_ownership",
+        lambda claimed, **_kw: sm_rs.SliceOwnership(
+            unowned_alive=1, owned_dead=0, owned_alive=1, readable=True
+        ),
+    )
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["confirmed"] is True
+    assert sli["healthy"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_clean_reading_clears_the_suspicion(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """Churn's one-sample fault must not accumulate across unrelated polls into a
+    confirmation it never earned."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    readings = iter(
+        [
+            sm_rs.SliceOwnership(unowned_alive=1, owned_dead=0, owned_alive=1, readable=True),
+            sm_rs.SliceOwnership(unowned_alive=0, owned_dead=0, owned_alive=1, readable=True),
+            sm_rs.SliceOwnership(unowned_alive=1, owned_dead=0, owned_alive=1, readable=True),
+        ]
+    )
+    monkeypatch.setattr(sm_rs, "slice_ownership", lambda claimed, **_kw: next(readings))
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    assert out["totals"]["slice_ownership"]["confirmed"] is False  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_slice_is_never_confirmed_healthy_or_faulted(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A slice that cannot be enumerated has not been shown clean OR faulted, so
+    it must not accumulate a confirmation from repeated unreadable polls."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs, "slice_ownership", lambda claimed, **_kw: sm_rs.UNREADABLE_SLICE_OWNERSHIP
+    )
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["readable"] is False
+    assert sli["confirmed"] is False
+    assert sli["healthy"] is False

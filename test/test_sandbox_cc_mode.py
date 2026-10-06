@@ -25,6 +25,7 @@ from kiro_crew.sandbox import (
     scrub_env,
     wrap_argv,
 )
+from kiro_crew.sandbox_plan import BACKEND_NAMESPACE, ConfinementPlan
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +37,21 @@ def _neutralize_sandbox_env(monkeypatch):
         "_KIRO_INTERNAL_SETTINGS_PATH",
         "/nonexistent/kirocrew-test/amazon-internal.json",
     )
+    # ``_build_launcher_script`` asks the HOST's ``ssh -V`` whether it knows
+    # ``StrictHostKeyChecking=accept-new``. Nothing here is about that probe, and
+    # a real ssh spawned from the test process is a host dependency the launcher
+    # text must not vary with -- pin the answer so no binary runs.
+    monkeypatch.setattr(_sb_mod, "_ssh_supports_accept_new", lambda: True)
+
+
+def _home(rel: str) -> str:
+    """*rel* under ``$HOME``, spelled as the plan spells a tier entry."""
+    return os.path.join(str(Path.home()), rel)
+
+
+def _plan(tier: str, **kwargs: object) -> ConfinementPlan:
+    """The Linux namespace plan for one spawn at *tier* on this host."""
+    return _sb_mod._spawn_plan(BACKEND_NAMESPACE, tier, **kwargs)
 
 
 class TestCcDirsList:
@@ -88,52 +104,119 @@ class TestCcFilesList:
 
 class TestBuildLauncherScriptCcMode:
     def test_extra_hidden_directory_is_bound_over(self):
-        script = _build_launcher_script(
-            "strict",
-            extra_hidden_dirs=("/private/kiro/crew",),
-        )
+        plan = _plan("strict", extra_hidden_dirs=("/private/kiro/crew",))
 
-        assert "/private/kiro/crew" in script
+        assert "/private/kiro/crew" in plan.sensitive_dirs
 
     def test_cc_mode_uses_cc_dirs(self):
-        script = _build_launcher_script("cc")
+        masked = _plan("cc").sensitive_dirs
         for d in _CC_DIRS:
-            assert d in script, f"{d} should be in cc launcher script"
+            assert _home(d) in masked, f"{d} should be masked by the cc launcher"
 
     def test_cc_mode_includes_expose_files(self):
-        script = _build_launcher_script("cc")
-        assert "EXPOSE_FILES" in script
-        assert ".aws/config" in script
+        assert (_home(".aws/config"), "config") in _plan("cc").expose
 
     def test_cc_mode_includes_sensitive_files(self):
-        script = _build_launcher_script("cc")
-        assert "SENSITIVE_FILES" in script
+        files = _plan("cc").sensitive_files
         for f in _CC_FILES:
-            assert f in script, f"{f} should be in cc launcher script"
+            assert _home(f) in files, f"{f} should be masked by the cc launcher's file loop"
 
     def test_cc_mode_does_not_hide_ssh(self):
-        script = _build_launcher_script("cc")
-        assert "HIDE_SSH = False" in script
+        assert _plan("cc").hide_ssh is False
 
     def test_strict_mode_hides_ssh(self):
-        script = _build_launcher_script("strict")
-        assert "HIDE_SSH = True" in script
+        assert _plan("strict").hide_ssh is True
 
     def test_standard_mode_does_not_hide_ssh(self):
-        script = _build_launcher_script("standard")
-        assert "HIDE_SSH = False" in script
+        assert _plan("standard").hide_ssh is False
 
     def test_standard_mode_uses_standard_dirs(self):
-        script = _build_launcher_script("standard")
+        masked = _plan("standard").sensitive_dirs
         for d in _STANDARD_DIRS:
-            assert d in script
+            assert _home(d) in masked
 
     def test_standard_mode_no_expose_files(self):
-        script = _build_launcher_script("standard")
-        assert "EXPOSE_FILES = []" in script
+        assert _plan("standard").expose == ()
+
+    def test_extra_expose_files_are_embedded_with_their_basename(self):
+        """The enforced-adapter mask's Linux half rides the cc expose primitive.
+
+        ``acp_tool_gate.adapter_expose_files`` hands absolute paths here; each
+        must land in the plan's exposed files as a ``(source, basename)`` pair so
+        the launcher restores a read-only copy inside the hidden parent. Standard
+        tier, because that is the tier the codex adapter actually runs under.
+        """
+        plan = _plan("standard", extra_expose_files=("/h/u/.aws/config",))
+        assert ("/h/u/.aws/config", "config") in plan.expose
+
+    def test_cc_expose_files_survive_extra_entries(self):
+        plan = _plan("cc", extra_expose_files=("/h/u/.aws/config",))
+        assert (_home(".aws/config"), "config") in plan.expose
+        assert ("/h/u/.aws/config", "config") in plan.expose
+
+    def test_an_extra_expose_file_already_in_the_tier_list_appears_once(self):
+        """cc + codex both name ``~/.aws/config``; the plan must carry it once.
+
+        The restore loop writes each entry's destination then chmods it 0444, so
+        a duplicate entry's second open-for-write raises PermissionError inside
+        the launcher and the spawn dies. Without the dedupe the pair appears twice.
+        """
+        cfg = os.path.join(str(Path.home()), ".aws", "config")
+        expose = _plan("cc", extra_expose_files=(cfg,)).expose
+        assert expose.count((cfg, "config")) == 1, expose
 
 
 class TestBuildSeatbeltProfileCcMode:
+    def test_extra_expose_file_carves_read_only_out_of_an_extra_hidden_dir(self):
+        """The enforced adapter's ``~/.aws/config`` on macOS.
+
+        Read deny becomes ``require-all (subpath) (require-not (literal))`` --
+        the same shape the strict tier uses for ``.ssh/known_hosts`` -- while the
+        write and hardlink denies stay blanket over the subpath, so the child
+        can read its ``credential_process`` entry and nothing else, and cannot
+        rewrite or hardlink the file it is allowed to read.
+        """
+        profile = _build_seatbelt_profile(
+            "standard",
+            extra_hidden_dirs=("/h/u/.aws",),
+            extra_expose_files=("/h/u/.aws/config",),
+        )
+        assert (
+            '(deny file-read* (require-all (subpath "/h/u/.aws")'
+            ' (require-not (literal "/h/u/.aws/config"))))'
+        ) in profile
+        assert '(deny file-read* (subpath "/h/u/.aws"))' not in profile
+        assert '(deny file-write* (subpath "/h/u/.aws"))' in profile
+        assert '(deny file-link (subpath "/h/u/.aws"))' in profile
+
+    def test_extra_expose_file_is_carved_when_the_tier_already_hides_the_dir(self):
+        """strict already lists ``.aws``; the tier loop must carry the carve-out too.
+
+        Seatbelt cannot cancel an earlier blanket deny with a later narrower one,
+        so if only the extra-hidden loop carved the file out, a strict-tier codex
+        would still fail auth. Both loops must emit the ``require-not`` shape and
+        neither may emit the bare subpath read deny for that dir.
+        """
+        home = str(Path.home())
+        aws = os.path.join(home, ".aws")
+        cfg = os.path.join(aws, "config")
+        profile = _build_seatbelt_profile(
+            "strict", extra_hidden_dirs=(aws,), extra_expose_files=(cfg,)
+        )
+        assert f'(deny file-read* (subpath "{aws}"))' not in profile
+        assert f'(require-not (literal "{cfg}"))' in profile
+        assert f'(deny file-write* (subpath "{aws}"))' in profile
+
+    def test_extra_expose_file_outside_any_hidden_dir_emits_nothing(self):
+        """No deny to carve out of means no rule at all -- never a bare allow."""
+        profile = _build_seatbelt_profile(
+            "standard",
+            extra_hidden_dirs=("/h/u/.kube",),
+            extra_expose_files=("/h/u/.aws/config",),
+        )
+        assert ".aws/config" not in profile
+        assert '(deny file-read* (subpath "/h/u/.kube"))' in profile
+
     def test_extra_hidden_directory_denies_reads_and_writes(self):
         profile = _build_seatbelt_profile(
             "strict",
@@ -331,9 +414,9 @@ class TestChannelCredentialIsolation:
         (``config.loader.inject_kiro_cli_api_key``) instead of letting it ride
         the inherited environ.
         """
-        from kiro_crew.config.loader import _CREDENTIAL_KEYS, CRED_KIRO_API_KEY
+        from kiro_crew.config.loader import CRED_KIRO_API_KEY, CREDENTIAL_KEYS
 
-        missing = set(_CREDENTIAL_KEYS) - set(_AGENT_DENIED_ENV_KEYS) - {CRED_KIRO_API_KEY}
+        missing = set(CREDENTIAL_KEYS) - set(_AGENT_DENIED_ENV_KEYS) - {CRED_KIRO_API_KEY}
         assert not missing, f"loader credential keys not in agent denylist: {sorted(missing)}"
         # The carve-out stays exactly one key wide and never joins the denylist:
         # a denied KIRO_API_KEY would strip the agent's own credential.
@@ -436,10 +519,14 @@ class TestChannelCredentialIsolation:
 # launcher source rather than a copy, so they cannot drift from what the child
 # actually executes.
 _EXPOSE_BLOCK_START = "expose_data = {}"
-_EXPOSE_BLOCK_END = "# Bind-mount empty dirs over credential paths"
+#: The private-window staging sits between the pre-read and the credential
+#: loop, so the end marker is the staging comment: ending at the credential
+#: loop instead would pull staging into a slice named for the pre-read and
+#: exec it with ``PRIVATE_DIRS`` undefined.
+_EXPOSE_BLOCK_END = "# Private windows: a directory INSIDE a hidden tree that stays"
 #: Structural landmarks the slice must contain, so an edit that moves either
 #: marker and shrinks the block fails HERE rather than leaving the assertions
-#: below vacuously green against a fragment that no longer holds the read.
+#: below vacuously green against a fragment that does not hold the read.
 _EXPOSE_SLICE_LANDMARKS = (
     "for src_path, filename in EXPOSE_FILES:",  # the loop
     "os.path.isfile(src_path)",  # the absent-file guard
@@ -502,8 +589,8 @@ class TestCcExposePreReadIsNonFatal:
 
         The read sits in sandbox setup, so the exception killed the spawn
         outright. Measured consequence on one host: every cc-mode spawn died,
-        which is the whole ``command`` cron kind (``run_command_sandboxed`` uses
-        ``mode="cc"`` while ``run_script_sandboxed`` uses ``mode="standard"``),
+        which is both cron kinds (``run_command_sandboxed`` and
+        ``run_script_sandboxed`` both use ``mode="cc"``),
         and the repeated failures latched three jobs into auto-pause.
         """
         src = tmp_path / "config"
@@ -714,10 +801,11 @@ class TestKnownHostsPreReadFailsClosed:
     def test_an_unreadable_known_hosts_aborts_setup(self, tmp_path: Path) -> None:
         """Unreadable host-trust data must FAIL CLOSED, not degrade.
 
-        This test previously pinned the opposite, and that was a defect. The
+        This must fail closed because the
         launcher injects ``StrictHostKeyChecking=accept-new`` into
-        ``GIT_SSH_COMMAND`` (built at sandbox.py:1513-1515, applied at
-        sandbox.py:1786-1793) gated only on that variable being unset -- NOT on
+        ``GIT_SSH_COMMAND`` (built and applied by the program
+        ``sandbox._build_launcher_script`` renders) gated only on that
+        variable being unset -- NOT on
         whether known_hosts was restored. So degrading to an empty ``kh_data``
         leaves the sandbox pointing ``UserKnownHostsFile`` at an absent file
         while auto-accept is still on: every host reads as NEW, and an

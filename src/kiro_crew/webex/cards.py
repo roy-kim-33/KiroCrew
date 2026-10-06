@@ -25,8 +25,9 @@ feature. Only ONE card is allowed per message.
 
 from __future__ import annotations
 
-import secrets
 from typing import Any
+
+from kiro_crew.messaging.renderer import nonce_eq
 
 #: The attachment content type Webex (and Microsoft Teams) accept.
 CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
@@ -136,7 +137,7 @@ class LiveChoices:
     Lives OUTSIDE the renderer, and that is the whole point. An options card is
     sent at the very END of a turn, so the press necessarily arrives after the
     turn — and therefore after any per-turn object — has been torn down. A
-    renderer-owned map answers every press with "no longer current", which is a
+    renderer-owned map answers every press with "not current", which is a
     card that is inert 100% of the time.
 
     Entries expire by REPLACEMENT (the conversation renders a newer card) or by
@@ -173,7 +174,7 @@ class LiveChoices:
         if entry is None:
             return ""
         minted, choices = entry
-        if not minted or not nonce or not secrets.compare_digest(nonce, minted):
+        if not minted or not nonce or not nonce_eq(minted, nonce):
             return ""
         if not index.isdigit():
             return ""

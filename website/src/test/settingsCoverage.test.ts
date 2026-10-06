@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 
-import { extractFromSource, EXTRACTABLE_PRIMITIVE_TAGS, PANEL_TAB_MAP } from '../../scripts/settingsExtract'
+import { extractAll, extractFromSource, EXTRACTABLE_PRIMITIVE_TAGS, PANEL_TAB_MAP, panelRoots, rootFiles } from '../../scripts/settingsExtract'
 import { SETTINGS_MANUAL } from '../components/commandPalette/settingsManual'
 
 /**
@@ -36,18 +37,23 @@ import { SETTINGS_MANUAL } from '../components/commandPalette/settingsManual'
  * it to BARE_CONTROL_TAGS. When introducing a shared labeled control, do both.
  */
 
-const SETTINGS_DIR = path.resolve(__dirname, '../pages/settings')
+const SRC_DIR = path.resolve(__dirname, '..')
+const SETTINGS_DIR = path.join(SRC_DIR, 'pages', 'settings')
+
+/** Panel basename -> full path, over every root the extractor scans. */
+const PANEL_PATHS = new Map(
+  rootFiles(panelRoots(SRC_DIR))
+    .filter(f => !f.includes('.test.'))
+    .map(f => [path.basename(f), f] as const),
+)
 
 /** Panel sources (tests excluded), sorted for stable failure output. */
 function panelFiles(): string[] {
-  return fs
-    .readdirSync(SETTINGS_DIR)
-    .filter(f => f.endsWith('.tsx') && !f.includes('.test.'))
-    .sort()
+  return [...PANEL_PATHS.keys()].sort()
 }
 
 function readPanel(file: string): string {
-  return fs.readFileSync(path.join(SETTINGS_DIR, file), 'utf-8')
+  return fs.readFileSync(PANEL_PATHS.get(file) ?? path.join(SETTINGS_DIR, file), 'utf-8')
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -60,8 +66,11 @@ function readPanel(file: string): string {
  * an unlisted file fails, so the choice is always conscious.
  */
 const UNMAPPED_PANELS: Record<string, string> = {
+  'BrowserInstallStatus.tsx': 'read-only install progress region BrowserPanel mounts above its sections, zero controls',
   'ChannelDisabledPanel.tsx': 'informational placeholder (locked/loading/error states), zero controls',
+  'ChannelFolderBackfill.tsx': 'one action button shared by the channel panels; files existing conversations into the folder the OWNING panel configures, and holds no setting of its own',
   'ChannelsPanel.tsx': 'list-detail shell routing to per-channel panels; carries no controls of its own',
+  'DecisionsProviderPicker.tsx': 'the Decisions card\'s provider choice writes a preset id through the owner-only PUT /api/decisions/provider, not a config path, so there is no configKey to index; it is reached through the card the developer.decisions-jev entry deep-links to',
   'DiscordPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=discord',
   'TelegramPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=telegram',
   'FeishuPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=feishu',
@@ -73,9 +82,9 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
   'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
   'ReportProblemCard.tsx': 'feedback action card, no settings',
-  'SecretsPanel.tsx': 'CRUD list for stored secrets; add/delete forms are transient, no persistent knobs',
   'SettingsSearch.tsx': 'the settings search box itself — indexing it would be self-referential',
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
+  'TranslucentPanelsPreview.tsx': 'aria-hidden illustration under the Translucent panels switch (registry id display.translucent-panels, on DisplayPanel); it holds no control of its own',
   'WebhooksPanel.tsx': 'status summary card; the real controls live on the /webhooks page',
 }
 
@@ -99,7 +108,7 @@ describe('settings coverage gate — PANEL_TAB_MAP completeness', () => {
     // graduate into PANEL_TAB_MAP.
     const offenders: string[] = []
     for (const file of Object.keys(UNMAPPED_PANELS)) {
-      if (!fs.existsSync(path.join(SETTINGS_DIR, file))) continue
+      if (!PANEL_PATHS.has(file)) continue
       const source = readPanel(file)
       for (const tag of EXTRACTABLE_PRIMITIVE_TAGS) {
         if (new RegExp(`<${tag}\\b`).test(source)) offenders.push(`${file}: <${tag}>`)
@@ -130,6 +139,43 @@ describe('settings coverage gate — PANEL_TAB_MAP completeness', () => {
       'A panel is both mapped and waived — remove it from UNMAPPED_PANELS.',
     ).toEqual([])
   })
+
+  it('every component a panel mounts from another pages/ directory is scanned', () => {
+    // An import like `../overview/PortabilityTab` puts that file's controls on
+    // a Settings tab, but the extractor reads only its roots. One that renders
+    // an extractable primitive must be a root, and so mapped.
+    const missing: string[] = []
+    for (const file of fs.readdirSync(SETTINGS_DIR).filter(f => f.endsWith('.tsx') && !f.includes('.test.'))) {
+      for (const m of readPanel(file).matchAll(/^import [^'\n]+ from '(\.\.\/[\w/-]+)'/gm)) {
+        const target = path.resolve(SETTINGS_DIR, `${m[1]}.tsx`)
+        if (!fs.existsSync(target)) continue
+        const source = fs.readFileSync(target, 'utf-8')
+        if (!EXTRACTABLE_PRIMITIVE_TAGS.some(tag => new RegExp(`<${tag}\\b`).test(source))) continue
+        const name = path.basename(target)
+        if (PANEL_PATHS.get(name) !== target || !(name in PANEL_TAB_MAP)) missing.push(`${file} -> ${name}`)
+      }
+    }
+    expect(
+      missing,
+      'A settings panel mounts a component from outside pages/settings that renders ' +
+      'Settings* primitives, but the extractor never reads it. Add it to panelRoots ' +
+      'and PANEL_TAB_MAP in scripts/settingsExtract.ts.',
+    ).toEqual([])
+  })
+
+  it('a primitive in an extra root reaches the registry on its tab', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'settings-root-'))
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'PortabilityTab.tsx'),
+        '<SettingsToggle label="Restore on start" checked={on} onChange={setOn} />',
+      )
+      const { entries } = extractAll([{ dir, file: 'PortabilityTab.tsx' }])
+      expect(entries.filter(e => e.label === 'Restore on start').map(e => e.tab)).toEqual(['imports'])
+    } finally {
+      fs.rmSync(dir, { recursive: true })
+    }
+  })
 })
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -152,21 +198,40 @@ type BareCounts = Partial<Record<(typeof BARE_CONTROL_TAGS)[number], number>>
  */
 const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string }> = {
   'AboutPanel.tsx': {
-    counts: { Toggle: 1, SegmentedControl: 2 },
-    reason:
-      'gateway auto-update Toggle has a ternary label (manual: about.update-notifications); ' +
-      'the two channel SegmentedControls share manual: about.update-channel',
+    counts: { SegmentedControl: 2 },
+    reason: 'the two channel SegmentedControls share manual: about.update-channel',
   },
-  'BrowserPanel.tsx': {
+  'ChatPanel.tsx': {
+    counts: { Input: 2 },
+    reason: "LinkPatternsEditor's per-row pattern/url fields — part of a composite the extractor indexes whole (chat.text-link-patterns)",
+  },
+  'ConnectBrowserSection.tsx': {
     counts: { Input: 1 },
     reason: 'attach-token credential field with Save/Clear semantics (manual: browser.attach-token)',
   },
+<<<<<<< HEAD
   'ChatPanel.tsx': {
     counts: { input: 1 },
     reason:
       'fork: the router model-whitelist checkbox is rendered once per model in a ' +
       'runtime-fetched catalog (agent.model_whitelist), so it has no fixed label to ' +
       'index — same shape as the per-channel rows waived below, not a named setting',
+=======
+  'DecisionsCard.tsx': {
+    counts: { input: 1 },
+    reason:
+      'the sampling-share range input has no slider primitive, exactly as ' +
+      "NotificationsPanel's volume does; it is reached through the card the " +
+      'developer.decisions-jev entry deep-links to, and a manual entry for it would ' +
+      'advertise a row that the capabilities.decisions ceiling can withdraw',
+  },
+  'DecisionsProviderPicker.tsx': {
+    counts: { input: 1 },
+    reason:
+      'the provider radio group: not a config path (the choice is written through ' +
+      'the owner-only provider route as a preset id), and it sits inside the card the ' +
+      'developer.decisions-jev entry deep-links to',
+>>>>>>> upstream/main
   },
   'DisplayPanel.tsx': {
     counts: { SimpleSelect: 1, Input: 1 },
@@ -191,14 +256,20 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
       '(manual: notifications.sources); the volume range input has no slider ' +
       'primitive (manual: notifications.volume)',
   },
+  'PortabilityTab.tsx': {
+    counts: { input: 1, SimpleSelect: 1 },
+    reason: 'backup-restore form: the export zip file picker and the merge/replace mode for that one import — per-import arguments, not persistent settings',
+  },
   'RemoteCrewPanel.tsx': {
-    counts: { input: 2 },
+    counts: { input: 7 },
     reason:
       'setup-wizard AWS profile/region convenience fields (localStorage) behind a ' +
-      'non-URL sub-tab a deep link cannot mount',
+      'non-URL sub-tab a deep link cannot mount; plus the launch form\'s identity ' +
+      'choice (2 radios), Identity Center start-URL/region and subnet ID fields — per-launch ' +
+      'arguments sent with the launch request, not persistent settings',
   },
   'SecretsPanel.tsx': {
-    counts: { input: 2 },
+    counts: { Input: 2 },
     reason: 'add-secret name/value form — transient CRUD, not persistent knobs',
   },
   'SecurityPanel.tsx': {
@@ -275,12 +346,28 @@ const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> 
       'labels arrive through BotChannelSpec props (per-channel copy decided by the ' +
       'mounting wrapper); the static-label primitives in the same file fan out per channel',
   },
+  'DecisionsPointPanel.tsx': {
+    count: 2,
+    reason:
+      "the per-point scope switch and model.route's tier pickers take their label " +
+      'from a Record keyed by the SERVER id (the scope name, the tier), which is what ' +
+      'lets a gateway ship another point or scope with no edit here — the same ' +
+      'arrangement AgentBackendTab uses for capability labels. Both are one level ' +
+      'inside the card the developer.decisions-jev entry deep-links to, and a manual ' +
+      'entry would advertise a row the capabilities.decisions ceiling can withdraw',
+  },
   'NotificationsPanel.tsx': {
     count: 1,
     reason:
       'per-category sound SettingsSelect renders label={i18nT(CATEGORY_LABEL_KEY[cat])} ' +
       'inside a map over a closed union — indexed via manual entries ' +
       'notifications.sound-category-*',
+  },
+  'SecretsPanel.tsx': {
+    count: 1,
+    reason:
+      'managed SecretField labels are selected from a closed kind-to-copy map and the ' +
+      'rows are transient server-provided credential slots, not persistent settings',
   },
 }
 
@@ -350,5 +437,50 @@ describe('settings coverage gate — manual entries anchor to panel source', () 
       'source — the deep-link anchor is gone or renamed. Restore the ' +
       'data-setting-label anchor (or update/remove the manual entry).',
     ).toEqual([])
+  })
+})
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Rail pages: a search hit must name a page the Chat rail actually has      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('settings coverage gate — Chat rail pages', () => {
+  it('every Chat control is tagged with a page the rail lists', () => {
+    const source = readPanel('ChatPanel.tsx')
+    const railStart = source.indexOf('= [', source.indexOf('const railItems'))
+    const railBlock = source.slice(railStart, source.indexOf('\n  ]', railStart))
+    const railKeys = [...railBlock.matchAll(/key: '([a-z0-9-]+)'/g)].map(m => m[1])
+    expect(railKeys.length).toBeGreaterThan(1)
+
+    const { entries } = extractFromSource(source, 'ChatPanel.tsx')
+    expect(entries.length).toBeGreaterThan(0)
+    const offRail = entries
+      .filter(e => !railKeys.includes(String(e.params?.sub)))
+      .map(e => `${e.label ?? e.labelKey} -> ${String(e.params?.sub)}`)
+    expect(offRail, 'search would open a page the rail does not have').toEqual([])
+  })
+
+  it('tags each control with the page whose case renders it', () => {
+    const { entries } = extractFromSource(
+      `switch (active) {
+        case 'composer':
+          return <SettingsToggle label="Quick Send" checked={x} onChange={f} />
+        case 'advanced':
+          return <SettingsToggle label="Prevent sleep" checked={x} onChange={f} />
+      }`,
+      'website/src/pages/settings/ChatPanel.tsx',
+    )
+    expect(entries.map(e => [e.label, e.params?.sub])).toEqual([
+      ['Quick Send', 'composer'],
+      ['Prevent sleep', 'advanced'],
+    ])
+  })
+
+  it('leaves panels without a rail untouched', () => {
+    const { entries } = extractFromSource(
+      `case 'x': return <SettingsToggle label="Mode" checked={x} onChange={f} />`,
+      'website/src/pages/settings/BrowserPanel.tsx',
+    )
+    expect(entries[0].params).toBeUndefined()
   })
 })

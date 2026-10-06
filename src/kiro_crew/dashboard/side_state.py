@@ -6,6 +6,7 @@ JSONL, memory.db, lessons, or preferences. Lifecycle: open → turn(s) → close
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -62,6 +63,41 @@ class SideState:
     #: submitter has to tell apart, and inferring them from an entry's absence
     #: cannot distinguish the first from the third.
     steers: list[dict[str, str]] = field(default_factory=list)
+    #: This sidecar's generation, the suffix of its ACP session key
+    #: (``side:<slot>:<gen>``). A close+reopen makes a NEW sidecar with a new
+    #: generation, so a turn still finishing on the old one can only ever
+    #: destroy, acquire or release the old session — never the replacement's.
+    gen: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    #: The binding the live side session was created under, as
+    #: ``(derived agent name, cwd, derived-spec digest)`` — set by
+    #: ``_run_side_turn`` after ``get_or_create``. A later turn whose binding
+    #: differs (the slot's project or agent changed, or the base spec changed so
+    #: the derived spec's content did) destroys the session first: kiro-cli
+    #: loads the spec at spawn, so a retained session would keep running under
+    #: the old agent, in the old cwd, with the old grants. ``None`` = no live
+    #: session has been bound through this sidecar yet.
+    binding: tuple[str, str, str] | None = None
+    #: The asyncio task driving the in-flight turn, so a stop request can cancel
+    #: it by lookup. The turn's own handle is otherwise only in
+    #: ``state._background_tasks`` (a set with no per-slot key), which a stop
+    #: endpoint cannot address. Set when the turn is dispatched, cleared in the
+    #: turn's ``finally`` once it is the sidecar's current run. ``None`` = no
+    #: turn is running (or the running turn belongs to a superseded sidecar).
+    task: asyncio.Task[None] | None = None
+    #: True while ``api_side_stop`` is cancelling this turn and has not yet
+    #: recorded its terminal ``(side response stopped)`` row. The turn's own
+    #: ``finally`` flips ``is_complete`` True synchronously as it unwinds, which
+    #: lands DURING the stop handler's bounded await of the task cleanup — before
+    #: the handler resumes to settle. For that window ``is_complete`` alone would
+    #: read the turn as idle, so a concurrent ``POST /side/turn`` that finished
+    #: parsing its body in those few event-loop ticks would pass the busy gate,
+    #: dispatch a successor, and make the stop handler see a replacement and skip
+    #: settlement — leaving the cancelled question in the next turn's history with
+    #: no stopped row (GPT F1 / Opus, security-class). ``is_stopping`` keeps the
+    #: deliberately-cancelled turn BUSY through cleanup: the busy gate and the
+    #: queue drain both honour it, so no successor is admitted until the stop
+    #: handler clears it after recording and broadcasting the terminal row.
+    is_stopping: bool = False
 
     def append_user(self, content: str, ts: str = "", *, steer: bool = False) -> None:
         """Append a user turn. ``steer`` marks it as injected mid-turn, which the
@@ -90,6 +126,8 @@ class SideState:
         self.is_complete = True
         self.queue.clear()
         self.steers.clear()
+        self.task = None
+        self.is_stopping = False
 
     # ── Queue helpers ──
 

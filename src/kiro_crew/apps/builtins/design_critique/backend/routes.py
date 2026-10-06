@@ -7,8 +7,8 @@ Registered at gateway startup by the ``BUILTIN_NAMES`` loop in
 These endpoints do every step that needs a shell or the filesystem — cloning a
 repo, discovering its routes, and rendering screens to PNGs — server-side, so the
 LLM agent never has to. The agent is then only ever asked to reason over finished
-images with no tools, which is why it can no longer stall on a tool-approval
-prompt that the app panel has nowhere to show.
+images with no tools, so it cannot stall on a tool-approval prompt that the app
+panel has nowhere to show.
 
 Routes (browser-facing, same-origin authed):
 
@@ -44,6 +44,7 @@ import kiro_crew
 from kiro_crew import link_unfurl, platform_compat, sandbox
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.config.paths import config_dir
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import (
     DENIED_ROOT_PARTS,
     is_sensitive_path,
@@ -94,11 +95,10 @@ _CLONE_TTL_SEC = 60 * 60
 
 # ── background job registry ──
 #
-# discover/render used to run inline in the request, so a browser navigating away
-# mid-scan cancelled the fetch and the scan with it. Now the heavy work runs in a
-# DETACHED asyncio task keyed by a job id: the request returns the id immediately
-# and the client polls a GET for the result, so a disconnect can no longer stop
-# the scan. Records live in memory only (a critique is transient) and are swept on
+# The heavy discover/render work runs in a DETACHED asyncio task keyed by a job
+# id: the request returns the id immediately and the client polls a GET for the
+# result, so a browser navigating away mid-scan cancels only the fetch, never the
+# scan. Records live in memory only (a critique is transient) and are swept on
 # the same ~1h TTL the clone dirs use.
 _JOBS: dict[str, dict[str, Any]] = {}
 _JOBS_LOCK = threading.Lock()
@@ -330,6 +330,16 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
     symlinked directory nor a symlinked file as one, and skips dot-entries, so none
     of those is ever reachable over the preview server — and none is signed here.
 
+    Matching that test needs ``is_link_or_junction``, not ``os.path.islink``. Node's
+    Dirent reports a Windows junction as a symbolic link and therefore serves nothing
+    behind it, while ``os.path.islink`` calls the same junction a plain directory —
+    so the bare check descended into it and signed bytes the server will not serve.
+    Nothing outside ``build_dir`` is disclosed by that (the token is a digest, and it
+    is never served), but it is exactly the "false mismatches and needless
+    re-captures" this paragraph rules out, it lets an unserved tree raise
+    ``newest_mtime_ns`` for the mid-capture check, and its files count against
+    ``_SIGNATURE_MAX_FILES``.
+
     Returns ``None`` whenever the served set cannot be read in full: missing,
     unreadable, or larger than ``_SIGNATURE_MAX_FILES``. A caller MUST treat ``None``
     as "unknown" rather than "unchanged" and refuse reuse — a token over part of a
@@ -353,7 +363,8 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
             dirs[:] = sorted(
                 d
                 for d in dirs
-                if not d.startswith(".") and not os.path.islink(os.path.join(root, d))
+                if not d.startswith(".")
+                and not platform_compat.is_link_or_junction(os.path.join(root, d))
             )
             # Each directory's own mtime feeds ``newest_mtime_ns`` but NOT the digest.
             # It has to feed the former because a DELETION leaves no file behind to
@@ -366,7 +377,7 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
             rel_root = os.path.relpath(root, build_dir)
             for name in sorted(files):
                 path = os.path.join(root, name)
-                if name.startswith(".") or os.path.islink(path):
+                if name.startswith(".") or platform_compat.is_link_or_junction(path):
                     continue
                 seen += 1
                 if seen > _SIGNATURE_MAX_FILES:
@@ -469,7 +480,7 @@ def _sweep_clones() -> None:
     with _PROBE_CACHE_LOCK:
         # A retained probe dir (dc-probe-*) is swept above on the same TTL, but its
         # _PROBE_CACHE entry would otherwise outlive the dir and hand /render a
-        # route->png path for a directory that no longer exists. Purge any cache entry
+        # route->png path for a directory that does not exist. Purge any cache entry
         # whose retained dir was just removed, so the cache never serves a missing PNG.
         if removed:
             stale_handles = [
@@ -628,6 +639,22 @@ def _require_enabled(handler):
     return _wrapped
 
 
+async def _owner_gate(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the host-touching POSTs (discover, render).
+
+    Both start host work: a git clone, a route scan over a host directory, a
+    headless Chromium run, PNGs written under the owner's data home. So a
+    dashboard caller must be the owner, and gets the shared 403 ``owner_only``
+    otherwise. A request with no app claim is judged the same way, so a
+    missing claim fails closed. An app token passes here: the token
+    middleware has already confirmed it holds this path, as its own namespace
+    or through a manifest ``permissions.api`` grant.
+    """
+    if not request.get("app"):
+        return await require_owner_dashboard_request(request, operation)
+    return None
+
+
 async def _json_object(
     request: web.Request,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
@@ -680,7 +707,12 @@ async def _run(
             env=run_env,
             # Own process group so the tree kill in kill_and_reap reaches the whole
             # child tree (the node capture script's Chromium), not just node.
-            start_new_session=True,
+            # Windows silently ignores start_new_session, so the equivalent there is
+            # CREATE_NEW_PROCESS_GROUP, which is what makes the tree taskkill /T-reapable.
+            # platform_compat.CREATE_NEW_PROCESS_GROUP is 0 on POSIX, where a non-zero
+            # creationflags would be rejected outright.
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
         )
         try:
             # Read both pipes concurrently (avoids a full-buffer deadlock) with a
@@ -783,9 +815,9 @@ def _group_for(path: str) -> str:
 
 
 async def _handle_method(request: web.Request) -> web.Response:
-    # The critique rubric used to be fetched by the agent with fs_read (a tool
-    # call that stalls in the panel). Serve the checklist here so the frontend
-    # can inline it into the tool-free prompt instead.
+    # Serve the critique rubric here so the frontend can inline it into the
+    # tool-free prompt: an agent fetching it with fs_read is a tool call, and a
+    # tool call stalls in the panel.
     def _read() -> dict[str, str]:
         checklist = (_SKILL_DIR / "frameworks/main-checklist.md").read_text(encoding="utf-8")
         return {"checklist": checklist}
@@ -1078,6 +1110,9 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
 
 
 async def _handle_discover(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.discover")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")
@@ -1358,6 +1393,9 @@ async def _render_capture_job(
 
 
 async def _handle_render(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.render")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")
@@ -1454,7 +1492,7 @@ async def _handle_render(request: web.Request) -> web.Response:
         if cached is not None:
             token = await asyncio.to_thread(_served_signature, Path(cached["build_dir"]))
             # A missing token means "unknown", not "unchanged", so it must not satisfy
-            # the match: a build output that no longer stats is no evidence it stands
+            # the match: a build output that does not stat is no evidence it stands
             # still. Only the digest is compared — newest_mtime_ns is a discover-time
             # concern. The stored side is never None: _probe_put is only reached with a
             # real digest.

@@ -14,11 +14,25 @@ from typing import Any
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _owner_request(*args, **kwargs):
+    """A mocked request that reads as the dashboard owner.
+
+    The mutating routes are owner-gated, and the gate reads
+    ``request.app["state"]`` plus the claims the token middleware sets.
+    """
+    req = make_mocked_request(*args, **kwargs)
+    req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
+    return req
 
 
 class _Ctx:
@@ -56,7 +70,7 @@ async def _live_runtime(tmp_path):
 
 def _json_request(method: str, path: str, body: dict | None = None):
     payload = json.dumps(body or {}).encode()
-    req = make_mocked_request(
+    req = _owner_request(
         method, path, headers={"Content-Type": "application/json"}, payload=None
     )
 
@@ -75,13 +89,13 @@ class TestGates:
     async def test_disabled_app_403s(self, monkeypatch):
         monkeypatch.setattr(routes, "is_app_enabled", lambda name: False)
         handler = routes._require_enabled(routes._handle_stats_get)
-        resp = await handler(make_mocked_request("GET", "/api/apps/mochi/stats"))
+        resp = await handler(_owner_request("GET", "/api/apps/mochi/stats"))
         assert resp.status == 403
 
     @pytest.mark.asyncio
     async def test_no_runtime_503s(self):
         handler = routes._require_enabled(routes._handle_stats_get)
-        resp = await handler(make_mocked_request("GET", "/api/apps/mochi/stats"))
+        resp = await handler(_owner_request("GET", "/api/apps/mochi/stats"))
         assert resp.status == 503
 
 
@@ -90,7 +104,7 @@ class TestWatchlistRoutes:
     async def test_get_empty_watchlist(self, tmp_path):
         async with _live_runtime(tmp_path):
             resp = await routes._handle_watchlist_get(
-                make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                _owner_request("GET", "/api/apps/mochi/watchlist")
             )
             assert resp.status == 200
             assert json.loads(resp.body) == {"items": []}
@@ -113,7 +127,7 @@ class TestWatchlistRoutes:
             assert data["items"][0]["status"] == "watching"
 
             resp2 = await routes._handle_watchlist_get(
-                make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                _owner_request("GET", "/api/apps/mochi/watchlist")
             )
             assert len(json.loads(resp2.body)["items"]) == 1
 
@@ -134,7 +148,7 @@ class TestWatchlistRoutes:
             assert secret not in upd.body.decode()
 
             got = await routes._handle_watchlist_get(
-                make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                _owner_request("GET", "/api/apps/mochi/watchlist")
             )
             assert got.status == 200
             assert secret not in got.body.decode()
@@ -159,7 +173,7 @@ class TestWatchlistRoutes:
 
     @pytest.mark.asyncio
     async def test_remove_via_update(self, tmp_path):
-        # The panel Delete button posts {remove: [id]}; the route guard used to
+        # The panel Delete button posts {remove: [id]}; the route guard would
         # reject it (400 invalid_watchlist_op) even though the backend + MCP
         # schema support remove, so the row reappeared on the next refresh.
         async with _live_runtime(tmp_path):
@@ -196,7 +210,7 @@ class TestWatchlistRoutes:
             wl = json.loads(
                 (
                     await routes._handle_watchlist_get(
-                        make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                        _owner_request("GET", "/api/apps/mochi/watchlist")
                     )
                 ).body
             )
@@ -217,7 +231,7 @@ class TestWatchlistRoutes:
             remaining = json.loads(
                 (
                     await routes._handle_watchlist_get(
-                        make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                        _owner_request("GET", "/api/apps/mochi/watchlist")
                     )
                 ).body
             )["items"]
@@ -248,7 +262,7 @@ class TestStatsAndSoulRoutes:
     async def test_stats_shape(self, tmp_path):
         async with _live_runtime(tmp_path):
             resp = await routes._handle_stats_get(
-                make_mocked_request("GET", "/api/apps/mochi/stats")
+                _owner_request("GET", "/api/apps/mochi/stats")
             )
             data = json.loads(resp.body)
             assert data["streak"] == 1
@@ -257,7 +271,7 @@ class TestStatsAndSoulRoutes:
     @pytest.mark.asyncio
     async def test_soul_default(self, tmp_path):
         async with _live_runtime(tmp_path):
-            resp = await routes._handle_soul_get(make_mocked_request("GET", "/api/apps/mochi/soul"))
+            resp = await routes._handle_soul_get(_owner_request("GET", "/api/apps/mochi/soul"))
             data = json.loads(resp.body)
             assert data["petName"] == "Mochi"
             assert data["isDefault"] is True
@@ -267,7 +281,7 @@ class TestStatsAndSoulRoutes:
     async def test_pet_state_shape(self, tmp_path):
         async with _live_runtime(tmp_path):
             resp = await routes._handle_pet_state_get(
-                make_mocked_request("GET", "/api/apps/mochi/pet-state")
+                _owner_request("GET", "/api/apps/mochi/pet-state")
             )
             data = json.loads(resp.body)
             # Runtime start applies 'connect' (offline → idle); mood seeds neutral.
@@ -290,7 +304,7 @@ class TestQuietRoute:
             state = json.loads(
                 (
                     await routes._handle_pet_state_get(
-                        make_mocked_request("GET", "/api/apps/mochi/pet-state")
+                        _owner_request("GET", "/api/apps/mochi/pet-state")
                     )
                 ).body
             )
@@ -337,7 +351,7 @@ class TestPinnedRoutes:
             assert runtime.pinned.add_pin(str(target), now_ms=1_000)
 
             resp = await routes._handle_pinned_get(
-                make_mocked_request("GET", "/api/apps/mochi/pinned")
+                _owner_request("GET", "/api/apps/mochi/pinned")
             )
             pins = json.loads(resp.body)["pins"]
             assert len(pins) == 1
@@ -352,7 +366,7 @@ class TestPinnedRoutes:
             )
             assert json.loads(resp3.body) == {"ok": True}
             resp4 = await routes._handle_pinned_get(
-                make_mocked_request("GET", "/api/apps/mochi/pinned")
+                _owner_request("GET", "/api/apps/mochi/pinned")
             )
             assert json.loads(resp4.body)["pins"] == []
 
@@ -368,7 +382,7 @@ class TestPinnedRoutes:
             planted = "AKIA" + "IOSFODNN7EXAMPLE"
             assert runtime.pinned.add_pin(str(target), label=f"see {planted}", now_ms=1_000)
             resp = await routes._handle_pinned_get(
-                make_mocked_request("GET", "/api/apps/mochi/pinned")
+                _owner_request("GET", "/api/apps/mochi/pinned")
             )
             raw = resp.body.decode()
             assert planted not in raw
@@ -378,7 +392,7 @@ class TestPinnedRoutes:
     async def test_settings_round_trip(self, tmp_path):
         async with _live_runtime(tmp_path):
             resp = await routes._handle_settings_get(
-                make_mocked_request("GET", "/api/apps/mochi/settings")
+                _owner_request("GET", "/api/apps/mochi/settings")
             )
             assert json.loads(resp.body)["petInstance"] == "self"
 
@@ -388,7 +402,7 @@ class TestPinnedRoutes:
             assert json.loads(resp.body)["petInstance"] == "inst-3"
 
             resp = await routes._handle_settings_get(
-                make_mocked_request("GET", "/api/apps/mochi/settings")
+                _owner_request("GET", "/api/apps/mochi/settings")
             )
             assert json.loads(resp.body)["petInstance"] == "inst-3"
 
@@ -400,7 +414,7 @@ class TestPinnedRoutes:
             )
             assert resp.status == 400
 
-            bad = make_mocked_request("POST", "/api/apps/mochi/settings")
+            bad = _owner_request("POST", "/api/apps/mochi/settings")
             resp = await routes._handle_settings_update(bad)
             assert resp.status == 400
 
@@ -565,7 +579,7 @@ class TestMovementReports:
             # the monitors, so without the cache the tool cannot answer at all.
             assert cached["activeId"] == 7
             entry = cached["displays"][0]
-            # The GEOMETRY has to survive. The projection used to keep only
+            # The GEOMETRY has to survive. A trimmed projection keeps only
             # {id, width, height}, which left the pet with no way to say WHICH screen
             # it was on — so it guessed, and told the user "display 1" while standing
             # on display 2.
@@ -617,7 +631,7 @@ class TestPackFileServing:
             lambda data_dir, pack_id, filename: b"<svg><script>steal()</script></svg>",
         )
         async with _live_runtime(tmp_path):
-            req = make_mocked_request(
+            req = _owner_request(
                 "GET",
                 "/api/apps/mochi/packs/p1/evil.svg",
                 match_info={"pack_id": "p1", "filename": "evil.svg"},
@@ -638,7 +652,7 @@ class TestPackFileServing:
             lambda data_dir, pack_id, filename: b"\x89PNG fake-bytes",
         )
         async with _live_runtime(tmp_path):
-            req = make_mocked_request(
+            req = _owner_request(
                 "GET",
                 "/api/apps/mochi/packs/p1/idle.png",
                 match_info={"pack_id": "p1", "filename": "idle.png"},
@@ -687,7 +701,7 @@ class TestReset:
         """Stats reset runs off the loop (asyncio.to_thread) under the same lock
         as tick(), and the dirty flag + pending flush deadline are cleared, so a
         due flush in another worker thread cannot rewrite a stale snapshot back
-        over the wipe. (A lock-free off-thread unlink used to race a flush and
+        over the wipe. (A lock-free off-thread unlink would race a flush and
         'restore' pre-reset counters.)
         """
         async with _live_runtime(tmp_path) as rt:
@@ -1058,13 +1072,13 @@ class TestResetSerializesUnlinks:
         async with _live_runtime(tmp_path):
             # Wrap AFTER startup so only the reset's own acquisitions are counted.
             # `routes` is the namespace, not each source module: routes imports
-            # these at module scope, so patching the source no longer intercepts.
+            # these at module scope, so patching the source does not intercept.
             _spy(routes, "queue_mutation")
             _spy(routes, "watchlist_mutation")
             _spy(routes, "pins_mutation")
             _spy(routes, "activity_mutation")
 
-            resp = await routes._handle_reset(make_mocked_request("POST", "/api/apps/mochi/reset"))
+            resp = await routes._handle_reset(_owner_request("POST", "/api/apps/mochi/reset"))
             assert json.loads(resp.body)["ok"] is True
 
         # Every lock-guarded store must have been entered during the wipe; a
@@ -1152,7 +1166,7 @@ class TestMalformedWatchlistOpsRejected:
                 assert resp.status == 400
 
             got = await routes._handle_watchlist_get(
-                make_mocked_request("GET", "/api/apps/mochi/watchlist")
+                _owner_request("GET", "/api/apps/mochi/watchlist")
             )
             items = json.loads(got.body)["items"]
             assert [i["id"] for i in items] == [item_id]
@@ -1178,7 +1192,7 @@ class TestMalformedWatchlistOpsRejected:
 class TestQueueFilenameHasOneDefinition:
     """The queue filename is defined ONCE, in the module that owns queue files.
 
-    `hooks` and `mcp_server` each used to define their own copy of the literal,
+    `hooks` and `mcp_server` could each define their own copy of the literal,
     and `routes` imported it from whichever was convenient per call site.
     Renaming the file in one module would have left the others reading a path
     nothing writes — a reset that clears nothing, with no error anywhere.
@@ -1211,7 +1225,7 @@ class TestQueueFilenameHasOneDefinition:
 class TestMcpToolsRoute:
     """GET /api/apps/mochi/mcp-tools/{name} — the settings panel's discover action.
 
-    The panel used to call core's ``/api/mcp/servers/{name}``, which only has
+    The panel must not call core's ``/api/mcp/servers/{name}``, which only has
     PUT/DELETE registered, so every discover took a 405 and both the api helper
     and the click handler swallowed it.
     """
@@ -1270,7 +1284,7 @@ class TestMcpToolsRoute:
             return server
 
         self._patch(monkeypatch, [srv], _probe)
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 200
         body = json.loads(resp.text)
@@ -1297,7 +1311,7 @@ class TestMcpToolsRoute:
             return server
 
         self._patch(monkeypatch, [srv], _probe)
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 200
         body = json.loads(resp.text)
@@ -1319,7 +1333,7 @@ class TestMcpToolsRoute:
             return server
 
         self._patch(monkeypatch, [srv], _probe)
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 200
         assert "SECRETVALUE" not in resp.text
@@ -1332,7 +1346,7 @@ class TestMcpToolsRoute:
         from kiro_crew.apps.builtins.mochi.backend import routes
 
         self._patch(monkeypatch, [self._server(name="other")])
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 404
 
@@ -1350,7 +1364,7 @@ class TestMcpToolsRoute:
             return server
 
         self._patch(monkeypatch, [self._server(disabled=True)], _probe)
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 409
         assert json.loads(resp.text)["code"] == "server_disabled"
@@ -1380,7 +1394,7 @@ class TestMcpToolsRoute:
             _probe,
             scopes={"kiroGlobal": {"srv": {"command": "node", "disabled": True}}},
         )
-        req = make_mocked_request(
+        req = _owner_request(
             "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
         )
         resp = await routes._handle_mcp_tools_probe(req)
@@ -1405,7 +1419,7 @@ class TestMcpToolsRoute:
             raise OSError("unreadable")
 
         monkeypatch.setattr(routes, "_mcp_scope_specs_strict", _boom)
-        req = make_mocked_request(
+        req = _owner_request(
             "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
         )
         resp = await routes._handle_mcp_tools_probe(req)
@@ -1438,7 +1452,7 @@ class TestMcpToolsRoute:
                 }
             },
         )
-        req = make_mocked_request(
+        req = _owner_request(
             "POST",
             "/api/apps/mochi/mcp-tools/playwright-mcp",
             match_info={"name": "playwright-mcp"},
@@ -1479,7 +1493,7 @@ class TestMcpToolsRoute:
         monkeypatch.setattr(r, "list_servers", lambda: [self._server(disabled=False)])
         monkeypatch.setattr(r, "probe_server", _probe)
 
-        req = make_mocked_request(
+        req = _owner_request(
             "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
         )
         resp = await routes._handle_mcp_tools_probe(req)
@@ -1517,7 +1531,7 @@ class TestMcpToolsRoute:
         monkeypatch.setattr(r, "list_servers", lambda: [self._server(disabled=False)])
         monkeypatch.setattr(r, "probe_server", _probe)
 
-        req = make_mocked_request(
+        req = _owner_request(
             "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
         )
         resp = await r._handle_mcp_tools_probe(req)
@@ -1540,7 +1554,7 @@ class TestMcpToolsRoute:
         from kiro_crew.apps.builtins.mochi.backend import routes
 
         self._patch(monkeypatch, [])
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/ ", match_info={"name": "  "})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/ ", match_info={"name": "  "})
         resp = await routes._handle_mcp_tools_probe(req)
         assert resp.status == 400
 
@@ -1555,7 +1569,7 @@ class TestMcpToolsRoute:
         self._patch(monkeypatch, [self._server()], _probe)
         routes._mcp_probe_inflight.add("srv")
         try:
-            req = make_mocked_request(
+            req = _owner_request(
                 "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
             )
             resp = await routes._handle_mcp_tools_probe(req)
@@ -1572,7 +1586,7 @@ class TestMcpToolsRoute:
             raise RuntimeError("boom")
 
         self._patch(monkeypatch, [self._server()], _probe)
-        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        req = _owner_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
         with pytest.raises(RuntimeError):
             await routes._handle_mcp_tools_probe(req)
         assert "srv" not in routes._mcp_probe_inflight

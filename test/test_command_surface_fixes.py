@@ -1,6 +1,6 @@
 """Command-surface and dispatch fixes shared by the messaging channels.
 
-Four defects, each of which used to surface as "the feature is broken" rather
+Four defects, each of which would surface as "the feature is broken" rather
 than as an error:
 
 1. ``!dashboard 0h`` minted a login link that had already expired, on Discord and
@@ -341,7 +341,9 @@ class _PipelineSessions:
         self.created: list[str] = []
         self.released = 0
 
-    async def get_or_create(self, key: str, agent: str = "", channel_id: str = "") -> Any:
+    async def get_or_create(
+        self, key: str, agent: str = "", channel_id: str = "", start_priority=None
+    ) -> Any:
         self.created.append(key)
         return object(), False, False
 

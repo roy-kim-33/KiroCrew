@@ -11,7 +11,8 @@ transcript.
 ## Where the link lives
 
 The link is persisted on the session map entry (`session_map.py`,
-`~/.kiro/crew/session_map.json`), not in a gateway-lifetime dict, so it survives a
+`<data home>/session_map.json`, where the data home is `KIROCREW_HOME` or
+`~/.kiro/crew` by default), not in a gateway-lifetime dict, so it survives a
 restart. Two fields on the entry:
 
 ```
@@ -93,8 +94,9 @@ link untouched, so mirroring would silently resume on the next turn.
 | Origin | How the link is set |
 |---|---|
 | Slack DM or @mention thread | Self-link. `handle_message` calls `set_slack_link(session_key, reply_ts, channel)` on a new session. `reply_ts` (`thread_ts or msg_ts`), never the namespaced key, is stored as `slack_thread_ts`: storing the namespaced form would corrupt reply routing. |
-| Dashboard, user action | `POST /api/chat/slots/{name}/slack-link`. Opens a DM (or uses a supplied channel), posts a thread anchor, links, and back-fills the last 5 messages as context. |
+| Dashboard, user action | `POST /api/chat/slots/{name}/slack-link`. Opens a DM (or uses a supplied channel), posts a thread anchor, links, and back-fills context: the opening turn, a gap marker when turns are skipped, then the last 5 turns. |
 | Dashboard, auto-link from a redirect | The same endpoint with `thread_ts` in the body. Links to THAT existing thread instead of posting a new one, which is what makes a thread reply route back bidirectionally. Context back-fill is skipped, since the thread already contains those messages. |
+| Dashboard, automatic link | With `slack.auto_link_sessions` on, a person's own dashboard session gets a thread in the owner DM on its first message (`maybe_auto_link_slack`). Governed, with no back-fill; the send waits up to `AUTO_LINK_HOLD_SECS` (5 s). See [slack-gateway](../../system-specs/modules/slack-gateway.md). |
 | Slack thread imported to dashboard | `!link-to-dashboard` (`/kirocrew link-to-dashboard`) fetches the thread, redacts each message, imports up to the last 50 into a fresh slot, then `link_slack`. Idempotent: an already-linked thread returns its existing slot. |
 | `/kirocrew sessions` resume | Posts a resume header in-thread or in a DM, then `set_slack_link` plus `dashboard_state.link_slack`. |
 
@@ -107,7 +109,7 @@ truncation boundary cannot split and thereby hide a credential.
 
 ### Slack to dashboard
 
-`maybe_route_linked_thread` (`slack/handler.py`) runs before hook handling and
+`maybe_route_linked_thread` (`slack/handler_runtime/inbound.py`, re-exported by `slack/handler.py`) runs before hook handling and
 before any turn work, on both the native and messaging-transport paths:
 
 1. Look up `get_linked_slot(reply_ts)`. The index is keyed by the **bare
@@ -153,8 +155,10 @@ capability-gated on `supports_proactive_send` and governance-gated fail-closed.
 ### Tool approvals
 
 A tool-approval prompt on a linked session is mirrored into the thread with
-Approve / Reject buttons (`post_linked_approval`), because a Slack-only user
-would otherwise never see it and the turn would park on the 2h timeout holding
+Approve / Reject buttons — Approve / Trust / Reject in a DM whose card is
+grantable, see below — (`post_linked_approval`), because a Slack-only user
+would otherwise never see it and the turn would park for the whole
+`agent.tool_approval_timeout_secs` window (600s by default) holding
 the slot lock. The click resolves the dashboard slot's approval future, so there
 is still exactly one caller of `approve_tool` / `reject_tool`.
 
@@ -164,15 +168,45 @@ cancel path) the future is resolved as `rejected` and the user is told, so they
 retry rather than wait. A cancelled turn never obtained consent, so `rejected` is
 the correct reading.
 
-`is_dm=False` is passed deliberately: trust for a linked slot is a dashboard-side
-mode and is not wired through this path, so only Approve and Reject are offered.
+Trust is offered on this path only when the mirror target is a DM (`channel`
+starts with `D` — Trust escalates the whole session, so a group channel gets
+Approve / Reject, the same blast-radius rule as the native path) **and** the
+dashboard's pending card carries the server's durable-grant proof
+(`trust_grantable`, which `chat_runner` stamps only on unredacted, fully
+derivable calls precisely so an alternate approval surface cannot offer a durable
+grant off a pending card). `post_linked_approval` re-derives that proof from the
+owning slot's card rather than trusting its caller, records the verdict on the
+`_LinkedApproval` entry, and the click acts on that recorded verdict rather than
+on the `action_id` the Slack payload carries.
+
+A Trust click writes all three halves the grant needs — `slot._trust`, which
+`chat_runner._slot_is_trusted` re-reads per event, plus the two the shared
+`messaging.session_trust.add_trusted_session` owns: `approval_policy="auto"`, which a
+spawned subagent inherits, and the in-memory grant mapping that the channel
+`TurnDriver`'s `auto_approve_session` predicate reads — all keyed by the slot's
+effective session key. Policy alone would be erased by the next
+`_persistable_session_policy` write; `_trust` alone would never reach subagents; and
+without the shared mapping a Slack-typed follow-up on a CHANNEL-BORN session's own
+thread would re-prompt for every tool, because that thread is deliberately absent
+from `_slack_to_slot` and so is driven by `slack/transport_dispatch` rather than by
+the dashboard chat runner. The grant is taken in `strict` mode, so a failing policy
+write undoes the mapping half and raises rather than reporting a partial grant as
+"Trusted".
+It fails closed: no proof, no `SessionManager`, no live owning slot, or any raise
+grants nothing, resolves the request as Reject, and returns the Rejected label,
+never a mislabelled "Trusted". Every outcome emits a `slack.interactive.trust_linked`
+SEL event.
 
 ## Unlinking
 
 `POST /api/chat/slots/{slot}/slack-unlink` is the symmetric counterpart. It
 clears the link (both the effective key and, for a dashboard session, its bare
-twin), resets the three slot fields, and posts a best-effort courtesy note into
-the thread so a Slack watcher knows why it went quiet. The session, its history,
+twin) and posts a best-effort courtesy note into the thread so a Slack watcher
+knows why it went quiet. The clear is guarded: an optional `{channel_type,
+binding}` body names the binding to sever, a mismatch is 409 `mirror_changed` and
+clears nothing, the map write is flushed before anything reports it done, and the
+answer carries `relinked` when the slot was linked again meanwhile. The full
+contract is in [session](../../system-specs/modules/session.md). The session, its history,
 and the thread itself all survive. Idempotent: unlinking an unlinked session
 returns `was_linked: false`.
 
@@ -201,5 +235,6 @@ browser action to loopback-only callers.
 - **Mirror posts are best-effort and never buffered.** Every mirror call site
   wraps its post in a `try`/`except` that logs at debug and continues, so a
   Slack-side failure (rate limit, transient 5xx) costs one mirrored message and
-  not the turn. Only `open_dm` retries (`slack/retry.py`); `post_message` stays
-  single-shot at each call site so a retry cannot duplicate a message.
+  not the turn. Only the Slack gateway's proactive and cron DM delivery retries
+  `open_dm` (`slack/retry.py`); the dashboard link path calls `open_dm` once, and
+  `post_message` stays single-shot at each call site so a retry cannot duplicate a message.

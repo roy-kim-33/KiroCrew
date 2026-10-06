@@ -19,7 +19,9 @@ def _sessions_with(provider: MagicMock) -> MagicMock:
     sessions = MagicMock()
     sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
 
-    async def _open_task_session(_pk, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(
+        _pk, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None
+    ):
         return await sessions.get_or_create(session_key, agent=agent, cwd=cwd)
 
     sessions.open_task_session = _open_task_session
@@ -45,6 +47,8 @@ def _provider_requesting_tool() -> MagicMock:
 
 def _ctx_with_hook(action: str) -> MagicMock:
     ctx = MagicMock()
+    ctx.conversation_log.get_metadata_status.return_value = ({}, True)
+    ctx.memory_mode_for_session = AsyncMock(return_value="persistent")
     ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=action))
     ctx.build_message = MagicMock(return_value=("prompt", None))
     return ctx
