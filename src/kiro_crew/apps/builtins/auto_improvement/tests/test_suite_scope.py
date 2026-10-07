@@ -15,7 +15,9 @@ it fails OPEN to whole-tree behavior whenever a scope cannot be established.
 
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
 from pathlib import Path
 
 from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.profile import (
@@ -23,6 +25,7 @@ from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.profile impor
     PytestBuildGate,
     _suite_scope_for_globs,
 )
+from kiro_crew.apps.builtins.auto_improvement.spine import scope as scope_util
 
 
 def _repo(tmp_path: Path) -> Path:
@@ -129,22 +132,56 @@ class TestUnresolvableScopeRefuses:
             "GIT_COMMITTER_EMAIL": "t@t",
         }
         root.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, env=env)
+        # ``cwd=root`` on every spawn: a test's git must never inherit pytest's working
+        # directory (the checkout) as the child's cwd.
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(root)], check=True, env=env, cwd=str(root)
+        )
         (root / "f.txt").write_text("x\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env)
-        subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env, cwd=str(root))
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env, cwd=str(root)
+        )
         return root
 
-    def test_an_unresolvable_scope_base_refuses_to_build_the_profile(self, tmp_path) -> None:
+    @staticmethod
+    def _profile_git_runs_in(monkeypatch, clone: Path) -> None:
+        """Pin the profile's scope diff so its ``git`` spawns with ``cwd=clone``.
+
+        The profile calls ``scope.scoped_relpaths(clone, base)``, which addresses the
+        clone with ``-C`` and passes no ``cwd`` on purpose (a missing clone must stay
+        git's rc=128, not a ``FileNotFoundError`` before git runs), so left alone that
+        git inherits the process cwd -- the pytest worker's, which is this checkout.
+        ``scoped_relpaths`` already takes its spawn as an injectable ``runner``; the
+        profile does not expose it, so the module attribute the profile reads is
+        rebound to the same function with a cwd-carrying runner. Real git still
+        answers -- these tests are about git's own verdict on an unresolvable ref and
+        on an empty diff -- only the descriptor changes. A ``chdir`` would move the
+        process there too, but leaves the descriptor ``cwd=None``, which a per-spawn
+        probe cannot tell from a spawn that really did run in the checkout.
+        """
+        monkeypatch.setattr(
+            scope_util,
+            "scoped_relpaths",
+            functools.partial(
+                scope_util.scoped_relpaths,
+                runner=functools.partial(subprocess.run, cwd=str(clone)),
+            ),
+        )
+
+    def test_an_unresolvable_scope_base_refuses_to_build_the_profile(
+        self, tmp_path, monkeypatch
+    ) -> None:
         import pytest
 
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 
         clone = self._repo(tmp_path / "clone")
-        # Matches on the CONSEQUENCE, not the cause: the guard deliberately no longer
-        # distinguishes "does not resolve" from "resolves but cannot be diffed" (both widen
-        # the fence identically), so asserting the old cause-specific wording would pin a
-        # distinction the code dropped on purpose.
+        self._profile_git_runs_in(monkeypatch, clone)
+        # Matches on the CONSEQUENCE, not the cause: the guard deliberately does not
+        # distinguish "does not resolve" from "resolves but cannot be diffed" (both widen
+        # the fence identically), so asserting cause-specific wording would pin a
+        # distinction the code does not make.
         with pytest.raises(ValueError, match="could not be resolved to a file set"):
             gp.GitHubRepoProfile(
                 clone_path=clone,
@@ -152,7 +189,9 @@ class TestUnresolvableScopeRefuses:
                 scope_base="origin/no-such-branch",
             )
 
-    def test_a_resolvable_base_with_an_empty_diff_scopes_to_NOTHING(self, tmp_path) -> None:
+    def test_a_resolvable_base_with_an_empty_diff_scopes_to_NOTHING(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """base == HEAD must scope to the EMPTY SET, not fall through to unscoped.
 
         REPLACES an assertion that `_scope is None` here, on the reasoning that "there is
@@ -167,6 +206,7 @@ class TestUnresolvableScopeRefuses:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 
         clone = self._repo(tmp_path / "clone")
+        self._profile_git_runs_in(monkeypatch, clone)
         prof = gp.GitHubRepoProfile(
             clone_path=clone, pr_queue_dir=tmp_path / "queue", scope_base="HEAD"
         )

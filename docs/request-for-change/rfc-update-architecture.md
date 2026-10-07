@@ -1,10 +1,10 @@
 ---
 title: Update Architecture (install-shape capability contract)
-status: draft
+status: in-progress
 author: zezhexu
 created: 2026-07-31
-last-audited: 2026-08-06
-audited-at: 8861f89e
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr: 1003
 implementation-prs: [1734]
 tracking-issues: []
@@ -13,14 +13,14 @@ superseded-by: []
 ---
 # RFC: Update Architecture (install-shape capability contract)
 
-- Status: draft — **Phase 1 is now partly implemented.** PR #1734 (merged,
-  `8861f89e`) shipped the install-shape → behavior derivation for the *check* path
-  and the SPA surfaces that read it. What that PR closed, and what it did not, is
-  itemized under **Implementation status** below; the phase list further down has
-  been amended to match. Adjacent in-flight under a **different** design: PR #999
-  (`feat/emergency-release-controls`, open) adds a feed-served minimum version +
-  mandatory-update modal for the desktop lane only, without the capability
-  contract.
+- Status: in-progress — the backend capability contract
+  (`platform/update_capability.py`), managed-venv wheel engine
+  (`platform/wheel_engine.py`) and host-local dashboard approval step-up
+  (`platform/update_stepup.py`) ship; the engine's unattended use is in flight
+  (see "In flight" below). The source-tree automatic apply and legacy
+  `auto_update` surfaces remain, while the Phase 3 `state` / `progress` and
+  shared drain-and-restart contract are still open. The implementation-status
+  sections below preserve earlier audit snapshots; current code is authoritative.
 - Correction to the reference below: KiroCrew ships **five** distribution shapes, not the set implied — `beacon.py:155` lists `{dmg, appimage, wheel, source, docker}`.
 - Author: zezhexu
 - Created: 2026-07-31
@@ -28,7 +28,7 @@ superseded-by: []
   `docs/request-for-change/version-compliance-framework.md` (the policy ceiling
   this RFC must honor)
 
-## Implementation status (as of `8861f89e`)
+## Implementation status (as of `80bd0a81f`)
 
 **Phase 2, CLI half — implemented** (`platform/wheel_engine.py`): the
 managed-venv shape (`cli.sh`'s non-pipx branch) now updates via versioned
@@ -37,21 +37,81 @@ and first-migration protocol. `kirocrew update` builds
 `crew-venv-<version>` fresh (manifest signature verified against the
 cli.sh-pinned trust root, wheel SHA-256 against the signed digest), verifies
 the tree imports the promised version, promotes the stable link via sibling
-symlink + `os.replace`, repoints `~/.local/bin/kirocrew`, and deliberately does NOT
-prune old trees — deletion needs an ownership/liveness proof this engine
-cannot make yet, so superseded trees stay as manual recovery targets.
+symlink + `os.replace`, and repoints `~/.local/bin/kirocrew`. At this audit it
+did not prune old trees (the liveness proof is in flight, below).
 `cli.sh` repoints the stable link at the legacy tree after its own installs,
 so the link always names the last-installed version whichever writer ran.
-Gateway restarts resolve their interpreter through the stable link
-(`respawn_executable`), which is the `updates.py` launch path from §3's list;
-the service-unit and macOS-launcher rewrites, the in-app Apply now ships WITH its OQ7 step-up: the SPA's
+Gateway restarts choose their interpreter through the stable link
+(`respawn_executable`), which is the `updates.py` launch path from §3's list.
+Dashboard apply handlers load that resolver before an update can replace the
+running install tree and pass it to the restart helper. A plain restart loads
+the resolver when invoked.
+The service-unit and macOS-launcher rewrites remain separate. The in-app Apply
+now ships WITH its OQ7 step-up: the SPA's
 Update button arms a pending request (`POST /api/update/arm`; single-use
 nonce, TTL 10 min, written owner-only to the data home and never returned to
 the SPA), and `kirocrew update approve` on the gateway host presents the
 nonce back (`POST /api/update/approve`, loopback + unix-socket preferred),
-upon which the gateway runs the shadow apply itself and restarts. The full
-drain lease (§5) and hash-pinned dependency constraints remain open. pipx
-installs keep the installer re-run.
+upon which the gateway removes the nonce before accepting the approval, fails
+closed if that removal does not succeed, and serializes that read-validate-remove
+against a concurrent re-arm so the request it removes is always the request it
+validated, then runs the shadow apply itself and
+restarts. The full drain lease (§5) and hash-pinned dependency constraints
+remain open. pipx installs keep the installer re-run.
+
+**In flight — valid only at the head of the PR below; re-audit at merge.** One
+open PR, not on main: the engine hardening, and the gateway's unattended apply
+through it. What it changes, as read at its head:
+
+- One update lease per layout, `${VENV}.update.lock`, taken by every engine
+  writer (`kirocrew update`, the approve route, the gateway's automatic apply)
+  and by `cli.sh`'s managed-venv branch. A held lock is `busy`; a filesystem that
+  cannot lock is a failure, never a permanent `busy`. Every child of an apply
+  holds the lock's descriptor, so an orphaned child keeps it.
+- Every child runs in its own session and is killed with its group on timeout,
+  cancel or interrupt, then reaped (`ApplyCancel` kills it synchronously when
+  set). Interpreter children run `-I`; inside the gateway they get the trusted
+  system PATH, while `kirocrew update` passes its own shell's environment.
+- The tree is proven with `pip check` and an import of `kiro_crew.cli` before
+  promotion; a release whose signed `python_requires` the build interpreter
+  fails is refused before any download.
+- Superseded trees are pruned after a promotion: the engine keeps the stable
+  link's target, the previous tree, the tree serving the caller, the tree the
+  persisted launcher resolves into, and any tree some process holds. Every
+  process started from an engine-built tree holds a shared liveness lock on it
+  (`platform/tree_liveness.py`, taken at `kiro_crew.cli.main` after parsing
+  for non-gateway commands; the gateway takes it off-loop after readiness,
+  before its update coordinator starts). Only trees this
+  layout built (an ownership marker naming it) are ever swept or pruned, and a
+  tree is removed through a tombstone rename. An apply aimed at a version whose
+  tree already exists replaces it on the same proof (this layout built it, it is
+  none of the pinned trees, and its liveness lock is taken exclusively), so a
+  channel move back to the kept previous version rebuilds that tree instead of
+  refusing it on every attempt.
+- A stable link whose target is gone is never read as "promoted": the apply
+  repoints it at a tree that exists (the caller's own, else the legacy venv),
+  as `cli.sh` does, and then builds. A caller restarts onto a promotion only
+  when the restart would exec the promoted tree (`wheel_apply.restart_reaches`);
+  otherwise it says so, because re-running the old version would find the same
+  update and restart again for ever.
+- Restarts exec the stable link's RESOLVED tree, so a running gateway keeps
+  loading its own tree when the next promotion flips the link. Launch paths
+  executed outside the writing process's lifetime (a service `ExecStart`, the
+  launchd launcher, the `~/.local/bin` shim) name the stable link rather than a
+  versioned tree. The commands a gateway hands its own children (the built-in
+  MCP servers in `kirocrew.json` and the member specs, the jail re-exec) name
+  the gateway's own tree instead, so the sessions it starts after a promotion
+  keep its version until it restarts; that tree is kept while the gateway holds
+  its liveness lock, and the gateway rewrites those files at every start. A
+  gateway an earlier version restarted through the link itself restarts onto the
+  resolved tree before its unattended apply builds anything.
+- The gateway's unattended apply (`auto_update`, or a policy `min_version`
+  floor) runs the same engine through the same helper as the approve route
+  (`platform/wheel_apply.py`), with admission open until the restart; that
+  behaviour is specified in
+  [slack-gateway](../system-specs/modules/slack-gateway.md#automatic-apply-on-a-managed-venv-install).
+
+A direct `cli.sh` run still rebuilds the fixed `crew-venv` in place.
 
 **Landed in PR #1734** — the tactical half of Phase 1, driven by a user-visible
 defect rather than the architecture: the dashboard told wheel installs "you're on
@@ -211,13 +271,14 @@ re-asked which shapes it still governs.
    `isDesktop`; `SettingsPage.tsx:92` couples differently — it selects the
    desktop-only redux field `desktopUpdateAvailable`, mirrored from the Electron
    updater, so on a wheel install its update nudge simply never lights up. The
-   changelog modal at `App.tsx:1709` does neither. That modal fires on the first
+   changelog modal (`ChangelogModal`, `website/src/shell/updates/updateFlow.tsx`)
+   does neither. That modal fires on the first
    launch after a version change — i.e. immediately after an OTA install — and
    renders:
-   - an **inert** "Auto-update on restart" toggle (`App.tsx:1739`) writing
+   - an **inert** "Auto-update on restart" toggle (in `ChangelogModal`) writing
      `auto_update`, which nothing on a packaged install reads; and
    - an **Update now** button whenever `updateAvailable` is true, where
-     `updateAvailable` includes `desktopUpdateAvailable` (`App.tsx:728`,
+     `updateAvailable` includes `desktopUpdateAvailable` (the `updateAvailable` selector in `App.tsx`,
      mirrored from the Electron updater). It POSTs to the git-only
      `/api/update`, which answers 400 or `409 Not a git checkout — update by
      redeploying (e.g. \`kirocrew cloud launch\`)`. A `.dmg` user is told to run
@@ -230,8 +291,8 @@ re-asked which shapes it still governs.
    in-app Update button where `POST /api/update` would 409, and surfaces the
    installer command instead. The other two surfaces are **unchanged** —
    `SettingsPage.tsx` still selects the desktop-only `desktopUpdateAvailable`
-   (so its nudge still never lights on a wheel install), and the `App.tsx`
-   changelog modal still has no capability check at all. Phase 1b converts both.
+   (so its nudge still never lights on a wheel install), and the changelog
+   modal (`ChangelogModal`) still has no capability check at all. Phase 1b converts both.
    Note also that #1734 fixed the *check*, not the *apply*: Problem 1 stands in
    full.
 
@@ -425,7 +486,7 @@ opt-out. Without it in the contract, the UI can show that an update is
 mandatory but not why.
 
 The three consumers — `AboutPanel.tsx`, `SettingsPage.tsx`, and the
-`App.tsx:1709` changelog modal — read only this contract. Each sheds a
+changelog modal (`ChangelogModal`) — read only this contract. Each sheds a
 *different* coupling: `AboutPanel.tsx:491` loses its `isDesktop` branch,
 `SettingsPage.tsx:92` stops selecting `desktopUpdateAvailable` in favour of the
 contract's `state` / `latest_version`, and the changelog modal gains the
@@ -662,8 +723,8 @@ as one.
 - **Phase 1b — remaining.** Add `platform/update_capability.py` and serve the §2
   contract; collapse the three ad-hoc `.git` derivations into it (Open Question
   5); convert the two SPA surfaces 1a did **not** touch — `SettingsPage.tsx`
-  (still selecting the desktop-only `desktopUpdateAvailable`) and the `App.tsx`
-  changelog modal (still no capability check at all); de-arm the boot-time git
+  (still selecting the desktop-only `desktopUpdateAvailable`) and the changelog
+  modal, `ChangelogModal` (still no capability check at all); de-arm the boot-time git
   apply; retire the three `auto_update` surfaces named under Migration.
   **Problem 2 is only PARTLY closed by 1a** — `AboutPanel.tsx` reads capability,
   the other two surfaces do not, so the third-instance-of-the-same-class defect

@@ -11,8 +11,8 @@ that, and neither shows up as a failing check of its own:
   IS slack, so that is pinned here directly rather than left to prose in the
   workflow asking the next author not to lift it.
 * **Transcription.** Prose that repeats a *drifting* number goes stale the first
-  time anyone moves the ceiling, and then documents a gate that no longer
-  exists; a stale ceiling in a doc is also what makes the next burn-down look
+  time anyone moves the ceiling, and then documents a gate that does not
+  exist; a stale ceiling in a doc is also what makes the next burn-down look
   already done. That is pinned too, but only while the ceiling can drift --
   see `test_the_ceiling_is_not_transcribed_into_prose`.
 * **A second gate.** The number copied into ANOTHER workflow is not prose that
@@ -88,7 +88,7 @@ def test_no_other_workflow_transcribes_the_ceiling() -> None:
     `ci.yml` reds. That is a false all-clear on `main`, which is exactly what a
     lane auditing `main`'s ratchets exists to prevent. Read the value instead --
     `main-ratchet-audit.yml` greps it out of `ci.yml` at run time, the same way
-    the prepare-pr profile does.
+    the kirocrew-prepare-pr profile does.
 
     Checked at every value, including zero: the early return in
     `test_the_ceiling_is_not_transcribed_into_prose` turns on a doc quoting the

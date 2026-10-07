@@ -91,6 +91,16 @@ function renderSidebar(
   chat: Record<string, unknown> = {},
   { activeSlotProp = null, unreadSlots = [] }: { activeSlotProp?: string | null; unreadSlots?: string[] } = {},
 ) {
+  const legacyFixtures = chat.goalLoops as Record<string, { cycle_count: number; max_cycles: number }> | undefined
+  const { goalLoops: _legacyFixtures, ...chatState } = chat
+  const automations = Object.fromEntries(Object.entries(legacyFixtures ?? {}).map(([slotKey, loop]) => [
+    slotKey,
+    {
+      kind: 'legacy_goal_loop', id: `loop-${slotKey}`, slotKey, message: '', idleSecs: 60,
+      maxCycles: loop.max_cycles, cycleCount: loop.cycle_count, active: true,
+      lastFireAt: 0, stoppedReason: '',
+    },
+  ]))
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -99,7 +109,7 @@ function renderSidebar(
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
     } as unknown as RootState['dashboard'],
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {}, goalLoops: {}, ...chat } as unknown as RootState['chat'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {}, ...chatState, automations } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -190,7 +200,7 @@ describe('sidebar slot derivation — every derived value still reaches the row'
     const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, last_message: 'cycle 7 output' }] as unknown as ChatSlot[]
     const { getByText, queryByText } = renderSidebar(
       slots,
-      { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } }, slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } } },
     )
     expect(getByText('Loop 7/24')).toBeTruthy()
     expect(getByText(/cycle 7 output/)).toBeTruthy()
@@ -201,7 +211,7 @@ describe('sidebar slot derivation — every derived value still reaches the row'
     const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, last_message: 'cycle 7 output' }] as unknown as ChatSlot[]
     const { getByText, queryByText } = renderSidebar(
       slots,
-      { activeSlot: 'k', goalLoops: { k: { cycle_count: 7, max_cycles: 24 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { activeSlot: 'k', goalLoops: { k: { cycle_count: 7, max_cycles: 24 } }, slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } } },
       { activeSlotProp: 'k' },
     )
     expect(getByText('Loop 7/24')).toBeTruthy()

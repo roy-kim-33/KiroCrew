@@ -296,8 +296,8 @@ def dispatch_tool(
     *session_key* is the identity the shim resolved with
     ``mcp_core._resolve_session_key_strict`` (env var, or ``KIROCREW_HOST_PID``
     plus the HMAC sidecar signed with the keystone-protected ``sel_hmac.key``). It
-    is used for the AUDIT RECORD, not for authorization: an empty value no longer
-    refuses, because the unattended-surface rule is gone and a cron job driving the
+    is used for the AUDIT RECORD, not for authorization: an empty value does not
+    refuse, because a cron job driving the
     desktop is a supported flow. It is still never inferred here — the lenient
     resolver walks a file mcp_core itself documents as "agent-writable and therefore
     forgeable", so a guess would put a forgeable identity in the audit trail.
@@ -487,7 +487,7 @@ def _dispatch(
         return _static_refusal(denial, session_key=session_key, agent=agent, tool_name=tool_name)
 
     # (4b) THE REAL-POINTER PATH — reached only when the resolved method actually
-    #      warps the operator's physical cursor. It no longer needs a permit of its
+    #      warps the operator's physical cursor. It needs no permit of its
     #      own: one enable covers the feature. What still protects the cursor is
     #      upstream, in ``policy.resolve_click_method`` — ``auto`` NEVER resolves to
     #      ``global``, so the model has to NAME the pointer-moving method, and an
@@ -640,9 +640,9 @@ def _run(
         # TWO filters, and only the first is now a policy decision.
         # ``policy.check_app`` applies the built-in denylist plus the operator's own
         # allow/deny lists, so an app the agent may not touch is not enumerated
-        # either. ``gate.app_is_disclosable`` used to apply the per-app governance
-        # axes; with those gone it only asks "does this window have an identity at
-        # all", dropping rows there is nothing to show for. Both are kept in this
+        # either. ``gate.app_is_disclosable`` only asks "does this window have an
+        # identity at all", dropping rows there is nothing to show for. Both are kept
+        # in this
         # order so reintroducing a disclosure ceiling is a one-function change.
         visible = tuple(
             ref
@@ -750,11 +750,11 @@ def _run(
     #
     # Redacting the two parts separately rather than the joined string is deliberate:
     # ``render_tree`` deliberately appends the screenshot note AFTER its own
-    # redaction, because the per-user temp path contains a long random segment that
-    # the bare-secret-key heuristic masks — re-running redaction over the joined text
-    # would destroy every screenshot path (verified live, documented in
-    # ``render._render_image_note``). So the header is redacted on its own and the
-    # already-redacted body is left untouched.
+    # redaction, because its spool path must reach the model byte-exact and the
+    # bare-secret-key heuristic reads a path as one base64-alphabet run —
+    # re-running redaction over the joined text would expose every screenshot path
+    # to it (documented in ``render._render_image_note``). So the header is
+    # redacted on its own and the already-redacted body is left untouched.
     return f"{ACTION_RESULT_HEADER.format(detail=policy.redact_result(detail))}\n{body}"
 
 

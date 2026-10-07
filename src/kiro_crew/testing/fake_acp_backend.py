@@ -10,6 +10,19 @@ newline-delimited stdio) that ``kiro_crew.acp.client.AcpClient`` drives:
     session/set_model -> {}
     session/prompt    -> stream update(s), then {stopReason: "end_turn"}
 
+Spawned as the KAS relay (``acp --agent-engine v3 ...``, the argv
+``kiro_crew.acp.kas_transport.build_kas_argv`` renders) it also reports every
+managed MCP server the host declared -- the session-level ``mcpServers`` array
+and the active ``_meta.kiro.customAgents`` entry's ``mcpServers`` block -- as
+``connected`` through ``_kiro/mcp/status`` plus ``_kiro/tools/didChange``,
+after ``session/new`` and again after ``session/set_mode``. The KAS harness
+holds the first prompt behind that readiness barrier, and a relay that never
+reports leaves every KAS-routed session (crew-member DMs by default) timing out
+before its first turn. Each entry carries ``_meta.kiro.resource.source.origin =
+client`` and a one-tool catalog, the two facts the barrier reads as "this
+session's own server is reachable". The plain kiro-cli spawn (no engine flag)
+sends none of this, exactly like kiro-cli v2.
+
 Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
 
 * Default text -> stream one ``agent_message_chunk`` (the canned reply).
@@ -41,6 +54,17 @@ Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
   chunk, so the host's ``soft_pending`` state lasts ~250ms on average and a
   loaded browser can miss it entirely; the wind-down makes that state
   observable while still acking well inside the budget.
+* ``[[SLOW_HOLD:<token>]]`` at the start of a line -> a cancel-aware slow
+  stream that HOLDS after ``SLOW_HOLD_AFTER_CHUNKS`` chunk(s) until the file
+  ``slow_hold_path($KIROCREW_FAKE_ACP_HOLD_DIR, token)`` exists, then streams
+  the rest ``SLOW_HOLD_CHUNK_DELAY_SECS`` apart. A test creates that file once
+  it has observed what it orders on, so an ordering across two turns is
+  constructed rather than raced against ``SLOW_CHUNK_DELAY_SECS``.
+  Line-anchored, so a transcript quoting the prompt (``User: [[SLOW_HOLD:...]]``,
+  as the auto-title job sends it) is data and never holds. Bounded by
+  ``SLOW_HOLD_WAIT_SECS``: a hold nobody releases fails the turn with a JSON-RPC
+  error naming the token, an unset hold directory fails it at once, and a
+  ``session/cancel`` during the hold acks with ``stopReason: "cancelled"``.
 * ``[[ERROR]]`` -> reply with a JSON-RPC error instead of a result.
 * ``[[MAXTOKENS]]`` / ``[[REFUSAL]]`` -> alternate terminal ``stopReason``.
 
@@ -56,14 +80,20 @@ selectable from a real gateway. Run standalone as
 live-test harness both point ``KIROCREW_KIRO_BIN`` at a launcher that runs it).
 ``AcpClient`` invokes it as ``<launcher> acp [--agent NAME ...]`` -- argv is
 ignored on that path and the protocol is driven entirely over stdio. The
-``--version`` and ``whoami`` commands return deterministic success so the
-offline gateway exercises the same first-run readiness gate as production.
+``--version`` and ``whoami`` (with any flags) commands return deterministic
+success so the offline gateway exercises the same first-run readiness gate as
+production, and ``chat --list-models`` prints a fixed catalog so the
+dashboard's model picker (``/api/models``) has rows to show instead of a 503
+for a silent child.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
+import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -76,6 +106,29 @@ PROTOCOL_VERSION = "2025-08-22"
 REPLY_TEXT = "pong from the fake ACP backend"
 FAKE_VERSION = "kiro-cli fake-e2e"
 FAKE_IDENTITY = "fake-e2e-user"
+
+# The catalog ``chat --list-models --format json`` prints. Shaped like the real
+# CLI's payload (``{"models": [{model_name, model_id, description,
+# context_window_tokens}]}``) because ``api_models`` rejects anything else with
+# a 503, and every row names a model this fake will happily "run": it answers
+# every prompt the same way whatever model the picker selects. Two rows so the
+# picker has something to switch between.
+FAKE_MODEL_CATALOG: dict[str, Any] = {
+    "models": [
+        {
+            "model_name": "fake-model-fast",
+            "model_id": "fake-model-fast",
+            "description": "Fake e2e model (fast)",
+            "context_window_tokens": 200_000,
+        },
+        {
+            "model_name": "fake-model-large",
+            "model_id": "fake-model-large",
+            "description": "Fake e2e model (large context)",
+            "context_window_tokens": 1_000_000,
+        },
+    ]
+}
 
 # Prompt sentinels. Absent by default so a plain prompt stays text-only.
 TOOL_TRIGGER = "[[TOOL]]"
@@ -111,6 +164,19 @@ SLOW_CHUNK_TEXT = "fake slow chunk "
 # ends cooperatively) and roughly 12x the ~250ms window a plain SLOW cancel
 # leaves, which is too short for a loaded browser to paint.
 SLOW_LATEACK_CHUNKS = 6
+# The ordered slow stream (see the module docstring). The token is restricted to
+# a safe file-name alphabet, so the release path is always a direct child of the
+# test-owned directory the environment names, never a path the prompt chose.
+SLOW_HOLD_TRIGGER_PREFIX = "[[SLOW_HOLD:"
+_SLOW_HOLD_TOKEN = r"[A-Za-z0-9_-]{1,64}"
+_SLOW_HOLD_RE = re.compile(r"^[ \t]*\[\[SLOW_HOLD:(" + _SLOW_HOLD_TOKEN + r")\]\]", re.MULTILINE)
+# Inherited: the gateway hands its own environment to the agent child it spawns.
+SLOW_HOLD_DIR_ENV = "KIROCREW_FAKE_ACP_HOLD_DIR"
+SLOW_HOLD_AFTER_CHUNKS = 1
+# The hold supplies the ordering window, so the rest of the stream need not be slow.
+SLOW_HOLD_CHUNK_DELAY_SECS = 0.05
+# Never block forever: a test releases its hold long before this.
+SLOW_HOLD_WAIT_SECS = 60.0
 # How long a gated permission waits for the host's answer before giving up.
 # Bounded on purpose: the headless backend suite has nothing to resolve a modal,
 # and a hang there would stall the whole turn.
@@ -120,7 +186,23 @@ _POLL_INTERVAL_SECS = 0.02
 ERROR_CODE = -32603
 ERROR_MESSAGE = "fake ACP backend: injected failure"
 
+_SESSION_IDS = itertools.count(1)
 _SESSION_ID = "fake-1"
+_SESSIONS: dict[str, tuple[list[dict[str, Any]], str]] = {}
+#: ``_meta.kiro.customAgents`` as each session/new declared them, by session id:
+#: the roster the relay reports readiness for is read from here on set_mode.
+_SESSION_AGENTS: dict[str, list[dict[str, Any]]] = {}
+# The KAS relay's engine flag (kas_transport.KAS_RELAY_ENGINE_FLAG; spelled here
+# so this module stays stdlib-only). Its presence in argv is what tells a KAS
+# spawn from a kiro-cli one, and only the KAS spawn reports MCP readiness.
+KAS_RELAY_FLAG = "--agent-engine"
+_KAS_RELAY = False
+#: The one tool every reported managed server advertises; a non-empty catalog on
+#: the connected entry is the readiness barrier's exposure evidence.
+MCP_CATALOG_TOOL = "ping"
+_MCP_CLIENT_ORIGIN = {
+    "kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": "client"}}}
+}
 _TOOL_CALL_ID = "fake-tool-1"
 # The agent-authored purpose line, carried as a reserved tool argument. kiro-cli
 # echoes it back in ``rawInput`` under EITHER spelling; the fake emits the
@@ -128,6 +210,18 @@ _TOOL_CALL_ID = "fake-tool-1"
 # pill can otherwise drop (falling back to the literal command line).
 _TOOL_PURPOSE = "Say hello from the fake backend"
 _PERMISSION_REQ_ID = 9001
+
+
+def slow_hold_trigger(token: str) -> str:
+    """The prompt marker that holds a slow stream on *token* (module docstring)."""
+    if not re.fullmatch(_SLOW_HOLD_TOKEN, token):
+        raise ValueError(f"slow-hold token must match {_SLOW_HOLD_TOKEN}: {token!r}")
+    return f"{SLOW_HOLD_TRIGGER_PREFIX}{token}]]"
+
+
+def slow_hold_path(hold_dir: str, token: str) -> str:
+    """The file whose existence releases the stream held on *token*."""
+    return os.path.join(hold_dir, token)
 
 
 def _send(obj: dict[str, Any]) -> None:
@@ -149,6 +243,67 @@ def _update(session_id: str, update: dict[str, Any]) -> None:
 
 def _error(req_id: Any, code: int = ERROR_CODE, message: str = ERROR_MESSAGE) -> None:
     _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+
+
+def _custom_agents(params: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = params.get("_meta")
+    kiro = meta.get("kiro") if isinstance(meta, dict) else None
+    agents = kiro.get("customAgents") if isinstance(kiro, dict) else None
+    return [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else []
+
+
+def _managed_server_names(session_id: str, mode_id: str | None) -> list[str]:
+    """Servers this session was declared with, in declaration order.
+
+    The session-level array first, then the ``mcpServers`` block of the agent
+    ``mode_id`` names (every declared agent when no mode is named yet, as after
+    session/new), deduplicated -- the same two declaration sites the host's
+    ``required_managed_servers`` reads.
+    """
+    servers, _cwd = _SESSIONS.get(session_id, ([], ""))
+    names: list[str] = []
+    for server in servers:
+        name = server.get("name") if isinstance(server, dict) else None
+        if isinstance(name, str) and name not in names:
+            names.append(name)
+    for agent in _SESSION_AGENTS.get(session_id, []):
+        if mode_id is not None and agent.get("id") != mode_id:
+            continue
+        block = agent.get("mcpServers")
+        if isinstance(block, dict):
+            names.extend(name for name in block if isinstance(name, str) and name not in names)
+    return names
+
+
+def _report_mcp_ready(session_id: str, mode_id: str | None = None) -> None:
+    """KAS wire: every managed server connected, catalogued, and this session's own."""
+    if not _KAS_RELAY:
+        return
+    names = _managed_server_names(session_id, mode_id)
+    _notify(
+        "_kiro/mcp/status",
+        {
+            "sessionId": session_id,
+            "servers": [
+                {
+                    "name": name,
+                    "status": "connected",
+                    "tools": [
+                        {"name": MCP_CATALOG_TOOL, "description": "probe", "disabled": False}
+                    ],
+                    "_meta": _MCP_CLIENT_ORIGIN,
+                }
+                for name in names
+            ],
+        },
+    )
+    _notify(
+        "_kiro/tools/didChange",
+        {
+            "sessionId": session_id,
+            "tags": [{"source": "mcp", "tag": f"@{name}/{MCP_CATALOG_TOOL}"} for name in names],
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -187,9 +342,7 @@ def _poll_inbox(match: Callable[[dict[str, Any]], bool]) -> dict[str, Any] | Non
     return found
 
 
-def _await_inbox(
-    match: Callable[[dict[str, Any]], bool], timeout: float
-) -> dict[str, Any] | None:
+def _await_inbox(match: Callable[[dict[str, Any]], bool], timeout: float) -> dict[str, Any] | None:
     """Poll for a matching message until `timeout` elapses. Never blocks forever."""
     deadline = time.monotonic() + timeout
     while True:
@@ -237,9 +390,7 @@ def _prompt_text(params: dict[str, Any]) -> str:
     if not isinstance(blocks, list):
         return ""
     parts = [
-        str(b.get("text", ""))
-        for b in blocks
-        if isinstance(b, dict) and b.get("type") == "text"
+        str(b.get("text", "")) for b in blocks if isinstance(b, dict) and b.get("type") == "text"
     ]
     return "".join(parts)
 
@@ -264,9 +415,7 @@ def _permission_status(session_id: str) -> str:
     return "completed"
 
 
-def _emit_tool_call(
-    session_id: str, *, with_permission: bool, gated: bool = False
-) -> None:
+def _emit_tool_call(session_id: str, *, with_permission: bool, gated: bool = False) -> None:
     """Emit a tool_call (+ optional approval modal) then a completed update."""
     _update(
         session_id,
@@ -328,8 +477,33 @@ def _emit_tool_call(
     )
 
 
+class _SlowHoldExpired(Exception):
+    """A held stream was not released within ``SLOW_HOLD_WAIT_SECS``."""
+
+
+def _hold_until_released(session_id: str, released: Callable[[], bool]) -> bool:
+    """Wait until *released* answers True. True if a session/cancel came first.
+
+    Polls like :func:`_await_inbox`, and raises :class:`_SlowHoldExpired` at
+    ``SLOW_HOLD_WAIT_SECS`` rather than block a turn forever.
+    """
+    deadline = time.monotonic() + SLOW_HOLD_WAIT_SECS
+    while not released():
+        if _cancel_requested(session_id):
+            return True
+        if time.monotonic() >= deadline:
+            raise _SlowHoldExpired
+        time.sleep(_POLL_INTERVAL_SECS)
+    return False
+
+
 def _stream_slowly(
-    session_id: str, *, cancel_aware: bool, ack_after_chunks: int = 0
+    session_id: str,
+    *,
+    cancel_aware: bool,
+    ack_after_chunks: int = 0,
+    hold: Callable[[], bool] | None = None,
+    delay: float | None = None,
 ) -> bool:
     """Stream SLOW_CHUNKS chunks with a delay. True if cancelled mid-stream.
 
@@ -345,10 +519,18 @@ def _stream_slowly(
     The cancel observation is LATCHED because `_cancel_requested` consumes the
     message from the inbox: a second call after the wind-down starts would
     return False and the ack would never fire.
+
+    *hold*, when given, is asked before chunk ``SLOW_HOLD_AFTER_CHUNKS``: the
+    stream waits there until it answers True (:func:`_hold_until_released`),
+    and a cancel during that wait ends the turn as cancelled. *delay* replaces
+    ``SLOW_CHUNK_DELAY_SECS`` between chunks.
     """
     cancelled = False
     winding_down = 0
     for i in range(SLOW_CHUNKS):
+        if hold is not None and i == SLOW_HOLD_AFTER_CHUNKS:
+            if _hold_until_released(session_id, hold):
+                return True
         if cancel_aware and not cancelled and _cancel_requested(session_id):
             cancelled = True
             winding_down = ack_after_chunks
@@ -363,12 +545,14 @@ def _stream_slowly(
                 "content": {"type": "text", "text": f"{SLOW_CHUNK_TEXT}{i} "},
             },
         )
-        time.sleep(SLOW_CHUNK_DELAY_SECS)
+        time.sleep(SLOW_CHUNK_DELAY_SECS if delay is None else delay)
     # A cancel arriving during the final sleep still counts.
     return bool(cancelled or (cancel_aware and _cancel_requested(session_id)))
 
 
 def _handle(msg: dict[str, Any]) -> None:
+    global _SESSION_ID
+
     method = msg.get("method")
     if method is None:
         # A response/error to one of our requests (e.g. the permission answer).
@@ -388,11 +572,53 @@ def _handle(msg: dict[str, Any]) -> None:
             },
         )
     elif method == "session/new":
+        # Warm reset creates the new handle before destroying the old one.
+        # Reusing an ID makes old.destroy() remove the new runtime event queue.
+        _SESSION_ID = f"fake-{next(_SESSION_IDS)}"
+        params = msg.get("params") or {}
+        _SESSIONS[_SESSION_ID] = (params.get("mcpServers") or [], params.get("cwd") or "")
+        _SESSION_AGENTS[_SESSION_ID] = _custom_agents(params)
         _result(req_id, {"sessionId": _SESSION_ID})
+        _report_mcp_ready(_SESSION_ID)
+    elif method in ("_kiro.dev/session/terminate", "_kiro/session/delete"):
+        params = msg.get("params") or {}
+        _SESSIONS.pop(str(params.get("sessionId", "")), None)
+        _SESSION_AGENTS.pop(str(params.get("sessionId", "")), None)
+        _result(req_id, {})
+    elif method == "session/set_mode":
+        # Reported again here, not only after session/new: the host counts every
+        # frame queued before its set_mode request as describing the pre-switch
+        # roster and skips that many, so the session/new report alone would
+        # never satisfy the barrier for the agent it switches to.
+        params = msg.get("params") or {}
+        _result(req_id, {})
+        mode_id = params.get("modeId")
+        _report_mcp_ready(
+            str(params.get("sessionId", "")), mode_id if isinstance(mode_id, str) else None
+        )
     elif method == "session/prompt":
         params = msg.get("params") or {}
-        session_id = str(params.get("sessionId", _SESSION_ID))
+        session_id = str(params.get("sessionId", ""))
+        session = _SESSIONS.get(session_id)
+        if session is None:
+            _error(req_id, message="Unknown or terminated ACP session")
+            return
+        servers, cwd = session
         text = _prompt_text(params)
+        if "[[WF_E2E:" in text:
+            from kiro_crew.testing.workflow_memory_scenario import respond
+
+            response = respond(text, servers, cwd)
+            if response is not None:
+                _update(
+                    session_id,
+                    {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": response},
+                    },
+                )
+                _result(req_id, {"stopReason": "end_turn"})
+                return
         if ERROR_TRIGGER in text:
             # A JSON-RPC error instead of a result: the turn fails, not stops.
             _error(req_id)
@@ -404,7 +630,30 @@ def _handle(msg: dict[str, Any]) -> None:
         elif TOOL_TRIGGER in text:
             _emit_tool_call(session_id, with_permission=False)
 
-        if SLOW_NOACK_TRIGGER in text:
+        holds = _SLOW_HOLD_RE.findall(text)
+        if holds:
+            token = holds[-1]
+            hold_dir = os.environ.get(SLOW_HOLD_DIR_ENV, "")
+            if not hold_dir:
+                _error(req_id, message=f"fake ACP backend: a slow hold needs {SLOW_HOLD_DIR_ENV}")
+                return
+            release = slow_hold_path(hold_dir, token)
+            try:
+                cancelled = _stream_slowly(
+                    session_id,
+                    cancel_aware=True,
+                    hold=lambda: os.path.exists(release),
+                    delay=SLOW_HOLD_CHUNK_DELAY_SECS,
+                )
+            except _SlowHoldExpired:
+                _error(
+                    req_id,
+                    message=f"fake ACP backend: slow hold {token!r} was not released "
+                    f"within {SLOW_HOLD_WAIT_SECS:g}s",
+                )
+                return
+            stop_reason = "cancelled" if cancelled else "end_turn"
+        elif SLOW_NOACK_TRIGGER in text:
             _stream_slowly(session_id, cancel_aware=False)
             stop_reason = "end_turn"
         elif SLOW_LATEACK_TRIGGER in text:
@@ -446,12 +695,26 @@ def _pump_stdin() -> None:
 
 
 def main() -> None:
+    global _KAS_RELAY
+
     args = sys.argv[1:]
+    _KAS_RELAY = KAS_RELAY_FLAG in args
     if args == ["--version"]:
         print(FAKE_VERSION)
         return
-    if args == ["whoami"]:
+    if args[:1] == ["whoami"]:
+        # Flags after the subcommand (``--format json``, which the dashboard's
+        # credit refresh passes) are accepted and ignored. Answering here keeps
+        # that call off the ACP loop below, which would wait on stdin.
         print(FAKE_IDENTITY)
+        return
+    if args[:2] == ["chat", "--list-models"]:
+        # The dashboard's model picker spawns
+        # ``kiro-cli chat --list-models --format json --no-interactive`` and
+        # treats empty stdout as a 503. Flags after the subcommand are accepted
+        # and ignored; the payload is JSON regardless, which is what the one
+        # caller asks for.
+        print(json.dumps(FAKE_MODEL_CATALOG))
         return
     if args == ["acp", "--help"]:
         # The readiness probe runs this to confirm the `acp` subcommand exists

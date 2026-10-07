@@ -799,8 +799,8 @@ class TestTunnelProviderDelegation:
 
     @pytest.mark.asyncio
     async def test_snapshot_omitting_key_resets_stale_field(self):
-        """A later snapshot that omits a previously-set key (error/url) resets it
-        to default rather than retaining the stale value."""
+        """A later snapshot that omits a key an earlier one set (error/url) resets
+        it to default rather than retaining the stale value."""
         provider = _install_tunnel_provider(_FakeTunnelProvider())
         mgr = TunnelManager(port=5476)
 
@@ -910,6 +910,21 @@ def _cleanup_registration_order() -> list[str]:
     from kiro_crew.dashboard import server
 
     src = inspect.getsource(server.start_dashboard)
+    # The registrations the one-module file made inline now sit in the boot phases
+    # it calls in server_runtime owners; each phase's source replaces its call.
+    for phase in (
+        server._start_app_backends,
+        server._register_watchdog_shutdown,
+        server._register_diag_recorder_shutdown,
+        server._register_kiro_service_shutdown,
+    ):
+        start = src.index(f"{phase.__name__}(")
+        depth = 0
+        for end in range(start, len(src)):
+            depth += {"(": 1, ")": -1}.get(src[end], 0)
+            if src[end] == ")" and depth == 0:
+                break
+        src = src[:start] + inspect.getsource(phase) + src[end + 1 :]
     hits: list[tuple[int, str]] = []
     for token in _CLEANUP_REGISTRARS:
         start = 0
@@ -922,9 +937,9 @@ def _cleanup_registration_order() -> list[str]:
 class TestTunnelShutdownWiring:
     """``TunnelManager.stop()`` MUST be reached from the gateway shutdown path.
 
-    Regression for a production-wiring gap: ``stop()`` existed but had ZERO
-    production callers, so a started tunnel outlived its gateway even on a clean
-    Ctrl+C — a companion provider's supervised child reparented to PID 1 and the
+    If ``stop()`` has no production caller, a started tunnel outlives its gateway
+    even on a clean Ctrl+C — a companion provider's supervised child reparents to
+    PID 1 and the
     next start collided on the tunnel name. These tests drive the real wiring
     helper (``dashboard.server._wire_tunnel_shutdown``) rather than the manager
     in isolation, so they fail if the hook is dropped again.

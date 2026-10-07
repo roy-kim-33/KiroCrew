@@ -303,6 +303,14 @@ def _post_command(
     session key) goes in the ``X-Session-Key`` HEADER, which the strict route's
     AF_UNIX peer check compares against the HMAC-signed session the caller
     resolves to; a bare header would be a 403.
+
+    The per-session token goes WITH it, and the pair must not be separated. On a
+    pid hosting several sessions the kernel's proof of the PROCESS cannot say
+    which of them holds this socket, so the peer check requires a token naming
+    exactly the declared key there and refuses the declaration otherwise. The two
+    agree by construction, because on such a pid the ladder resolves the key from
+    that very token. On a 1:1 install the helper contributes no header at all, so
+    the request is byte-identical to before.
     """
     body = json.dumps(
         {"session_key": bus_key, "op": op, "args": args, "timeout_ms": timeout_ms}
@@ -314,6 +322,7 @@ def _post_command(
             "Content-Type": "application/json",
             "X-Internal-Secret": mcp_core._internal_secret(),
             "X-Session-Key": session_header,
+            **mcp_core._session_token_header(),
         },
         method="POST",
     )
@@ -428,10 +437,11 @@ def browser(name: str, args: dict[str, Any]) -> str:
     # off, so there is no per-call caller context and no KIROCREW_SESSION_KEY,
     # and macOS/Windows have no HMAC pid sidecar -- i.e. ALL THREE sources the
     # strict resolver accepts are absent, so strict returns "" for the user's
-    # own main session too, not just subagents. The tool used to then fabricate
-    # a bogus ``unresolved:<pid>`` key; the strict command route rejects that
-    # header (the gateway kernel-resolves the AF_UNIX peer and denies a declared
-    # key that differs from it), 403-ing every op on a default install. The
+    # own main session too, not just subagents. Feeding strict's empty result
+    # into a fabricated ``unresolved:<pid>`` key gets that header rejected by
+    # the strict command route (the gateway kernel-resolves the AF_UNIX peer
+    # and denies a declared key that differs from it), 403-ing every op on a
+    # default install. The
     # lenient resolver returns the REAL slot key, which matches what the peer
     # check resolves, so the op is admitted. (Tradeoff: a subagent's MCP-core
     # child walks up into the parent slot, so a subagent op resolves to the

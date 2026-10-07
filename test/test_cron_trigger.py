@@ -115,6 +115,26 @@ class TestTriggerCronJob:
         assert ok is False
         assert "HTTP 403" in msg
 
+    def test_secret_file_disappears_before_read(self, mock_dashboard, monkeypatch):
+        """A concurrent secret cleanup behaves like an already-missing fallback."""
+        port, cfg_dir = mock_dashboard
+        secret_path = cfg_dir / ".local_secret"
+        path_type = type(secret_path)
+        original_read_text = path_type.read_text
+
+        def remove_before_read(path, *args, **kwargs):
+            if path == secret_path:
+                path.unlink()
+                raise FileNotFoundError(path)
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(path_type, "read_text", remove_before_read)
+        with patch("kiro_crew.cron_trigger.run_marker.read_secret", return_value=None):
+            ok, msg = trigger_cron_job("abc12345", port, secret_path)
+
+        assert ok is False
+        assert "HTTP 403" in msg
+
     def test_invalid_job_id_rejected(self, mock_dashboard):
         """Malformed job IDs are rejected before making HTTP request."""
         port, cfg_dir = mock_dashboard
@@ -226,7 +246,7 @@ class TestCronTriggerMCP:
         from kiro_crew.cron import CronService
 
         # The ownership gate reads the stored row, so the job has to exist and be
-        # owned by this caller. It used to be reachable without either, because an
+        # owned by this caller. Without that gate it is reachable without either, because an
         # unidentified caller was waved through -- which also meant a nonexistent
         # id could be POSTed to the dashboard.
         svc = CronService(base_dir=cfg_dir)
@@ -265,7 +285,7 @@ class TestCronTriggerMCP:
 class TestCronTriggerCLI:
     """Tests for the CLI cron trigger subcommand."""
 
-    def test_cli_subcommand_registered(self):
+    def test_cli_subcommand_registered(self, tmp_path):
         """kirocrew cron trigger is a recognized subcommand with job_id argument."""
         # Verify the handler accepts "trigger" action without crashing
         import argparse
@@ -273,10 +293,11 @@ class TestCronTriggerCLI:
         from kiro_crew.cli_commands import _cron
         args = argparse.Namespace(cron_action="trigger", job_id="abc12345")
         # Will fail with connection error (no gateway) but proves the action is recognized
-        from pathlib import Path
         from unittest.mock import patch as _patch
-        with _patch("kiro_crew.cli_commands.config_dir", return_value=Path("/tmp/nonexistent")):
+        with _patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path / "nonexistent"), \
+             pytest.raises(SystemExit) as exc:
             _cron(args)
+        assert exc.value.code == 1
         # If we get here without "Usage:" being printed, the action was recognized
 
     def test_cli_trigger_success(self, mock_dashboard, capsys):
@@ -301,7 +322,26 @@ class TestCronTriggerCLI:
         assert "Triggered job:" in captured.out
         assert "abc12345" in captured.out
 
-    def test_cli_trigger_invalid_id(self, capsys):
+    def test_cli_trigger_not_found_exits_nonzero(self, mock_dashboard, capsys):
+        """A failed trigger exits 1 so scripts can tell it from success."""
+        import argparse
+
+        from kiro_crew.cli_commands import _cron
+
+        port, cfg_dir = mock_dashboard
+        args = argparse.Namespace(cron_action="trigger", job_id="aabbccddee")
+
+        with patch("kiro_crew.cli_commands.config_dir", return_value=cfg_dir), \
+             patch(
+                 "kiro_crew.cli_commands.resolve_client_port_ex",
+                 lambda _cli: (port, True),
+             ):
+            with pytest.raises(SystemExit) as exc:
+                _cron(args)
+        assert exc.value.code == 1
+        assert "Job not found" in capsys.readouterr().out
+
+    def test_cli_trigger_invalid_id(self, capsys, tmp_path):
         """CLI rejects malformed job IDs."""
         import argparse
 
@@ -309,7 +349,6 @@ class TestCronTriggerCLI:
 
         args = argparse.Namespace(cron_action="trigger", job_id="../evil")
 
-        from pathlib import Path
         from unittest.mock import patch as _patch
 
         from kiro_crew.config import loader
@@ -317,13 +356,30 @@ class TestCronTriggerCLI:
         orig_port = loader.DASHBOARD_PORT
         loader.DASHBOARD_PORT = 19999
         try:
-            with _patch("kiro_crew.cli_commands.config_dir", return_value=Path("/tmp")):
+            with _patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path), \
+                 pytest.raises(SystemExit) as exc:
                 _cron(args)
         finally:
             loader.DASHBOARD_PORT = orig_port
 
+        assert exc.value.code == 1
         captured = capsys.readouterr()
         assert "Invalid job ID format" in captured.out
+
+    @pytest.mark.parametrize("action", ["pause", "resume"])
+    def test_cli_unknown_job_exits_nonzero(self, action, capsys, tmp_path):
+        """pause and resume exit 1 on an unknown job id."""
+        import argparse
+
+        from kiro_crew.cli_commands import _cron
+
+        args = argparse.Namespace(cron_action=action, job_id="abc12345")
+
+        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path), \
+             pytest.raises(SystemExit) as exc:
+            _cron(args)
+        assert exc.value.code == 1
+        assert "Job not found: abc12345" in capsys.readouterr().out
 
 
 # ── Tool Definition Tests ──

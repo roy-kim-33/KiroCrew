@@ -5,7 +5,7 @@ One invocation answers every cheap question about one candidate work item and
 returns ONE verdict, so a worker dispatch is never spent discovering that the
 work does not exist.
 
-WHY FIVE QUESTIONS AND NOT ONE. The predicate this replaces was a single prose
+WHY SIX QUESTIONS AND NOT ONE. The predicate this replaces was a single prose
 line, ``gh pr list --search``, and it was blind in three directions at once.
 Each blind spot cost a whole dispatch to discover:
 
@@ -21,8 +21,16 @@ Each blind spot cost a whole dispatch to discover:
   * three items said "I am claiming this issue" / "Ownership claimed by @X" in
     PROSE, in the body, which no label or field query sees.
 
-The lesson those three share, and the design rule of this script: **one
-question with an empty answer is not permission.** So it asks all five, and an
+The fourth blind spot was this script's own, found the same way: four live items
+in three days carried another pipeline's ``claimed`` label — two with the
+assignee set too — and every one read CLAIM, because the first five questions
+read neither forge field. The label and the assignee are what the skill calls
+the cross-operator lock; the queue build excludes on the label, and this script
+is the live recheck immediately before the atomic claim, so it was the one
+reader that had to look and did not.
+
+The lesson those four share, and the design rule of this script: **one
+question with an empty answer is not permission.** So it asks all six, and an
 unanswerable question yields UNKNOWN — never CLAIM.
 
 Usage:
@@ -50,34 +58,40 @@ Exit codes (the conductor branches on these):
 
     0   CLAIM    — dispatch it
    10   SKIP     — covered or not workable; do not dispatch
-   11   CLOSE    — triage debt: already fixed, or the reporter asked to close
+   11   CLOSE    — triage debt: a merged PR already landed the fix
+   13   REVIEW   — a standing closure request was READ in the item's prose. Do
+                   not dispatch and do not close: hand it to a human, or to the
+                   conductor, with the reason. Prose noticing that something
+                   might be resolved is not prose deciding it.
     2            — malformed arguments or config
     3   UNKNOWN  — a check could not be answered (forge unreachable, rate
                    limited, no clone for a question only git can answer)
 
-The five checks, all of them, every call:
+The six checks, all of them, every call:
 
-  1. ``open_prs``      open PRs referencing the item, FORK PRs included, with
-                       ``is_cross_repository`` and author per hit, plus
-                       ``untrusted_fork`` when a cross-repository PR's author
-                       has no standing. That last one changes no verdict: it
-                       makes the suppression LOUD, because opening a fork PR
+  1. ``open_prs``      open PRs referencing the item, FORK PRs included, each
+                       annotated ``closes_item`` by a closing keyword aimed at
+                       this item, with ``is_cross_repository`` and author per
+                       hit, plus ``untrusted_fork`` when a cross-repository PR's
+                       author has no standing. That last one changes no verdict:
+                       it makes the suppression LOUD, because opening a fork PR
                        needs no permission and a silent SKIP anybody can cause
                        is how an item leaves the queue with nobody told.
   2. ``merged_prs``    MERGED PRs referencing the item, each annotated
                        ``landed`` by ``git merge-base --is-ancestor`` and
-                       ``closes_item`` by a closing keyword aimed at this item.
-                       BOTH are load-bearing: a PR merged somewhere other than
-                       the branch a worker would start from is not coverage, and
-                       a PR that merely MENTIONS the item is not closure.
+                       ``closes_item`` by the same keyword read. BOTH are
+                       load-bearing: a PR merged somewhere other than the branch
+                       a worker would start from is not coverage, and a PR that
+                       merely MENTIONS the item is not closure.
   3. ``prose_claim``   the body and the NEWEST human comment, scanned for
                        self-claim phrases and for closure requests — over what
                        the author SAYS, with code fences, backtick spans,
                        blockquotes and quoted spans removed first, because a
                        phrase inside them is being cited. BOTH phrase sets need
-                       standing (the reporter, or a repository insider), for
-                       opposite reasons: CLOSE acts on live work, and a SKIP any
-                       commenter can cast is a denial-of-work channel.
+                       standing (the reporter, or a repository insider), and for
+                       the SAME reason, because neither one closes anything:
+                       each suppresses a dispatch, and a suppression any passer-by
+                       can cast is a denial-of-work channel.
   4. ``symbol_on_base``every symbol the item names, by ``git grep`` on the
                        default branch. Absent means the target code may live
                        only on an unmerged branch — but that reading holds only
@@ -92,30 +106,74 @@ The five checks, all of them, every call:
                        consumer is the skill: ``risk=high`` means the item is
                        not batched, it gets a live re-check immediately before
                        the atomic claim.
+  6. ``forge_claim``   the item's own ownership fields: a ``claimed`` or
+                       ``in-progress`` label (the skill's documented
+                       ``skip_signals`` vocabulary), and the assignees. Either
+                       one alone is a claim, and it is FOREIGN unless every
+                       assignee is the authenticated login — a label with
+                       nobody assigned is unattributed and reads as foreign, as
+                       does every claim when the login is unknown. Read off the
+                       issue payload the prose check already fetched, so it
+                       costs no call of its own.
 
 Verdict precedence, first match wins (see :func:`verdict`, a pure function of
 the checks dict so every branch is unit-testable with no forge access):
 
   1. ``merged_prs`` LANDED and CLOSES it       → CLOSE ``already-fixed``
-  2. any ``open_prs`` entry                  → SKIP  ``open-pr``, marked
+  2. an ``open_prs`` entry that CLOSES it    → SKIP  ``open-pr``, marked
                                                ``untrusted-fork`` at
                                                ``risk=high`` when the PR is an
-                                               unvouched fork
-  3. ``prose_claim.closure_requested``       → CLOSE ``reporter-asked-close``
-  4. ``prose_claim.claimed_by_other``        → SKIP  ``prose-claim``
-  5. ``symbol_on_base.missing`` AND bug-class→ SKIP  ``symbol-absent``
-  6. any check errored                       → UNKNOWN
-  7. otherwise                               → CLAIM, annotated with ``risk``,
+                                               unvouched fork. An entry that only
+                                               MENTIONS the item does not
+                                               suppress: it falls through and
+                                               forces ``risk=high``
+  3. ``prose_claim.closure_requested``       → REVIEW ``reporter-asked-close``
+                                               at ``risk=high``
+  4. ``forge_claim.foreign``                 → SKIP  ``forge-claim``, with the
+                                               label term and the assignees as
+                                               evidence. Below 1 so a claimed
+                                               item that is already fixed still
+                                               reads CLOSE; above 5 because a
+                                               forge field outranks prose
+  5. ``prose_claim.claimed_by_other``        → SKIP  ``prose-claim``
+  6. ``symbol_on_base.missing`` AND bug-class→ SKIP  ``symbol-absent``
+  7. any check errored                       → UNKNOWN
+  8. otherwise                               → CLAIM, annotated with ``risk``,
                                                which an UNCORROBORATED absent
-                                               symbol or an UNAUTHORIZED claim
-                                               forces to ``high``
+                                               symbol, an UNAUTHORIZED claim, or
+                                               a MENTION-ONLY open PR forces to
+                                               ``high``
 
-Rules 2 and 4 both suppress work on evidence anybody can manufacture, and both
+Rule 3 is the one verdict here that is read out of HAND-WRITTEN ENGLISH, which is
+why it is REVIEW and not CLOSE. CLOSE is the strongest response this script has,
+aimed at somebody else's live work, and prose is the weakest evidence it
+collects. Pairing the two is what nine separate false-CLOSE paths came out of: a
+quotation bound truncated at a fixed offset, closure verbs with no object, bare
+pronouns resolving to a socket rather than the item, a means-versus-state
+confusion between two prepositions. Each is fixed on its merits and a ratchet
+stops a new PATTERN shipping unguarded. What the ratchet cannot stop is the next
+unguarded PHRASING of a pattern that is already guarded, and the space of English
+that accidentally resembles "close this" has no edge to reach. So detection keeps
+the job it can do, which is noticing that an item might be resolved, and does not
+get the job of deciding it. Rule 1 still CLOSES, because a merged commit that is
+an ancestor of the base is evidence, not prose.
+
+Rules 2, 3 and 5 all suppress work on evidence anybody can manufacture, and all
 answer it the same way rather than by refusing to look: the finding stands, and
 the doubt is published alongside it. A verdict that acts while doubting has to
-say so, or the doubt is only in this docstring.
+say so, or the doubt is only in this docstring. Rule 4 is not in that family:
+setting a label or an assignee needs triage permission on the repository, so
+standing is built into the field it reads and it carries no doubt marker.
 
-Note that 6 sits BELOW the positive findings on purpose: a definite answer to
+The mention-only open PR is that rule run backwards, and it owes the same debt. A
+reference with no closing keyword is the weaker evidence, so rule 2 DECLINES to
+suppress — but a bare reference can still be work in flight whose author never
+spelled a keyword, so declining silently would trade one blind spot for another.
+The finding is published as ``open_pr_mention_only`` and forces ``risk=high``,
+which routes the item to the live recheck instead of the batch. A verdict that
+declines while doubting has to say so too.
+
+Note that 7 sits BELOW the positive findings on purpose: a definite answer to
 one question outranks a partial view of another, and no error path can reach
 CLAIM.
 
@@ -127,11 +185,14 @@ Deliberately boring properties, do not weaken:
     never labels, assigns, comments, or closes.
   * At most one forge call per question. The timeline is fetched once and
     answers checks 1 and 2 together; each referencing PR is then detailed once,
-    because fork-ness and the merge commit exist only on the pull object.
+    because fork-ness and the merge commit exist only on the pull object. The
+    issue is fetched once and feeds checks 3 through 6, and the authenticated
+    login is looked up at most once, only when a claim needs attributing.
   * No user-authored PROSE reaches stdout. Failures are reported as SLUGS
     rather than forge stderr, a prose match reports the PATTERN that fired
-    rather than the sentence, and a bug-class match reports this module's own
-    TERM rather than the label's text — this output lands in an agent's context.
+    rather than the sentence, and a bug-class or claim-label match reports this
+    module's own TERM rather than the label's text — this output lands in an
+    agent's context.
     What DOES appear is identifiers: logins, PR numbers, commit prefixes,
     comment ids and symbol names extracted from the item. Those are the evidence
     a conductor needs to check the verdict, and a login is chosen by its owner
@@ -147,6 +208,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -164,11 +226,10 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 #: NOT a closure request: that direction costs one dispatch, the other closes
 #: work in flight.
 #:
-#: Bare ``it`` and bare ``that`` are deliberately NOT objects, which cost a
-#: round to learn: the first version of this list accepted them, and "The
-#: connection leaks. Please close it." closed the item. A bare pronoun resolves
-#: to whatever was last mentioned, and in a bug report that is usually a socket,
-#: a file or a handle. ``this`` is kept because it points at the thread's topic
+#: Bare ``it`` and bare ``that`` are deliberately NOT objects. A bare pronoun
+#: resolves to whatever was last mentioned, and in a bug report that is usually a
+#: socket, a file or a handle, so accepting one fires on "The connection leaks.
+#: Please close it." ``this`` is kept because it points at the thread's topic
 #: rather than at the previous noun, and ``that issue`` still works with the noun
 #: present. The noun alternatives come FIRST so "this issue" is not consumed by
 #: bare ``this`` and then failed on the clause end.
@@ -242,9 +303,12 @@ WITHDRAWAL_RES: tuple[str, ...] = (
 )
 
 #: Closure requests, from the item whose reporter had already said it was done.
-#: Every pattern that can produce CLOSE carries a continuation guard, because
-#: CLOSE is the one verdict that writes to somebody else's live work and this
-#: list has now produced four separate false positives without one.
+#: Every pattern here carries a continuation guard even though the verdict does
+#: not close anything: REVIEW does not write, but it does take the item out of
+#: the dispatch queue and put it in front of a human, so a phrase that fires on
+#: "please close the connection" still spends attention and still withholds work.
+#: Without the guards this list yields four separate false positives, and losing
+#: them restores that whether or not the verdict writes.
 CLOSURE_RES: tuple[str, ...] = (
     rf"\bthis\s+(?:is|was)\s+(?:already\s+)?(?:resolved|fixed)\b{_STATE_END}",
     rf"\bhappy\s+to\s+have\s+(?:{_ISSUE_OBJECT})\s+closed\b",
@@ -262,9 +326,9 @@ CLOSURE_RES: tuple[str, ...] = (
 #: Patterns above that name the item in their own words rather than through
 #: ``_ISSUE_OBJECT`` or a guard. The ratchet test uses this: every closure
 #: pattern must either carry a guard or be listed here WITH a reason, so the next
-#: phrase added to the list cannot quietly ship without one. Six separate
-#: false-CLOSE defects reached review because a pattern was added without a
-#: guard and nothing checked.
+#: phrase added to the list cannot quietly ship without one. An unguarded pattern
+#: is what six separate false-CLOSE defects came out of, and this list plus that
+#: test are the only things that check for one.
 ITEM_SCOPED_CLOSURE_RES: frozenset[str] = frozenset(
     {
         # "an issue" and "reproducible" can only describe the item itself.
@@ -279,15 +343,21 @@ ACTIVE_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR
 
 #: Standing to ask for closure on somebody else's item. Narrower than
 #: ACTIVE_ASSOCIATIONS on purpose: CONTRIBUTOR means "has had a PR merged here
-#: once", which is not authority to close another person's report, while CLOSE
-#: is the one verdict that acts on live work.
+#: once", which is not standing to declare another person's report finished. A
+#: closure request produces REVIEW rather than CLOSE, so the reason the set is
+#: this narrow is not "this verdict writes": it is that REVIEW withholds a
+#: dispatch, and a suppression any passer-by can cast is the same denial-of-work
+#: channel the self-claim path already refuses to open.
 INSIDER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 
-#: GitHub's closing keywords. A merged PR is coverage only if it CLAIMS to close
-#: the item; a bare cross-reference ("see #123", "related to #123") is a mention
-#: and decides nothing. Deliberately negation-blind, matching GitHub's own
-#: parser: "does not close #123" links and closes #123 there too, so treating it
-#: as a claim keeps this script's reading and the forge's reading identical.
+#: GitHub's closing keywords. A PR is coverage only if it CLAIMS to close the
+#: item; a bare cross-reference ("see #123", "related to #123", "Refs #123") is a
+#: mention and decides nothing. Read on BOTH the merged and the open side, from
+#: the same title-and-body text, because the question does not change across the
+#: merge boundary: a merged mention is not closure, and an open mention is not
+#: coverage. Deliberately negation-blind, matching GitHub's own parser: "does not
+#: close #123" links and closes #123 there too, so treating it as a claim keeps
+#: this script's reading and the forge's reading identical.
 _CLOSING_WORDS = "close[sd]?|fix(?:e[sd])?|resolve[sd]?"
 
 
@@ -304,6 +374,24 @@ def closing_reference_re(repo: str, item: int) -> re.Pattern[str]:
         rf"|https?://github\.com/{owner_repo}/issues/{item}\b)"
     )
     return re.compile(rf"\b(?:{_CLOSING_WORDS})\s*:?\s+{target}", re.IGNORECASE)
+
+
+def claims_closure(closing_re: re.Pattern[str], title: Any, body: Any) -> bool:
+    """Whether a closing keyword aimed at the item sits WITHIN one field.
+
+    The title and the body are searched SEPARATELY and never concatenated.
+    GitHub honours a closing reference only within a single field, and the
+    pattern's ``\\s+`` matches a newline, so joining the two fields with one lets
+    a title ending in a closing word glue to a body opening with a bare ``#N``
+    (``fix`` + ``\\n`` + ``#123``) and match a reference NEITHER field carries.
+    That fabricates coverage, and fabricated coverage suppresses an item nobody
+    is fixing -- silently, which is the harm this module exists to prevent.
+
+    The text is arbitrary and opening a fork PR needs no permission, so the
+    fabrication is craftable rather than accidental. Searching per field removes
+    the whole class instead of guarding one spelling of it.
+    """
+    return bool(closing_re.search(str(title or ""))) or bool(closing_re.search(str(body or "")))
 
 
 RECENT_DAYS = 14
@@ -324,9 +412,16 @@ CHECK_NAMES = (
     "prose_claim",
     "symbol_on_base",
     "recency",
+    "forge_claim",
 )
 
-EXIT_CODES = {"CLAIM": 0, "SKIP": 10, "CLOSE": 11, "UNKNOWN": 3}
+#: One integer per verdict, and a verdict never borrows another's number: the
+#: caller branches on the number alone, so a number that means two things is a
+#: wrong branch rather than a confusing message. Numbers are assigned, never
+#: recycled -- 12 is unallocated here and a later verdict should take the next
+#: free integer rather than fill the gap, because a reader cannot tell a gap
+#: that is free from one that is retired.
+EXIT_CODES = {"CLAIM": 0, "SKIP": 10, "CLOSE": 11, "REVIEW": 13, "UNKNOWN": 3}
 
 #: ``gh`` shapes this script is allowed to run. Everything else — including
 #: every write verb — is refused before the subprocess starts.
@@ -456,7 +551,13 @@ def gh_json(args: list[str]) -> tuple[Any, str | None]:
 
 
 def git(repo_dir: str, args: list[str]) -> tuple[int, str, str]:
-    return run(["git", "-C", repo_dir, *args])
+    # ``-C`` scopes git to the clone; ``cwd`` makes the clone the child's working
+    # directory as well, so the read runs from inside it rather than from wherever
+    # the conductor happened to launch this script. ABSOLUTE for both: git resolves
+    # ``-C`` against the child's cwd, so a relative path handed to both would be
+    # applied twice (``repo/repo``) and a valid nested clone would read as missing.
+    where = os.path.abspath(repo_dir)
+    return run(["git", "-C", where, *args], cwd=where)
 
 
 # --------------------------------------------------------------------------- #
@@ -487,8 +588,15 @@ def referencing_prs(repo: str, item: int) -> tuple[list[dict], list[dict], str |
 
     ONE timeline call finds every cross-reference — fork PRs included, which is
     the half the old ``--state open`` search could not see — and one detail call
-    per referenced PR supplies the two fields the timeline omits: the merge
-    commit, and the head repository that makes a PR a fork PR.
+    per referenced PR supplies the fields the timeline omits: the merge commit,
+    the head repository that makes a PR a fork PR, and the title and body a
+    closing keyword would be written in.
+
+    Every hit on BOTH lists carries ``closes_item``. The timeline event is
+    keyword-free by construction — it fires on a bare mention — so the reference
+    alone cannot tell coverage from a pointer, and the keyword is what does. The
+    annotation is symmetric on purpose: when only the merged side carried it, an
+    open ``Refs #N`` was read as coverage while a merged one was not.
 
     A reference to a PR in ANOTHER repository is skipped: it cannot land code
     on this repo's default branch, so it is not coverage of this item.
@@ -529,13 +637,16 @@ def referencing_prs(repo: str, item: int) -> tuple[list[dict], list[dict], str |
     for number in numbers:
         detail, error = gh_json(["gh", "api", f"repos/{repo}/pulls/{number}"])
         if error or not isinstance(detail, dict):
-            # An OPEN PR already confirmed is a definite answer, and the module's
-            # precedence puts a definite answer above a partial view: discarding
-            # it here turned a SKIP into UNKNOWN over a later PR that could not
-            # have changed it. The accumulated hits travel with the error, and
-            # the caller keeps the finding while marking the merged side
-            # unanswered. Rule 1 outranks rule 2, so a CLOSE can still be missed
-            # this way -- that costs an item left open, never a false close.
+            # An OPEN PR already confirmed to CLAIM CLOSURE is a definite answer,
+            # and the module's precedence puts a definite answer above a partial
+            # view: discarding it here turned a SKIP into UNKNOWN over a later PR
+            # that could not have changed it. The accumulated hits travel with
+            # the error, and the caller keeps the finding while marking the
+            # merged side unanswered. Hits that only MENTION the item are kept
+            # too and suppress nothing, so the errored merged side still decides
+            # the verdict and it reads UNKNOWN rather than CLAIM. Rule 1 outranks
+            # rule 2, so a CLOSE can still be missed this way -- that costs an
+            # item left open, never a false close.
             return open_prs, merged_prs, (error or "unparseable-json")
         head = detail.get("head") or {}
         base = detail.get("base") or {}
@@ -551,15 +662,20 @@ def referencing_prs(repo: str, item: int) -> tuple[list[dict], list[dict], str |
             # a forge enum, but the trust decision belongs in one place.
             "author_association": detail.get("author_association"),
         }
+        # A PR is coverage only if it CLAIMS to close the item. A bare
+        # cross-reference is a mention, and a mention decides nothing: reading it
+        # as coverage suppresses an item nobody is fixing, and reading it as a
+        # claim would starve an item whose fix was only partial. So it is
+        # recorded and left to fall through to the remaining checks.
+        #
+        # Asked ONCE, above the merge boundary, because it is the same question
+        # on both sides of it. Asking it only of merged PRs leaves an asymmetry
+        # that suppresses an item on a bare reference: an OPEN PR saying
+        # "Refs #N", this repository's own idiom for deliberately-not-closing,
+        # would take the item out of the queue.
+        hit["closes_item"] = claims_closure(closing_re, detail.get("title"), detail.get("body"))
         if detail.get("merged"):
             hit["merge_commit_sha"] = detail.get("merge_commit_sha")
-            # A merged PR is coverage only if it CLAIMS to close the item. A
-            # bare cross-reference is a mention, and a mention decides nothing:
-            # reading it as coverage would CLOSE live work, and reading it as a
-            # claim would starve an item whose fix was only partial. So it is
-            # recorded and left to fall through to the remaining checks.
-            claimed = f"{detail.get('title') or ''}\n{detail.get('body') or ''}"
-            hit["closes_item"] = bool(closing_re.search(claimed))
             merged_prs.append(hit)
         elif detail.get("state") == "open":
             open_prs.append(hit)
@@ -570,20 +686,25 @@ def referencing_prs(repo: str, item: int) -> tuple[list[dict], list[dict], str |
 def annotate_untrusted_forks(open_prs: list[dict], reporter: str | None) -> None:
     """Set ``untrusted_fork`` on each open hit. Annotation only, by design.
 
-    Opening a fork PR needs no permission, so a cross-repository PR that merely
-    MENTIONS an item is a suppression channel available to anybody: the item
+    Opening a fork PR needs no permission, so a cross-repository PR that claims
+    to close an item is a suppression channel available to anybody: the item
     SKIPs and leaves the queue. The tempting fix -- stop trusting fork PRs -- is
     the wrong trade. In a public repository most genuine coverage arrives as a
     fork PR, and dropping those reinstates the duplicate-dispatch class this
     whole script was built from, repeatedly, to close a channel that costs an
     outsider one throwaway PR.
 
-    So the verdict does not move: an open PR still SKIPs, fork PRs included, as
-    the skill's check list requires. What changes is that the suppression stops
-    being SILENT -- it carries ``risk=high`` and an ``untrusted-fork`` marker, so
-    the conductor reviews it as a triage signal instead of watching the item
-    vanish. The objection worth answering was never the detection; it was a
-    response that was both unconditional and unreported.
+    So the verdict does not move: an open PR that claims closure still SKIPs,
+    fork PRs included, as the skill's check list requires. What changes is that
+    the suppression stops being SILENT -- it carries ``risk=high`` and an
+    ``untrusted-fork`` marker, so the conductor reviews it as a triage signal
+    instead of watching the item vanish. The objection worth answering was never
+    the detection; it was a response that was both unconditional and unreported.
+
+    Every open hit is annotated, not only the suppressing ones, because this
+    function answers a question of fact and :func:`verdict` decides what the fact
+    is worth -- and because the marker is read back by
+    :func:`untrusted_fork_skip`, which is where the covering-only scoping lives.
 
     Standing is an insider association or the item's own reporter, since a
     reporter fixing their own bug from a fork is the ordinary case, not an
@@ -664,10 +785,11 @@ _FENCE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"(`+)[^`]*?\1")
 _BLOCKQUOTE_RE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)
 #: Deliberately UNBOUNDED between the delimiters. A length cap here is a
-#: false-CLOSE channel: a reporter who quotes "please close" inside a quotation
-#: longer than the cap has the phrase read as their OWN prose, and this verdict
-#: performs a write on live work. Linear despite the ``*`` because the class is
-#: negated -- there is no nested quantifier to backtrack through.
+#: false-reading channel: a reporter who quotes "please close" inside a quotation
+#: longer than the cap has the phrase read as their OWN prose, and the item is
+#: then withheld from dispatch over a sentence they were citing. Linear despite
+#: the ``*`` because the class is negated -- there is no nested quantifier to
+#: backtrack through.
 _QUOTED_RE = re.compile('["\u201c\u201d][^"\u201c\u201d\n]*["\u201c\u201d]')
 #: An UNMATCHED opening delimiter is the same channel by the other door: a
 #: citation whose closing quote the author forgot (or that a smart-quote pair
@@ -675,7 +797,7 @@ _QUOTED_RE = re.compile('["\u201c\u201d][^"\u201c\u201d\n]*["\u201c\u201d]')
 #: words. Everything from a leftover delimiter to the end is therefore dropped
 #: too. This is the deliberately lossy direction -- prose after an unbalanced
 #: quote can hide a REAL closure request, which costs one dispatch, where the
-#: other reading closes somebody's live work.
+#: other reading withholds one and asks a human to read a citation.
 _UNCLOSED_QUOTE_RE = re.compile('["\u201c\u201d].*$', re.DOTALL)
 
 
@@ -684,26 +806,28 @@ def plain_prose(text: str) -> str:
 
     Measured on the item that specified this script: its body quotes the very
     closure phrases the check looks for ("this is resolved / happy to have it
-    closed", as a description of what to detect), and scanning it raw produced
-    CLOSE on a live item. A false CLOSE closes work in flight; a missed one only
-    costs the dispatch that discovers the work is done — so citations come out
-    before matching, and the asymmetry runs the cheap way.
+    closed", as a description of what to detect), and scanning it raw fires the
+    closure branch on a live item. That branch's verdict is REVIEW, so a false
+    reading does not close work in flight — but it still withholds the item from
+    dispatch and spends a human read, while a missed one only costs the dispatch
+    that discovers the work is done. The asymmetry is narrow and does not invert,
+    so citations come out before matching.
 
     Line structure first, then whitespace, then spans. Fences and blockquotes
     are line-shaped, so they have to go while the newlines are still there.
     Quotation marks are not, and markdown hard-wraps prose, so a quoted phrase
     routinely straddles a line break: collapsing whitespace before matching the
     spans is what makes the stripper as newline-tolerant as the ``\\s+`` in the
-    phrases it defends. Without that step it missed the very body that found
-    this bug, where the quote broke mid-phrase.
+    phrases it defends. Without that step a body whose quote breaks mid-phrase --
+    the shape this defends against -- slips through unstripped.
 
     Balanced spans go first, then any LEFTOVER delimiter takes the rest of the
-    text with it. Both halves matter and the second was missing: an unclosed
-    citation matches no pair, so the phrase inside it used to survive as the
-    author's own words and returned CLOSE on a live item. Every span rule here
-    is therefore allowed to strip too MUCH, never too little -- over-stripping
-    can hide a real closure request and cost one dispatch, while under-stripping
-    closes somebody's work in flight.
+    text with it. Both halves matter: an unclosed citation matches no pair, so
+    without the second the phrase inside it survives as the author's own words
+    and withholds a live item from dispatch. Every span rule here is therefore
+    allowed to strip too MUCH, never too little -- over-stripping can hide a real
+    closure request and cost one dispatch, while under-stripping withholds one on
+    a sentence the author was only citing.
     """
     text = _HTML_COMMENT_RE.sub(" ", text)
     text = _FENCE_RE.sub(" ", text)
@@ -794,10 +918,10 @@ def newest_authorized_claim(comments: Any, reporter: str | None) -> dict | None:
     older claims, so recovery cannot park an item on somebody who already walked
     away.
 
-    A withdrawal only ever releases its OWN author's claim. The first version
-    applied any withdrawal to every earlier claim, which handed a stranger the
-    power to erase a maintainer's claim by typing "dropping this" -- the same
-    denial-of-work shape as an unauthorized claim, running the other direction
+    A withdrawal only ever releases its OWN author's claim. Applying any
+    withdrawal to every earlier claim would hand a stranger the power to erase a
+    maintainer's claim by typing "dropping this" -- the same denial-of-work shape
+    as an unauthorized claim, running the other direction
     and costing a duplicate dispatch instead of a suppression. You can only give
     up what you hold.
     """
@@ -832,20 +956,19 @@ def newest_authorized_claim(comments: Any, reporter: str | None) -> dict | None:
 def last_human_comment(comments: Any) -> dict | None:
     """The NEWEST non-bot comment, chosen by timestamp rather than by position.
 
-    Two measurements shaped this. First, the per-issue comments endpoint
-    documents only ``since``, ``per_page`` and ``page``: it silently IGNORES
-    ``sort`` and ``direction`` and answers oldest-first. An earlier version of
-    this function asked for ``direction=desc`` and took the first element, and
-    on a real item that returned the OLDEST of twelve comments (2026-09-01
-    10:40) against a newest of 2026-09-03 00:56 — so a reporter's later "please
-    close" was invisible to the check that exists to find it. Second, this
-    repository's triage bot comments on issues, and its summary was the OLDEST
-    entry rather than the newest, so skipping bots is right but reading from
-    either end is not.
+    Two measurements shape this. First, the per-issue comments endpoint documents
+    only ``since``, ``per_page`` and ``page``: it silently IGNORES ``sort`` and
+    ``direction`` and answers oldest-first. So asking for ``direction=desc`` and
+    taking the first element returns the OLDEST comment -- measured on a real
+    item, the oldest of twelve, some 38 hours behind the newest -- which hides a
+    reporter's later "please close" from the check that exists to find it.
+    Second, this repository's triage bot comments on issues and its summary lands
+    at the OLDEST end, so skipping bots is right but reading from either end is
+    not.
 
     Hence selection by ``max(created_at)`` over non-bot comments and never by
     position: an endpoint that changes its order, or a client that merges pages
-    in another sequence, cannot bring the bug back. Position breaks ties only
+    in another sequence, cannot reach either failure. Position breaks ties only
     when a timestamp is missing.
     """
     if not isinstance(comments, list):
@@ -878,14 +1001,18 @@ def scan_prose(
     as somebody else's — the fail-safe direction is SKIP, never CLAIM.
 
     BOTH phrase sets need STANDING (the item's own author, always true of the
-    body, or a repository insider by ``author_association``) but for opposite
-    reasons, and the asymmetry is the point:
+    body, or a repository insider by ``author_association``). One reason covers
+    both, because neither reading closes anything:
 
-    * a closure request produces CLOSE, which acts on live work, so "please
-      close" from a passer-by must not fire it;
+    * a closure request produces REVIEW, which withholds a dispatch and asks a
+      human, so "please close" from a passer-by must not fire it;
     * a self-claim produces SKIP, and a veto anyone can cast is a
       denial-of-work channel -- one comment would suppress a queued item
       indefinitely with nothing downstream reporting the suppression.
+
+    This function is the DETECTOR and knows nothing about either verdict. What
+    it reports and what is done about it are deliberately separate concerns, and
+    that separation is what let the response change without the patterns moving.
 
     So an unauthorized claim is not discarded and not obeyed: it sets
     ``claim_without_standing``, which annotates ``risk=high`` and sends the item
@@ -1127,6 +1254,92 @@ def scan_recency(issue: dict, now: datetime | None = None) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# check 6 — forge ownership: the claim label and the assignees
+# --------------------------------------------------------------------------- #
+
+
+#: Label names that mean "somebody owns this", as the skill's own documented
+#: ``work_source.skip_signals`` default spells them: ``claimed`` and
+#: ``in-progress``. The queue build excludes on these labels; this check is the
+#: live recheck immediately before the atomic claim, and it was the one reader
+#: that did not look -- four live items in three days carried another pipeline's
+#: ``claimed`` label, two with the assignee set too, and every one read CLAIM.
+#:
+#: Enumerated against this repository's labels at the time of the fix:
+#:
+#:   * ``claimed`` ("An automated fix is in progress") -- 60 open items carried
+#:     it, 2 with no assignee at all. Matched.
+#:   * ``crew: in progress`` ("A Kiro Crew Issue Radar worker is actively
+#:     working this issue") -- 4 of the 8 most recent closed items carrying it
+#:     had no assignee, so the assignee rule alone would miss that worker.
+#:     Matched, through ``in[ -]progress`` with any prefix.
+#:   * ``wip`` / ``assigned``-style names -- NOT matched. The skill's default
+#:     does not list them, and widening a veto past the documented contract is
+#:     how a label nobody meant as a lock starts parking items.
+#:
+#: ``\b`` keeps ``unclaimed`` and ``reclaimed`` out. The match is reported as
+#: this module's TERM, never the label's text, the same rule :func:`bug_class_of`
+#: follows: a label name is user-authored and this value is printed.
+CLAIM_LABEL_RE = re.compile(r"\b(claimed|in[ -]progress)\b", re.IGNORECASE)
+
+
+def claim_label_of(issue: dict) -> str | None:
+    """The module's term for the first ownership label on the item, or None."""
+    labels = issue.get("labels")
+    if not isinstance(labels, list):
+        return None
+    for label in labels:
+        name = label.get("name") if isinstance(label, dict) else label
+        if isinstance(name, str):
+            hit = CLAIM_LABEL_RE.search(name)
+            if hit:
+                return hit.group(1).lower().replace(" ", "-")
+    return None
+
+
+def assignee_logins(issue: dict) -> list[str]:
+    """Every assignee login on the item, in payload order. Reads the list the
+    forge sends and falls back to the singular field only when the list is
+    missing, so a payload with both never counts one person twice."""
+    assignees = issue.get("assignees")
+    if not isinstance(assignees, list):
+        single = issue.get("assignee")
+        assignees = [single] if isinstance(single, dict) else []
+    found: list[str] = []
+    for entry in assignees:
+        login = entry.get("login") if isinstance(entry, dict) else None
+        if isinstance(login, str) and login:
+            found.append(login)
+    return found
+
+
+def scan_forge_claim(issue: dict, me: str | None) -> dict:
+    """The ``forge_claim`` check value. Pure: no forge access.
+
+    Either field alone is a claim -- the skill calls labels and assignees the
+    cross-operator lock, and measured on this repository they arrive together
+    from an atomic claim and apart from a human assigning by hand, so a rule
+    that needed both would miss half of each.
+
+    WHOSE claim it is comes from the assignees: ours when every assignee is the
+    authenticated login, since a label with ourselves assigned is exactly the
+    shape of our own atomic claim and a conductor re-checking an item it holds
+    must not be told to abandon it. A label with nobody assigned is unattributed
+    and reads as foreign; a co-assignee reads as foreign; and when ``me`` is
+    unknown every claim reads as foreign -- the same fail-safe direction
+    :func:`scan_prose` takes, because SKIP costs one dispatch and the other
+    reading dispatches onto somebody's live work.
+    """
+    label = claim_label_of(issue)
+    assignees = assignee_logins(issue)
+    if assignees:
+        foreign = me is None or any(login != me for login in assignees)
+    else:
+        foreign = label is not None
+    return {"label": label, "assignees": assignees, "foreign": foreign}
+
+
+# --------------------------------------------------------------------------- #
 # the verdict — pure function of the checks
 # --------------------------------------------------------------------------- #
 
@@ -1175,26 +1388,93 @@ def unauthorized_claim(checks: dict) -> str | None:
     return str(who) if who else "unknown"
 
 
+def covering_open_prs(checks: dict) -> list[dict]:
+    """Open PR hits that CLAIM to close the item, in timeline order.
+
+    The suppressing subset of check 1. A hit without a closing keyword is a
+    pointer rather than coverage, so it is not here — see
+    :func:`mention_only_open_prs`, which reports it instead.
+    """
+    return [hit for hit in entries(checks.get("open_prs")) if hit.get("closes_item")]
+
+
+def mention_only_open_prs(checks: dict) -> list[int]:
+    """Numbers of open PRs that reference the item WITHOUT claiming to close it.
+
+    The fourth member of the family with :func:`unauthorized_claim`,
+    :func:`untrusted_fork_skip` and :func:`closure_request`, and the only one that
+    runs the other way round: those three act while doubting, this one DECLINES
+    to act and still has to say what it saw.
+
+    Declining is the fix for a measured suppression. ``Refs #N`` is this
+    repository's own idiom for referenced-but-deliberately-not-closed and its PR
+    template keeps ``Related Issues`` apart from a closing trailer, so the
+    clearest signal an author can give that they are leaving an item for somebody
+    else was being read as the reason to skip it — silently, since the item did
+    not appear as refused-for-a-reason, it simply never came up.
+
+    Reporting is the other half, and it is not decoration: a bare reference may
+    still be work in flight that its author never spelled as a closing keyword.
+    So these numbers force ``risk=high``, which is the pipeline's existing "do not
+    batch this, re-check it live immediately before claiming" channel. Nothing is
+    lost that the old suppression had — the per-item recheck sees the same
+    reference — and the item reaches the queue.
+    """
+    found: list[int] = []
+    for hit in entries(checks.get("open_prs")):
+        if hit.get("closes_item"):
+            continue
+        number = hit.get("number")
+        if isinstance(number, int):
+            found.append(number)
+    return found
+
+
 def untrusted_fork_skip(checks: dict) -> int | None:
     """The number of the first open PR whose SKIP is an untrusted fork, or None.
 
     The counterpart to :func:`unauthorized_claim`: both name a finding this
     script acts on while doubting, so the doubt has to travel with the verdict.
+
+    Only a COVERING hit is considered, because only a covering hit suppresses. A
+    mention-only fork PR leaves the item in the queue, so reporting it as an
+    untrusted-fork suppression would name a suppression that does not happen —
+    :func:`mention_only_open_prs` carries that case, and raises the risk just the
+    same.
     """
-    for hit in entries(checks.get("open_prs")):
+    for hit in covering_open_prs(checks):
         if hit.get("untrusted_fork"):
             number = hit.get("number")
             return number if isinstance(number, int) else None
     return None
 
 
+def closure_request(checks: dict) -> bool:
+    """Whether a STANDING closure request was read out of the item's prose.
+
+    The third member of the family with :func:`unauthorized_claim` and
+    :func:`untrusted_fork_skip`, and the one whose evidence is weakest: those two
+    read a forge field, this one reads hand-written English. So it is also the
+    only one whose verdict declines to act at all — see rule 3 in
+    :func:`verdict` — and the ``risk=high`` it forces is the whole point of the
+    verdict rather than a footnote on it.
+    """
+    prose = checks.get("prose_claim")
+    if not isinstance(prose, dict) or errored(prose):
+        return False
+    return bool(prose.get("closure_requested"))
+
+
 def risk_of(checks: dict) -> str:
     """``low`` or ``high``, from check 5, from an uncorroborated absent symbol,
-    from an unauthorized self-claim, and from an untrusted-fork suppression,
-    defaulting to the cautious side."""
+    from an unauthorized self-claim, from an untrusted-fork suppression, from a
+    prose closure request, and from an open PR that references the item without
+    claiming to close it, defaulting to the cautious side."""
     if uncorroborated_absent_symbols(checks) or unauthorized_claim(checks):
         return "high"
-    if untrusted_fork_skip(checks) is not None:
+    if untrusted_fork_skip(checks) is not None or closure_request(checks):
+        return "high"
+    if mention_only_open_prs(checks):
         return "high"
     recency = checks.get("recency")
     if not isinstance(recency, dict) or errored(recency):
@@ -1223,7 +1503,11 @@ def verdict(checks: dict) -> tuple[str, str, dict]:
                     "landed": True,
                 },
             )
-    for hit in entries(checks.get("open_prs")):
+    for hit in covering_open_prs(checks):
+        # A closing keyword, same as rule 1 demands of a merged PR. An open PR
+        # that merely MENTIONS the item is not coverage: it falls through, and
+        # mention_only_open_prs() raises the risk so the item takes the live
+        # recheck rather than leaving the queue unannounced.
         return (
             "SKIP",
             "open-pr",
@@ -1237,11 +1521,39 @@ def verdict(checks: dict) -> tuple[str, str, dict]:
     prose = checks.get("prose_claim")
     if isinstance(prose, dict) and not errored(prose):
         if prose.get("closure_requested"):
+            # NOT CLOSE. A prose reading is the weakest evidence this script
+            # collects and closing is the strongest thing it could do with it,
+            # aimed at work somebody else may still be doing. Nine false-CLOSE
+            # paths in one review made the case that the pairing was the defect
+            # rather than the patterns, so the reading survives and the response
+            # is withheld: the item leaves the dispatch queue, nothing is
+            # written, and a human or the conductor decides. Rule 1 above still
+            # closes, on a merge commit that is an ancestor of the base.
             return (
-                "CLOSE",
+                "REVIEW",
                 "reporter-asked-close",
                 {"comment_id": prose.get("comment_id"), "where": prose.get("where")},
             )
+    forge = checks.get("forge_claim")
+    if isinstance(forge, dict) and not errored(forge) and forge.get("foreign"):
+        # The forge's own ownership fields -- the lock the skill tells every
+        # operator to honour. Below rule 1 on purpose: an item that is open,
+        # claimed and already fixed is triage debt, and the claim must not hide
+        # the CLOSE. Above the prose claim because a forge field outranks
+        # hand-written English, so when both say the same thing the stronger
+        # evidence is the reason printed. The detector already decided WHOSE
+        # claim it is; this rule reads only ``foreign``.
+        return (
+            "SKIP",
+            "forge-claim",
+            {
+                "label": forge.get("label"),
+                "assignees": [
+                    login for login in forge.get("assignees") or [] if isinstance(login, str)
+                ],
+            },
+        )
+    if isinstance(prose, dict) and not errored(prose):
         if prose.get("claimed_by_other"):
             return (
                 "SKIP",
@@ -1282,6 +1594,12 @@ def verdict(checks: dict) -> tuple[str, str, dict]:
     claimed = unauthorized_claim(checks)
     if claimed:
         evidence["claim_without_standing"] = claimed
+    mention_only = mention_only_open_prs(checks)
+    if mention_only:
+        # The suppression this rule DECLINED to make, published rather than
+        # dropped. Same contract as symbol_absent_uncorroborated above: the human
+        # line is one field wide, so the reason lives in --json.
+        evidence["open_pr_mention_only"] = mention_only
     return "CLAIM", "clean", evidence
 
 
@@ -1311,11 +1629,22 @@ def human_line(item: int, name: str, reason: str, evidence: dict, risk: str) -> 
     if reason == "reporter-asked-close":
         ident = evidence.get("comment_id")
         tail = f"comment-id={ident}" if ident is not None else f"where={evidence.get('where')}"
-        return f"CLOSE {item} reporter-asked-close {tail}"
+        # The comment id is the whole point of the line: this verdict asks a
+        # human to read the sentence the scanner matched, and it never prints
+        # that sentence, so it has to say where to find it.
+        return f"REVIEW {item} reporter-asked-close {tail} risk={risk}"
     if reason == "prose-claim":
         return (
             f"SKIP {item} prose-claim claimed-by={evidence.get('claimed_by')} "
             f"where={evidence.get('where')}"
+        )
+    if reason == "forge-claim":
+        # Logins and this module's own label term: identifiers a conductor
+        # needs to check the verdict, never the label's text.
+        assignees = ",".join(evidence.get("assignees") or []) or "none"
+        return (
+            f"SKIP {item} forge-claim label={evidence.get('label') or 'none'} "
+            f"assignees={assignees}"
         )
     if reason == "symbol-absent":
         return f"SKIP {item} symbol-absent={evidence.get('symbol')}"
@@ -1328,8 +1657,9 @@ def human_line(item: int, name: str, reason: str, evidence: dict, risk: str) -> 
 
 
 def whoami() -> str | None:
-    """The authenticated login, or None. Called only when a self-claim phrase
-    already matched, so the common path pays nothing for it."""
+    """The authenticated login, or None. Called only when it can change a
+    verdict -- a self-claim phrase matched, or the item has an assignee -- and
+    at most once per run, so the common path pays nothing for it."""
     data, error = gh_json(["gh", "api", "user"])
     if error or not isinstance(data, dict):
         return None
@@ -1338,7 +1668,7 @@ def whoami() -> str | None:
 
 
 def collect(repo: str, item: int, default_branch: str, repo_dir: str | None) -> dict:
-    """Run all five checks. A check that cannot be answered carries ``error``."""
+    """Run all six checks. A check that cannot be answered carries ``error``."""
     checks: dict[str, Any] = {}
 
     open_prs, merged_prs, prs_error = referencing_prs(repo, item)
@@ -1361,9 +1691,12 @@ def collect(repo: str, item: int, default_branch: str, repo_dir: str | None) -> 
         checks["prose_claim"] = {"error": slug}
         checks["recency"] = {"error": slug}
         checks["symbol_on_base"] = {"error": slug}
-        # An open PR still SKIPs when the item itself cannot be read, so the
-        # suppression still needs its marker. Nobody is known to be the
-        # reporter here, which annotates more forks rather than fewer.
+        checks["forge_claim"] = {"error": slug}
+        # An open PR that claims closure still SKIPs when the item itself cannot
+        # be read -- ``closes_item`` comes from the PULL's own title and body, so
+        # it survives an unreadable item -- and the suppression still needs its
+        # marker. Nobody is known to be the reporter here, which annotates more
+        # forks rather than fewer.
         #
         # Keyed on the HITS, not on the absence of an error: a half-finished scan
         # can now return a confirmed open PR alongside its error, and gating on
@@ -1374,6 +1707,19 @@ def collect(repo: str, item: int, default_branch: str, repo_dir: str | None) -> 
     else:
         reporter = (issue.get("user") or {}).get("login") if isinstance(issue, dict) else None
         annotate_untrusted_forks(open_prs, reporter if isinstance(reporter, str) else None)
+        identity: list[str | None] = []
+
+        def me() -> str | None:
+            # One lookup at most, shared by the two readers that can need it,
+            # and made only when an answer can change the verdict.
+            if not identity:
+                identity.append(whoami())
+            return identity[0]
+
+        # The ownership fields ride on the payload just fetched, so this check
+        # costs no call of its own. Identity is needed only to attribute an
+        # assignee: an unattributed label is foreign whoever we are.
+        checks["forge_claim"] = scan_forge_claim(issue, me() if assignee_logins(issue) else None)
         comments, comments_error = gh_json(
             [
                 "gh",
@@ -1401,8 +1747,9 @@ def collect(repo: str, item: int, default_branch: str, repo_dir: str | None) -> 
                         comment, prose = claimed, recovered
             if prose["claimed_by_other"]:
                 # Re-scan knowing who we are: our own claim is not somebody
-                # else's. One extra call, only when it can change the verdict.
-                prose = scan_prose(issue, comment, whoami(), withdrawn)
+                # else's. One extra call at most, only when it can change the
+                # verdict, and none if check 6 already asked.
+                prose = scan_prose(issue, comment, me(), withdrawn)
             checks["prose_claim"] = prose
         checks["recency"] = scan_recency(issue)
         text = f"{issue.get('title') or ''}\n{issue.get('body') or ''}"

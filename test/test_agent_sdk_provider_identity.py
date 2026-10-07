@@ -6,7 +6,7 @@ sweep cannot quietly merge them:
 
 1. **The provider-identity axis** — ``agent.provider``, asked through
    :func:`kiro_crew.agent_sdk.provider_identity.is_claude_code`. The eleven
-   branches that used to spell the literal inline now route through it, and
+   branches that would spell the literal inline route through it instead, and
    :func:`test_no_converted_file_compares_the_literal` keeps them there.
 2. **The session-map provider label** — ``PROVIDER_LABEL_CLAUDE``. Equal in
    value, different in job. Pinned equal by
@@ -176,6 +176,23 @@ def test_importing_this_module_does_not_load_the_acp_package() -> None:
     assert loaded["drivers_acp"] is True
 
 
+#: A converted file whose functions live in owner modules it composes: the
+#: dashboard agents handlers run the functions ``dashboard/agent_admin`` defines on
+#: ``handlers/agents.py``'s globals, so the literal ratchet reads those owners as
+#: part of that file.
+_COMPOSED_OWNERS = {"dashboard/handlers/agents.py": "dashboard/agent_admin"}
+
+
+def _composed_owner_paths(rel: str) -> list[Path]:
+    """The owner modules *rel* composes, or ``[]`` for a self-contained file."""
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return []
+    owners = sorted((SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return owners
+
+
 def _literal_comparisons(path: Path) -> list[int]:
     """Line numbers where code compares something against ``"claude_code"``."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -202,7 +219,10 @@ def test_no_converted_file_compares_the_literal(rel: str) -> None:
     the ``model_registry`` namespace arguments, which are call arguments rather
     than comparisons.
     """
-    hits = _literal_comparisons(SRC / rel)
+    hits: list[int | str] = list(_literal_comparisons(SRC / rel))
+    for owner in _composed_owner_paths(rel):
+        rel_owner = owner.relative_to(SRC).as_posix()
+        hits += [f"{rel_owner}:{line}" for line in _literal_comparisons(owner)]
     assert hits == [], (
         f'{rel} compares the raw "{PROVIDER_CLAUDE_CODE}" literal at line(s) '
         f"{hits}; ask is_claude_code() instead so provider-specific logic stays "

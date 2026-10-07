@@ -45,9 +45,9 @@ deliberately does not use one.
    handle from another device works — see [Messaging yourself](#messaging-yourself).
 
 If the gateway is not on your Mac, or `imsg` is missing, the channel reports why
-in **Settings → Channels → iMessage** instead of failing silently.
+in **Settings → Messaging Channels → iMessage** instead of failing silently.
 
-## Who can reach the agent
+## Access control
 
 **The allow-list is the whole gate, and an empty one authorizes nobody.** Every
 other channel has an org or workspace boundary in front of it; iMessage has
@@ -107,7 +107,7 @@ Commands, sent as an ordinary message:
 | `/compact` | Compress the conversation's context |
 | `/help` | List these commands |
 
-## Settings
+## Settings reference
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -133,7 +133,7 @@ receive fine and answer nothing.
 Rather than ship a send path that cannot be made to work, the channel refuses to
 start off-Mac and says so.
 
-## Not in this version
+## Limits
 
 Group chats, attachments in either direction, and every kind of message
 mutation: tapbacks, edit, unsend, effects, polls, and group management. Those
@@ -146,12 +146,12 @@ not.
 
 **Nothing happens when I message it.** Check the allow-list first — an empty or
 mistyped `allowed_handles` is the common cause, and by design it produces
-silence rather than an error. **Settings → Channels → iMessage** shows whether
+silence rather than an error. **Settings → Messaging Channels → iMessage** shows whether
 the channel is connected and why not.
 
 **It answers its own messages / the conversation never stops.** A self-chat where
 the echo guard is not doing its job — [Messaging yourself](#messaging-yourself)
-explains the mechanism. Turn the channel off in **Settings → Channels →
+explains the mechanism. Turn the channel off in **Settings → Messaging Channels →
 iMessage** to stop it immediately (every cycle is a real turn), and please report
 it: the log records the handle, redacted, the first time it suppresses an echo.
 
@@ -164,3 +164,9 @@ or the gateway is not running on the Messages host.
 
 **The channel never starts and the log says it requires macOS.** Expected on
 Linux or Windows; there is no iMessage there to reach.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

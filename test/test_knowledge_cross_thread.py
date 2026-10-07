@@ -13,13 +13,26 @@ contract.
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 
 import pytest
 
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.store import KnowledgeStore
+
+# Lost-run ceilings for test_writes_from_two_threads_are_serialized.
+# Measured: the whole 8-write call phase took 0.277 s on Backend Tests
+# (Windows) (5) (windows-pytest-progress-5, run 37452342645) and at most
+# 0.262 s over 50 local repeats. A starved Windows runner whose setup phase
+# took 92.6 s against 1.65 s in that measured run is about 56x slower, which
+# puts the same call near 15.5 s: past the store's
+# 10 s busy_timeout. 25 s covers that starved case and is 90x the measured
+# worst. ALL_WRITES_CEILING_S is half the suite's --timeout=120, so a
+# genuine hang fails here by name instead of killing the xdist worker.
+WRITE_LOCK_CEILING_S = 25
+ALL_WRITES_CEILING_S = 60
 
 
 @pytest.fixture()
@@ -29,18 +42,40 @@ def store(tmp_path):
     s.close()
 
 
+# ``close()`` releases only the CALLING thread's connection, so a worker that
+# used ``store.db`` must close it before returning. A connection a pool thread
+# leaves open lives as long as the thread does -- and the pool outlives the
+# test -- so every helper that runs off the main thread ends with this.
+def _on_worker(fn, store):
+    try:
+        return fn()
+    finally:
+        store.close()
+
+
 def _add_item(store: KnowledgeStore, title: str, content: str) -> None:
     now = datetime.utcnow().isoformat()
-    store.db.execute(
-        "INSERT INTO items (id, title, content, item_type, created_at, updated_at)"
-        " VALUES (?, ?, ?, 'note', ?, ?)",
-        (title.lower().replace(" ", "-"), title, content, now, now),
-    )
-    row = store.db.execute("SELECT rowid FROM items WHERE title = ?", (title,)).fetchone()
-    store.db.execute(
-        "INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, '[]')",
-        (row["rowid"], title, content),
-    )
+    conn = store.db
+    # Wrap both INSERTs in one explicit transaction so the writer lock is
+    # acquired once instead of per-statement (isolation_level=None means
+    # autocommit).  This halves lock-contention rounds and makes the
+    # 4-thread concurrent-write test far less sensitive to runner starvation.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT INTO items (id, title, content, item_type, created_at, updated_at)"
+            " VALUES (?, ?, ?, 'note', ?, ?)",
+            (title.lower().replace(" ", "-"), title, content, now, now),
+        )
+        row = conn.execute("SELECT rowid FROM items WHERE title = ?", (title,)).fetchone()
+        conn.execute(
+            "INSERT INTO items_fts (rowid, title, content, tags) VALUES (?, ?, ?, '[]')",
+            (row["rowid"], title, content),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def test_db_property_returns_per_thread_connections(store):
@@ -51,8 +86,11 @@ def test_db_property_returns_per_thread_connections(store):
     seen = {}
 
     def grab(idx):
-        seen[idx] = store.db
-        assert store.db is seen[idx]
+        def body():
+            seen[idx] = store.db
+            assert store.db is seen[idx]
+
+        _on_worker(body, store)
 
     threads = [threading.Thread(target=grab, args=(i,)) for i in range(3)]
     for t in threads:
@@ -69,7 +107,10 @@ def test_worker_thread_query_does_not_raise(store):
     _add_item(store, "Deployment Runbook", "How to deploy the gateway safely.")
 
     def query():
-        return store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"]
+        return _on_worker(
+            lambda: store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"],
+            store,
+        )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         # Before the fix this raised sqlite3.ProgrammingError
@@ -85,7 +126,9 @@ def test_hybrid_retriever_search_from_executor_thread(store):
     retriever = HybridRetriever(store)
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mc-embed-test") as pool:
-        results = pool.submit(retriever.search, "gateway restart", 5).result(timeout=10)
+        results = pool.submit(
+            _on_worker, lambda: retriever.search("gateway restart", 5), store
+        ).result(timeout=10)
 
     assert any(r["id"] == "gateway-restart-guide" for r in results)
 
@@ -94,11 +137,25 @@ def test_writes_from_two_threads_are_serialized(store):
     """WAL + busy_timeout must let concurrent writers succeed, not error."""
 
     def write(n):
-        _add_item(store, f"Doc {n}", f"content {n}")
+        def body():
+            # This worker's own connection only; the store's 10 s default is
+            # left alone. See WRITE_LOCK_CEILING_S for the derivation.
+            store.db.execute(f"PRAGMA busy_timeout={WRITE_LOCK_CEILING_S * 1000}")
+            _add_item(store, f"Doc {n}", f"content {n}")
 
+        _on_worker(body, store)
+
+    start = time.monotonic()
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for f in [pool.submit(write, i) for i in range(8)]:
-            f.result(timeout=15)
+        futures = [pool.submit(write, i) for i in range(8)]
+        done, not_done = wait(futures, timeout=ALL_WRITES_CEILING_S)
+        if not_done:
+            pytest.fail(
+                f"{len(not_done)} of 8 writers still running after "
+                f"{time.monotonic() - start:.1f}s (ceiling {ALL_WRITES_CEILING_S}s)"
+            )
+        for f in done:
+            f.result()
 
     assert store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 8
 
@@ -110,11 +167,14 @@ def test_close_only_releases_calling_threads_connection(store):
     worker_conn_ok = {}
 
     def use_then_signal(barrier):
-        store.db.execute("SELECT 1").fetchone()
-        barrier.wait(timeout=10)  # main thread closes its conn here
-        worker_conn_ok["ok"] = (
-            store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 1
-        )
+        def body():
+            store.db.execute("SELECT 1").fetchone()
+            barrier.wait(timeout=10)  # main thread closes its conn here
+            worker_conn_ok["ok"] = (
+                store.db.execute("SELECT COUNT(*) AS n FROM items").fetchone()["n"] == 1
+            )
+
+        _on_worker(body, store)
 
     barrier = threading.Barrier(2)
     t = threading.Thread(target=use_then_signal, args=(barrier,))
@@ -128,9 +188,9 @@ def test_close_only_releases_calling_threads_connection(store):
 
 
 # ── In-memory graph thread-safety ──
-# The thread-local sqlite fix (above) removed a de-facto guard: previously the
-# shared connection raised sqlite3.ProgrammingError in _keyword_search before
-# _graph_search ran, so the in-memory graph was never traversed cross-thread.
+# Per-thread sqlite connections remove a de-facto guard: a single shared
+# connection raises sqlite3.ProgrammingError in _keyword_search before
+# _graph_search runs, so the in-memory graph is never traversed cross-thread.
 # With per-thread connections, HybridRetriever.search() reaches the graph leg on
 # an mc-embed thread (get_neighbors -> successors/predecessors/nodes) while the
 # event-loop thread mutates the SAME SimpleDiGraph inline (ingest add_entity/

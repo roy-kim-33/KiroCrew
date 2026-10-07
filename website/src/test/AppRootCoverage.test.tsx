@@ -18,7 +18,6 @@ import { setUpdateProgress, sseConnected, sseDisconnected } from '../store/dashb
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => null }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => null }))
 vi.mock('../pages/LogsPage', () => ({ default: () => <div data-testid="logs-page">LogsPage</div> }))
 vi.mock('../pages/DeveloperPage', () => ({ default: () => <div data-testid="developer-page">DeveloperPage</div> }))
@@ -55,6 +54,7 @@ vi.mock('../api/client', () => ({
     applyUpdate: vi.fn().mockResolvedValue({}),
     cancelUpdate: vi.fn().mockResolvedValue({}),
     setAutoUpdate: vi.fn().mockResolvedValue({}),
+    kirocrewConfig: vi.fn().mockResolvedValue({ auto_update: true }),
   },
   isAuthBannerShown: vi.fn(() => false),
   ApiError: class ApiError extends Error {},
@@ -118,6 +118,7 @@ beforeEach(() => {
   vi.mocked(api.applyUpdate).mockResolvedValue({} as never)
   vi.mocked(api.cancelUpdate).mockResolvedValue({} as never)
   vi.mocked(api.setAutoUpdate).mockResolvedValue({} as never)
+  vi.mocked(api.kirocrewConfig).mockResolvedValue({ auto_update: true } as never)
   vi.mocked(api.system).mockResolvedValue({ mem_used_gb: 4, mem_total_gb: 16, cpu_pct: 25, disk_total_gb: 100, disk_free_gb: 60 } as never)
   vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
 })
@@ -210,12 +211,16 @@ describe('App — changelog modal controls', () => {
   it('persists the auto-update preference from the changelog switch', async () => {
     renderShell()
     const dialog = await changelogDialog()
-    const toggle = within(dialog).getByRole('switch', { name: 'Auto-update on restart' })
+    const toggle = await within(dialog).findByRole('switch', { name: 'Update the gateway automatically' })
+    // Held until the saved value has been read.
+    await waitFor(() => expect(toggle).not.toHaveAttribute('aria-disabled'))
     expect(toggle.getAttribute('aria-checked')).toBe('true')
 
+    // The gateway now holds what it was sent, as the re-read after the save shows.
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ auto_update: false } as never)
     fireEvent.click(toggle)
     await waitFor(() => expect(api.setAutoUpdate).toHaveBeenCalledWith(false))
-    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
   })
 })
 
@@ -301,6 +306,28 @@ describe('App — update progress overlay', () => {
     expect(screen.getByText('Page will reconnect when ready…')).toBeInTheDocument()
   })
 
+  it.each(['failed', 'error'] as const)('treats the %s step as terminal', async (step) => {
+    // The apply worker pushes `failed` from its outer handler and `error` from
+    // its per-step handlers (a fast-forward that will not apply, pip refusing
+    // the merged revision). Both must end the overlay with the failure card:
+    // an unrecognised step rendered as a stall until the five-minute stuck
+    // timer, with the spinner still pulsing above the reason.
+    const { store } = await startUpdate()
+    await screen.findByText('Updating Kiro Crew…')
+
+    act(() => { store.dispatch(setUpdateProgress({ step, detail: 'Fast-forward to 9f8202496fcf failed (git merge --ff-only)' })) })
+
+    const card = screen.getByTestId('update-overlay-error')
+    expect(card.textContent).toContain('Fast-forward to 9f8202496fcf failed')
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+    // No step is "active", and the header glyph is the terminal one, not the
+    // in-progress spinner.
+    expect(screen.queryByText('Page will reconnect when ready…')).toBeNull()
+    const icon = screen.getByTestId('update-overlay-step-icon')
+    expect(icon.className).not.toContain('animate-pulse')
+    expect(icon.className).toContain('text-danger')
+  })
+
 })
 
 describe('App — header capsule resource posture', () => {
@@ -351,12 +378,12 @@ describe('App — system metrics segment', () => {
     localStorage.setItem('mc-topbar-metrics', '1')
   })
 
-  it('shows an unavailable pill when the metrics fetch fails, and hides on click', async () => {
+  it('shows an unavailable notice when the metrics fetch fails, and hides on click', async () => {
     vi.mocked(api.system).mockRejectedValue(new Error('probe unreachable'))
     renderWithProviders(<App />, { route: '/chat' })
 
-    const pill = await screen.findByText('metrics unavailable')
-    fireEvent.click(pill)
+    expect(await screen.findByText('metrics unavailable')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'System metrics' }))
     await waitFor(() => expect(localStorage.getItem('mc-topbar-metrics')).toBe('0'))
     expect(screen.queryByText('metrics unavailable')).toBeNull()
   })
@@ -367,10 +394,9 @@ describe('App — system metrics segment', () => {
     } as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    const cpu = await screen.findByTitle('CPU: unavailable')
-    expect(cpu.textContent).toContain('—')
-    expect(screen.getByTitle('Memory: unavailable').textContent).toContain('—')
-    expect(screen.getByTitle('Disk: unavailable').textContent).toContain('—')
+    expect(await screen.findByText('CPU —')).toBeInTheDocument()
+    expect(screen.getByText('MEM —')).toBeInTheDocument()
+    expect(screen.getByText('DSK —')).toBeInTheDocument()
   })
 })
 

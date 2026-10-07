@@ -10,7 +10,7 @@ That is load-bearing rather than untidy. ``notify_slot_closed`` reports a hook
 failure instead of swallowing it, and ``api_chat_slot_delete`` REFUSES the
 dismissal on a false return — deliberately, so a dismissed tab can never outlive
 a still-running worker. Applied to a stale hook the same rule inverts: a slot
-belonging to an uninstalled app can no longer be closed at all, because the hook
+belonging to an uninstalled app cannot be closed at all, because the hook
 that must approve the close belongs to an app that is gone.
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from dashboard_owner_helpers import owner_claims
 
 import kiro_crew.apps.teardown as teardown
 
@@ -102,7 +103,15 @@ class TestUninstallDropsTheHooks:
         }
         request = MagicMock()
         request.match_info = {"name": APP}
-        request.app = {"state": MagicMock()}
+        # No cron service, so the handler's cron step is skipped and this test stays
+        # scoped to hook teardown. A bare MagicMock is not inert here: the handler
+        # would drive a fake removal that raises, and an uninstall whose cron
+        # cleanup raises is refused before anything destructive runs.
+        state = MagicMock()
+        state.crons = None
+        state.owner_id = ""
+        request.app = {"state": state}
+        owner_claims(request)
         request.json = AsyncMock(return_value={})
 
         with (

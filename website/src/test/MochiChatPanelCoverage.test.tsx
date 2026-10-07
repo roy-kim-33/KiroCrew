@@ -226,11 +226,24 @@ describe('ChatPanel lazy history', () => {
     // transcript and no way to notice there is more.
     history = Array.from({ length: 25 }, (_, i) => turn('user', `turn ${i}`, 1700000000000 + i))
     await renderPanel()
-    expect(await screen.findByText('turn 24')).toBeInTheDocument()
+    // `renderPanel` only awaits the mount-time config read, so this is the
+    // panel's very first commit — the auto-load effect (a 150ms `setTimeout`
+    // chain that keeps pulling older turns in while the scroller reports no
+    // overflow) has not had a tick to run yet. That makes this the one point
+    // where "turn 0 is absent" is a fact about the render instead of a race
+    // against the loader: checked after `findByText('turn 24')` below, the
+    // loader chain (10 -> 20 -> 25 turns, two 150ms steps) can already have
+    // finished under load, and the assertion flips from "not yet" to "again
+    // not because it's gone" for the wrong reason.
     expect(screen.queryByText('turn 0')).not.toBeInTheDocument()
-    expect(await screen.findByText('turn 0', {}, { timeout: 5000 })).toBeInTheDocument()
-    // Everything is loaded, so the load-earlier affordance is gone.
-    expect(screen.queryByText(/Load earlier messages/)).not.toBeInTheDocument()
+    expect(await screen.findByText('turn 24')).toBeInTheDocument()
+    // The loader keeps firing on its own timers until every turn is mounted;
+    // wait on that actual condition rather than a fixed timeout guess.
+    await waitFor(() => {
+      expect(screen.getByText('turn 0')).toBeInTheDocument()
+      // Everything is loaded, so the load-earlier affordance is gone.
+      expect(screen.queryByText(/Load earlier messages/)).not.toBeInTheDocument()
+    }, { timeout: 5000 })
   })
 
   it('keeps the reading position steady when the sentinel pulls older turns in', async () => {
@@ -711,7 +724,7 @@ describe('ChatPanel trust scopes', () => {
       fullCommand: 'cat x', baseCommand: 'cat', trustGrantable: true,
     })
     await userEvent.click(await screen.findByRole('button', { name: 'Trust' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Trust all tools' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Trust all tools for this session' }))
     expect(respondApproval).toHaveBeenCalledWith('req-9', 'trust', undefined, true)
     expect(await screen.findByText('Trusted')).toBeInTheDocument()
   })
@@ -806,16 +819,32 @@ describe('ChatPanel pointer feedback', () => {
   })
 })
 
-describe('PinnedSidePanel chip hover', () => {
-  it('withdraws the unpin dot when the pointer leaves the chip', async () => {
+describe('PinnedSidePanel chip unpin control', () => {
+  it('always renders a self-describing unpin control, revealed by CSS not by mount', async () => {
+    // Post-#13818 the unpin control is a real keyboard tab stop: it is ALWAYS in
+    // the DOM (a pin-off button named "Unpin <file>"), and the reveal is a CSS
+    // :hover/:focus-within opacity rule — not a hover-gated React mount — so it
+    // is reachable by keyboard and discoverable by a screen reader. It must be
+    // present without any hover, keep its name after the pointer leaves, and
+    // only unpin on activation.
     const pin = { path: '/home/u/src/a.ts', label: '', pinnedAt: 1 }
     render(
       <PinnedSidePanel pins={[pin]} updatedPaths={new Set()} deletedPaths={new Set()} visible />,
     )
+    const unpin = screen.getByRole('button', { name: 'Unpin a.ts' })
+    expect(unpin).toBeInTheDocument()
+    // Hover / unhover does not add or remove it (CSS handles visibility).
     await userEvent.hover(screen.getByText('a.ts'))
-    expect(screen.getByRole('button', { name: 'Unpin' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Unpin a.ts' })).toBeInTheDocument()
     await userEvent.unhover(screen.getByText('a.ts'))
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Unpin a.ts' })).toBeInTheDocument()
+    // It fires only on activation, never on mere hover. (The control carries
+    // `pointer-events: none` until the CSS :hover/:focus-within reveal, which
+    // happy-dom does not paint, so drive the handler with fireEvent rather than
+    // userEvent's pointer-events-aware click — in a real browser focus/hover
+    // flips it to `pointer-events: auto`, exercised via the harness screenshots.)
     expect(unpinFile).not.toHaveBeenCalled()
+    fireEvent.click(unpin)
+    expect(unpinFile).toHaveBeenCalledWith(pin.path)
   })
 })

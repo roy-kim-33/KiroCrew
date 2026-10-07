@@ -1,4 +1,4 @@
-"""Off-loop DB discipline for the knowledge store (#7078, remedy A of #3057).
+"""Off-loop DB discipline for the knowledge store.
 
 ``scripts/check_sync_io_in_async.py`` rejects a blocking DB call written
 *lexically* inside an ``async def``. It cannot see the same call one frame down:
@@ -13,7 +13,7 @@ These tests pin the discipline from four directions:
 2. the *interprocedural* catch, together with proof that the static gate is
    blind to the very same call -- the two are complementary, not redundant,
 3. the deliberate departure from ``history.py``: ``KIROCREW_DEV_MODE`` alone
-   must NOT arm this store's raise while #7019's 85 recorded on-loop callers
+   must NOT arm this store's raise while 85 recorded on-loop callers
    are outstanding,
 4. a mutation guard, so deleting the check from the accessor fails loudly
    instead of silently disarming everything above.
@@ -27,6 +27,7 @@ import importlib.util
 import inspect
 import textwrap
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -45,7 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> KnowledgeStore:
+def store(tmp_path: Path) -> Iterator[KnowledgeStore]:
     """A store built OFF the loop.
 
     Construction is the one sanctioned on-loop take (``__init__`` wraps its
@@ -54,7 +55,9 @@ def store(tmp_path: Path) -> KnowledgeStore:
     store off-loop so that what it exercises afterwards is exactly one
     deliberate accessor take, not construction noise.
     """
-    return KnowledgeStore(str(tmp_path / "knowledge.db"))
+    s = KnowledgeStore(str(tmp_path / "knowledge.db"))
+    yield s
+    s._close_all_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -69,9 +72,9 @@ class TestOnLoopGuard:
     """The runtime chokepoint: ``KnowledgeStore.db`` flags on-loop entry."""
 
     @pytest.mark.asyncio
-    async def test_on_loop_db_raises_under_strict(self, tmp_path, monkeypatch):
+    async def test_on_loop_db_raises_under_strict(self, tmp_path, monkeypatch, opened):
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         with pytest.raises(OnLoopStoreError):
             st.db  # noqa: B018 - taking the connection is the operation under test
 
@@ -82,28 +85,28 @@ class TestOnLoopGuard:
         assert store.db.execute("SELECT 1").fetchone()[0] == 1
 
     @pytest.mark.asyncio
-    async def test_offloaded_call_is_allowed_under_strict(self, tmp_path, monkeypatch):
+    async def test_offloaded_call_is_allowed_under_strict(self, tmp_path, monkeypatch, opened):
         """The remedy the message names must actually satisfy the guard."""
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         got = await asyncio.to_thread(lambda: st.db.execute("SELECT 1").fetchone()[0])
         assert got == 1
 
     @pytest.mark.asyncio
-    async def test_on_loop_db_warns_in_production_mode(self, tmp_path, monkeypatch, caplog):
+    async def test_on_loop_db_warns_in_production_mode(self, tmp_path, monkeypatch, caplog, opened):
         """Strict off (production): the take proceeds but logs loudly, so a
         mis-wired call-site is never silent. Production must not start raising --
         that would turn a slow query into a failed request."""
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "0")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
             assert st.db.execute("SELECT 1").fetchone()[0] == 1
         assert any("event loop" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_on_loop_warning_is_throttled(self, tmp_path, monkeypatch, caplog):
+    async def test_on_loop_warning_is_throttled(self, tmp_path, monkeypatch, caplog, opened):
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "0")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
             for _ in range(3):
                 st.db.execute("SELECT 1").fetchone()
@@ -136,12 +139,12 @@ class TestInterproceduralCatch:
     )
 
     @pytest.mark.asyncio
-    async def test_sync_helper_one_frame_down_is_caught(self, tmp_path, monkeypatch):
+    async def test_sync_helper_one_frame_down_is_caught(self, tmp_path, monkeypatch, opened):
         """``get_item`` is a plain ``def`` that runs ``self.db.execute(...)``.
         Called from an ``async def`` it runs the busy wait on the loop, and the
         runtime guard is what notices."""
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
 
         async def handler():
             return st.get_item("does-not-exist")
@@ -181,28 +184,30 @@ class TestDevModeDeparture:
     ``history.py``'s guard can arm that branch because every session mutator was
     already offloaded when it landed, so a raise there means genuinely new
     drift. This store still has 85 recorded on-loop callers (the whole of
-    ``.github/sync-io-in-async-baseline.txt``), owned by #7019. Raising on a
+    ``.github/sync-io-in-async-baseline.txt``). Raising on a
     tracked backlog reports it as a regression, and the developer's rational
     response -- unset ``KIROCREW_DEV_MODE`` -- would silence history.py's guard
     too. Pinned so flipping it later is a conscious edit with a failing test.
     """
 
     @pytest.mark.asyncio
-    async def test_dev_mode_alone_warns_but_does_not_raise(self, tmp_path, monkeypatch, caplog):
+    async def test_dev_mode_alone_warns_but_does_not_raise(
+        self, tmp_path, monkeypatch, caplog, opened
+    ):
         monkeypatch.delenv("KIROCREW_STRICT_ON_LOOP_STORE", raising=False)
         monkeypatch.setenv("KIROCREW_DEV_MODE", "1")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
             assert st.db.execute("SELECT 1").fetchone()[0] == 1  # must NOT raise
         assert any("event loop" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
-    async def test_explicit_opt_in_still_raises_under_dev_mode(self, tmp_path, monkeypatch):
+    async def test_explicit_opt_in_still_raises_under_dev_mode(self, tmp_path, monkeypatch, opened):
         """The escape from the departure: a CI job or a discipline test that
         wants the hard failure exports the explicit flag."""
         monkeypatch.setenv("KIROCREW_DEV_MODE", "1")
         monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_STORE", "1")
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         with pytest.raises(OnLoopStoreError):
             st.db  # noqa: B018
 
@@ -220,7 +225,7 @@ class TestSharedSwitchCannotArmThisStore:
     were written to history's fully-offloaded surface. If this store read that
     same switch, the on-loop ``/api/knowledge/stats`` and
     ``/api/knowledge/namespaces`` handlers would raise and 500 the e2e run --
-    a green-looking flag arming a raise on the backlog #7019 owns. The store
+    a green-looking flag arming a raise on the tracked backlog. The store
     therefore reads its OWN switch. Pinned here because the failure only shows
     up in an expensive end-to-end job.
     """
@@ -230,21 +235,23 @@ class TestSharedSwitchCannotArmThisStore:
         assert STORE_STRICT_ENV != STRICT_ENV
 
     @pytest.mark.asyncio
-    async def test_ci_shared_flag_alone_does_not_raise(self, tmp_path, monkeypatch):
+    async def test_ci_shared_flag_alone_does_not_raise(self, tmp_path, monkeypatch, opened):
         """The exact e2e environment: shared flag on, store flag absent."""
         monkeypatch.setenv(STRICT_ENV, "1")
         monkeypatch.delenv(STORE_STRICT_ENV, raising=False)
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         assert st.db.execute("SELECT 1").fetchone()[0] == 1  # must NOT raise
 
     @pytest.mark.asyncio
-    async def test_the_e2e_handler_shapes_survive_the_shared_flag(self, tmp_path, monkeypatch):
+    async def test_the_e2e_handler_shapes_survive_the_shared_flag(
+        self, tmp_path, monkeypatch, opened
+    ):
         """Both shapes the e2e Playwright run exercises against /knowledge: the
         interprocedural one (``get_stats`` -> ``self.db``) and the direct one
         (``store.db.execute``) that the namespaces handler uses."""
         monkeypatch.setenv(STRICT_ENV, "1")
         monkeypatch.delenv(STORE_STRICT_ENV, raising=False)
-        st = await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db"))
+        st = opened(await asyncio.to_thread(KnowledgeStore, str(tmp_path / "k.db")))
         assert isinstance(st.get_stats(), dict)
         st.db.execute(
             "SELECT namespace, COUNT(*) FROM items WHERE status = 'active' GROUP BY namespace"
@@ -253,7 +260,7 @@ class TestSharedSwitchCannotArmThisStore:
     def test_ci_exports_the_shared_flag_not_the_store_flag(self):
         """The premise above, asserted against the real CI config rather than
         assumed. If CI later exports the store switch too, this fails and the
-        narrowing must be re-judged (that is the #7019 completion signal)."""
+        narrowing must be re-judged (that is the completion signal)."""
         ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         setup_py = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
         assert STRICT_ENV in ci and STRICT_ENV in setup_py, (
@@ -267,14 +274,14 @@ class TestSharedSwitchCannotArmThisStore:
 
 
 class TestConstructionOnLoopIsSanctioned:
-    """Construction is the ONE vetted on-loop take (#8231).
+    """Construction is the ONE vetted on-loop take.
 
     ``setup_knowledge_routes()`` reads the gateway's lazy ``knowledge_store``
     property at route registration, before the socket binds, so ``__init__``
     -- schema init, migrations, graph load -- runs on the event-loop thread on
     every launch, by the constructor's documented design (moving that work off
-    the boot path is #8329). Before #8231 the guard warned on every boot for
-    that deliberate take. The constructor now wraps exactly those calls in
+    the boot path is a separate change). The guard would warn on every boot for
+    that deliberate take, so the constructor wraps exactly those calls in
     ``allow_on_loop()``; these tests pin both directions -- construction is
     silent, AND the guard stays fully armed on every path after the block ends.
     """
@@ -287,33 +294,39 @@ class TestConstructionOnLoopIsSanctioned:
         return [r for r in caplog.records if r.name == "kiro_crew.on_loop_db"]
 
     @pytest.mark.asyncio
-    async def test_construction_on_loop_emits_no_warning(self, tmp_path, monkeypatch, caplog):
+    async def test_construction_on_loop_emits_no_warning(
+        self, tmp_path, monkeypatch, caplog, opened
+    ):
         """The boot-time symptom itself: building the store on the loop must
         not log the on-loop diagnostic. (The presence control proving this
         probe is wired lives in ``test_reader_after_construction_still_warns``,
         which sees the same logger fire for a real reader take.)"""
         monkeypatch.setenv(STORE_STRICT_ENV, "0")
         with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
-            KnowledgeStore(str(tmp_path / "k.db"))
+            opened(KnowledgeStore(str(tmp_path / "k.db")))
         assert not self._guard_records(caplog)
 
     @pytest.mark.asyncio
-    async def test_construction_on_loop_does_not_raise_under_strict(self, tmp_path, monkeypatch):
+    async def test_construction_on_loop_does_not_raise_under_strict(
+        self, tmp_path, monkeypatch, opened
+    ):
         """Strict mode must not turn a sanctioned constructor into a boot
         failure -- and the guard must re-arm the instant the block ends."""
         monkeypatch.setenv(STORE_STRICT_ENV, "1")
-        st = KnowledgeStore(str(tmp_path / "k.db"))  # must NOT raise
+        st = opened(KnowledgeStore(str(tmp_path / "k.db")))  # must NOT raise
         with pytest.raises(OnLoopStoreError):
             st.db  # noqa: B018 - the accessor take is the operation under test
 
     @pytest.mark.asyncio
-    async def test_reader_after_construction_still_warns(self, tmp_path, monkeypatch, caplog):
+    async def test_reader_after_construction_still_warns(
+        self, tmp_path, monkeypatch, caplog, opened
+    ):
         """The other mutation direction: the opt-out must not disarm the real
         reader paths. A genuine on-loop take right after construction warns --
         which also proves the suppression left the throttle clock untouched."""
         monkeypatch.setenv(STORE_STRICT_ENV, "0")
         with caplog.at_level("WARNING", logger="kiro_crew.on_loop_db"):
-            st = KnowledgeStore(str(tmp_path / "k.db"))
+            st = opened(KnowledgeStore(str(tmp_path / "k.db")))
             assert not self._guard_records(caplog), "construction itself must stay silent"
             st.get_item("does-not-exist")
         assert any("event loop" in r.message for r in self._guard_records(caplog))
@@ -336,11 +349,18 @@ class TestConstructionOnLoopIsSanctioned:
 
     def test_constructor_wraps_init_in_the_scoped_opt_out(self):
         """Mutation guard: the ``allow_on_loop()`` ``with`` block's body must be
-        EXACTLY the three init calls. Textual-order checks are not enough: they
+        EXACTLY the two init calls. Textual-order checks are not enough: they
         stay green when the calls are dedented out of the block (the likely
-        drift in a later constructor edit), and they cannot see a FOURTH call
+        drift in a later constructor edit), and they cannot see a THIRD call
         joining the block -- which the scoped exemption would silently sanction
         against a ``blocking: true`` rule. AST nesting catches both.
+
+        ``_load_graph`` sits OUTSIDE this block: the
+        graph is materialised by its first reader via ``ensure_graph_loaded``,
+        which runs on a worker thread, so the guard SHOULD be armed for it --
+        reaching the load on the loop is now a real finding, not a sanctioned
+        take. It is asserted absent below so a later edit cannot quietly put a
+        data-scaled scan back on the pre-bind boot path.
         """
         src = textwrap.dedent(inspect.getsource(KnowledgeStore.__init__))
         tree = ast.parse(src)
@@ -369,7 +389,12 @@ class TestConstructionOnLoopIsSanctioned:
                 and func.value.id == "self"
             ), "the sanctioned block must call methods on self only"
             calls.append(func.attr)
-        assert calls == ["_init_schema", "_migrate", "_load_graph"], (
+        assert "_load_graph" not in calls, (
+            "the graph load is back inside the sanctioned block -- that returns a "
+            "data-scaled two-table scan to the pre-bind boot path and un-arms the "
+            "guard for it. It belongs behind ensure_graph_loaded (#8329)."
+        )
+        assert calls == ["_init_schema", "_migrate"], (
             "the sanctioned block's body changed -- a call moved out (re-arming "
             "the guard for it) or joined in (sanctioning NEW on-loop work, which "
             f"needs its own justification): {calls}"

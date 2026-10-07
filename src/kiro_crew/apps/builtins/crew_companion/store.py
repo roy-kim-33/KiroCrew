@@ -335,7 +335,8 @@ class CompanionStore:
                 )
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(serialized, "utf-8")
-            # chmod_safe, not os.chmod: the root AGENTS.md mandates the
+            # chmod_safe, not os.chmod: docs/system-specs/common/platform-compat.md
+            # mandates the
             # platform_compat shim, which is a no-op where POSIX modes mean
             # nothing (Windows) instead of raising or silently misleading.
             chmod_safe(tmp, 0o600)
@@ -496,6 +497,21 @@ class CompanionStore:
                 self._save_locked()
         return {"ok": found}
 
+    def update(self, ident: str, text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("text is required")
+        with self._lock:
+            rows = self._state.reminders.reminders
+            if not any(r.id == ident for r in rows):
+                return {"ok": False}
+            edited = tuple(replace(r, text=cleaned) if r.id == ident else r for r in rows)
+            self._state = replace(
+                self._state, reminders=replace(self._state.reminders, reminders=edited)
+            )
+            self._save_locked()
+        return {"ok": True}
+
     def skip(self, ident: str) -> dict[str, Any]:
         """Push a recurring reminder past its next occurrence. No-op for one-time."""
         with self._lock:
@@ -559,17 +575,11 @@ class CompanionStore:
             # Re-arm ONLY when the interval itself changed, so a shortened interval
             # takes effect now rather than after the old, longer one elapses.
             #
-            # This used to re-arm on EVERY patch, which quietly broke break nudges
-            # altogether: the overlay saves the companion's position through this same
-            # config endpoint, and the companion moves ITSELF (the idle fidget). So
-            # each little hop reset the break countdown, and a companion left alone
-            # postponed its own breaks indefinitely. Measured live: 22 seconds before
-            # a nudge was due, a position write pushed it back out to 269 seconds.
-            #
-            # The app this was ported from never had the bug — it re-arms only on
-            # start, on return from away, and after firing, and reads the interval
-            # lazily at arm time. Gating on a real change keeps the prompt behaviour
-            # that comment wanted without inventing the regression.
+            # Re-arming on EVERY patch breaks break nudges altogether: the overlay
+            # saves the companion's position through this same config endpoint, and
+            # the companion moves ITSELF (the idle fidget), so each little hop would
+            # reset the break countdown and a companion left alone would postpone its
+            # own breaks indefinitely.
             if cfg.break_reminder_mins != before_mins:
                 self._next_break_at = 0.0
         self._last_stats_flush = 0.0

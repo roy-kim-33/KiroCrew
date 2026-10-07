@@ -1,8 +1,8 @@
-"""Startup warm of the SecurityEventLog singleton (#8608).
+"""Startup warm of the SecurityEventLog singleton.
 
 ``SecurityEventLog._init_locked`` runs on whatever thread first calls
 ``sel()``; after init, a non-critical ``log_api_access`` only enqueues to the
-writer thread. Before #8608 that first touch was dodged per call site — 18+
+writer thread. Without the startup warm the first touch is dodged per call site — 18+
 ``asyncio.to_thread`` wrappers across the dashboard handlers — while 250+
 other ``log_api_access`` sites remained candidate first-touch stalls. The
 cause-level fix warms the singleton once, off the loop, in BOTH async server
@@ -13,7 +13,7 @@ These tests pin the three halves of that contract:
 
 * the warm helper genuinely initializes the singleton OFF the event loop
   (real ``SecurityEventLog``, fresh directory, recorded ``_init_locked``
-  thread) — this is the migrated #8523 first-touch property, now asserted at
+  thread) — this is the first-touch property, asserted at
   the startup warm instead of at a per-site hop;
 * a failed warm never raises out of the helper (an SEL init error must not
   keep the gateway from becoming ready);
@@ -108,6 +108,23 @@ def test_warm_sel_singleton_swallows_init_failure(monkeypatch, caplog):
     assert any("SEL startup warm failed" in r.message for r in caplog.records)
 
 
+def _with_call_inlined(src: str, callee) -> str:
+    """*src* with its call to *callee* replaced by *callee*'s source, in place.
+
+    The middleware chain moved out of the entrypoints into a ``server_runtime``
+    installer they call, so the chain's position in the boot is the call's.
+    """
+    import inspect
+
+    start = src.index(f"{callee.__name__}(")
+    depth = 0
+    for end in range(start, len(src)):
+        depth += {"(": 1, ")": -1}.get(src[end], 0)
+        if src[end] == ")" and depth == 0:
+            break
+    return src[:start] + inspect.getsource(callee) + src[end + 1 :]
+
+
 def test_start_paths_warm_sel_singleton_before_ready() -> None:
     """Source guard: both async server startup paths must await
     ``warm_sel_singleton()`` BEFORE publishing readiness, so no handler's
@@ -132,8 +149,12 @@ def test_start_paths_warm_sel_singleton_before_ready() -> None:
         "keep the gateway from becoming ready"
     )
 
+    installers = {
+        "start_dashboard": _srv._install_dashboard_middlewares,
+        "start_api_server": _srv._install_api_middlewares,
+    }
     for fn in (_srv.start_dashboard, _srv.start_api_server):
-        src = inspect.getsource(fn)
+        src = _with_call_inlined(inspect.getsource(fn), installers[fn.__name__])
         warm_at = src.find("await warm_sel_singleton()")
         assert warm_at != -1, f"{fn.__name__} must await warm_sel_singleton()"
         ready_at = src.find("state.ready = True")
@@ -155,7 +176,7 @@ def test_writer_unavailable_fallback_never_writes_on_the_event_loop(tmp_path, mo
 
     ``log()``'s enqueue path falls back to a synchronous ``_flush_batch`` when
     ``_ensure_writer()`` raises (thread/resource exhaustion). With the per-site
-    ``to_thread`` wrappers gone (#8608), that fallback is now reachable ON the
+    ``to_thread`` wrappers gone, that fallback is reachable ON the
     event loop — where its redaction + chain lock + open/write would freeze
     every task the loop serves. So on the loop the event is dropped with a
     warning; off the loop the synchronous write still lands the entry. Either
@@ -194,3 +215,76 @@ def test_writer_unavailable_fallback_never_writes_on_the_event_loop(tmp_path, mo
     finally:
         sel_mod.SecurityEventLog._instance = prior_instance
         sel_mod.SecurityEventLog._initialized = False
+
+
+def test_sel_is_warm_tracks_the_singleton_state(monkeypatch):
+    """The gate ``_audit_denied`` asks before choosing enqueue-vs-hop: false
+    with no instance, false with an instance whose init never completed (a
+    failed warm), true once initialized."""
+    prior_instance = sel_mod.SecurityEventLog._instance
+    try:
+        sel_mod.SecurityEventLog._instance = None
+        assert sel_mod.sel_is_warm() is False
+
+        inst = object.__new__(sel_mod.SecurityEventLog)
+        inst._initialized = False
+        sel_mod.SecurityEventLog._instance = inst
+        assert sel_mod.sel_is_warm() is False, "an allocated-but-uninitialized instance is not warm"
+
+        inst._initialized = True
+        assert sel_mod.sel_is_warm() is True
+    finally:
+        sel_mod.SecurityEventLog._instance = prior_instance
+
+
+def test_audit_denied_hops_off_the_loop_only_when_the_warm_failed(monkeypatch):
+    """The deny path is reached by every refused request. With a warmed
+    singleton it must stay a direct enqueue (no per-call hop). With a
+    FAILED warm the next ``sel()`` runs ``_init_locked`` -- blocking file I/O --
+    on the caller's thread, and the caller here is the event loop: that case
+    must take the hop. Both branches are driven through the real helper with
+    ``sel()`` and ``asyncio.to_thread`` replaced by recorders."""
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard import server as server_mod
+
+    calls: list[str] = []
+
+    class _Log:
+        def log_api_access(self, **kw):
+            calls.append(f"write:{threading.get_ident() == loop_ident}")
+
+    async def _fake_to_thread(fn, *a, **kw):
+        calls.append("hop")
+        return fn(*a, **kw)
+
+    monkeypatch.setattr(server_mod, "sel", lambda: _Log())
+    monkeypatch.setattr(server_mod.asyncio, "to_thread", _fake_to_thread)
+    monkeypatch.setattr(server_mod, "mark_audit_claimed", lambda request: None)
+    # ``get`` reads the request's claims (``audit_actor`` asks for ``app``), as a
+    # real ``web.Request`` mapping does; this one carries none.
+    request = SimpleNamespace(
+        method="POST", path="/api/x", headers={}, get=lambda key, default=None: default
+    )
+    loop_ident = threading.get_ident()
+
+    # Warm succeeded: enqueue inline, no hop.
+    monkeypatch.setattr(server_mod, "sel_is_warm", lambda: True)
+    asyncio.run(server_mod._audit_denied("caller", request, "denied"))
+    assert calls == ["write:True"], calls
+
+    # Warm failed: hop, then write inside the hop.
+    calls.clear()
+    monkeypatch.setattr(server_mod, "sel_is_warm", lambda: False)
+    asyncio.run(server_mod._audit_denied("caller", request, "denied"))
+    assert calls == ["hop", "write:True"], calls  # recorder runs inline; the ORDER is the property
+
+    # Best-effort on both paths: a raising write is swallowed, never a 500.
+    class _Boom:
+        def log_api_access(self, **kw):
+            raise RuntimeError("trust root too short")
+
+    monkeypatch.setattr(server_mod, "sel", lambda: _Boom())
+    for warm in (True, False):
+        monkeypatch.setattr(server_mod, "sel_is_warm", lambda warm=warm: warm)
+        asyncio.run(server_mod._audit_denied("caller", request, "denied"))  # must not raise

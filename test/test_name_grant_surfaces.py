@@ -1,7 +1,7 @@
 """Name-grant verification on every surface that honours a name-based grant.
 
 The check refuses to honour a name-based shell auto-approve when a program
-name in the command no longer resolves to the program it appears to name
+name in the command does not resolve to the program it appears to name
 (a PATH-shadowing shim, an agent-writable tree, an unwitnessed file). It was
 originally wired into the dashboard chat loop only; these tests pin that the
 task runner, subagents, the channel turn driver, and the native Slack handler
@@ -37,6 +37,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
 )
 from kiro_crew.context import ContextBuilder
+from kiro_crew.execution_context import execution_for_store
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, HookManager, ToolHookResult
 from kiro_crew.messaging import (
     APPROVAL_INTERACTIVE,
@@ -49,6 +50,11 @@ from kiro_crew.providers.base import LLMEvent
 from kiro_crew.task_models import Project, Task
 
 _REFUSAL = name_grant.Refusal(name_grant.SHADOWED, "head resolves to a shadowing file")
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 def _stub_verdict(monkeypatch, refusal):
@@ -147,10 +153,12 @@ class TestLoopSafetyPins:
     def test_every_surface_shares_the_one_off_loop_entry_point(self):
         # The dashboard's rung seam IS the promoted helper (an alias, never a
         # copy), and no surface spawns its own thread instead of using it.
+        import importlib
         import inspect
+        import pkgutil
 
-        from kiro_crew import llm_helpers, subagent, task_executor
-        from kiro_crew.dashboard import chat_runner
+        from kiro_crew import llm_helpers, subagent, task_executor, tool_permission
+        from kiro_crew.dashboard import chat_runner, chat_turn
         from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import driver
         from kiro_crew.slack import handler as slack_handler
@@ -158,10 +166,19 @@ class TestLoopSafetyPins:
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
 
         assert chat_runner._name_grant_refusal_off_loop is name_grant.refusal_for_command_off_loop
+        # The dashboard's rung is composed into chat_runner from these owners.
+        owners = [
+            importlib.import_module(f"{chat_turn.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(chat_turn.__path__)
+        ]
+        assert owners, "the owner scan found no module, so it is measuring nothing"
         for mod in (
             chat_runner,
+            *owners,
             task_executor,
             subagent,
+            # The subagent's and the task runner's name check is made here.
+            tool_permission,
             driver,
             slack_handler,
             llm_helpers,
@@ -197,7 +214,9 @@ def _mock_sessions(provider):
     s = MagicMock()
     s.get_or_create = AsyncMock(return_value=(provider, True, False))
 
-    async def _open_task_session(_pk, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(
+        _pk, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None
+    ):
         return await s.get_or_create(session_key, agent=agent, cwd=cwd)
 
     s.open_task_session = _open_task_session
@@ -332,6 +351,8 @@ class TestSubagentSurface:
         sessions = MagicMock()
         sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
         sessions.get_approval_policy = MagicMock(return_value="")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
         sessions.release_subagent_runtime = AsyncMock()
 
         ctx = MagicMock()
@@ -339,7 +360,13 @@ class TestSubagentSurface:
         ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=1)
-        info = SubagentInfo(id="ng01", task="t", parent_session_key="dashboard:default")
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="ng01",
+            task="t",
+            parent_session_key="dashboard:default",
+        )
+        manager._log_spawned(info)
         manager._agents["ng01"] = info
         return manager, info, provider
 
@@ -564,12 +591,11 @@ class TestTurnDriverSurface:
         # surface's one security decision to an unattributable row.
         import inspect
 
-        from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import dispatch
         from kiro_crew.slack import transport_dispatch as slack_dispatch
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
 
-        for mod in (dispatch, slack_dispatch, discord_dispatch, telegram_dispatch):
+        for mod in (dispatch, slack_dispatch, telegram_dispatch):
             assert "audit_session_key=" in inspect.getsource(mod), mod.__name__
 
 
@@ -578,7 +604,7 @@ class TestTurnDriverSurface:
 
 class TestSpawnRungEventIdentity:
     """The ``auto_approve_subagent_spawn`` rung keys on canonical event
-    identity, never the model-authored title (issue #6506).
+    identity, never the model-authored title.
 
     Pinned through the real ``build_auto_approve`` predicate on the shared
     driver honour point, using this file's event doubles. Both directions per

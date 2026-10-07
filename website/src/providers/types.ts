@@ -36,13 +36,29 @@ export interface TokenBreakdown {
 }
 
 export interface NormalizedUsage {
+  /** Session analytics are still refreshing; billing data is already usable. */
+  refreshing?: boolean
   sessions: {
     total: number
     today: UsagePeriod
     thisWeek: UsagePeriod
     thisMonth: UsagePeriod
     avgMsgsPerSession: number
-    dailyHistory: { date: string; sessions: number; messages: number; toolCalls: number }[]
+    /**
+     * Transcripts the path validator refused while scanning the sessions dir
+     * (#6733). On a Windows roaming-profile (UNC) home every transcript is
+     * refused, so a `total` of 0 with a positive count here is the silent
+     * failure the usage page must not render as a confident zero.
+     */
+    refusedTranscripts: number
+    dailyHistory: {
+      date: string
+      sessions: number
+      messages: number
+      toolCalls: number
+      /** Credits billed that local day; absent when the provider does not report per-day spend. */
+      credits?: number
+    }[]
   }
   billing: {
     plan?: string
@@ -96,9 +112,7 @@ export interface AgentBinding {
 
 export interface ProviderLabels {
   sessionProcess: string
-  agentTemplateField: string
   processCountLabel: string
-  warmPoolDescription: string
   configFile: string
   pluginRegistryName: string
   hooksSection: string
@@ -149,8 +163,9 @@ export interface ProviderAdapter {
    *  Distinct from resolveModel, which resolves a specific agent template. */
   resolveDefaultModel(): Promise<string>
   /** The provider-level default reasoning effort for NEW sessions ('' = none,
-   *  i.e. let the model choose). A per-session override always outranks it. */
-  resolveDefaultEffort(): Promise<string>
+   *  i.e. let the model choose). A per-session override always outranks it.
+   *  `readConfig` supplies the gateway config body from a shared query cache. */
+  resolveDefaultEffort(readConfig: () => Promise<unknown>): Promise<string>
 
   fetchUsage(): Promise<NormalizedUsage>
 

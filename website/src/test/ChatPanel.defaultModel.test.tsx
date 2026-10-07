@@ -3,6 +3,7 @@
 // are real role="option" nodes.
 vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -31,14 +32,29 @@ vi.mock('../api/client', () => ({
     updateDashboardConfig: () => Promise.resolve({}),
     tipsStatus: () => Promise.resolve({ enabled_config: true, opted_out: false }),
     tipsFeedback: () => Promise.resolve({ ok: true }),
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
-function wrap(ui: React.ReactElement) {
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
+function wrap(ui: React.ReactElement, sub = 'models') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 const seed = (agent: Record<string, unknown>) =>
@@ -51,7 +67,8 @@ async function openSelect(label: string) {
   const trigger = await screen.findByRole('combobox', { name: label })
   await waitFor(() => expect(trigger).not.toHaveAttribute('data-disabled'))
   fireEvent.click(trigger)
-  return screen.getAllByRole('option')
+  // The settings rail is also a listbox of options; count only the dropdown's.
+  return screen.getAllByRole('option').filter(o => !o.closest('nav'))
 }
 
 /** Assert a SettingsSelect is inert: it stays closed when clicked. */
@@ -59,7 +76,7 @@ async function expectSelectInert(label: string) {
   const trigger = await screen.findByRole('combobox', { name: label })
   await waitFor(() => expect(trigger).toHaveAttribute('data-disabled'))
   fireEvent.click(trigger)
-  expect(screen.queryAllByRole('option')).toHaveLength(0)
+  expect(screen.queryAllByRole('option').filter(o => !o.closest('nav'))).toHaveLength(0)
   return trigger
 }
 

@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-import sys
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -32,9 +31,6 @@ from kiro_crew.history import ConversationLog, transcript_sort_key
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.slack import transport_dispatch
 
-_test_dir = Path(__file__).parent
-if str(_test_dir) not in sys.path:  # pragma: no cover
-    sys.path.insert(0, str(_test_dir))
 _golden = importlib.import_module("test_slack_golden_transcript")
 
 FakeSessions = _golden.FakeSessions
@@ -265,7 +261,11 @@ class TestDTheQuestionIsRecordedBeforeTheAnswer:
     @pytest.fixture(autouse=True)
     def _quiet_agents(self, monkeypatch):
         monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
         monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
 

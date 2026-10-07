@@ -346,6 +346,12 @@ def test_webex_held_env_lock_leaves_legacy_credential_intact(tmp_path, monkeypat
     monkeypatch.setattr(loader, "env_path", lambda: env)
     monkeypatch.setattr(loader, "config_path", lambda: cfg)
     monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+    # A pasted bot_token is checked against the real Webex API before it is
+    # stored (Phase 1.5); stub that verification so the test's lock-contention
+    # scenario never reaches the network.
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(mod, "_validate_webex_token", AsyncMock(return_value=None))
 
     # Simulate a held .env lock: _write_env_updates raises OSError.
     def _write_env_raises(_updates):
@@ -408,6 +414,12 @@ def test_teams_held_env_lock_leaves_legacy_credential_intact(tmp_path, monkeypat
     monkeypatch.setattr(loader, "env_path", lambda: env)
     monkeypatch.setattr(loader, "config_path", lambda: cfg)
     monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
+    # A pasted app_password is checked against Azure AD before it is stored
+    # (client-credentials token exchange); stub that verification so the
+    # test's lock-contention scenario never reaches the network.
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(mod, "_validate_teams_app_credentials", AsyncMock(return_value=None))
 
     # Simulate a held .env lock: asyncio.to_thread(_write_env_updates, ...) raises.
     _orig_to_thread = asyncio.to_thread
@@ -444,7 +456,7 @@ def test_teams_held_env_lock_leaves_legacy_credential_intact(tmp_path, monkeypat
 
 
 def test_teams_config_json_write_failure_leaves_consistent_pair(tmp_path, monkeypatch) -> None:
-    """Teams SET that rotates password+app_id: if _atomic_json_write raises,
+    """Teams SET that rotates password+app_id: if the config write raises,
     .env must be UNTOUCHED — the config-first ordering means a config-write
     failure leaves old-credential + old-metadata, always a consistent pair.
 
@@ -456,7 +468,6 @@ def test_teams_config_json_write_failure_leaves_consistent_pair(tmp_path, monkey
     """
     import json
 
-    import kiro_crew.agent as agent_mod
     import kiro_crew.config.loader as loader
     import kiro_crew.dashboard.handlers.messaging as mod
 
@@ -479,13 +490,12 @@ def test_teams_config_json_write_failure_leaves_consistent_pair(tmp_path, monkey
     monkeypatch.setattr(loader, "config_path", lambda: cfg)
     monkeypatch.setattr(mod, "is_direct_local_request", lambda req: True)
 
-    # _atomic_json_write is imported locally inside the handler function via
-    # `from kiro_crew.agent import _atomic_json_write`.  Patch the source module
-    # so the local import picks up the stub.
-    def _boom(path, data, **kw):
+    # The save writes through ``update_config_locked``, whose file write is the
+    # loader's ``write_config_atomically``; failing THAT is the disk-full.
+    def _boom(*a, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr(agent_mod, "_atomic_json_write", _boom)
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
 
     # Track _write_env_updates calls: with config-first ordering, .env must
     # never be written when the config write fails.
@@ -529,7 +539,7 @@ def test_teams_config_json_write_failure_leaves_consistent_pair(tmp_path, monkey
     # before the handler reached _commit_env().
     assert _write_env_calls == [], (
         "Config-first ordering: _write_env_updates must not be called when "
-        f"_atomic_json_write raises; got calls: {_write_env_calls}"
+        f"the config write raises; got calls: {_write_env_calls}"
     )
 
     # .env must still hold the original password, untouched.
@@ -555,7 +565,7 @@ def test_teams_config_write_failure_preserves_process_only_credential(
     Scenario:
       - os.environ["MICROSOFT_APP_PASSWORD"] = "env-only-pass"  (process-only)
       - .env file has no MICROSOFT_APP_PASSWORD entry at all
-      - _atomic_json_write raises (disk full)
+      - the config.json write raises (disk full)
 
     With config-first ordering: config write fails before _commit_env() is
     called, so os.environ is never mutated by the handler.  The process-only
@@ -563,7 +573,6 @@ def test_teams_config_write_failure_preserves_process_only_credential(
     """
     import json
 
-    import kiro_crew.agent as agent_mod
     import kiro_crew.config.loader as loader
     import kiro_crew.dashboard.handlers.messaging as mod
 
@@ -590,10 +599,10 @@ def test_teams_config_write_failure_preserves_process_only_credential(
     # Plant the credential ONLY in os.environ, not in .env.
     monkeypatch.setenv("MICROSOFT_APP_PASSWORD", "env-only-pass")
 
-    def _boom(path, data, **kw):
+    def _boom(*a, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr(agent_mod, "_atomic_json_write", _boom)
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
 
     async def _mock_validate(*a, **kw):
         return None

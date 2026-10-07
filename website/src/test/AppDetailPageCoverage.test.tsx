@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { consumeChatHandoff, installSoftNavigate, __resetErrorJournalForTests, __resetNavSeamForTests } from '../utils/errorReport'
 
 // The resolved colour mode drives screenshot-set and hero selection, so it has
 // to be switchable per test. `vi.hoisted` keeps the box defined before the mock
@@ -144,7 +145,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
   })
 
   afterEach(() => {
-    delete (window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch
+    __resetErrorJournalForTests()
+    __resetNavSeamForTests()
+    sessionStorage.clear()
   })
 
   // --- Not found / load failure --------------------------------------------
@@ -153,7 +156,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
     renderDetail()
 
     expect(await screen.findByText('App Not Found')).toBeInTheDocument()
-    expect(screen.getByText(`App "${NAME}" not found`)).toBeInTheDocument()
+    // A genuine miss reads as absence, with no error notice: nothing failed.
+    expect(screen.getByText(`"${NAME}" doesn't exist`)).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /back to apps/i }))
     expect(await screen.findByText('apps list')).toBeInTheDocument()
@@ -165,13 +170,21 @@ describe('AppDetailPage — uncovered surfaces', () => {
     listRegistry.mockResolvedValue(null)
     renderDetail()
 
-    expect(await screen.findByText('App Not Found')).toBeInTheDocument()
-    expect(screen.getByText(/Cannot read properties of null/)).toBeInTheDocument()
+    // A load FAILURE is not "not found": the header says so, and the reason
+    // goes through the shared ErrorNotice (with the agent hand-off) plus Retry.
+    expect(await screen.findByText('Failed to load app')).toBeInTheDocument()
+    expect(screen.queryByText('App Not Found')).not.toBeInTheDocument()
+    const notice = screen.getByRole('alert')
+    expect(notice.textContent).toMatch(/Cannot read properties of null/)
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
   })
 
-  it('renders the app even when the registry and system endpoints fail', async () => {
-    // Both are best-effort enrichment, so a failure must degrade to the
-    // installed record rather than taking the page down with it.
+  it('renders the app even when the registry and system endpoints fail, and says so', async () => {
+    // Both are enrichment, so a failure must degrade to the installed record
+    // rather than taking the page down with it — but it is still a failed
+    // request, so the reader is told through the shared notice instead of the
+    // catalog silently reading as empty.
     getApp.mockResolvedValue(installedApp())
     listRegistry.mockRejectedValue(new Error('registry offline'))
     system.mockRejectedValue(new Error('no system info'))
@@ -179,7 +192,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     expect(screen.getByText('Reads your books and explains them.')).toBeInTheDocument()
-    expect(screen.queryByText('registry offline')).not.toBeInTheDocument()
+    const notice = screen.getByRole('alert')
+    expect(notice.textContent).toContain('registry offline')
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
   })
 
   // --- Screenshot gallery + lightbox ---------------------------------------
@@ -188,8 +203,8 @@ describe('AppDetailPage — uncovered surfaces', () => {
     displayName: 'Ledger Lens',
     description: 'Reads your books and explains them.',
     author: 'zezhexu',
-    screenshots: ['/shots/light-one.png', '/shots/light-two.png', '/shots/light-three.png'],
-    screenshotsDark: ['/shots/dark-one.png', '/shots/dark-two.png'],
+    screenshots: ['/app-assets/shots/light-one.png', '/app-assets/shots/light-two.png', '/app-assets/shots/light-three.png'],
+    screenshotsDark: ['/app-assets/shots/dark-one.png', '/app-assets/shots/dark-two.png'],
   }
 
   it('steps through the lightbox with the next and previous controls', async () => {
@@ -278,7 +293,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     expect((screen.getByAltText('Screenshot 1') as HTMLImageElement).getAttribute('src'))
-      .toBe('/shots/dark-one.png')
+      .toBe('/app-assets/shots/dark-one.png')
     // The dark set is shorter, so the third light shot must not leak through.
     expect(screen.queryByAltText('Screenshot 3')).not.toBeInTheDocument()
   })
@@ -298,24 +313,24 @@ describe('AppDetailPage — uncovered surfaces', () => {
         description: 'Reads your books and explains them.',
         // The detail-ratio banner wins over the Browse hero and sizes its own
         // container, so both resolution arms are exercised here.
-        heroImageDetail: '/hero/detail-light.png',
-        heroImage: '/hero/browse-light.png',
+        heroImageDetail: '/app-assets/hero/detail-light.png',
+        heroImage: '/app-assets/hero/browse-light.png',
       },
     }))
     renderDetail()
     await loaded()
 
-    const hero = document.querySelector('img[src="/hero/detail-light.png"]') as HTMLImageElement
+    const hero = document.querySelector('img[src="/app-assets/hero/detail-light.png"]') as HTMLImageElement
     expect(hero).not.toBeNull()
     expect(hero.parentElement?.className).toContain('aspect-[25/6]')
-    expect(document.querySelector('img[src="/hero/browse-light.png"]')).toBeNull()
+    expect(document.querySelector('img[src="/app-assets/hero/browse-light.png"]')).toBeNull()
 
     fireEvent.error(hero)
     // #6864: the terminal state is now an UNMOUNTED banner. The fallback
     // candidate here is the identical URL (no registry row, so the local art
     // already won the precedence), nothing is retried, and no empty bordered
     // box is left where the banner was.
-    expect(document.querySelector('img[src="/hero/detail-light.png"]')).toBeNull()
+    expect(document.querySelector('img[src="/app-assets/hero/detail-light.png"]')).toBeNull()
     expect(document.querySelector('.aspect-\\[25\\/6\\]')).toBeNull()
   })
 
@@ -339,12 +354,24 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(log.textContent).toContain('installing dependencies')
     expect(screen.getByText('pip exploded')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: /fix with ai/i }))
-
-    const launch = (window as Window & { __mc_chat_launch?: { message: string } }).__mc_chat_launch
-    expect(launch?.message).toContain('installing dependencies')
-    expect(launch?.message).toContain(`app-sources/${NAME}/`)
-    expect(await screen.findByText('chat page')).toBeInTheDocument()
+    // The hand-off is the shared ErrorNotice's "Ask the agent", not a bespoke
+    // button: the failed headline and the page banner both resolve the journal
+    // entry `reportInstallFailure` wrote, so the staged prompt carries the log
+    // tail the old button used to paste by hand.
+    const navigated: string[] = []
+    installSoftNavigate(to => { navigated.push(to) })
+    try {
+      const [handoff] = screen.getAllByRole('button', { name: /ask the agent/i })
+      expect(handoff).toBeInTheDocument()
+      fireEvent.click(handoff)
+      const prompt = consumeChatHandoff()
+      expect(prompt).toContain('pip exploded')
+      expect(prompt).toContain('installing dependencies')
+      expect(prompt).toContain('/api/apps/registry/install-stream')
+      expect(navigated).toEqual(['/chat'])
+    } finally {
+      __resetNavSeamForTests()
+    }
   })
 
   it('closes the install log once a successful install has landed', async () => {
@@ -473,6 +500,30 @@ describe('AppDetailPage — uncovered surfaces', () => {
     }
   })
 
+  it('shows no checkmark when the resolved-shell copy fails outright', async () => {
+    // Both clipboard layers fail: writeText rejects, and jsdom's execCommand
+    // (no real backing implementation) reports false via the shared helper's
+    // fallback — the boolean-gated confirmation must never fire.
+    listRegistry.mockResolvedValue({ apps: [registryRow()], serverPlatform: { os: 'darwin', arch: 'arm64' } })
+    installFromRegistryStream.mockResolvedValue({
+      needsClientInstall: true,
+      clientInstall: { shell: 'brew install lens' },
+    })
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+      configurable: true,
+    })
+    renderDetail()
+    await loaded()
+
+    fireEvent.click(screen.getByRole('button', { name: /install/i }))
+    const copy = await screen.findByRole('button', { name: 'Copy command' })
+
+    fireEvent.click(copy)
+    await waitFor(() => expect(copy).toBeInTheDocument())
+    expect(copy.querySelector('.lucide-check')).toBeNull()
+  })
+
   // --- Trust consent retry -------------------------------------------------
 
   it('opens the consent modal when the install REJECTS with the denial code', async () => {
@@ -565,10 +616,40 @@ describe('AppDetailPage — uncovered surfaces', () => {
     renderDetail()
     await loaded()
 
-    fireEvent.click(screen.getByRole('button', { name: /enable/i }))
-    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME))
+    fireEvent.click(screen.getByRole('button', { name: /^enable$/i }))
+    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, false))
     await waitFor(() => expect(changed.count()).toBeGreaterThan(0))
     changed.stop()
+  })
+
+  it('confirms pending session approval from the detail disclosure', async () => {
+    getApp.mockResolvedValue(installedApp({ enabled: false, sessionApprovalConsentPending: true }))
+    renderDetail()
+    await loaded()
+
+    const consentButton = screen.getByRole('button', { name: 'Enable and allow chat control' })
+    expect(screen.queryByRole('button', { name: /^enable$/i })).not.toBeInTheDocument()
+    fireEvent.click(consentButton)
+    // One ceremony on every path: the click restates the grant in a dialog and
+    // nothing is enabled until it is confirmed there.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/Allow .* to control your chats\?/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/Can send messages and choose response options/)).toBeInTheDocument()
+    expect(enableApp).not.toHaveBeenCalled()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Enable and allow chat control' }))
+    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, true))
+  })
+
+  it('cancelling the consent dialog enables nothing', async () => {
+    getApp.mockResolvedValue(installedApp({ enabled: false, sessionApprovalConsentPending: true }))
+    renderDetail()
+    await loaded()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Enable and allow chat control' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(enableApp).not.toHaveBeenCalled()
   })
 
   it('syncs a gateway-managed app that has no update waiting', async () => {
@@ -579,6 +660,46 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(screen.queryByRole('button', { name: /^update$/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /sync/i }))
     await waitFor(() => expect(updateApp).toHaveBeenCalledWith(NAME))
+  })
+
+  it('says the app is disabled pending consent when an update widens the grant', async () => {
+    getApp
+      .mockResolvedValueOnce(installedApp())
+      .mockResolvedValueOnce(installedApp({
+        enabled: false,
+        sessionApprovalConsentPending: true,
+      }))
+    // The backend left the app disabled because the new version newly asks for
+    // session control; a generic "updated" toast would report success over an
+    // app that just stopped running.
+    updateApp.mockResolvedValue({ ok: true, notice: 'session_approval_reconsent' })
+    renderDetail()
+    await loaded()
+
+    fireEvent.click(screen.getByRole('button', { name: /sync/i }))
+    const notice = await screen.findByText(/newly asks to control your chats/)
+    expect(notice).toHaveTextContent('Review the permission on this page before enabling it.')
+    expect(screen.getByRole('button', { name: 'Enable and allow chat control' })).toBeInTheDocument()
+    expect(screen.queryByText(/from the registry\./)).not.toBeInTheDocument()
+    // Warn-styled, not the green success box: the text says the app is disabled.
+    const box = notice.closest('[role="status"]')
+    expect(box).not.toBeNull()
+    expect(box?.className).toContain('bg-warn-subtle')
+    expect(box?.className).not.toContain('bg-ok')
+  })
+
+  it('restores the consent warning after leaving and reopening the page', async () => {
+    getApp.mockResolvedValue(installedApp({
+      enabled: false,
+      sessionApprovalConsentPending: true,
+    }))
+
+    renderDetail()
+    await loaded()
+
+    const notice = await screen.findByText(/newly asks to control your chats/)
+    expect(notice).toHaveTextContent('Review the permission on this page before enabling it.')
+    expect(notice.closest('[role="status"]')).not.toBeNull()
   })
 
   it('reports a failed sync inline and lets the user dismiss it', async () => {
@@ -593,7 +714,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
     // hand-off alongside it.
     expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText('git conflict')).not.toBeInTheDocument()
   })
 
@@ -627,6 +748,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     expect(screen.getByText('Built-in')).toBeInTheDocument()
+    expect(screen.getByText('Built-in · kirocrew')).toBeInTheDocument()
     expect(screen.getByText('Disabled')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /enable/i })).toBeInTheDocument()
     // Stated in text, not only in a hover title: a tooltip is unreachable by
@@ -713,6 +835,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
           cron: true,
           network: true,
           memory: 'read',
+          sessionApproval: true,
         },
         mcpServers: {
           ledgerd: {
@@ -744,6 +867,17 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(screen.getByText('Cron: yes')).toBeInTheDocument()
     expect(screen.getByText('Network: yes')).toBeInTheDocument()
     expect(screen.getByText(/Memory:/)).toBeInTheDocument()
+    expect(screen.getByText(/Can send messages and choose response options in your chats/)).toBeInTheDocument()
+    expect(screen.getByText('Chat approval modes it can set')).toBeInTheDocument()
+    // Each mode carries the picker's gloss, so "Trust" here cannot be read as
+    // the consent verb.
+    expect(screen.getByText(/checks with you before doing anything/)).toBeInTheDocument()
+    expect(screen.getByText('sessionApproval')).toBeInTheDocument()
+    expect(screen.getByText('Normal')).toBeInTheDocument()
+    expect(screen.getByText('Reads')).toBeInTheDocument()
+    expect(screen.getByText('Trust (chat mode)')).toBeInTheDocument()
+    // YOLO is process-global and dashboard-only, so it is not offered to apps.
+    expect(screen.queryByText('YOLO')).toBeNull()
 
     expect(screen.getByText('MCP Servers')).toBeInTheDocument()
     expect(screen.getByText('ledgerd')).toBeInTheDocument()

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -39,6 +40,11 @@ SPEC = importlib.util.spec_from_file_location("ratchet_scope", SCRIPT)
 assert SPEC and SPEC.loader
 scope = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(scope)
+
+
+#: Config a ``git -c ...`` that ran the suite (a pre-push hook) exports to its children.
+#: git reads it after ``GIT_CONFIG_COUNT``, so it would override any pin set there.
+_GIT_COMMAND_LINE_CONFIG = ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT")
 
 
 def _fixture_git_env() -> dict[str, str]:
@@ -64,6 +70,7 @@ def _fixture_git_env() -> dict[str, str]:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
     }
+    env.pop("GIT_CONFIG_PARAMETERS", None)  # see _GIT_COMMAND_LINE_CONFIG
     count = int(env["GIT_CONFIG_COUNT"])
     env[f"GIT_CONFIG_KEY_{count}"] = "init.templateDir"
     env[f"GIT_CONFIG_VALUE_{count}"] = ""
@@ -90,22 +97,36 @@ def _commit_file(repo: Path, name: str, message: str) -> None:
     _git(repo, "commit", "-m", message)
 
 
-def _repo_with_diverged_feature(tmp_path: Path) -> Path:
-    """One base repo both shapes start from.
+def _build_repo_with_diverged_feature(repo: Path) -> None:
+    """Populate ``repo`` with the one base shape every test in this module starts
+    from.
 
     ``main`` gains ``mainline.txt`` AFTER ``feature`` branches off with its own
     ``feature.py``, so the two sides of every merge below differ and a wrong
     parent choice shows up in the returned path set, not just the label.
     """
-    repo = tmp_path / "repo"
-    repo.mkdir()
     _git(repo, "init", "-b", "main", ".")
     _commit_file(repo, "base.txt", "base")
     _git(repo, "checkout", "-b", "feature")
     _commit_file(repo, "feature.py", "the change under judgment")
     _git(repo, "checkout", "main")
     _commit_file(repo, "mainline.txt", "someone else's change, landed after the branch point")
-    return repo
+
+
+@pytest.fixture(scope="session")
+def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the diverged-feature repo once per session; ``repo`` copies it per test.
+
+    Six git subprocesses (~2-3s) would otherwise be paid on every one of the 23
+    tests in this module. Session scope is safe here because the template is
+    never handed to a test, only copied from via ``shutil.copytree`` -- so a
+    test that adds a commit, merges, or moves a branch cannot reach another's
+    copy.
+    """
+    template = tmp_path_factory.mktemp("ratchet-scope-seed") / "repo"
+    template.mkdir()
+    _build_repo_with_diverged_feature(template)
+    return template
 
 
 def _set_origin_main(repo: Path) -> None:
@@ -115,7 +136,7 @@ def _set_origin_main(repo: Path) -> None:
 
 
 @pytest.fixture()
-def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _repo_template: Path) -> Path:
     # The fixture's own git calls build a scrubbed env per call, but the
     # RESOLVER under test runs git with the ambient process environment: an
     # exported GIT_DIR (pytest run from a git hook, `git rebase --exec`,
@@ -123,9 +144,14 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # repository. Delete the whole location family -- monkeypatch restores it
     # after the test -- using the same canonical list the production env
     # builder strips.
-    for var in _GIT_LOCATION_VARS:
+    for var in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
         monkeypatch.delenv(var, raising=False)
-    fixture_repo = _repo_with_diverged_feature(tmp_path)
+    fixture_repo = tmp_path / "repo"
+    shutil.copytree(_repo_template, fixture_repo)
+    # A copied checkout reads as "unstaged changes" on Windows (fresh inode/ctime
+    # invalidate the index stat cache); nothing in the template is uncommitted, so
+    # this changes no content and only re-stats the index.
+    _git(fixture_repo, "reset", "--hard", "HEAD")
     # The module runs git with cwd=ROOT; retarget it at the synthetic repo.
     monkeypatch.setattr(scope, "ROOT", fixture_repo)
     return fixture_repo
@@ -284,6 +310,85 @@ class TestWholeTreeOverride:
         )
 
 
+class TestDirtyTree:
+    """``added_lines`` must describe the file state the consuming gates scan.
+
+    The merge-ref ratchets read violations from the WORKING TREE. On a tree
+    with uncommitted edits, an added set numbered by HEAD's copy of a file and
+    a violation numbered by the working-tree copy can collide: a pre-existing
+    line shifted by an uncommitted insert lands on a line number the HEAD diff
+    counts as added, and the gate fails on bytes that pass once committed.
+    These tests pin the three-dot label's diff to base-to-working-tree, and pin
+    that the base stays the MERGE-BASE rather than the base tip.
+    """
+
+    def test_uncommitted_edits_are_in_the_added_set(self, repo: Path) -> None:
+        _git(repo, "checkout", "feature")
+        _set_origin_main(repo)
+        (repo / "feature.py").write_text("feature.py\nuncommitted\n", encoding="utf-8")
+
+        added = scope.added_lines("origin/main...HEAD")
+
+        assert added is not None
+        assert 2 in added["feature.py"]
+
+    def test_a_shifted_preexisting_line_is_not_counted_as_added(self, repo: Path) -> None:
+        # The reproduction from the comment-history gate: `victim.py` exists on
+        # the base with a line the baseline already records, the branch appends
+        # committed lines below it, and an uncommitted insert ABOVE it shifts
+        # the recorded line onto a number the base..HEAD diff counts as added.
+        # The added set must describe the working tree, where that line is old.
+        (repo / "victim.py").write_text("recorded = 1\n", encoding="utf-8")
+        _git(repo, "add", "victim.py")
+        _git(repo, "commit", "-m", "base file with a recorded line")
+        _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        _git(repo, "checkout", "-b", "topic")
+        (repo / "victim.py").write_text(
+            "recorded = 1\nadded_a = 2\nadded_b = 3\n", encoding="utf-8"
+        )
+        _git(repo, "add", "victim.py")
+        _git(repo, "commit", "-m", "append two lines below the recorded one")
+        # Uncommitted: insert two lines above. The recorded line now sits at
+        # working-tree line 3, a number inside HEAD's added range {2, 3}.
+        (repo / "victim.py").write_text(
+            "wip_a = 0\nwip_b = 0\nrecorded = 1\nadded_a = 2\nadded_b = 3\n", encoding="utf-8"
+        )
+
+        added = scope.added_lines("origin/main...HEAD")
+
+        assert added is not None
+        assert 3 not in added["victim.py"]
+        assert {1, 2}.issubset(added["victim.py"])
+
+    def test_the_base_is_the_merge_base_not_the_base_tip(self, repo: Path) -> None:
+        # main rewrites base.txt AFTER the branch point. A diff against the
+        # base TIP would count the working tree's older copy of base.txt as
+        # this change's added lines; the merge-base diff sees no edit there.
+        _git(repo, "checkout", "main")
+        (repo / "base.txt").write_text("rewritten on main\n", encoding="utf-8")
+        _git(repo, "add", "base.txt")
+        _git(repo, "commit", "-m", "rewrite base.txt on main after the branch point")
+        _set_origin_main(repo)
+        _git(repo, "checkout", "feature")
+        (repo / "feature.py").write_text("feature.py\nuncommitted\n", encoding="utf-8")
+
+        added = scope.added_lines("origin/main...HEAD")
+
+        assert added is not None
+        assert "base.txt" not in added
+        assert 2 in added["feature.py"]
+
+    def test_a_clean_tree_matches_the_head_diff(self, repo: Path) -> None:
+        # CI checks out a clean tree; the working-tree diff must be identical
+        # to the committed one there, so this change is invisible to CI.
+        _git(repo, "checkout", "feature")
+        _set_origin_main(repo)
+
+        added = scope.added_lines("origin/main...HEAD")
+
+        assert added == {"feature.py": {1}}
+
+
 class TestExplicitBase:
     """The env-base family's entry points: an EXPLICIT ref in, shared parsing out.
 
@@ -383,6 +488,38 @@ class TestExplicitBase:
 
         assert scope.resolve_base("main") == "main"
 
+    def test_the_fallback_announces_that_it_degraded(
+        self, repo: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A verdict computed against the tip must not look like one from the merge base.
+
+        The fallback answers a question it cannot answer exactly, and the pair
+        (exact answer, degraded answer) is indistinguishable in every gate's
+        report. So the degradation is stated where the gates already print, as a
+        ``warning`` so CI surfaces it as an annotation.
+        """
+        _git(repo, "checkout", "--orphan", "detached")
+        _git(repo, "commit", "-m", "unrelated root")
+
+        scope.resolve_base("main")
+
+        out = capsys.readouterr().out
+        assert "::warning::" in out
+        assert "base TIP" in out
+
+    def test_the_merge_base_path_announces_too(
+        self, repo: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Silence on success would make a lost announcement look like a clean run."""
+        _git(repo, "checkout", "feature")
+
+        resolved = scope.resolve_base("main")
+
+        out = capsys.readouterr().out
+        assert "::notice::" in out
+        assert resolved in out
+        assert "::warning::" not in out
+
 
 class TestParseAddedLines:
     """The text-level parser, reachable without a repository."""
@@ -427,3 +564,216 @@ def test_env_base_gates_delegate_to_the_shared_plumbing() -> None:
         source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert "ratchet_scope.py" in source, f"{name} no longer uses the shared plumbing"
         assert r"\+(\d+)(?:,(\d+))?" not in source, f"{name} grew a private hunk parser back"
+
+
+# ── fork-aware helpers (change_merge_base / change_files / show_at) ────
+
+
+def _drop_ambient_git_location(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The helpers under test run git with the ambient env, so an exported ``GIT_DIR``
+    or ``GIT_INDEX_FILE`` (pytest run from a git hook) would answer for the wrong
+    repository, and an exported ``git -c`` config would change what they read. Delete
+    both, as the ``repo`` fixture above does."""
+    for var in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
+        monkeypatch.delenv(var, raising=False)
+
+
+def assert_fixture_ignores_ambient_git(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fixture: str,
+) -> None:
+    """Build *fixture* under an inherited ``GIT_INDEX_FILE`` and a ``GIT_TEMPLATE_DIR``
+    whose post-commit hook writes a marker: the foreign index stays untouched and the
+    hook never runs. A commit on the scrubbed env with only the template's hooks put
+    back proves the hook would run on this host, so the absence means something."""
+    template = tmp_path / "template"
+    (template / "hooks").mkdir(parents=True)
+    marker = tmp_path / "hook-ran"
+    hook = template / "hooks" / "post-commit"
+    # LF on every host: Git for Windows' sh would read a CRLF line's redirect target as
+    # "hook-ran\r" and the marker would never appear under its real name.
+    hook.write_text(
+        f'#!/bin/sh\necho ran > "{marker.as_posix()}"\n', encoding="utf-8", newline="\n"
+    )
+    hook.chmod(0o755)
+    index = tmp_path / "foreign-index"
+    index.write_bytes(b"not an index")
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(template))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+    hooks = (template / "hooks").as_posix()
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.hooksPath'='{hooks}'")
+    scrubbed = _fixture_git_env()
+    assert "GIT_INDEX_FILE" not in scrubbed, "the fixture env keeps a foreign index"
+    assert "GIT_CONFIG_PARAMETERS" not in scrubbed, "the fixture env keeps git -c options"
+    request.getfixturevalue(fixture)
+    # The helpers under test read the ambient env: the fixture must have dropped both.
+    ambient = sorted({*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG} & set(os.environ))
+    assert not ambient, f"the fixture left {ambient} for the helpers under test"
+    assert index.read_bytes() == b"not an index", "a fixture git call used the foreign index"
+    assert not marker.exists(), "a fixture commit ran an inherited template hook"
+    copied = [path for path in tmp_path.rglob("post-commit") if template not in path.parents]
+    assert not copied, f"git init copied the inherited template's hook: {copied}"
+    control = tmp_path / "control"
+    control.mkdir()
+    env = _fixture_git_env()
+    env["GIT_TEMPLATE_DIR"] = str(template)
+    count = int(env["GIT_CONFIG_COUNT"])  # undo the scrubbed env's core.hooksPath pin
+    env[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    env[f"GIT_CONFIG_VALUE_{count}"] = ".git/hooks"
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    for argv in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "control"]):
+        subprocess.run(["git", *argv], cwd=control, env=env, check=True, capture_output=True)
+    assert marker.exists(), "the inherited hook never runs here, so this proves nothing"
+
+
+class _RepoHelper:
+    """A tiny ``Repo`` wrapper holding a ``git(*argv)`` runner so a fixture can keep both."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def git(self, *argv: str) -> str:
+        # The scrubbed fixture env: no inherited location, template hooks or identity.
+        return _git(self.root, *argv)
+
+    def __truediv__(self, name: str) -> Path:
+        return self.root / name
+
+
+class TestChangeMergeBase:
+    """The change-shaped base resolver, for a per-file comparison that must handle a
+    forked ``origin`` and a shallow CI checkout.
+    """
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        root = tmp_path / "repo"
+        root.mkdir()
+        repo = _RepoHelper(root)
+        (root / "a.txt").write_text("one\n", encoding="utf-8")
+        repo.git("init", "-q")
+        repo.git("checkout", "-q", "-b", "main")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "base")
+        repo.git("checkout", "-q", "-b", "change")
+        (root / "b.txt").write_text("two\n", encoding="utf-8")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "add b.txt")
+        return repo
+
+    def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
+        assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")
+
+    def test_the_local_base_branch_is_used_when_nothing_else_resolves(
+        self, repo: _RepoHelper
+    ) -> None:
+        base, how = scope.change_merge_base(cwd=repo.root, env={})
+        assert base == repo.git("rev-parse", "main") and "main" in how
+
+    def test_a_fork_s_stale_origin_loses_to_a_newer_upstream(self, repo: _RepoHelper) -> None:
+        # upstream/main picks up a commit origin/main has not (the fork lags).
+        repo.git("checkout", "-q", "main")
+        stale_main = repo.git("rev-parse", "main")
+        (repo / "c.txt").write_text("three\n", encoding="utf-8")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "merged upstream")
+        new_main = repo.git("rev-parse", "main")
+        # change rebases onto the new main so its merge-base with upstream/main is new_main.
+        repo.git("checkout", "-q", "change")
+        repo.git("rebase", "-q", "main")
+        repo.git("update-ref", "refs/remotes/origin/main", stale_main)
+        repo.git("update-ref", "refs/remotes/upstream/main", new_main)
+        base, how = scope.change_merge_base(cwd=repo.root, env={})
+        assert base == new_main and "upstream/main" in how
+
+    def test_the_env_override_wins_and_an_unresolvable_value_is_rejected(
+        self, repo: _RepoHelper
+    ) -> None:
+        change = repo.git("rev-parse", "change")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"FLAKE_RATCHET_BASE": "change"})
+        assert base == change and "FLAKE_RATCHET_BASE" in how
+        assert (
+            scope.change_merge_base(cwd=repo.root, env={"FLAKE_RATCHET_BASE": "no-such-ref"})[0]
+            is None
+        )
+
+    def test_a_pull_request_merge_commit_s_first_parent_is_the_base(
+        self, repo: _RepoHelper
+    ) -> None:
+        before = repo.git("rev-parse", "main")
+        repo.git("checkout", "-q", "main")
+        repo.git("merge", "-q", "--no-ff", "-m", "merge", "change")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"GITHUB_BASE_REF": "main"})
+        assert base == before and "first parent" in how
+
+    def test_a_push_event_uses_the_first_parent_too(self, repo: _RepoHelper) -> None:
+        before = repo.git("rev-parse", "HEAD")
+        (repo / "a.txt").write_text("edited\n", encoding="utf-8")
+        repo.git("commit", "-q", "-am", "another")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"GITHUB_EVENT_NAME": "push"})
+        assert base == before and "push" in how
+
+    def test_an_unreadable_merge_base_returns_none(self, tmp_path: Path, monkeypatch) -> None:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        root = tmp_path / "bare"
+        root.mkdir()
+        assert scope.change_merge_base(cwd=root, env={})[0] is None
+
+
+class TestChangeFilesAndShowAt:
+    """``change_files`` reports (base path, now path) for each file the working tree
+    changes against *base*, and ``show_at`` reads a file's bytes at that base."""
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        root = tmp_path / "repo"
+        root.mkdir()
+        repo = _RepoHelper(root)
+        (root / "a.txt").write_text("one\n", encoding="utf-8")
+        (root / "b.txt").write_text("two\n", encoding="utf-8")
+        (root / "to_delete.txt").write_text("gone\n", encoding="utf-8")
+        repo.git("init", "-q")
+        repo.git("checkout", "-q", "-b", "main")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "base")
+        repo.git("checkout", "-q", "-b", "change")
+        return repo
+
+    def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
+        assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")
+
+    def _base(self, repo: _RepoHelper) -> str:
+        return repo.git("rev-parse", "main")
+
+    def test_adds_deletes_renames_copies_and_untracked_are_paired_right(
+        self, repo: _RepoHelper
+    ) -> None:
+        # one of each kind that change_files pairs: modify, rename, delete, add, untracked.
+        (repo / "a.txt").write_text("edited\n", encoding="utf-8")  # modify
+        repo.git("mv", "b.txt", "c.txt")  # rename
+        (repo / "e.txt").write_text("tracked add\n", encoding="utf-8")
+        repo.git("add", "e.txt")  # tracked add
+        repo.git("rm", "-q", "to_delete.txt")  # delete
+        (repo / "untracked.txt").write_text("outside git\n", encoding="utf-8")  # untracked
+        pairs = scope.change_files(self._base(repo), cwd=repo.root)
+        assert ("a.txt", "a.txt") in pairs
+        assert ("b.txt", "c.txt") in pairs
+        assert ("to_delete.txt", None) in pairs
+        assert (None, "e.txt") in pairs
+        assert (None, "untracked.txt") in pairs
+
+    def test_show_at_reads_bytes_at_the_base_and_returns_none_for_absent(
+        self, repo: _RepoHelper
+    ) -> None:
+        assert scope.show_at(self._base(repo), "a.txt", cwd=repo.root) == "one\n"
+        assert scope.show_at(self._base(repo), "nope.txt", cwd=repo.root) is None

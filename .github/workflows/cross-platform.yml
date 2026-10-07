@@ -12,7 +12,11 @@ name: Cross-Platform Portability
 # Scope: `src/kiro_crew/**/*.py`, excluding the vendored tree (not ours to fix),
 # tests (they may legitimately assert POSIX behaviour behind a skip marker),
 # and `platform_compat.py` itself -- that module's whole job is to name the
-# os-specific primitives everything else routes through.
+# os-specific primitives everything else routes through. Its siblings
+# `platform_owner_compat.py` and `platform_lock_compat.py` hold POSIX owner and
+# lock primitives too but ARE scanned like any other module, so a PR that adds
+# a line matching a rule there (an `os.getuid` call, say) needs the
+# `posix-only-approved` label.
 #
 # The test exclusion has to be spelled out as a pathspec, not assumed from the
 # `test/` tree living outside `src/`: ~120 test modules ship INSIDE the package
@@ -36,7 +40,7 @@ concurrency:
 jobs:
   cross-platform:
     name: Cross-Platform Portability
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

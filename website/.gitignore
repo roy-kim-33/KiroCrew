@@ -1,5 +1,9 @@
 node_modules
 dist
+# A build's scratch and swapped-aside trees (scripts/publish-dist.mjs).
+.dist*.next-*
+.dist*.ready-*
+.dist*.prev-*
 build
 coverage
 *.tsbuildinfo
@@ -10,6 +14,10 @@ coverage
 # true, so it carries the en-XA pseudolocale catalog and dev-only tooling. The bare
 # `dist` rule above does not cover it.
 dist-dev
+
+# Storybook static build (`npm run build-storybook`) and its dev log.
+storybook-static
+*storybook.log
 
 # Electron
 electron/dist

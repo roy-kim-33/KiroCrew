@@ -18,6 +18,7 @@ import logging
 
 import pytest
 
+from kiro_crew.platform import governance
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance import (
     CAPABILITY,
@@ -28,6 +29,7 @@ from kiro_crew.platform.governance import (
     SIGNATURE_UNSIGNED,
     SIGNATURE_UNVERIFIED,
     SIGNATURE_VERIFIED,
+    TIER_ENV,
     Bind,
     CapabilityGate,
     GovernanceCeiling,
@@ -39,6 +41,7 @@ from kiro_crew.platform.governance import (
     assert_governance_floor,
     assert_policy_signature_satisfied,
     compose_profiles,
+    compose_tier_ladder,
     deny_all_profile,
     load_security_policy,
     mcp_title_to_ref,
@@ -241,7 +244,7 @@ class TestCapabilityGate:
                 CapabilityGate.from_dict({"enabled": bogus}, default_enabled=True)
 
     def test_known_capability_rejects_non_boolean_enabled(self):
-        # Default-ON siblings (memory_writes, browse, …) used to coerce
+        # Default-ON siblings (memory_writes, browse, …) must not coerce
         # enabled: "false" through bool() and stay on.
         with pytest.raises(PlatformCompositionError, match="boolean"):
             parse_profile(
@@ -313,6 +316,96 @@ class TestScopedMap:
         # posture is policy-only → preserved from ceiling.
         assert composed.posture_permits("slack", "allowed_team_ids", "T1").permitted
 
+    def test_three_tier_members_all_tighten(self):
+        # Regression: once one fold has produced an ``_AndRuleset``, the next
+        # fold must still honour that tier's narrowing instead of returning
+        # the existing pair unchanged.
+        t1 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}},
+            allow_posture=True,
+        )
+        t2 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord"]}}, allow_posture=False
+        )
+        t3 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack"]}}, allow_posture=False
+        )
+        composed = t1.compose(t2).compose(t3)
+        assert composed.permits_member("slack").permitted
+        # The third tier must tighten the already-composed pair.
+        assert not composed.permits_member("discord").permitted
+        assert not composed.permits_member("telegram").permitted
+
+    def test_nested_inner_denial_not_labelled_profile(self):
+        # When the inner half of an ``_AndRuleset`` is itself a nested pair,
+        # its denial is another policy tier, not the profile: the nested
+        # decision's own layer and label must propagate.
+        t1 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}},
+            allow_posture=True,
+        )
+        t2 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack"]}}, allow_posture=False
+        )
+        t3 = ScopedMap.from_dict(
+            {"members": {"mode": "allow", "allow": ["slack", "telegram"]}}, allow_posture=False
+        )
+        composed = t1.compose(t2.compose(t3))
+        decision = composed.permits_member("discord")  # denied by t2, a nested tier
+        assert not decision.permitted
+        assert decision.layer == "policy"
+        assert not decision.reason.startswith("profile:")
+
+    def test_extends_chain_third_link_channels_narrowing_applies(self):
+        # Same shape through the public entry point: a three-link ``extends``
+        # chain carrying a channels ScopedMap.
+        grandparent = parse_profile(
+            {
+                "name": "gp",
+                "channels": {
+                    "members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}
+                },
+            }
+        )
+        parent = parse_profile(
+            {
+                "name": "parent",
+                "extends": "gp",
+                "channels": {"members": {"mode": "allow", "allow": ["slack", "discord"]}},
+            }
+        )
+        child = parse_profile(
+            {
+                "name": "child",
+                "extends": "parent",
+                "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
+            }
+        )
+        merged = compose_profiles(compose_profiles(grandparent, parent), child)
+        assert resolve(None, merged, "channels", "slack").permitted
+        assert not resolve(None, merged, "channels", "discord").permitted
+        assert not resolve(None, merged, "channels", "telegram").permitted
+
+    def test_tier_ladder_third_tier_channels_members_tighten(self):
+        # The tier ladder folds through the same ``ScopedMap.compose`` path;
+        # the lowest tier's channels narrowing must survive a three-tier fold.
+        managed = parse_policy(
+            _policy_body(
+                channels={"members": {"mode": "allow", "allow": ["slack", "discord", "telegram"]}}
+            )
+        )
+        central = parse_policy(
+            _policy_body(channels={"members": {"mode": "allow", "allow": ["slack", "discord"]}})
+        )
+        subordinate = parse_policy(
+            _policy_body(channels={"members": {"mode": "allow", "allow": ["slack"]}})
+        )
+        ceiling = compose_tier_ladder(managed, central, subordinate)
+        assert ceiling is not None
+        assert resolve(ceiling, None, "channels", "slack").permitted
+        assert not resolve(ceiling, None, "channels", "discord").permitted
+        assert not resolve(ceiling, None, "channels", "telegram").permitted
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Loader — precedence + fail-closed (mirrors admission)
@@ -321,9 +414,7 @@ class TestLoader:
     def test_absent_returns_none(self, monkeypatch, tmp_path):
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         _nope = tmp_path / "nope.json"
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: _nope
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: _nope)
         assert load_security_policy() is None
 
     def test_env_path_wins(self, monkeypatch, tmp_path):
@@ -350,18 +441,14 @@ class TestLoader:
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         home = tmp_path / "security_policy.json"
         home.write_text(json.dumps(_policy_body()))
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: home
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: home)
         ceiling = load_security_policy()
         assert ceiling is not None
 
     def test_bundled_loader_precedence(self, monkeypatch, tmp_path):
         monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
         _nope = tmp_path / "nope.json"
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: _nope
-        )
+        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: _nope)
         called = {}
 
         def bundled():
@@ -374,12 +461,38 @@ class TestLoader:
         assert "commands" in ceiling.controls
 
     def test_env_beats_bundled(self, monkeypatch, tmp_path):
+        """Env still outranks the bundled resource — but bundled IS now resolved.
+
+        The bundled loader is resolved even when the env tier is set, and this
+        test asserts that by failing if it does not run.  It is resolved
+        unconditionally, deliberately: the CENTRAL tier outranks env, and the
+        source it fetches from may be DECLARED by a lower tier's ``distribution``
+        block, so the bundled document has to be read for its declaration to be
+        seen even when env will win the subordinate slot.
+
+        The contract that still holds — and the one this pins — is the precedence
+        itself: tiers 3–5 are mutually exclusive with env first, so the env
+        document is the one that becomes the ceiling.  Asserted on identity rather
+        than on whether the loader ran, because "who won" is the invariant; "was
+        bundled consulted" is an implementation detail that just changed.
+        """
+        monkeypatch.delenv("KIROCREW_POLICY_URL", raising=False)
         p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
+        p.write_text(json.dumps(_policy_body(identity={"issuer": "env-tier"})))
         monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        # bundled_loader must NOT be consulted when env wins.
-        ceiling = load_security_policy(bundled_loader=lambda: pytest.fail("should not call"))
+        resolved = {}
+
+        def bundled():
+            resolved["yes"] = True
+            return _policy_body(identity={"issuer": "bundled-tier"})
+
+        ceiling = load_security_policy(bundled_loader=bundled)
         assert ceiling is not None
+        # Resolved, so a ``distribution`` block declared here would be seen…
+        assert resolved.get("yes")
+        # …but it does not win: env is the first present subordinate tier.
+        assert ceiling.identity_issuer == "env-tier"
+        assert ceiling.tier == TIER_ENV
 
     def test_wrong_version_fails_closed(self):
         with pytest.raises(PlatformCompositionError):
@@ -396,7 +509,7 @@ class TestLoader:
     def test_typod_sandbox_child_fails_closed(self):
         """A typo'd ``min_level`` must RAISE, not vanish into the reserved scope.
 
-        ``sandbox`` used to accept ANY child into the write-only
+        A ``sandbox`` block that accepted ANY child into the write-only
         ``sandbox._flags`` scope, so ``min_levl`` parsed clean and left the
         floor absent — green validation, zero enforcement, on the ordinal with
         the widest blast radius.  The message names the key so the operator can
@@ -441,6 +554,53 @@ class TestLoader:
         ceiling = parse_policy(_policy_body(sandbox={"min_level": "strict"}))
         assert isinstance(ceiling.get("sandbox.min_level"), OrdinalControl)
         assert "sandbox._flags" not in ceiling.controls
+
+
+class TestBootFlagCoercion:
+    """Non-boolean ``boot`` gate flags read fail-closed, never via ``bool()``.
+
+    A ``"false"`` string is truthy, so the old read turned the terminal ON
+    for a policy that says off. Real booleans are honoured, absent keys take
+    their documented defaults, and anything else warns and reads in the
+    fail-closed direction per flag.
+    """
+
+    @staticmethod
+    def _boot(**flags):
+        body = _policy_body()
+        body["boot"] = flags
+        return parse_policy(body).boot
+
+    def test_absent_flags_take_documented_defaults(self):
+        boot = self._boot()
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_real_booleans_honoured(self):
+        boot = self._boot(require_sandbox=False, allow_terminal=True, fail_closed=False)
+        assert boot.require_sandbox is False
+        assert boot.allow_terminal is True
+        assert boot.fail_closed is False
+
+    def test_string_false_reads_fail_closed(self):
+        boot = self._boot(require_sandbox="false", allow_terminal="false", fail_closed="false")
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_string_true_reads_fail_closed(self):
+        boot = self._boot(require_sandbox="true", allow_terminal="true", fail_closed="true")
+        assert boot.require_sandbox is True
+        assert boot.allow_terminal is False
+        assert boot.fail_closed is True
+
+    def test_null_and_numbers_read_fail_closed(self):
+        for stray in (None, 0, 1):
+            boot = self._boot(require_sandbox=stray, allow_terminal=stray, fail_closed=stray)
+            assert boot.require_sandbox is True
+            assert boot.allow_terminal is False
+            assert boot.fail_closed is True
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -985,6 +1145,191 @@ class TestSchemaStrictness:
             ScopedRuleset.from_dict({"mode": "allow", "allow": ["read"], "deny": ["grep"]})
         assert any("Rule 1" in r.message or "allow beats deny" in r.message for r in caplog.records)
 
+    def test_allow_mode_deny_warning_never_carries_the_pasted_url(self, caplog):
+        """The Rule-1 sibling fires on every boot too, so it must not echo a deny entry."""
+        pasted = "https://user:pass@evil.example/p?api_key=SECRET123"
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict({"mode": "allow", "allow": ["skills.sh"], "deny": [pasted]})
+        warned = [r.getMessage() for r in caplog.records if r.name == "kiro_crew.platform.governance"]
+        assert any("Rule 1: allow beats deny" in m for m in warned), warned
+        for secret in ("user", "pass", "SECRET123", pasted):
+            assert all(secret not in m for m in warned), (secret, warned)
+            assert secret not in caplog.text, secret
+
+    @staticmethod
+    def _host_warnings(caplog, body, *, matcher="host"):
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict(body, matcher=matcher, scope="network.egress")
+        return [r.getMessage() for r in caplog.records if "matcher=host" in r.getMessage()]
+
+    @pytest.mark.parametrize("matcher", sorted(governance._MATCHERS))
+    def test_only_the_host_matcher_warns_on_a_url_shaped_item(self, matcher, caplog):
+        """A URL-shaped entry is dead ONLY under `host`, so only `host` may warn.
+
+        Every other matcher tests an item that legitimately carries a `/`, a
+        path, a command line, an `@server/tool` reference, so warning there
+        would be noise on correct config.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": ["https://skills.sh/api"]}, matcher=matcher
+        )
+        assert bool(warned) is (matcher == "host"), f"{matcher} warned: {bool(warned)}"
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "skills.sh",
+            "*.skills.sh",
+            "*",
+            "**",
+            "*.*",
+            "localhost",
+            "skills.*",
+            "sub.*.skills.sh",
+            # urlparse reads `?` as a query and finds no host, yet the glob works.
+            "?.skills.sh",
+            # `_splitnetloc` cuts a netloc at `?`, so `_url_host` gives `api`, yet
+            # `apix.skills.sh` matches.
+            "api?.skills.sh",
+            "*.skills?.sh",
+            "foo_bar",
+            "127.0.0.1",
+            "UPPER.CASE.COM",
+            "xn--80ak6aa92e.com",
+            "skills.sh.",
+            # `_match_host` strips, so padding is not a dead entry either.
+            " skills.sh ",
+            "server",
+            "intranet",
+            # A bare IPv6 literal is the item `_url_host` yields for `[::1]`, so it
+            # matches. Its colons are not a port, whatever `rsplit(":")` makes of them.
+            "::1",
+            "2001:db8::1",
+            "fe80::1",
+            "2001:db8:0:0:0:0:0:1",
+            # `_match_host` is fnmatch, so a bracket that is not IPv6 syntax is a
+            # live character class: `[ab].example.com` matches `a.example.com`.
+            "[ab].example.com",
+            "[a-z].example.com",
+            # A colon inside the class does not make it IPv6: `_url_host` finds no
+            # host in `[a:].example.com`, and the class matches `a.example.com`.
+            "[a:].example.com",
+            "[a:b].example.com",
+            "[abc]x.com",
+            "web[0-9][0-9].corp.example",
+            # An unpaired bracket is literal to fnmatch, so the entry matches itself.
+            "a]b.com",
+            "a[b.com",
+            # A glob absorbs the colon: `*:443` matches `fe80::443`, the item
+            # `_url_host` yields for `https://[fe80::443]/x`, so this is no port.
+            "*:443",
+            "web*:443",
+        ],
+    )
+    def test_a_pattern_that_can_match_a_host_does_not_warn(self, pattern, caplog):
+        """The form that WORKS must stay silent, or the warning trains operators to ignore it.
+
+        A known-dead sibling rides along so the case fails if the guard is gone,
+        not only if it over-fires.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": [pattern, "https://dead.example/x"]}
+        )
+        assert len(warned) == 1 and "deny[1]" in warned[0], warned
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "https://skills.sh/api",
+            "skills.sh/api",
+            "//skills.sh/api",
+            "http://skills.sh",
+            "skills.sh:8080",
+            "localhost:3000",
+            "10.0.0.1:443",
+            # A single-label host does not look like a host to `_url_host`, which
+            # finds none here, yet the entry is just as dead.
+            "server:443",
+            "intranet:8080",
+            "db:5432",
+            "https://user:pass@skills.sh/api",
+            "[::1]",
+            "[::1]:443",
+            "[2001:db8::1]",
+            "https://*.skills.sh/api",
+            "/api/v1",
+            "file:///etc/passwd",
+            "http://",
+            "user:pass@skills.sh",
+            "*://skills.sh",
+            "2001:db8::/32",
+            "https://*",
+            "http://*",
+            "10.0.0.0/8",
+            "192.168.0.0/16",
+        ],
+    )
+    def test_a_dead_entry_is_named_by_position(self, pattern, caplog):
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": ["ok.example", pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[1]" in warned[0]
+
+    @pytest.mark.parametrize(
+        "pattern,secret",
+        [
+            ("https://user:pass@skills.sh/api", "pass"),
+            ("https://skills.sh/api?api_key=SECRET123", "SECRET123"),
+            ("https://hooks.slack.com/services/T0/B0/XXSECRETXX", "XXSECRETXX"),
+            # urlsplit cuts a netloc only at `/`, `?` and `#`, so each of these
+            # survives `_url_host` verbatim.
+            ("https://ghp_AAAABBBBCCCCDDDD\\x.com/p", "ghp_"),
+            ("https://ghp_TOKEN1234\\evil.com", "ghp_"),
+            ("https://abc|ghp_LEAK.com/p", "ghp_"),
+            ("https://a'ghp_LEAK2.com/p", "ghp_"),
+            ("https://ghp_TOK^3.com/p", "ghp_"),
+            ("https://a b.com/p", "a b.com"),
+            ("https://a%40b.com/p", "a%40b.com"),
+            # Every character is host-shaped: the token IS the DNS label.
+            ("https://ghp_" + "A" * 36 + ".example.com/p", "ghp_" + "A" * 36),
+            ("https://github_pat_" + "B" * 40 + ".example.com/p", "github_pat_" + "B" * 40),
+            ("https://sk-ant-" + "C" * 40 + ".example.com/p", "sk-ant-" + "C" * 40),
+        ],
+    )
+    def test_the_warning_never_carries_the_pasted_url(self, pattern, secret, caplog):
+        """A pasted URL carries credentials, and this logs on every boot unredacted."""
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": [pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[0]" in warned[0]
+        # The handler's formatted text, so a secret smuggled via `%s` args is caught too.
+        assert secret not in caplog.text
+
+    @pytest.mark.parametrize(
+        "mode,listed,effect",
+        [
+            (MODE_DENY, "deny", "permits"),
+            (MODE_ALLOW, "allow", "refuses"),
+        ],
+    )
+    def test_only_the_list_the_mode_reads_is_walked(self, mode, listed, effect, caplog):
+        """The engine never reads the other list, so a warning about it is noise.
+
+        The consequence must match the mode: a dead allow refuses what it names,
+        and saying "permits" misdirects an operator debugging an egress outage.
+        """
+        warned = self._host_warnings(
+            caplog,
+            {
+                "mode": mode,
+                "allow": ["https://allowed.example/a"],
+                "deny": ["https://denied.example/a"],
+            },
+        )
+        assert len(warned) == 1, warned
+        assert f"{listed}[0]" in warned[0]
+        assert f"the scope {effect} the host it names" in warned[0]
+
     def test_posture_key_must_be_admitted_member(self):
         # posture for a member not in the members allow-set is rejected.
         with pytest.raises(PlatformCompositionError):
@@ -1143,11 +1488,40 @@ class TestPolicySignatureStates:
             assert ceiling is not None
             assert ceiling.signature_state == SIGNATURE_UNVERIFIED
 
+    def test_a_lone_surrogate_signature_is_unverified_not_a_crash(self):
+        """``json.loads`` accepts ``"\\udc80"``; a strict ``encode`` would raise.
+
+        A UnicodeEncodeError is a ValueError, not a PlatformCompositionError, so it
+        would escape the loader and the host would degrade to ungoverned. The tier
+        ladder verifies a user-owned home file beneath the central document on every
+        load, so this is one byte in that file removing the fleet ceiling. It must
+        classify like every other malformed signature instead.
+        """
+        doc = json.loads(
+            '{"version": 1, "boot": {"fail_closed": true}, '
+            '"identity": {"issuer": "corp", "signature": "\\udc80"}}'
+        )
+        state, _detail = governance._policy_signature_state(doc, {"corp": "k"})
+        assert state == SIGNATURE_UNVERIFIED
+
+    def test_a_lone_surrogate_trust_key_is_unverified_not_a_crash(self):
+        """The other text the compare depends on: the key from the JSON trust root.
+
+        ``hmac_signature`` encodes the key before hashing; a strict encode raised on a
+        lone surrogate there, one call before the compare this class fixes.
+        """
+        doc = json.loads(
+            '{"version": 1, "boot": {"fail_closed": true}, '
+            '"identity": {"issuer": "corp", "signature": "abcd"}}'
+        )
+        trust_keys = json.loads('{"corp": "\\udc80"}')
+        assert len(trust_keys["corp"]) == 1  # a real lone surrogate, not the 6-char escape
+        state, _detail = governance._policy_signature_state(doc, trust_keys)
+        assert state == SIGNATURE_UNVERIFIED
+
     def test_non_ascii_signature_fails_closed_when_required(self, monkeypatch, tmp_path):
         """...and with the opt-in ON it must ABORT, not degrade to ungoverned."""
-        body = _policy_body(
-            identity={"issuer": "fleet-control", "signature": "tamper\u2013ed"}
-        )
+        body = _policy_body(identity={"issuer": "fleet-control", "signature": "tamper\u2013ed"})
         p = tmp_path / "policy.json"
         p.write_text(json.dumps(body))
         monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
@@ -1343,9 +1717,7 @@ class TestPolicySignatureOptIn:
                 bundled_loader=lambda: _policy_body(identity={"issuer": "fleet-control"})
             )
         # A correctly-signed bundled policy verifies and loads.
-        signed = _sign_policy(
-            _policy_body(identity={"issuer": "fleet-control"}), "trust-key"
-        )
+        signed = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), "trust-key")
         ceiling = load_security_policy(bundled_loader=lambda: signed)
         assert ceiling is not None
         assert ceiling.signature_state == SIGNATURE_VERIFIED
@@ -1416,9 +1788,7 @@ class TestPolicySignatureAbsenceGate:
             parse_policy(signed, signature_state=SIGNATURE_VERIFIED)
         )
 
-    def test_present_but_unverified_ceiling_does_NOT_satisfy_the_gate(
-        self, monkeypatch, tmp_path
-    ):
+    def test_present_but_unverified_ceiling_does_NOT_satisfy_the_gate(self, monkeypatch, tmp_path):
         # Presence alone is not enough — the gate is the enforcement point for the
         # verdict too, now that load time only computes it. A tampered or unsigned
         # ceiling that survived precedence must abort here.
@@ -1448,9 +1818,7 @@ class TestPolicySignatureAbsenceGate:
     @pytest.mark.parametrize(
         "shape", ['{ "mode": "open",  <-- typo', "[]", "null", '"a string"', "123"]
     )
-    def test_a_broken_trust_root_reads_as_no_optin_by_design(
-        self, monkeypatch, tmp_path, shape
-    ):
+    def test_a_broken_trust_root_reads_as_no_optin_by_design(self, monkeypatch, tmp_path, shape):
         """A corrupt/malformed admission file does NOT fail closed. Deliberate.
 
         An attacker who can write this file is outside the policy-signature threat
@@ -1467,6 +1835,23 @@ class TestPolicySignatureAbsenceGate:
         assert_policy_signature_satisfied(
             parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
         )
+
+    @pytest.mark.parametrize("junk", ["false", None, 0, 1, ""])
+    def test_junk_flag_in_wellformed_trust_root_fails_closed(
+        self, monkeypatch, tmp_path, junk
+    ):
+        # A well-formed trust root whose flag is PRESENT but not a boolean is a
+        # different case from a broken file: the operator wrote the key down, so
+        # it reads fail-closed as opted-in (via admission._coerce_flag) and an
+        # unsigned policy is refused. Locks the enforcement reader to the same
+        # strict read as the key store.
+        adm = tmp_path / "admission_policy.json"
+        adm.write_text(json.dumps({"require_policy_signature": junk}))
+        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
+        with pytest.raises(PlatformCompositionError):
+            assert_policy_signature_satisfied(
+                parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
+            )
 
     def test_absent_admission_file_is_a_noop(self, monkeypatch, tmp_path):
         # No trust root: nobody opted in, so an unsigned policy still loads and
@@ -1507,9 +1892,7 @@ class TestPolicySignatureAbsenceGate:
         # second bespoke file, and NOT from the security policy itself.
         adm = tmp_path / "admission_policy.json"
         adm.write_text(
-            json.dumps(
-                {"require_policy_signature": True, "trust_keys": {"fleet-control": "k"}}
-            )
+            json.dumps({"require_policy_signature": True, "trust_keys": {"fleet-control": "k"}})
         )
         monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
         from kiro_crew.platform.governance import _policy_trust_settings
@@ -1753,3 +2136,26 @@ class TestValidateReportsUngovernedCapabilities:
         ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
         out = self._validate(capsys, ceiling)
         assert "UNGOVERNED" not in out
+
+    def test_validate_run_surfaces_a_url_shaped_network_egress_deny_entry(self, capsys, caplog):
+        """The operator's own `policy validate` run must surface the dead entry.
+
+        `validate` reports on the ceiling boot ALREADY resolved, so the finding
+        reaches that run as the parse-time warning, not as stdout: validate
+        re-reads a parsed object and cannot see a pattern that never matched.
+        The line matters because this policy reports OK while denying nothing.
+        """
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ceiling = parse_policy(
+                _policy_body(
+                    network={"egress": {"mode": MODE_DENY, "deny": ["https://skills.sh/api"]}}
+                )
+            )
+            out = self._validate(capsys, ceiling)
+        assert "governed scopes" in out
+        # The entry the operator wrote to block skills.sh does not block it.
+        assert resolve(ceiling, None, "network.egress", "skills.sh").permitted
+        line = next(r.getMessage() for r in caplog.records if "matcher=host" in r.getMessage())
+        assert "'network.egress'" in line
+        assert "deny[0]" in line
+        assert "https://skills.sh/api" not in line

@@ -3,8 +3,7 @@
 Two behaviours are locked in here:
 
 * every outbound path renders a trailing ``[OPTIONS: …]`` tag as a control,
-  never as literal text — including the link-time backfill, which used to post
-  message bodies verbatim;
+  never as literal text — including the link-time backfill;
 * a control stops being answerable once the conversation moves past the question
   it asked, whichever surface the next turn arrives on.
 """
@@ -19,7 +18,10 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state, drain_background_tasks
+from turn_harness import SlotSpec, TurnContext, TurnScript, run_turn
 
+from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.dashboard.chat_utils import remember_slack_options
 from kiro_crew.slack.format import (
     OPTIONS_CHECKBOXES_ACTION,
     OPTIONS_SUBMIT_ACTION,
@@ -66,6 +68,91 @@ def _set_recs(state, key, records):
     if hasattr(key, "key"):
         key = effective_session_key(key)
     set_options_records(state, key, records)
+
+
+def _mirror_slack() -> MagicMock:
+    """A Slack client a dashboard turn can mirror its streamed reply through."""
+    slack = MagicMock()
+    slack.post_message = AsyncMock(return_value="body-ts")
+    slack.start_stream = AsyncMock(return_value="stream-ts")
+    slack.append_stream = AsyncMock()
+    slack.stop_stream = AsyncMock()
+    slack.update_message = AsyncMock()
+    return slack
+
+
+_OPTIONS_REPLY = [
+    AcpEvent(kind=EVENT_TEXT_CHUNK, text="Pick one.\n\n[OPTIONS: A | B]"),
+    AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+]
+
+
+async def _mirror_turn(*, relink_to: str | None = None, newer: PostedOptions | None = None):
+    """One Slack-linked dashboard turn whose reply ends in an OPTIONS tag.
+
+    With *relink_to*, the thread is relinked to that session while the mirror's
+    ``post_blocks`` is in flight, and *newer* is the control it records meanwhile.
+    """
+    slack = _mirror_slack()
+    owner: dict = {"key": None}
+    held: dict = {}
+
+    async def _post_blocks(_channel, _blocks, _text, _thread, *_a, **_k):
+        if relink_to is not None:
+            owner["key"] = relink_to
+            _set_recs(held["state"], relink_to, (newer,))
+        return "opt-mirror"
+
+    slack.post_blocks = AsyncMock(side_effect=_post_blocks)
+
+    def _arrange(ctx: TurnContext) -> None:
+        held["state"] = ctx.state
+        ctx.state.slack_client = slack
+        ctx.state.sessions.set_slack_link("dashboard:s1", "thread-1", "C-1")
+        ctx.state.sessions.get_session_for_thread = lambda _ts: owner["key"]
+
+    record = await run_turn(
+        TurnScript(events=_OPTIONS_REPLY, setup=_arrange), slot=SlotSpec(key="s1")
+    )
+    return slack, record, held["state"]
+
+
+async def _live_control_turn(message: str):
+    """A dashboard turn on a slot whose previous answer left a live OPTIONS control.
+
+    ``seen["at_acquisition"]`` is the slot's control store and the edit count at
+    the moment the turn asks for its session, if it gets that far.
+    """
+    slack = _mirror_slack()
+    seen: dict = {}
+
+    def _arrange(ctx: TurnContext) -> None:
+        seen["state"] = ctx.state
+        ctx.state.slack_client = slack
+        remember_slack_options(
+            ctx.state,
+            "dashboard:s1",
+            PostedOptions(channel="C-1", ts="opt-live", choices=("A", "B"), blocks=()),
+        )
+        acquire = ctx.state.sessions.get_or_create
+
+        async def _acquire(*args, **kwargs):
+            seen["at_acquisition"] = (
+                _recs(ctx.state, "dashboard:s1"),
+                slack.update_message.await_count,
+            )
+            return await acquire(*args, **kwargs)
+
+        ctx.state.sessions.get_or_create = _acquire
+
+    events = [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+    ]
+    record = await run_turn(
+        TurnScript(events=events, message=message, setup=_arrange), slot=SlotSpec(key="s1")
+    )
+    return slack, record, seen["state"], seen
 
 
 def _posted_texts(slack: MagicMock) -> list[str]:
@@ -400,7 +487,7 @@ class TestLifecycleOnTheSlot:
     ):
         """The reverse index is what resolves a click back to this conversation.
 
-        The link handler used to assign the slot's fields directly and skip the
+        A link handler that assigns the slot's fields directly and skips the
         state helper that writes it, so a click on the replayed control could
         not find the slot and answered into a separate Slack session.
         """
@@ -451,13 +538,12 @@ class TestLifecycleOnTheSlot:
     async def test_a_slotless_session_is_still_tracked_and_expired(
         self, tmp_path, monkeypatch
     ):
-        """No dashboard slot must NOT mean no lifecycle (#1694).
+        """No dashboard slot must NOT mean no lifecycle.
 
-        This test previously asserted the opposite -- that a slotless session was a
-        no-op -- which was the defect: a plain Slack thread usually has no slot, so
-        the control was never recorded, no later turn could expire it, and the stale
-        click this whole lifecycle exists to prevent stayed possible. The store is
-        keyed by session key now, so the slotless case is ordinary.
+        A slotless session is NOT a no-op: a plain Slack thread usually has no slot,
+        so if the control were not recorded, no later turn could expire it, and the
+        stale click this whole lifecycle exists to prevent would stay possible. The
+        store is keyed by session key, so the slotless case is ordinary.
 
         Only a missing STATE is a genuine no-op: with nowhere to record, there is
         nothing to expire.
@@ -572,7 +658,11 @@ class TestTurnEntryWiring:
         monkeypatch.setattr(
             transport_dispatch, "maybe_route_linked_thread", _no_linked_thread
         )
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", MagicMock())
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", MagicMock())
         _stub_non_turn_paths(monkeypatch, transport_dispatch)
 
@@ -607,8 +697,6 @@ class TestTurnEntryWiring:
 
         ``ping`` answers and returns without running the agent, so the pending
         question is still the one being waited on and its control must survive.
-        This test previously used ``ping`` merely because it short-circuited
-        just after the old expiry -- which encoded the defect as the expectation.
         """
         from kiro_crew.slack import transport_dispatch
 
@@ -624,7 +712,11 @@ class TestTurnEntryWiring:
         monkeypatch.setattr(
             transport_dispatch, "maybe_route_linked_thread", _no_linked_thread
         )
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", MagicMock())
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", MagicMock())
 
         slack = _slack()
@@ -713,7 +805,11 @@ class TestTurnEntryWiring:
         monkeypatch.setattr(
             transport_dispatch, "maybe_route_linked_thread", _no_linked_thread
         )
-        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", MagicMock())
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(),
+        )
         monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", MagicMock())
         _stub_non_turn_paths(monkeypatch, transport_dispatch)
 
@@ -759,7 +855,7 @@ class TestLinkTimeBackfill:
         the response is read depends only on how the loop was scheduled. Asserting on
         the replay without awaiting it is a load-dependent coin flip, and it failed
         as ``'NoneType' object has no attribute 'args'`` on a DIFFERENT test each CI
-        run (#4130) — which reads as a flaky suite rather than a missing await.
+        run — which reads as a flaky suite rather than a missing await.
 
         If this ever fails because the handler became synchronous, delete the drains
         rather than weakening this.
@@ -982,7 +1078,7 @@ class TestUnlinkSpendsTheControl:
     Two failure modes, both closed by expiring rather than forgetting:
 
     1. Forget-only leaves the buttons live in Slack. After the link is gone a
-       click answers a question from a conversation this thread is no longer
+       click answers a question from a conversation this thread is not
        attached to, landing that stale answer in a brand-new session.
     2. Doing nothing leaves the record unreachable once the thread -> slot
        reverse index is popped, so the next dashboard turn's expiry strikes every
@@ -1266,7 +1362,7 @@ class TestEveryOutstandingControlIsExpired:
         """A message that can never be edited must not be retried every turn.
 
         The mirror of the test above: keeping EVERY failure would mean a deleted
-        message or a channel we are no longer in burns an API call on every
+        message or a channel we are not in burns an API call on every
         subsequent turn, forever. A 4xx that is not a rate limit will fail
         identically next time, so the record is settled.
         """
@@ -1303,7 +1399,7 @@ class TestEveryOutstandingControlIsExpired:
         ownership helpers only consulted the dashboard SLOT index (plus the
         syntactic ``slack:<ts>``), which cannot see a cron link -- so the
         selection's forget missed the record entirely and the next expiry edited
-        over the user's answer. It also defeated round 33's under-lock skip, which
+        over the user's answer. It also defeats the under-lock skip, which
         relies on the forget having removed the record.
         """
         from kiro_crew.dashboard.chat_utils import (
@@ -1561,7 +1657,7 @@ class TestControlPostedAfterTheWindowIsSpent:
         """`ping`/`status`/denial must not expire a still-pending question.
 
         Purely an ordering guarantee, so asserted on source order. The entry
-        expiry used to run before the shortcuts: a pending
+        expiry must not run before the shortcuts: a pending
         ``[OPTIONS: Deploy | Abort]`` plus a `ping` in the thread struck the
         control through, posted `pong`, and returned without running the agent --
         so the conversation had NOT moved, yet the buttons were spent and the
@@ -1908,8 +2004,8 @@ class TestControlPostedAfterTheWindowIsSpent:
     def test_an_ansi_split_credential_in_a_choice_does_not_reach_slack(self):
         """A credential broken up by escapes must not survive into a choice.
 
-        This guarantee moved owners. It used to live in this PR's own render
-        helper; `slack.format.build_options_blocks` now redacts every choice
+        The guarantee lives in `slack.format.build_options_blocks`, which redacts
+        every choice
         through `redact_for_display`, which canonicalises the form Slack actually
         DISPLAYS (ANSI, emphasis, backticks, link markup) before scanning. That
         is strictly stronger, so the test asserts against the real owner rather
@@ -1990,31 +2086,34 @@ class TestControlPostedAfterTheWindowIsSpent:
             "the rollback must run on the abort path too, which returns early"
         )
 
-    def test_all_three_posting_paths_resolve_the_live_owner(self):
+    @pytest.mark.asyncio
+    async def test_the_dashboard_mirror_files_its_control_under_the_live_owner(self):
         """The dashboard mirror path must do what the other two already do.
 
         Rounds 23 and 26 gave the native footer and the transport path an
-        owner-resolved record plus owner-change supersession. The dashboard mirror
-        in ``chat_runner`` recorded under the bare ``session_key`` -- so a thread
-        relinked while ``post_blocks`` was in flight got its control filed where
-        the new owner's expiry never looks, and clickable into a conversation it
-        does not belong to.
+        owner-resolved record plus owner-change supersession. Through the real
+        ``_run_chat``: the thread is relinked to another session WHILE the mirror's
+        ``post_blocks`` is in flight, and that session records a control of its own
+        meanwhile. The control just posted must be filed under the new owner and
+        struck at once -- the question would be answered into a conversation that
+        moved on -- and only OUR control struck: the new owner's survives.
         """
-        import inspect
+        newer = PostedOptions(channel="C-1", ts="opt-newer", choices=("X",), blocks=())
+        slack, record, state = await _mirror_turn(relink_to="dashboard:other", newer=newer)
+        assert record.stop_reason == "end_turn"
+        assert slack.post_blocks.await_count == 1
+        assert [c.args for c in slack.update_message.await_args_list] == [("C-1", "opt-mirror")]
+        assert _recs(state, "dashboard:other") == (newer,)
+        assert _recs(state, "dashboard:s1") == ()
 
-        from kiro_crew.dashboard import chat_runner
-
-        src = inspect.getsource(chat_runner)
-        mirror = src[src.find("_mirror_blocks = build_options_blocks(") :][:2600]
-        assert "_pre_owner" in mirror, "the mirror path must capture the owner before posting"
-        assert "remember_slack_options(\n                            state,\n                            _owner," in mirror, (
-            "the record must use the re-resolved owner, not the key the turn started with"
-        )
-        assert "_owner != _pre_owner" in mirror, "an owner change must supersede"
-        assert "ts=_mirror_ts" in mirror, (
-            "the supersession expiry must be narrowed to OUR ts, or it strikes "
-            "through a control the new owner recorded meanwhile"
-        )
+    @pytest.mark.asyncio
+    async def test_an_unraced_mirror_control_stays_live_under_the_turns_own_key(self):
+        """No relink: the control is the turn's own, recorded and left clickable."""
+        slack, _record, state = await _mirror_turn()
+        assert slack.post_blocks.await_count == 1
+        assert slack.update_message.await_count == 0
+        [mine] = _recs(state, "dashboard:s1")
+        assert (mine.ts, mine.choices) == ("opt-mirror", ("A", "B"))
 
     def test_the_forget_uses_owner_keys_snapshotted_before_the_edit(self):
         """A relink during the submit's edit must not orphan the old owner's record.
@@ -2112,10 +2211,20 @@ class TestControlPostedAfterTheWindowIsSpent:
         immediately above, so on the control it was pure duplication.
         """
         import inspect
+        from pathlib import Path
 
         from kiro_crew.dashboard.handlers import messaging
 
-        src = inspect.getsource(messaging)
+        # The send route's Slack leg runs from a messaging_api owner the facade
+        # composes, so the scan reads the facade and every owner, and fails if the
+        # leg lives in a file it does not read.
+        owners = sorted((Path(messaging.__file__).parents[1] / "messaging_api").glob("[!_]*.py"))
+        assert owners, "the messaging_api owners were not found"
+        held = Path(inspect.getsourcefile(messaging._post_send_message_to_slack) or "")
+        assert held.parts[-2:] in {path.parts[-2:] for path in owners}, held
+        src = "\n".join(
+            [inspect.getsource(messaging)] + [path.read_text(encoding="utf-8") for path in owners]
+        )
         at = src.find("option_blocks = build_options_blocks(")
         assert at != -1, "the send_message OPTIONS post should be findable"
         # Radius, not a behaviour bound: it only has to reach past the comment
@@ -2131,31 +2240,31 @@ class TestControlPostedAfterTheWindowIsSpent:
         # The body itself still reaches Slack, as its own message.
         assert "post_message(" in src, "the message body is still posted normally"
 
-    def test_a_local_dashboard_command_does_not_spend_the_control(self):
-        """`/goal` and `/prompts` return without an agent turn.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/goal status", "/prompts"])
+    async def test_a_local_dashboard_command_does_not_spend_the_control(self, command):
+        """`/goal` and `/prompts` answer without an agent turn.
 
-        Round 31 moved each SLACK entry point's expiry below its short-circuits;
-        the dashboard path kept its expiry at the very top of ``_run_chat``, so a
+        Each SLACK entry point's expiry runs below its short-circuits; the
+        dashboard path once kept its expiry at the very top of ``_run_chat``, so a
         local command that never starts a turn still struck a pending question
         through -- leaving valid choices unanswerable with nothing on the way to
         answer them.
         """
-        import inspect
+        slack, record, state, _seen = await _live_control_turn(command)
+        assert record.allocations == [], "a local command acquires no session"
+        assert slack.update_message.await_count == 0
+        assert [p.ts for p in _recs(state, "dashboard:s1")] == ["opt-live"]
 
-        from kiro_crew.dashboard import chat_runner
-
-        src = inspect.getsource(chat_runner._run_chat)
-        expiry = src.find("await expire_slack_options(state, session_key)")
-        assert expiry != -1, "the dashboard turn must still expire the control"
-        for local in ('if first_word == "/goal"', 'if first_word == "/prompts"'):
-            at = src.find(local)
-            assert at != -1, f"expected {local} in _run_chat"
-            assert at < expiry, (
-                f"{local} returns without a turn, so it must sit ABOVE the expiry"
-            )
-        assert expiry < src.find("_acquired = False"), (
-            "the expiry must still run before the turn is acquired"
-        )
+    @pytest.mark.asyncio
+    async def test_a_turn_spends_the_control_before_it_acquires_its_session(self):
+        """A real turn does spend it -- before it waits on the session lease or
+        spawn, so a slow (or failed) acquisition never leaves the superseded
+        question clickable."""
+        slack, record, state, seen = await _live_control_turn("hello")
+        assert seen["at_acquisition"] == ((), 1), "spent when the session is acquired"
+        assert [c.args for c in slack.update_message.await_args_list] == [("C-1", "opt-live")]
+        assert record.stop_reason == "end_turn"
 
     @pytest.mark.asyncio
     async def test_linking_an_existing_thread_retires_its_prior_control(self, tmp_path):
@@ -2206,7 +2315,7 @@ class TestControlPostedAfterTheWindowIsSpent:
 
         from kiro_crew.dashboard import chat_slack
 
-        src = inspect.getsource(chat_slack.api_chat_slot_slack_link)
+        src = inspect.getsource(chat_slack.link_slot_to_slack)
         snap = src.find("_prior_owner_keys = slack_options_owner_keys_snapshot(")
         link = src.find("state.link_slack(slot.key, thread_ts, target_channel)")
         assert snap != -1 and link != -1, "both the snapshot and the link must be present"
@@ -2259,7 +2368,7 @@ class TestControlPostedAfterTheWindowIsSpent:
         )
 
     def test_the_legacy_click_escapes_its_slack_fallback_text_too(self):
-        """Round 35 escaped the submit path's fallback; the legacy path was missed.
+        """The legacy click escapes its Slack fallback text too.
 
         Slack parses entities in a message's top-level ``text``, which is what
         notifications render, so a legacy choice containing ``<!channel>`` would
@@ -2325,7 +2434,7 @@ class TestControlPostedAfterTheWindowIsSpent:
 
         The unlink removes the routing before the drain finishes posting, so a
         click on the replayed control would start a FRESH Slack session and answer
-        a question that session never asked. Round 32's unlink abort covers the
+        a question that session never asked. The unlink abort covers the
         other order -- a control already tracked when the unlink arrives -- and had
         nothing to abort on here, because the record did not exist yet.
         """
@@ -2448,7 +2557,7 @@ class TestControlPostedAfterTheWindowIsSpent:
     def test_the_store_is_not_held_on_the_slot(self):
         """Structural: one store, keyed by session key, on DashboardState.
 
-        A slot-held record was the #1694 defect: a plain Slack thread has no slot,
+        A slot-held record is the defect: a plain Slack thread has no slot,
         so the control was dropped and no later turn could expire it. It also must
         not be a slot field PLUS a keyed fallback -- a slot can come into existence
         at any moment (the channel-surface reconciler creates one), so a fallback
@@ -2471,7 +2580,7 @@ class TestControlPostedAfterTheWindowIsSpent:
 
     @pytest.mark.asyncio
     async def test_a_slotless_thread_gets_the_whole_lifecycle(self, tmp_path):
-        """End to end for the case #1694 was filed about.
+        """End to end for the slotless-thread case.
 
         Record, expire and forget must all work for a session that has no dashboard
         slot at any point -- which is the normal state of a plain Slack thread.
@@ -2557,7 +2666,7 @@ class TestControlPostedAfterTheWindowIsSpent:
     def test_the_slack_fallback_text_is_escaped_but_the_answer_is_not(self):
         """A mention must not survive into the message's top-level `text`.
 
-        Round 28 escaped the mrkdwn BLOCKS. Slack parses entities in a message's
+        The mrkdwn BLOCKS are escaped, but Slack parses entities in a message's
         `text` argument too -- and `text` is what notifications and block-less
         clients show -- so the submit handler handing the raw selection to
         `update_message` / `post_blocks` left the notification path open even

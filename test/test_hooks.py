@@ -154,21 +154,28 @@ class TestToolHooks:
 
     def test_sensitive_bash_denied_without_running_prefix(self):
         """A bare bash command (Claude Code provider title — no 'Running: '
-        prefix) that reads a credential path must still be DENIED.
+        prefix) that reaches the instance metadata service must still be DENIED.
 
         The claude-agent-acp adapter sets a Bash tool's title to the raw
-        command (no kiro-cli 'Running: ' display prefix), so the sensitive
-        path check must not be gated on that prefix.
+        command (no kiro-cli 'Running: ' display prefix), so the shell-gate and
+        deny-rule evaluation must not be gated on that prefix. A credential-store
+        PATH is not the probe here: the shell gate matches no paths in command text
+        (the sandbox owns those), so the always-on refusal to exercise is the IMDS
+        tier.
         """
         mgr = HookManager()
-        result = mgr.on_tool_call("cat ~/.aws/credentials")
+        result = mgr.on_tool_call("curl http://169.254.169.254/latest/meta-data/")
         assert result.action == TOOL_DENY
-        assert "sensitive" in result.reason.lower()
+        assert result.security_deny
+        assert "169.254.169.254" in result.reason or "metadata" in result.reason.lower()
 
     def test_sensitive_bash_denied_with_running_prefix(self):
         """The kiro-cli 'Running: ' prefixed form must remain DENIED too."""
         mgr = HookManager()
-        assert mgr.on_tool_call("Running: cat ~/.ssh/id_rsa").action == TOOL_DENY
+        assert (
+            mgr.on_tool_call("Running: curl http://169.254.169.254/latest/meta-data/").action
+            == TOOL_DENY
+        )
 
     def test_benign_bash_without_prefix_not_denied(self):
         """A bare benign bash command must NOT be falsely denied.
@@ -181,8 +188,8 @@ class TestToolHooks:
         assert mgr.on_tool_call("ls -la /workplace").action == TOOL_AUTO_APPROVE
 
     def test_exfil_command_denied_at_gate(self):
-        """security-review 5682f92b: data-egress / reverse-shell command shapes must be
-        DENIED at the tool-invocation gate (previously only passively audited).
+        """Data-egress / reverse-shell command shapes must be DENIED at the
+        tool-invocation gate, not only passively audited.
 
         These carry the exfiltration reason specifically (they do not also name a
         sensitive credential path, which is caught by an earlier gate)."""
@@ -221,8 +228,8 @@ class TestToolHooks:
         """A file-read tool whose title is the BARE path (Claude Code provider —
         no 'Reading ' prefix) must be DENIED via is_sensitive_path.
 
-        is_sensitive_path was previously gated on the 'Reading ' prefix, so a
-        bare '~/.aws/credentials' title slipped through (is_sensitive_bash_command
+        Gating is_sensitive_path on the 'Reading ' prefix lets a bare
+        '~/.aws/credentials' title slip through (is_sensitive_bash_command
         needs a command verb, so it can't catch a bare path).
         """
         mgr = HookManager()
@@ -281,6 +288,701 @@ class TestToolHooks:
         # Plain tool name deny still works via normalized
         assert mgr.on_tool_call("Running: rm foo").action == TOOL_DENY
 
+    def test_auto_approve_matches_verified_mcp_identity_not_title(self):
+        """With a verified MCP identity the grant is keyed on the identity.
+
+        The title is agent-influenced (``select_tool_title`` prefers a
+        model-authored ``description``), so a title that reads like an allowed
+        tool must not approve a different one. The identity is rendered in
+        kiro-cli's own title spelling, so a pattern written against that title
+        keeps matching when the two agree.
+        """
+        cfg = HooksConfig(auto_approve_tools=["Running: @memory-mcp/*"])
+        mgr = HookManager(cfg)
+        # Title and identity agree: approved.
+        assert (
+            mgr.on_tool_call(
+                "Running: @memory-mcp/search_memory",
+                mcp_server_name="memory-mcp",
+                mcp_tool_name="search_memory",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_AUTO_APPROVE
+        )
+        # A description-derived title that does not spell the identity still
+        # approves, because the identity (not the title) is what is matched.
+        assert (
+            mgr.on_tool_call(
+                "Look up the paper the user mentioned",
+                mcp_server_name="memory-mcp",
+                mcp_tool_name="search_memory",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_AUTO_APPROVE
+        )
+        # A forged title over a DIFFERENT verified tool is not approved.
+        assert (
+            mgr.on_tool_call(
+                "Running: @memory-mcp/search_memory",
+                mcp_server_name="ops-mcp",
+                mcp_tool_name="delete_everything",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_ALLOW
+        )
+        # An identity that is present but UNPROVEN (no provenance flag) does not
+        # key the grant: the call falls back to the title branch, which here
+        # matches -- the same behavior as before this change, never wider.
+        unproven = mgr.on_tool_call(
+            "Running: @memory-mcp/search_memory",
+            mcp_server_name="memory-mcp",
+            mcp_tool_name="search_memory",
+        )
+        assert unproven.action == TOOL_AUTO_APPROVE and unproven.identity_grant is False
+        # The lossy wire spelling is NOT a grant target: `github`+`repo__delete`
+        # and `github__repo`+`delete` share `mcp__github__repo__delete`, so a
+        # grant written against it would approve the other tool.
+        cfg3 = HooksConfig(auto_approve_tools=["mcp__github__repo__delete"])
+        for server, tool in (("github", "repo__delete"), ("github__repo", "delete")):
+            assert (
+                HookManager(cfg3)
+                .on_tool_call(
+                    "anything",
+                    mcp_server_name=server,
+                    mcp_tool_name=tool,
+                    mcp_identity_trusted=True,
+                )
+                .action
+                == TOOL_ALLOW
+            )
+        # The bare "@server/tool" spelling matches too.
+        cfg2 = HooksConfig(auto_approve_tools=["@memory-mcp/search_*"])
+        mgr2 = HookManager(cfg2)
+        assert (
+            mgr2.on_tool_call(
+                "anything",
+                mcp_server_name="memory-mcp",
+                mcp_tool_name="search_memory",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_AUTO_APPROVE
+        )
+        # No identity (a built-in, or a backend without _meta.kiro): the title
+        # path is unchanged.
+        assert mgr.on_tool_call("Running: @memory-mcp/search_memory").action == TOOL_AUTO_APPROVE
+        assert mgr.on_tool_call("Running: @other/thing").action == TOOL_ALLOW
+
+    def test_deny_binds_to_verified_identity_spelling_too(self):
+        """A deny written in the same `@server/tool` spelling the approve loop
+        matches binds to the identity, not only to the title: a benign title
+        over a denied verified tool is denied, and deny still beats approve
+        when both lists are written against the identity."""
+        cfg = HooksConfig(
+            auto_approve_tools=["@ops/*"],
+            auto_deny_tools=["@ops/delete_*"],
+        )
+        mgr = HookManager(cfg)
+        # Benign title, denied identity -> DENY (the title never mattered).
+        assert (
+            mgr.on_tool_call(
+                "Tidy up the workspace",
+                mcp_server_name="ops",
+                mcp_tool_name="delete_everything",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_DENY
+        )
+        # The deny binds even without provenance: a deny target can only deny.
+        assert (
+            mgr.on_tool_call(
+                "Tidy up the workspace", mcp_server_name="ops", mcp_tool_name="delete_everything"
+            ).action
+            == TOOL_DENY
+        )
+        # A non-denied tool on the same server still auto-approves by identity.
+        assert (
+            mgr.on_tool_call(
+                "anything",
+                mcp_server_name="ops",
+                mcp_tool_name="list_items",
+                mcp_identity_trusted=True,
+            ).action
+            == TOOL_AUTO_APPROVE
+        )
+        # A server-level deny binds to every tool of that server.
+        mgr2 = HookManager(HooksConfig(auto_deny_tools=["@ops"]))
+        assert (
+            mgr2.on_tool_call("anything", mcp_server_name="ops", mcp_tool_name="list_items").action
+            == TOOL_DENY
+        )
+
+    def test_identity_grant_provenance_and_child_coverage(self):
+        """``identity_grant`` marks exactly the grants decided by verified MCP
+        identity, and ``identity_grant_covers_child`` admits only those, and
+        only for a child whose own identity verified."""
+        from types import SimpleNamespace
+
+        from kiro_crew.hooks import ToolHookResult, identity_grant_covers_child
+
+        cfg = HooksConfig(auto_approve_tools=["@memory-mcp/*", "Reading *"])
+        mgr = HookManager(cfg)
+        by_identity = mgr.on_tool_call(
+            "whatever",
+            mcp_server_name="memory-mcp",
+            mcp_tool_name="search_memory",
+            mcp_identity_trusted=True,
+        )
+        unproven_identity = mgr.on_tool_call(
+            "whatever", mcp_server_name="memory-mcp", mcp_tool_name="search_memory"
+        )
+        # Without provenance the identity keys nothing: title "whatever" matches
+        # no pattern, and the result carries no identity_grant.
+        assert unproven_identity.action == TOOL_ALLOW and unproven_identity.identity_grant is False
+        by_title = mgr.on_tool_call("Reading /tmp/x")
+        assert by_identity.action == TOOL_AUTO_APPROVE and by_identity.identity_grant is True
+        assert by_title.action == TOOL_AUTO_APPROVE and by_title.identity_grant is False
+
+        verified_child = SimpleNamespace(child_mcp_identity_trusted=True)
+        unverified_child = SimpleNamespace(child_mcp_identity_trusted=False)
+        assert identity_grant_covers_child(by_identity, verified_child) is True
+        assert identity_grant_covers_child(by_title, verified_child) is False
+        assert identity_grant_covers_child(by_identity, unverified_child) is False
+        assert identity_grant_covers_child(ToolHookResult.allow(), verified_child) is False
+        # A directly constructed result (the runner's downgrade shape) carries
+        # no identity provenance.
+        assert (
+            identity_grant_covers_child(ToolHookResult(action=TOOL_AUTO_APPROVE), verified_child)
+            is False
+        )
+
+    def test_title_only_pattern_logs_the_rewrite_once(self, caplog):
+        """A pattern that matches only the agent-authored title of an
+        identity-verified MCP call does not grant, and the gate logs the
+        rewrite once per (pattern, identity) so an unattended card can be
+        traced to its pattern."""
+        import logging
+
+        from kiro_crew import hooks as hooks_mod
+
+        hooks_mod._TITLE_ONLY_GRANT_NOTED.clear()
+        cfg = HooksConfig(auto_approve_tools=["Look up*"])
+        mgr = HookManager(cfg)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.hooks"):
+            for _ in range(2):
+                assert (
+                    mgr.on_tool_call(
+                        "Look up the paper the user mentioned",
+                        mcp_server_name="memory-mcp",
+                        mcp_tool_name="search_memory",
+                        mcp_identity_trusted=True,
+                    ).action
+                    == TOOL_ALLOW
+                )
+        notes = [r for r in caplog.records if "@memory-mcp/search_memory" in r.getMessage()]
+        assert len(notes) == 1
+        assert "'Look up*'" in notes[0].getMessage()
+        # No breadcrumb when the identity is unproven: the title branch is the
+        # grant key there and the pattern simply grants.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.hooks"):
+            assert (
+                mgr.on_tool_call(
+                    "Look up the paper", mcp_server_name="memory-mcp", mcp_tool_name="search_memory"
+                ).action
+                == TOOL_AUTO_APPROVE
+            )
+        assert not [r for r in caplog.records if "verified MCP identity" in r.getMessage()]
+
+
+class TestHookGateKwargs:
+    """``hook_gate_kwargs`` is the ONE extraction of the event-derived
+    ``on_tool_call`` arguments. A dispatcher that hand-copies the fields it
+    knows about drops the ones it does not, and the gate then never sees that
+    signal on that surface (``diff_path``, then the trusted MCP identity, were
+    each missed this way). The extraction is ``ToolCall.from_event`` and the
+    helper is that call's keyword form. These tests pin it on three axes: it
+    maps every field the gate reads (behavioral), the ``ToolCall`` it builds is
+    the gate's WHOLE input (completeness — a new gate field fails here first),
+    and every enforcing site in the package goes through it (structural — no
+    hand copy remains).
+    """
+
+    # The gate's keyword parameters that describe the CALLING SURFACE (who is
+    # asking, on whose behalf, in which mode) rather than the tool call. Every
+    # other keyword parameter is derived from the event, and the completeness
+    # test below demands the helper emit exactly those.
+    SURFACE_KWARGS = frozenset({"session_key", "agent", "app", "resolved_agent", "classifier_only"})
+
+    # The gate's event-derived parameters and the event attribute each reads.
+    # A new entry here means a new enforcement signal; the completeness test
+    # below then demands ``ToolCall.from_event`` fill it and the helper emit it.
+    EVENT_FIELD_BY_KWARG = {
+        "tool_kind": "tool_kind",
+        "raw_params": "raw_tool_params",
+        "diff_path": "diff_path",
+        "command": "shell_command",
+        "is_shell": "is_shell",
+        "mcp_server_name": "mcp_server_name",
+        "mcp_tool_name": "tool_name",
+        "mcp_identity_trusted": "mcp_identity_trusted",
+        "spawn_target": "spawn_target",
+    }
+
+    def test_maps_every_event_field_verbatim(self):
+        """A real ``AcpEvent`` carrying every enforcement field yields those
+        exact values under the gate's keyword names; ``command`` is the
+        recovered ``shell_command`` and ``mcp_tool_name`` is the ``_meta.kiro``
+        ``tool_name`` (never the model-authored title)."""
+        from kiro_crew.acp.types import AcpEvent
+        from kiro_crew.hooks import hook_gate_kwargs
+
+        event = AcpEvent(
+            kind="permission_request",
+            title="Run something the model described",
+            tool_kind="execute",
+            raw_tool_params={"command": "rm -rf ~/.aws"},
+            diff_path="/tmp/edited.txt",
+            is_shell=True,
+            mcp_server_name="ops",
+            tool_name="execute_bash",
+            mcp_identity_trusted=True,
+            spawn_target="helper",
+        )
+        kwargs = hook_gate_kwargs(event)
+        assert kwargs == {
+            "tool_kind": "execute",
+            "raw_params": {"command": "rm -rf ~/.aws"},
+            "diff_path": "/tmp/edited.txt",
+            "command": "rm -rf ~/.aws",
+            "is_shell": True,
+            "mcp_server_name": "ops",
+            "mcp_tool_name": "execute_bash",
+            "mcp_identity_trusted": True,
+            "spawn_target": "helper",
+        }
+        assert set(kwargs) == set(self.EVENT_FIELD_BY_KWARG)
+        # ``raw_params`` is the event's dict itself, not a copy — the gate
+        # reads it, never mutates it, and a copy would hide identity-based
+        # provenance checks downstream.
+        assert kwargs["raw_params"] is event.raw_tool_params
+
+    def test_missing_and_none_fields_take_the_gate_defaults(self):
+        """A provider event or test double missing a field — or carrying
+        ``None`` in a string/bool slot — yields exactly the default the gate
+        parameter declares, matching the ``getattr(...) or ""`` /
+        ``bool(getattr(...))`` reads the channel dispatchers used."""
+        from kiro_crew.hooks import hook_gate_kwargs
+
+        bare = hook_gate_kwargs(SimpleNamespace())
+        assert bare == {
+            "tool_kind": "",
+            "raw_params": None,
+            "diff_path": "",
+            "command": None,
+            "is_shell": False,
+            "mcp_server_name": "",
+            "mcp_tool_name": "",
+            "mcp_identity_trusted": False,
+            "spawn_target": "",
+        }
+        noisy = hook_gate_kwargs(
+            SimpleNamespace(
+                tool_kind=None,
+                raw_tool_params=None,
+                diff_path=None,
+                shell_command=None,
+                is_shell=None,
+                mcp_server_name=None,
+                tool_name=None,
+                mcp_identity_trusted=None,
+                spawn_target=None,
+            )
+        )
+        assert noisy == bare
+        # A non-shell event recovers no command even when its params carry one:
+        # ``shell_command`` is None off the shell kind, and the helper does not
+        # second-guess it (the gate keys deny-by-default on is_shell + command).
+        from kiro_crew.acp.types import AcpEvent
+
+        non_shell = AcpEvent(kind="permission_request", raw_tool_params={"command": "ls"})
+        assert hook_gate_kwargs(non_shell)["command"] is None
+        assert hook_gate_kwargs(non_shell)["is_shell"] is False
+
+    def test_output_is_accepted_by_the_gate_and_drives_it(self):
+        """The dict splats straight into ``on_tool_call``, and the gate reads
+        the identity out of it: an identity-keyed deny binds on a benign title
+        only because the helper threaded ``mcp_server_name``/``mcp_tool_name``/
+        ``mcp_identity_trusted`` — the very signal a hand-copying site drops."""
+        from kiro_crew.acp.types import AcpEvent
+        from kiro_crew.hooks import hook_gate_kwargs
+
+        mgr = HookManager(HooksConfig(auto_deny_tools=["@ops/delete_*"]))
+        event = AcpEvent(
+            kind="permission_request",
+            title="tidy up",
+            mcp_server_name="ops",
+            tool_name="delete_everything",
+            mcp_identity_trusted=True,
+        )
+        assert mgr.on_tool_call(event.title, session_key="s", **hook_gate_kwargs(event)).action == (
+            TOOL_DENY
+        )
+        # The same call with the identity dropped (the pre-helper drift) passes
+        # the deny — which is exactly what made the hand copies a security bug.
+        stripped = {
+            k: v
+            for k, v in hook_gate_kwargs(event).items()
+            if k not in ("mcp_server_name", "mcp_tool_name", "mcp_identity_trusted")
+        }
+        assert mgr.on_tool_call(event.title, session_key="s", **stripped).action == TOOL_ALLOW
+        # And a shell event whose command could not be recovered is denied by
+        # default through the helper's ``is_shell``/``command`` pair.
+        unrecoverable = AcpEvent(kind="permission_request", title="cleanup", is_shell=True)
+        assert (
+            HookManager().on_tool_call("cleanup", **hook_gate_kwargs(unrecoverable)).action
+            == TOOL_DENY
+        )
+
+    def test_overrides_replace_only_keys_the_helper_emits(self):
+        """A surface with a different event shape may replace an extracted
+        value; a key the helper does not extract is refused loudly, so a
+        misspelt override cannot become a stray gate kwarg."""
+        from kiro_crew.hooks import hook_gate_kwargs
+
+        ev = SimpleNamespace(tool_kind="", raw_tool_params={"cmd": "ls"}, is_shell=False)
+        kwargs = hook_gate_kwargs(ev, tool_kind="bash", command="ls", is_shell=True)
+        assert (kwargs["tool_kind"], kwargs["command"], kwargs["is_shell"]) == ("bash", "ls", True)
+        assert kwargs["raw_params"] == {"cmd": "ls"}
+        with pytest.raises(TypeError, match="mcp_tool"):
+            hook_gate_kwargs(ev, mcp_tool="typo")
+
+    def test_the_toolcall_from_an_event_is_the_whole_gate_input(self, monkeypatch):
+        """COMPLETENESS, observed: ``ToolCall.from_event`` fills every field of the
+        gate's input from the event (``resolved_agent`` excepted -- no event carries
+        it, so the site supplies it), the helper's output is exactly that call in
+        keyword form, and the keyword gate hands ``judge`` that same call plus the
+        surface. A field added to the gate's input is therefore extracted once, for
+        both forms, or this fails -- the failure mode the issue names is a new field
+        reaching no dispatcher because every site had to be edited by hand."""
+        import dataclasses
+
+        from kiro_crew.hooks import TOOL_ALLOW, ToolCall, ToolHookResult, hook_gate_kwargs
+
+        probe = SimpleNamespace(
+            title="<title>",
+            **{attr: f"<{attr}>" for attr in self.EVENT_FIELD_BY_KWARG.values()},
+        )
+        probe.is_shell = True
+        probe.mcp_identity_trusted = True
+        call = ToolCall.from_event(probe)
+        blank = ToolCall(title="")
+        unfilled = [
+            field.name
+            for field in dataclasses.fields(ToolCall)
+            if field.name not in ("title", "resolved_agent")
+            and getattr(call, field.name) == getattr(blank, field.name)
+        ]
+        assert unfilled == [], f"ToolCall fields no event attribute fills: {unfilled}"
+        assert (call.title, call.resolved_agent) == ("<title>", "")
+        assert ToolCall.from_event(probe, resolved_agent="kirocrew").resolved_agent == "kirocrew"
+        with pytest.raises(TypeError, match="resolved_agnet"):
+            ToolCall.from_event(probe, resolved_agnet="typo")
+
+        # The helper is the call's keyword form, field for field, and nothing else.
+        got = hook_gate_kwargs(probe)
+        assert got == call.kwargs()
+        assert set(got) == set(self.EVENT_FIELD_BY_KWARG)
+        assert set(got).isdisjoint(self.SURFACE_KWARGS)
+        for kwarg, attr in self.EVENT_FIELD_BY_KWARG.items():
+            if kwarg in ("is_shell", "mcp_identity_trusted"):
+                assert got[kwarg] is True
+            else:
+                assert got[kwarg] == f"<{attr}>", kwarg
+
+        # PARITY with the keyword form: ``on_tool_call``'s keywords are exactly the
+        # call's event-derived keywords plus the surface, and ``judge`` takes the
+        # call plus the surface alone -- a keyword added to either without a
+        # ``ToolCall`` field to carry it fails here instead of being dropped.
+        import inspect
+
+        def keyword_only(fn):
+            return {
+                name
+                for name, p in inspect.signature(fn).parameters.items()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY
+            }
+
+        shim = inspect.signature(HookManager.on_tool_call).parameters
+        assert [n for n, p in shim.items() if p.kind is not p.KEYWORD_ONLY] == ["self", "tool_name"]
+        assert keyword_only(HookManager.on_tool_call) == set(call.kwargs()) | self.SURFACE_KWARGS
+        assert keyword_only(HookManager.judge) | {"resolved_agent"} == self.SURFACE_KWARGS
+
+        # And the keyword gate judges exactly that call, with the surface beside it.
+        seen = []
+
+        def judge(self, gate_call, **surface):
+            seen.append((gate_call, surface))
+            return ToolHookResult(action=TOOL_ALLOW)
+
+        monkeypatch.setattr(HookManager, "judge", judge)
+        surface = {"session_key": "s", "agent": "a", "app": "p", "classifier_only": True}
+        HookManager().on_tool_call(
+            probe.title, resolved_agent="kirocrew", **surface, **hook_gate_kwargs(probe)
+        )
+        assert seen == [(dataclasses.replace(call, resolved_agent="kirocrew"), surface)]
+
+    # Sites the structural scan treats specially. Each entry is a reviewed
+    # decision, not drift: a new entry needs a reason in the site's comment.
+    INFORMATIONAL_SITES = {
+        # Slack's EVENT_TOOL_CALL branch: the tool is already executing, the
+        # branch cannot reject, and arming the params/diff/is_shell tiers would
+        # let a best-effort warning claim to have blocked a running call.
+        "slack/handler.py",
+    }
+    # ``.judge(`` calls that are not a hook-gate consultation, keyed by (site,
+    # receiver), so another receiver in the same module is still scanned.
+    NOT_HOOK_JUDGE_SITES = {
+        # The settle ladder's Gate port. Its HookGate adapter consults
+        # ``on_tool_call`` through each surface's own scanned site.
+        ("tool_permission.py", "policy.gate"),
+    }
+    ALLOWED_OVERRIDES = {
+        # Provider-agnostic readings of a stream that may not be an AcpEvent.
+        "apps/builtins/auto_improvement/spine/agent_runner.py": {
+            "tool_kind",
+            "command",
+            "is_shell",
+        },
+        # The KAS executeHook path gates a STORED hook's command, not a tool-call
+        # event: there is no event, and the command is the operator's own text.
+        "acp/kas_wire.py": {
+            "tool_kind",
+            "command",
+            "is_shell",
+        },
+    }
+
+    @staticmethod
+    def _gate_calls(text: str):
+        """Yield ``(line, call_text)`` for every gate consultation in ``text``.
+
+        The recognised consultation shape is an ASSIGNMENT
+        (``result = ...hooks.on_tool_call(`` or ``result = ...hooks.judge(``):
+        every gate consultation reads the verdict's ``.action``, so every one
+        binds the result. The renderers' unrelated ``on_tool_call`` handler
+        (``await self.on_tool_call(``) and docstring mentions are not
+        consultations. A gate call written in another shape would escape this
+        scan; keep the assignment shape when adding a site, or widen this pattern
+        with it.
+        """
+        import re
+
+        for match in re.finditer(r"=\s*[\w.]+\.(?:on_tool_call|judge)\(", text):
+            depth, i = 1, match.end()
+            while i < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[i], 0)
+                i += 1
+            # Comments inside the call explain the site; they are not kwargs.
+            call = re.sub(r"#[^\n]*", "", text[match.start() : i])
+            yield text.count("\n", 0, match.start()) + 1, call
+
+    @staticmethod
+    def _is_judge_site(call: str) -> bool:
+        """Whether a scanned consultation is the typed ``judge`` form."""
+        return call.split("(", 1)[0].endswith(".judge")
+
+    @staticmethod
+    def _judge_receiver(call: str) -> str:
+        """The expression a scanned ``judge`` site calls the method on."""
+        return call.split("(", 1)[0].lstrip("=").strip().removesuffix(".judge")
+
+    #: The ``ToolCall`` field each pinned ``hook_gate_kwargs`` override sets.
+    FIELD_BY_OVERRIDE = {"tool_kind": "kind", "command": "command", "is_shell": "is_shell"}
+
+    @classmethod
+    def _judge_site_offence(cls, rel: str, call: str) -> str | None:
+        """Why a typed ``judge`` consultation is an offender, or ``None``.
+
+        Held to the same rule as the keyword form. Its ``ToolCall`` is built IN
+        PLACE by ``ToolCall.from_event`` -- not hand-built, not bound to a name
+        first, not wrapped (``dataclasses.replace``) -- and the extraction may
+        override only ``resolved_agent``, which no event carries, plus the fields
+        the site's pinned ``ALLOWED_OVERRIDES`` set."""
+        import re
+
+        m = re.search(r"\.judge\(\s*(?:[\w.]+\.)?ToolCall\.from_event\(", call)
+        if not m:
+            return "judges a call not built in place by ToolCall.from_event"
+        depth, i = 1, m.end()
+        while i < len(call) and depth:
+            depth += {"(": 1, ")": -1}.get(call[i], 0)
+            i += 1
+        span = call[m.end() : i - 1]
+        if not re.match(r"\s*[,)]", call[i:]):
+            # Anything between the extraction and the end of the argument (a
+            # conditional, ``or``, an attribute or call on the result) can swap or
+            # reshape the call the gate judges.
+            return "wraps the ToolCall.from_event result"
+        if "**" in span:
+            return "splats unreviewable overrides into ToolCall.from_event"
+        pinned = cls.ALLOWED_OVERRIDES.get(rel, set())
+        allowed = {"resolved_agent"} | {cls.FIELD_BY_OVERRIDE[k] for k in pinned}
+        stray = sorted(set(re.findall(r"\b(\w+)\s*=(?!=)", span)) - allowed)
+        return f"overrides {stray} without a pinned reason" if stray else None
+
+    def test_a_typed_consultation_must_be_built_by_from_event(self):
+        """The scan sees the typed form and holds it to the one extraction and to
+        the pinned overrides, exactly as it holds an ``on_tool_call`` site."""
+        pinned = "apps/builtins/auto_improvement/spine/agent_runner.py"
+        cases = [
+            ("x.py", "a = self.hooks.judge(ToolCall.from_event(event), session_key=k)", None),
+            ("x.py", "a = gate.judge(hooks.ToolCall.from_event(event, resolved_agent=r))", None),
+            (
+                pinned,
+                "a = gate.judge(ToolCall.from_event(event, kind=k, command=c, is_shell=s))",
+                None,
+            ),
+            ("x.py", "b = self.hooks.judge(ToolCall(title=event.title, command=c))", "in place"),
+            ("x.py", "b = self.hooks.judge(call, session_key=k)", "in place"),
+            (
+                "x.py",
+                "b = gate.judge(dataclasses.replace(ToolCall.from_event(e), is_shell=False))",
+                "in place",
+            ),
+            (
+                "x.py",
+                "b = gate.judge(ToolCall.from_event(event, identity_trusted=True), app=p)",
+                "['identity_trusted']",
+            ),
+            ("x.py", "b = gate.judge(ToolCall.from_event(event, command=c))", "['command']"),
+            ("x.py", "b = gate.judge(ToolCall.from_event(event, **extra))", "splats"),
+            (
+                "x.py",
+                "b = gate.judge(ToolCall.from_event(e) if ok else ToolCall(identity_trusted=True))",
+                "wraps",
+            ),
+            ("x.py", "b = gate.judge(ToolCall.from_event(e) or forged, app=p)", "wraps"),
+            ("x.py", "b = gate.judge(ToolCall.from_event(e).__class__(title=t))", "wraps"),
+        ]
+        for rel, text, offence in cases:
+            ((_, call),) = self._gate_calls(text)
+            assert self._is_judge_site(call), text
+            got = self._judge_site_offence(rel, call)
+            assert (got is None) if offence is None else (offence in (got or "")), (text, got)
+        ((_, call),) = self._gate_calls(
+            "c = gate.on_tool_call(event.title, **hook_gate_kwargs(event))"
+        )
+        assert not self._is_judge_site(call)
+        # The pinned non-gate site is matched by its receiver, not by its module.
+        (_, port), (_, hooks_site) = self._gate_calls(
+            "v = policy.gate.judge(ask)\nr = self.hooks.judge(call, session_key=k)"
+        )
+        assert ("tool_permission.py", self._judge_receiver(port)) in self.NOT_HOOK_JUDGE_SITES
+        assert ("tool_permission.py", self._judge_receiver(hooks_site)) not in (
+            self.NOT_HOOK_JUDGE_SITES
+        )
+
+    @staticmethod
+    def _strip_helper_spans(call: str) -> tuple[str, list[str]]:
+        """Remove every ``hook_gate_kwargs(...)`` span from ``call``; return the
+        remainder and the override keys spelled inside those spans."""
+        import re
+
+        overrides: list[str] = []
+        out = call
+        while True:
+            m = re.search(r"hook_gate_kwargs\(", out)
+            if not m:
+                return out, overrides
+            depth, i = 1, m.end()
+            while i < len(out) and depth:
+                depth += {"(": 1, ")": -1}.get(out[i], 0)
+                i += 1
+            span = out[m.end() : i - 1]
+            overrides.extend(re.findall(r"\b(\w+)\s*=(?!=)", span))
+            out = out[: m.start()] + out[i:]
+
+    def test_every_enforcing_caller_uses_the_shared_extraction(self):
+        """STRUCTURAL: no hand-copied extraction remains. Every gate
+        consultation in the package splats ``**hook_gate_kwargs(event)``, and
+        outside that span spells none of the event-derived kwargs by hand — so
+        the next enforcement field is threaded in the helper once, and a site
+        cannot quietly drop a signal again. The informational Slack tool_call
+        site and the auto-improvement runner's three overrides are the pinned
+        exceptions; anything else is an offender."""
+        from pathlib import Path
+
+        import kiro_crew
+
+        root = Path(kiro_crew.__file__).resolve().parent
+        event_kwargs = set(self.EVENT_FIELD_BY_KWARG)
+        offenders: list[str] = []
+        helper_sites: set[str] = set()
+        not_hook_judge_sites: set[tuple[str, str]] = set()
+        for path in root.rglob("*.py"):
+            rel = path.relative_to(root).as_posix()
+            if "/tests/" in f"/{rel}" or rel == "hooks.py":
+                continue
+            text = path.read_text(encoding="utf-8")
+            for line, call in self._gate_calls(text):
+                if self._is_judge_site(call):
+                    if (rel, self._judge_receiver(call)) in self.NOT_HOOK_JUDGE_SITES:
+                        not_hook_judge_sites.add((rel, self._judge_receiver(call)))
+                        continue
+                    # The typed form: its input must be the one extraction too.
+                    offence = self._judge_site_offence(rel, call)
+                    if offence:
+                        offenders.append(f"{rel}:{line} {offence}")
+                    continue
+                uses_helper = "**hook_gate_kwargs(" in call
+                remainder, overrides = self._strip_helper_spans(call)
+                hand_copied = sorted(k for k in event_kwargs if f"{k}=" in remainder)
+                if not uses_helper:
+                    if rel in self.INFORMATIONAL_SITES:
+                        # Informational: may not arm deny-by-default or the
+                        # arg-derived tiers, but must still carry the identity
+                        # (the field whose omission was the original finding).
+                        missing = sorted(
+                            k
+                            for k in ("mcp_server_name", "mcp_tool_name", "mcp_identity_trusted")
+                            if f"{k}=" not in remainder
+                        )
+                        if missing or "is_shell=" in remainder:
+                            offenders.append(f"{rel}:{line} informational site drifted: {missing}")
+                        continue
+                    offenders.append(f"{rel}:{line} does not splat **hook_gate_kwargs(event)")
+                    continue
+                helper_sites.add(rel)
+                if hand_copied:
+                    offenders.append(f"{rel}:{line} hand-copies {hand_copied} beside the helper")
+                allowed = self.ALLOWED_OVERRIDES.get(rel, set())
+                stray = sorted(set(overrides) - allowed)
+                if stray:
+                    offenders.append(f"{rel}:{line} overrides {stray} without a pinned reason")
+        assert not offenders, "\n".join(offenders)
+        # The scan found the enforcing sites it was written for — an empty
+        # match set would make the assertion above vacuous.
+        assert helper_sites >= {
+            "permission_floor.py",
+            "dashboard/chat_runner.py",
+            "dashboard/handlers/hooks.py",
+            "llm_helpers.py",
+            "messaging/dispatch.py",
+            "slack/handler.py",
+            "slack/transport_dispatch.py",
+            "subagent_manager/run.py",
+            "task_executor.py",
+            "task_planner.py",
+            "telegram/transport_dispatch.py",
+            "apps/builtins/auto_improvement/spine/agent_runner.py",
+        }, sorted(helper_sites)
+        # Every pinned exception still exists; a deleted site must leave the
+        # table too, or the table drifts into fiction.
+        for rel in self.INFORMATIONAL_SITES | set(self.ALLOWED_OVERRIDES):
+            assert (root / rel).exists(), rel
+        # And each pinned non-gate ``judge`` site is still the call it names.
+        assert not_hook_judge_sites == self.NOT_HOOK_JUDGE_SITES
+
 
 class TestToolCallEvaluatesRawCommand:
     """Regression: the security gate must evaluate the ACTUAL shell command,
@@ -310,9 +1012,12 @@ class TestToolCallEvaluatesRawCommand:
 
     def test_credential_read_denied_via_command_not_benign_title(self):
         mgr = HookManager()
-        result = mgr.on_tool_call("check my config", command="cat ~/.aws/credentials")
+        result = mgr.on_tool_call(
+            "check my config", command="curl http://169.254.169.254/latest/meta-data/"
+        )
         assert result.action == TOOL_DENY
-        assert "sensitive" in result.reason.lower()
+        assert result.security_deny
+        assert "169.254.169.254" in result.reason or "metadata" in result.reason.lower()
 
     def test_benign_command_with_benign_title_allowed(self):
         cfg = HooksConfig(auto_deny_tools=["*cr --all*"])
@@ -380,8 +1085,8 @@ class TestShellCommandProperty:
     def test_from_tool_input_json_permission_event(self):
         """permission_request events set tool_input (JSON), NOT raw_tool_params
         — this is the dashboard's primary gate path, so the fallback is
-        load-bearing. Regression for the review-bot finding that the first cut
-        only read raw_tool_params and was a no-op on permission events."""
+        load-bearing: reading only raw_tool_params is a no-op on permission
+        events."""
         from kiro_crew.acp.types import AcpEvent
 
         ev = AcpEvent(
@@ -455,9 +1160,7 @@ class TestShellCommandUseAws:
         ev = AcpEvent(
             kind="permission_request",
             is_shell=True,
-            tool_input=_json.dumps(
-                {"service_name": "s3api", "operation_name": "list-buckets"}
-            ),
+            tool_input=_json.dumps({"service_name": "s3api", "operation_name": "list-buckets"}),
         )
         assert ev.shell_command == "aws s3api list-buckets"
 
@@ -519,12 +1222,10 @@ class TestShellCommandUseAws:
         stay armed for it."""
         from kiro_crew.acp.types import AcpEvent
 
-        ev = AcpEvent(
-            kind="tool_call", is_shell=True, raw_tool_params={"service_name": "ssm"}
-        )
+        ev = AcpEvent(kind="tool_call", is_shell=True, raw_tool_params={"service_name": "ssm"})
         assert ev.shell_command is None
 
-    # ── Casing normalization hardening (2026-08-05) ──
+    # ── Casing normalization hardening ──
 
     def test_pascal_case_operation_normalized_to_kebab(self):
         """PascalCase operation_name (the AWS API name, e.g. 'DeleteStack')
@@ -562,9 +1263,7 @@ class TestShellCommandUseAws:
         result = HookManager().on_tool_call(
             "AWS: cloudformation DeleteStack", command=ev.shell_command, is_shell=True
         )
-        assert result.action == TOOL_DENY, (
-            f"PascalCase 'DeleteStack' bypassed deny gate: {result}"
-        )
+        assert result.action == TOOL_DENY, f"PascalCase 'DeleteStack' bypassed deny gate: {result}"
 
     def test_camel_case_operation_normalized(self):
         """camelCase operation_name must also normalize (e.g. 'deleteStack')."""
@@ -661,8 +1360,11 @@ class TestShellCommandUseAws:
             kind="permission_request",
             is_shell=True,
             tool_input=_json.dumps(
-                {"service_name": "dynamodb", "operation_name": "DeleteTable",
-                 "parameters": {"table-name": "users-prod"}}
+                {
+                    "service_name": "dynamodb",
+                    "operation_name": "DeleteTable",
+                    "parameters": {"table-name": "users-prod"},
+                }
             ),
         )
         result = HookManager().on_tool_call(
@@ -805,6 +1507,161 @@ class TestSafeReadFile:
         security PermissionError — accurate error messages for callers."""
         with pytest.raises(FileNotFoundError):
             safe_read_file(str(tmp_path / "does-not-exist.txt"))
+
+    def test_refuses_a_file_already_past_the_ceiling(self, tmp_path, monkeypatch):
+        """A file whose open-time size exceeds MAX_FILE_BYTES is refused unread.
+
+        EFBIG as an OSError, not a bespoke type: most callers already wrap this
+        read in ``except OSError`` (``json.loads(safe_read_file(...))`` sites),
+        so the refusal degrades there instead of escaping as a crash.
+        """
+        import errno
+
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 16)
+        f = tmp_path / "big.json"
+        f.write_bytes(b"x" * 17)
+        with pytest.raises(OSError) as caught:
+            safe_read_file(str(f))
+        assert caught.value.errno == errno.EFBIG
+        assert not isinstance(caught.value, PermissionError)
+
+    def test_refuses_a_file_that_grows_after_the_open(self, tmp_path, monkeypatch):
+        """Growth between the size check and the read is refused mid-read.
+
+        ``fstat`` describes the file as it was at open time, so a writer holding
+        the same path can append while it is consumed. The append is driven from
+        the identity check because that is the real seam between the open and the
+        read — without the per-read charge this returns the grown content.
+        """
+        import errno
+
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 16)
+        f = tmp_path / "grows.json"
+        f.write_bytes(b"x" * 8)
+        real_check = hooks._opened_file_matches_validated_path
+
+        def append_then_check(fd: int, path: str) -> bool:
+            with open(f, "ab") as sink:
+                sink.write(b"y" * 64)
+            return real_check(fd, path)
+
+        monkeypatch.setattr(hooks, "_opened_file_matches_validated_path", append_then_check)
+        with pytest.raises(OSError) as caught:
+            safe_read_file(str(f))
+        assert caught.value.errno == errno.EFBIG
+
+    def test_collapses_crlf_like_the_text_handle_it_replaced(self, tmp_path):
+        """CRLF still arrives as "\\n".
+
+        The read moved from a text-mode handle to bytes plus a decode, and text
+        mode was collapsing line endings on the way out; a caller comparing
+        against a "\\n" literal would otherwise start seeing carriage returns.
+        """
+        f = tmp_path / "crlf.txt"
+        f.write_bytes(b"one\r\ntwo\rthree\n")
+        assert safe_read_file(str(f)) == "one\ntwo\nthree\n"
+
+    def test_identity_check_still_sees_the_opened_file_and_still_refuses(
+        self, tmp_path, monkeypatch
+    ):
+        """The authorization hook gets the REAL fd, and refusing it still raises.
+
+        The hook runs on the raw descriptor before any content reader is built.
+        A hook handed some other descriptor would leave this check comparing the
+        wrong file and passing everything, so the fd is pinned to the file's
+        identity rather than only asserting that the refusal fires.
+        """
+        import os
+
+        from kiro_crew import hooks
+
+        f = tmp_path / "watched.txt"
+        f.write_bytes(b"payload")
+        expected = os.stat(f)
+        seen: list[os.stat_result] = []
+
+        def refuse(fd: int, path: str) -> bool:
+            seen.append(os.fstat(fd))
+            return False
+
+        monkeypatch.setattr(hooks, "_opened_file_matches_validated_path", refuse)
+        with pytest.raises(PermissionError, match="no longer matches safe path"):
+            safe_read_file(str(f))
+        assert [(s.st_dev, s.st_ino) for s in seen] == [(expected.st_dev, expected.st_ino)]
+
+    def test_a_refused_descriptor_never_reaches_a_content_reader(self, tmp_path, monkeypatch):
+        """Authorization runs before the handle is built, not after it is yielded.
+
+        Routing the read through a context manager that opens AND wraps before
+        yielding puts the wrapping first, which is how this ordering was lost
+        once already.
+        """
+        import os
+
+        from kiro_crew import hooks
+
+        f = tmp_path / "refused.txt"
+        f.write_bytes(b"must not be read")
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("Refused descriptor reached the content reader")
+
+        monkeypatch.setattr(hooks, "_opened_file_matches_validated_path", lambda _fd, _p: False)
+        monkeypatch.setattr(os, "fdopen", forbidden)
+        with pytest.raises(PermissionError, match="no longer matches safe path"):
+            safe_read_file(str(f))
+
+    def test_the_opener_receives_the_resolved_path_as_a_str(self, tmp_path, monkeypatch):
+        """The leaf opener is a seam other suites stub, and those stubs match on ``str``.
+
+        Handing it a ``Path`` silently bypasses such a stub, which reads as the
+        stubbed refusal never firing rather than as a type mismatch.
+        """
+        import os
+
+        from kiro_crew import platform_compat
+
+        f = tmp_path / "plain.txt"
+        f.write_bytes(b"content")
+        real = platform_compat.open_file_no_reparse
+        seen: list[object] = []
+
+        def record(path, **kwargs):
+            seen.append(path)
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(platform_compat, "open_file_no_reparse", record)
+        assert safe_read_file(str(f)) == "content"
+        assert seen == [os.path.realpath(f)]
+        assert all(isinstance(p, str) for p in seen)
+
+    def test_an_unrelated_einval_is_not_renamed_into_a_safety_refusal(self, tmp_path, monkeypatch):
+        """EINVAL is overloaded, so only the opener's own non-regular refusal may be remapped.
+
+        A filesystem raising EINVAL for its own reason describes a legitimate file
+        that could not be opened; reporting it as a safe-path mismatch tells the
+        caller its file was refused on security grounds, which is a false claim.
+        """
+        import errno
+
+        from kiro_crew import platform_compat
+
+        f = tmp_path / "plain.txt"
+        f.write_bytes(b"content")
+
+        def einval(path, **kwargs):
+            raise OSError(errno.EINVAL, "invalid argument for this filesystem", str(path))
+
+        monkeypatch.setattr(platform_compat, "open_file_no_reparse", einval)
+        with pytest.raises(OSError) as caught:
+            safe_read_file(str(f))
+        assert not isinstance(caught.value, PermissionError)
+        assert caught.value.errno == errno.EINVAL
+        assert "invalid argument for this filesystem" in str(caught.value)
 
 
 class TestShouldAutoApproveSpawn:
@@ -962,13 +1819,82 @@ class TestEventIsSpawnRun:
         assert event_is_spawn_run(self._event(tool_name="", title="grep")) is False
 
 
+class TestClassifierOnlyHostTrustedProof:
+    """The READ_ONLY (``classifier_only``) non-shell proof is host-trusted only.
+
+    ``_is_host_read_only_builtin`` is the sole non-shell read-only proof the gate
+    accepts for the side chat. It demands a POSITIVE provenance signal
+    (``mcp_identity_trusted``) plus a host-known built-in name with no MCP server
+    behind it, and the allowlist itself is pinned to read scopes so a
+    write-capable built-in cannot join by mistake.
+    """
+
+    _WRITE_SCOPES = frozenset({"filesystem.write", "commands", "tools"})
+
+    def test_host_read_only_builtins_map_only_to_read_scopes(self):
+        # Every allowlisted name is a governed built-in whose scopes are read
+        # scopes only. A name absent from BUILTIN_TOOL_SCOPES has no governed
+        # scope at all and is not presumed read-only either.
+        from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS
+        from kiro_crew.platform.governance import BUILTIN_TOOL_SCOPES
+
+        read_scopes = {"filesystem.read", "network.egress"}
+        for name in sorted(_HOST_READ_ONLY_BUILTIN_TOOLS):
+            assert name in BUILTIN_TOOL_SCOPES, name
+            scopes = set(BUILTIN_TOOL_SCOPES[name])
+            assert scopes, name
+            assert scopes <= read_scopes, (name, scopes)
+            assert not (scopes & self._WRITE_SCOPES), (name, scopes)
+
+    def test_write_capable_builtins_are_not_allowlisted(self):
+        # The converse pin: no built-in that can write, run commands, or govern
+        # tools is on the read-only allowlist.
+        from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS
+        from kiro_crew.platform.governance import BUILTIN_TOOL_SCOPES
+
+        for name, scopes in BUILTIN_TOOL_SCOPES.items():
+            if self._WRITE_SCOPES & set(scopes):
+                assert name not in _HOST_READ_ONLY_BUILTIN_TOOLS, name
+
+    def test_trusted_host_builtin_is_proven_read_only(self):
+        from kiro_crew.hooks import _is_host_read_only_builtin
+
+        assert _is_host_read_only_builtin("fs_read", "", mcp_identity_trusted=True) is True
+
+    def test_untrusted_identity_refuses_a_host_known_name(self):
+        # The seam: a host-known name whose provenance is not the _meta.kiro
+        # parse this client made (inline payload, hand-built event, cache miss)
+        # is prose, not identity. The absence of a server name proves nothing.
+        from kiro_crew.hooks import _is_host_read_only_builtin
+
+        assert _is_host_read_only_builtin("fs_read", "", mcp_identity_trusted=False) is False
+
+    def test_mcp_served_tool_named_like_a_builtin_is_refused(self):
+        from kiro_crew.hooks import _is_host_read_only_builtin
+
+        assert (
+            _is_host_read_only_builtin("fs_read", "evil-server", mcp_identity_trusted=True) is False
+        )
+
+    def test_empty_identity_matches_nothing(self):
+        from kiro_crew.hooks import _is_host_read_only_builtin
+
+        assert _is_host_read_only_builtin("", "", mcp_identity_trusted=True) is False
+
+    def test_write_capable_builtin_is_not_a_read_only_proof(self):
+        from kiro_crew.hooks import _is_host_read_only_builtin
+
+        for name in ("fs_write", "code", "execute_bash"):
+            assert _is_host_read_only_builtin(name, "", mcp_identity_trusted=True) is False, name
+
+
 class TestMutatingKindBeatsTheTitle:
     """Only an explicitly READ-ONLY ``tool_kind`` may auto-approve on a title.
 
     ``tool_name`` is the display title, and ``select_tool_title``
     (``acp/_dispatch.py``) prefers the LLM-authored ``description`` — so it is
-    agent-controlled, which ``on_tool_call``'s own docstring states outright. The
-    computer-use read-only auto-approve used to be tested BEFORE any kind guard, so
+    agent-controlled, which ``ToolCall.title``'s own documentation states outright. The
+    computer-use read-only auto-approve must not be tested BEFORE any kind guard: otherwise,
     once the operator enabled computer use, an ``edit``/``execute``/``write``/
     ``delete`` call titled ``mcp__kirocrew-computer__computer_get_state`` skipped
     interactive approval entirely.
@@ -982,6 +1908,8 @@ class TestMutatingKindBeatsTheTitle:
     """
 
     _CU_OBSERVE_TITLE = "mcp__kirocrew-computer__computer_get_state"
+    #: A title no read-only rule recognises, so only the kind can approve it.
+    _OPAQUE_TITLE = "mcp__ops__frobnicate"
 
     #: Known mutators, plus the ACP values and shapes a denylist would miss. The
     #: second group is the point: those are what made the denylist fail open.
@@ -1012,31 +1940,47 @@ class TestMutatingKindBeatsTheTitle:
             "computer-use title — interactive approval was skipped"
         )
 
-    def test_the_read_only_kinds_are_an_allowlist_not_a_denylist(self):
-        """Pinned structurally: the gate must not reintroduce a mutating-kind list.
+    #: Kinds that must NOT auto-approve a non-shell call on their own: every
+    #: mutator, the ACP values a denylist would miss, and arbitrary strings.
+    _NOT_READ_ONLY = [
+        "other",
+        "edit",
+        "EDIT",
+        "execute",
+        "delete",
+        "move",
+        "search",
+        "think",
+        "switch_mode",
+        "write",
+        "frobnicate",
+    ]
 
-        A behavioural test alone would keep passing if someone widened the accepted
-        set back out, so this asserts the SHAPE — the read-only vocabulary is small
-        and explicit, and ``_WRITE_TOOL_KINDS`` is documentation rather than a branch.
-        """
-        import ast
-        import inspect
-        import textwrap
-
+    @pytest.mark.parametrize("kind", ["read", "fetch", "READ", " fetch "])
+    def test_only_the_read_only_kinds_auto_approve_a_call_on_their_own(self, kind):
+        """The allow-list, observed: ``read`` and ``fetch`` (case- and space-folded)
+        auto-approve a non-shell call whose title proves nothing -- and the
+        vocabulary is exactly those two, since a behavioural sample alone would keep
+        passing if the set were widened to a kind nobody listed here."""
         from kiro_crew import hooks as hooks_mod
 
         assert hooks_mod._READ_ONLY_TOOL_KINDS == frozenset({"read", "fetch"})
-        # Over the AST, not the source text: the explanatory comment names the
-        # constant deliberately, and a substring check would flag that prose.
-        tree = ast.parse(textwrap.dedent(inspect.getsource(hooks_mod.HookManager.on_tool_call)))
-        referenced = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
-            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
-        }
-        assert "_WRITE_TOOL_KINDS" not in referenced, (
-            "the gate branches on a denylist of mutating kinds again — `tool_kind` is "
-            "an arbitrary ACP string, so such a list is incomplete by construction"
-        )
-        assert "_READ_ONLY_TOOL_KINDS" in referenced, "the allow-list branch is gone"
+        result = HookManager().on_tool_call(self._OPAQUE_TITLE, tool_kind=kind)
+        assert (result.action, result.read_only) == (TOOL_AUTO_APPROVE, True)
+
+    @pytest.mark.parametrize("kind", _NOT_READ_ONLY)
+    def test_any_other_kind_reaches_a_prompt(self, kind):
+        """Fail closed on a kind nobody enumerated: ``other`` and an arbitrary string
+        are as unapproved as ``edit``. A DENYLIST of mutating kinds would auto-approve
+        exactly these, which is why the vocabulary is an allow-list."""
+        result = HookManager().on_tool_call(self._OPAQUE_TITLE, tool_kind=kind)
+        assert result.action == TOOL_ALLOW, f"tool_kind={kind!r} skipped the prompt"
+
+    def test_an_absent_kind_falls_back_to_the_title_and_no_further(self):
+        """No kind at all is not a read: the title-verb fallback decides, and a title
+        that proves nothing reaches a prompt."""
+        assert HookManager().on_tool_call(self._OPAQUE_TITLE).action == TOOL_ALLOW
+        assert HookManager().on_tool_call(self._OPAQUE_TITLE, tool_kind="").action == TOOL_ALLOW
 
     @pytest.mark.parametrize("kind", ["read", "fetch"])
     def test_a_genuine_cu_observation_still_auto_approves(self, kind, monkeypatch):
@@ -1235,7 +2179,7 @@ class TestCanonicalMcpIdentityGoverned:
         mgr = HookManager()
         r = mgr.on_tool_call(
             "Tidy up some files",
-            command="cat ~/.ssh/id_rsa",
+            command="curl http://169.254.169.254/latest/meta-data/",
             is_shell=True,
             mcp_server_name="shell:srv",
             mcp_tool_name="nothing_to_see",
@@ -1516,9 +2460,7 @@ class TestAppOwnMcpServerAutoApprove:
             "_is_first_party_app",
             lambda app: app.casefold() in {"myapp"},
         )
-        monkeypatch.setattr(
-            hooks_mod, "_BUILTIN_APP_MCP_SERVERS", frozenset({"myapp:srv"})
-        )
+        monkeypatch.setattr(hooks_mod, "_BUILTIN_APP_MCP_SERVERS", frozenset({"myapp:srv"}))
 
     def test_own_server_tool_auto_approved(self, _builtin):
         mgr = HookManager()
@@ -1956,7 +2898,7 @@ class TestTargetPathNestedExtraction:
     read shape ``{"operations": [{"mode": "Line", "path": …}]}`` — yielded ``[]``
     and the sensitive-path keystone in ``on_tool_call`` never saw the target.
     Worse than a missed deny: a read-kind call with the nested spelling was
-    AUTO-APPROVED while the flat spelling of the same path is denied (#6543).
+    AUTO-APPROVED while the flat spelling of the same path is denied.
 
     The fix recurses into dict/list values (depth-bounded) and stays
     extract-only; ``cli_chat``'s consent prompt shares the helper, so the
@@ -2079,9 +3021,7 @@ class TestTargetPathNestedExtraction:
         """The caps must not start refusing real batch reads."""
         from kiro_crew.hooks import target_paths
 
-        params = {
-            "operations": [{"mode": "Line", "path": f"/tmp/f{i}.txt"} for i in range(40)]
-        }
+        params = {"operations": [{"mode": "Line", "path": f"/tmp/f{i}.txt"} for i in range(40)]}
         result = target_paths(params)
         assert len(result) == 40
         assert result.truncated is False
@@ -2136,3 +3076,222 @@ class TestUnrecoverableShellIsRefusedUnconditionally:
         # so the assertion above pins the refusal and not a broken fixture.
         ok = HookManager(cfg).on_tool_call("Running: ls", is_shell=True, command="ls")
         assert ok.action == TOOL_AUTO_APPROVE
+
+
+class TestPathTierUnderAResolverStall:
+    """What the gate SAYS when the resolver cannot answer in time.
+
+    The decision is the same either way -- unverifiable is refused, fail-closed --
+    but a refusal reading ``access to sensitive path: <ordinary file>`` sends an
+    agent hunting for a credential in a project file, or concluding the session
+    has been locked down. The gate applies ONE path-tier check,
+    ``security.sensitive_path_refusal``; the verdict it is built on is stubbed on
+    the owning module, which is the global the real function reads.
+    """
+
+    def test_a_stalled_file_read_is_refused_as_unverifiable_not_as_sensitive(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew import security
+
+        target = tmp_path / "ws" / "README.md"
+        target.parent.mkdir()
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        result = HookManager().on_tool_call(
+            f"Reading {target}", tool_kind="read", raw_params={"path": str(target)}
+        )
+        assert result.action == TOOL_DENY
+        assert result.security_deny is True, "still a hard refusal, not policy state"
+        assert "access to sensitive path" not in result.reason
+        assert security.is_unverifiable_path_refusal(result.reason)
+        assert "NOT a match" in result.reason
+        assert repr(str(target)) in result.reason  # quoted: the unverifiable wording uses the repr
+
+    def test_a_sensitive_read_still_says_sensitive(self, monkeypatch):
+        from kiro_crew import security
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        result = HookManager().on_tool_call("~/.aws/credentials", tool_kind="read")
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.aws/credentials"
+
+    def test_safe_read_file_keeps_the_repr_quoted_match_wording(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert str(info.value) == f"Blocked: access to sensitive path: {str(target)!r}"
+
+    def test_safe_read_file_passes_the_unverifiable_wording_through(self, monkeypatch, tmp_path):
+        from kiro_crew import hooks, security
+
+        target = tmp_path / "plain.txt"
+        target.write_text("x")
+
+        def stalled(*args, **kwargs):
+            raise security.PathResolutionStalled(str(target), "/x")
+
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", stalled)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(str(target))
+        assert security.is_unverifiable_path_refusal(str(info.value))
+        assert "access to sensitive path" not in str(info.value)
+
+    def test_safe_read_file_escapes_a_matched_path_spelled_like_the_stall_wording(
+        self, monkeypatch, tmp_path
+    ):
+        """The stall is recognised by a fixed prefix the path cannot reach, so a
+        matched path that carries the stall wording -- and a forged newline -- is
+        still re-spelled with the repr (the log-forgery guard)."""
+        import os
+
+        from kiro_crew import hooks, security
+
+        forged = str(tmp_path / f"{security.UNVERIFIABLE_PATH_PREFIX}\nWARNING forged")
+        resolved = os.path.realpath(forged)
+        monkeypatch.setattr(security.paths, "_path_in_home_dirs", lambda *a, **k: True)
+        with pytest.raises(PermissionError) as info:
+            hooks.safe_read_file(forged)
+        message = str(info.value)
+        assert message == f"Blocked: access to sensitive path: {resolved!r}"
+        assert "\n" not in message
+
+
+class TestShellCommandTextLeavesThePathTier:
+    """A sandboxed shell tool's recovered COMMAND is command text, and the gate does
+    not match paths in command text (the sandbox holds the credential stores away
+    from the shell). Resolving ``cd /x && grep ...`` as a filename matches
+    nothing, spends a resolver round-trip per call, and under a resolver stall
+    yields ``access to sensitive path: cd /x && grep ...`` -- a refusal naming a
+    non-path as a credential. So exactly that string (and the title when it IS
+    that string) is spared the path tier; every other target still pays it.
+    """
+
+    CMD = "cd /workplace/me/proj && grep -rn verified_reverse_launch_into src"
+
+    def test_the_recovered_command_never_enters_the_path_tier(self, monkeypatch):
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return "Blocked: sensitive path could not be verified"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call(f"Running: {self.CMD}", command=self.CMD, is_shell=True)
+        assert asked == [], "no path resolution on the recovered command text"
+        assert result.action != TOOL_DENY or "sensitive path" not in result.reason
+
+    def test_a_shell_command_that_is_a_bare_path_is_left_to_the_sandbox(self, monkeypatch):
+        """The claude-agent-acp adapter's Bash title is the bare command. A command
+        that happens to be a bare path is command text all the same: the path tier
+        is not consulted, and the sandbox is what stands between the shell and the
+        credential store (see the spec's "does not match PATHS in command text")."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: asked.append(p) or "Blocked: sensitive path",
+        )
+        HookManager().on_tool_call(
+            "~/.aws/credentials", command="~/.aws/credentials", is_shell=True
+        )
+        assert asked == []
+
+    def test_a_shell_title_that_is_not_the_command_still_pays_the_path_tier(self, monkeypatch):
+        """An LLM-authored title on a shell frame is not command text; it is gated as
+        before (the resolver sees it, and a match on it is refused)."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            hooks, "sensitive_path_refusal", lambda p, base_dir=None: asked.append(p) or None
+        )
+        HookManager().on_tool_call("list the repo", command=self.CMD, is_shell=True)
+        assert asked == ["list the repo"]
+
+    def test_a_non_shell_title_is_still_path_gated(self, monkeypatch):
+        """The Claude Code adapter's file-read title is the bare path with no prefix
+        and no raw_params; the title tier is what fences it, and it must keep doing so."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return f"Blocked: access to sensitive path: {p}"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call("~/.ssh/id_rsa")
+        assert asked == ["~/.ssh/id_rsa"]
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.ssh/id_rsa"
+
+    def test_a_non_shell_read_with_raw_params_is_still_path_gated(self, monkeypatch):
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: f"Blocked: access to sensitive path: {p}",
+        )
+        result = HookManager().on_tool_call(
+            "Reading ~/.ssh/id_rsa", tool_kind="read", raw_params={"path": "~/.ssh/id_rsa"}
+        )
+        assert result.action == TOOL_DENY
+        assert "sensitive path" in result.reason
+
+    def test_an_mcp_served_shell_frame_keeps_the_path_tier(self, monkeypatch):
+        """kiro-cli can classify an execute-kind frame as shell while naming an MCP
+        server. An MCP-served tool runs outside the sandbox the exemption leans
+        on, so its command stays path-gated."""
+        from kiro_crew import hooks
+
+        asked: list[str] = []
+
+        def recording(p, base_dir=None):
+            asked.append(p)
+            return f"Blocked: access to sensitive path: {p}"
+
+        monkeypatch.setattr(hooks, "sensitive_path_refusal", recording)
+        result = HookManager().on_tool_call(
+            "~/.aws/credentials",
+            command="~/.aws/credentials",
+            is_shell=True,
+            mcp_server_name="local-files",
+            mcp_tool_name="read",
+        )
+        assert asked, "an MCP-served frame must reach the path tier"
+        assert result.action == TOOL_DENY
+        assert result.reason == "Blocked: access to sensitive path: ~/.aws/credentials"
+
+    def test_raw_params_paths_on_a_shell_frame_are_still_refused(self, monkeypatch):
+        """The raw_params path tier is independent of the command exemption: a shell-
+        classified frame carrying a path parameter is still refused on it."""
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(
+            hooks,
+            "sensitive_path_refusal",
+            lambda p, base_dir=None: f"Blocked: access to sensitive path: {p}",
+        )
+        result = HookManager().on_tool_call(
+            "Running: read",
+            command="read",
+            is_shell=True,
+            tool_kind="read",
+            raw_params={"path": "~/.ssh/id_rsa"},
+        )
+        assert result.action == TOOL_DENY
+        assert "sensitive path" in result.reason

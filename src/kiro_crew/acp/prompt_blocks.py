@@ -27,24 +27,48 @@ Wire shape (per docs/reference/kiro-cli/acp.md):
 from __future__ import annotations
 
 import base64
+<<<<<<< HEAD
 import io
+=======
+import hashlib
+>>>>>>> upstream/main
 import json
 import logging
 import os
 import re
 from pathlib import Path
 
-from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
+from kiro_crew.hooks import (
+    is_unc_shape,
+    safe_read_file_bytes,
+    safe_read_file_bytes_nolink,
+    unc_probe_allowed,
+)
+
+# The path grammar and the history scrubber live in the LEAF module
+# kiro_crew.image_refs for the same reason the Pillow machinery lives in
+# kiro_crew.imaging: kiro_crew.context needs the scrubber and the
+# agent-sdk-boundary gate forbids application code from importing
+# kiro_crew.acp. The pattern names are re-exported because this module and
+# its tests are where they have always been read from.
+from kiro_crew.image_refs import (  # noqa: F401 -- re-exported, see comment
+    _PATH_RE,
+    _POSIX_PATH_RE,
+    _WINDOWS_PATH_RE,
+    STRIPPED_IMAGE_MARKER,
+    strip_image_refs,
+)
 
 # The budget constants and Pillow machinery live in the LEAF module
 # kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
 # not import the ACP package). The two constants are re-exported because this
-# module is where the prompt path's callers and tests historically found them.
+# module is where the prompt path's callers and tests import them from.
 from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
     MAX_IMAGE_B64_BYTES,
     MAX_IMAGE_EDGE_PX,
     downscale_image_block,
 )
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -67,6 +91,7 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 #: a file that passed ingestion is not silently dropped here.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+<<<<<<< HEAD
 #: Formats every major vision provider accepts natively. Anything outside this
 #: set (AVIF, HEIC, TIFF, ICO, …) has to be transcoded to PNG before it is
 #: inlined, or the backend returns 400 "Could not process image". Mirrors the
@@ -174,46 +199,31 @@ def _transcode_to_png(raw: bytes, mime: str) -> bytes | None:
 #    guard rejects the "/" inside "https://" as a start position, which also
 #    stops a URL that merely ends in ".png" from being probed as a local file.
 _SUFFIX_GROUP = r"(?:png|jpg|jpeg|gif|webp|bmp)"
+=======
+#: Caps on what ONE prompt inlines, whatever its per-image sizes. The smallest
+#: backend request-body ceiling measured so far lies between a replayed request
+#: of 30.4 MB of base64 (accepted) and one of 33.8 MB (refused as improperly
+#: formed): 32 MiB. Three quarters of it is the images' share of a replayed
+#: request, the rest text, tool results and framing, and one prompt may inline
+#: half of that share -- 12 MiB. Twenty is where the backend's many-image
+#: dimension rule begins, and each replayed image costs about 1,600 tokens on
+#: every later turn. Both caps bound this prompt alone; what a conversation's
+#: replayed history carries in total is not measured here. A picture past either
+#: cap stays a path in the text, like one over the per-image cap.
+MAX_PROMPT_IMAGE_BLOCKS = 20
+MAX_PROMPT_IMAGE_B64_BYTES = 12 * 1024 * 1024
+>>>>>>> upstream/main
 
-#: Space and tab only -- NEVER `\s`. See note 2 above.
-_PATH_CHARS = r"[\w./@~ \t()\-]"
+#: Written after a readable picture's path when a cap kept it out of the
+#: prompt, so neither the user nor the model takes the picture as seen.
+PROMPT_LIMIT_NOTE = "[image not attached: prompt image limit]"
+IMAGE_SIZE_NOTE = "[image not attached: image size limit]"
 
-#: Must not begin mid-token: rules out "https://host/..." and a "/" that is
-#: already part of a longer path.
-_NOT_MID_TOKEN = r"(?<![\w:/])"
-
-_POSIX_PATH_RE = re.compile(
-    rf"{_NOT_MID_TOKEN}(/{_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
-    re.IGNORECASE,
-)
-
-# Windows absolute paths: a drive letter ("C:\...", "C:/...") or a UNC share
-# ("\\\\host\\share\\..."). Temp attachments land in %LOCALAPPDATA%\Temp and
-# dashboard uploads in %USERPROFILE%\.kiro\crew\uploads, so on Windows the
-# POSIX grammar matched NOTHING and every image stayed prose -- then the temp
-# file was deleted at end of turn, leaving a dead reference.
-#
-# Platform-gated rather than merged into one pattern: backslash and ":" are
-# legal in POSIX filenames, so accepting Windows shapes everywhere makes prose
-# like `the path C:\docs\logo.png is an example` a candidate -- and on Linux a
-# file with that literal name can exist in the CWD, which would inline a file
-# the user only mentioned. Matching the host's own grammar keeps that impossible.
-#
-# The UNC alternative accepts both separators after the leading pair
-# (``\\host\share\...`` and ``//host/share/...``): the dashboard composer
-# serializes image attachments with forward slashes (a markdown destination
-# cannot carry raw backslashes -- CommonMark eats ``\`` before punctuation),
-# and Windows file APIs accept the forward-slash form verbatim. The leading
-# pair likewise accepts ``//``; ``(?<![\w:/])`` guards it from matching inside
-# a URL's ``://``.
-_WINDOWS_PATH_CHARS = r"[\w\\/.@ \t()\-]"
-_WINDOWS_PATH_RE = re.compile(
-    rf"(?<![\w:])(?:(?<![\w:/]))((?:[A-Za-z]:[\\/]|[\\/]{{2}}[^\\/:*?\"<>|\r\n]+[\\/])"
-    rf"{_WINDOWS_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
-    re.IGNORECASE,
-)
-
-_PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
+#: A marker-shaped token the USER typed, in any case. Escaped before the builder
+#: writes its own, so only a marker this function produced reads as an
+#: attachment. The replay scrubber's "[image not carried ...]" is first-party
+#: text and is left alone.
+_TYPED_MARKER_RE = re.compile(r"\[image(?=:|\snot\sattached:)", re.IGNORECASE)
 
 
 def build_prompt_blocks(
@@ -223,12 +233,22 @@ def build_prompt_blocks(
     max_image_bytes: int = MAX_IMAGE_BYTES,
     max_image_edge: int = MAX_IMAGE_EDGE_PX,
     max_image_b64_bytes: int = MAX_IMAGE_B64_BYTES,
+    max_prompt_image_blocks: int = MAX_PROMPT_IMAGE_BLOCKS,
+    max_prompt_image_b64_bytes: int = MAX_PROMPT_IMAGE_B64_BYTES,
 ) -> list[dict]:
     """Return ACP prompt blocks for *message*.
 
     Each readable image path found in *message* becomes an ``image`` block and is
     replaced in the text by ``[image: <name>]`` so the model still sees where the
-    attachment sat in the sentence.
+    attachment sat in the sentence. The marker lands only where the path grammar
+    matched -- never inside a URL's own path or a longer local path that merely
+    contains the same characters; a local path quoted as a URL query value
+    (``?src=/tmp/a.png``) is a path to the grammar and is rewritten like any
+    other. A second DISTINCT file with the same basename gets
+    ``[image: <name> (2)]``, and so on; the same bytes under two names are one
+    block, marked both places with the first name. Past ``max_prompt_image_blocks``
+    blocks or ``max_prompt_image_b64_bytes`` of base64 in one prompt, a further
+    picture stays a path in the text.
 
     ``allow_image=False`` (the agent did not advertise
     ``promptCapabilities.image``) leaves the path in the text untouched: the file
@@ -248,22 +268,44 @@ def build_prompt_blocks(
 
     if allow_image:
         seen: set[str] = set()
+        # Every candidate the grammar matched, as ``(start, end, raw)`` in
+        # *message*, repeats included; the one-pass substitution after the loop
+        # rewrites exactly these spans.
+        candidates: list[tuple[int, int, str]] = []
+        # raw path -> the marker written for it, for every path this call
+        # inlined (or recognised as the same bytes as one it inlined).
+        markers: dict[str, str] = {}
+        # raw path -> the note written after it, for every readable picture a
+        # cap kept out of this prompt.
+        notes: dict[str, str] = {}
+        # sha256 of the file's bytes -> marker: the same bytes under a second
+        # name are the picture already attached, before any cap is consulted.
+        raw_digests: dict[str, str] = {}
+        # Basename -> how many DISTINCT files with that name were inlined, so
+        # the second one's marker can be told from the first.
+        marker_count: dict[str, int] = {}
+        prompt_b64_bytes = 0
+        past_block_cap = 0
         for match in _PATH_RE.finditer(message):
-            raw = match.group(1).strip()
+            group = match.group(1)
+            raw = group.strip()
+            start = match.start(1) + (len(group) - len(group.lstrip()))
+            end = start + len(raw)
+            candidates.append((start, end, raw))
             if raw in seen:
                 continue
+            seen.add(raw)
             # UNC-shaped candidates name a HOST on Windows: gate them before
             # any filesystem call, or is_file() below opens an SMB connection
             # to attacker-controlled text. POSIX has no such semantics (a
             # doubled leading slash is an ordinary local path), and _PATH_RE
             # is platform-gated anyway. See kiro_crew.hooks.unc_probe_allowed.
             if os.name == "nt" and is_unc_shape(raw) and not unc_probe_allowed(raw):
-                seen.add(raw)
                 continue
             path = Path(raw)
             suffix = path.suffix.lower()
-            mime = IMAGE_MEDIA_TYPES.get(suffix)
-            if mime is None:
+            suffix_mime = IMAGE_MEDIA_TYPES.get(suffix)
+            if suffix_mime is None:
                 # Unreachable for regex-produced candidates today (_PATH_RE's
                 # suffix group and IMAGE_MEDIA_TYPES share one key set), kept
                 # as the lexical backstop should the two ever drift.
@@ -276,16 +318,24 @@ def build_prompt_blocks(
             # on POSIX stat-ing through a symlink is harmless. Reference
             # wiring: dashboard/handlers/themes.py::_resolve_local_source.
             if os.name == "nt" and first_linked_ancestor(path) is not None:
-                seen.add(raw)
                 continue
             # The LEAF gets the junction-aware check the walk deliberately
             # excludes: is_file() below FOLLOWS a final-component link, so a
             # leaf symlink/junction targeting a UNC share is the same probe.
             # lstat-based, so the link itself is never followed.
             if os.name == "nt" and is_link_or_junction(path):
-                seen.add(raw)
                 continue
-            if not path.is_file():
+            # A long run of prose ending in an image suffix is not a path: a
+            # component over 255 characters (past every common name limit) raises
+            # ENAMETOOLONG (pathlib on 3.12 does not swallow it), and one raise
+            # here fails the whole turn. Skip it, and treat any probe error as
+            # "not a file" so the text still goes out.
+            if any(len(part) > 255 for part in path.parts):
+                continue
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
                 continue
             try:
                 size = path.stat().st_size
@@ -293,8 +343,12 @@ def build_prompt_blocks(
                 logger.debug("acp prompt: could not stat image %s", raw, exc_info=True)
                 continue
             if size > max_image_bytes:
-                # Leave the path in the text: the turn still carries a usable
-                # reference instead of silently losing the attachment.
+                # The path stays usable text, and the note says the picture
+                # was not attached, so nobody takes it as seen. The note speaks
+                # about an image, so only bytes that sniff as a raster earn it:
+                # a bounded read through the same gate, never the whole file.
+                if _sniffs_as_raster(path):
+                    notes[raw] = IMAGE_SIZE_NOTE
                 logger.warning(
                     "acp prompt: image %s is %d bytes (cap %d) - sending path, not inline",
                     path.name,
@@ -312,6 +366,7 @@ def build_prompt_blocks(
                 # stays in the text; it is NOT inlined.
                 logger.warning("acp prompt: image read refused for %s", path.name)
                 continue
+<<<<<<< HEAD
             # Magic-byte sniff is authoritative: a channel that lies about
             # content-type (Discord serving PNG bytes as webp) would otherwise
             # inline a payload the backend rejects with 400. When the real
@@ -342,6 +397,42 @@ def build_prompt_blocks(
                     continue
                 raw_bytes = transcoded
                 mime = "image/png"
+=======
+            raw_digest = hashlib.sha256(raw_bytes).hexdigest()
+            if raw_digest in raw_digests:
+                # The same picture under another name: one block, marked both
+                # places -- a cap never turns a duplicate into a dropped picture.
+                markers[raw] = raw_digests[raw_digest]
+                continue
+            # The suffix selects path CANDIDATES; the bytes decide what reaches
+            # the wire. Require a complete sniff window so a truncated header
+            # cannot become a pass-through image when Pillow is unavailable.
+            mime = (
+                sniff_raster_mime(raw_bytes[:SNIFF_BYTES])
+                if len(raw_bytes) >= SNIFF_BYTES
+                else None
+            )
+            if mime is None or mime not in IMAGE_MEDIA_TYPES.values():
+                logger.warning(
+                    "acp prompt: %s is not a supported raster by content - "
+                    "sending path, not inline",
+                    path.name,
+                )
+                continue
+            if len(images) >= max_prompt_image_blocks:
+                # The prompt is full: a further picture stays a path and says
+                # so, and is not decoded to learn that.
+                notes[raw] = PROMPT_LIMIT_NOTE
+                past_block_cap += 1
+                continue
+            if mime != suffix_mime:
+                logger.info(
+                    "acp prompt: %s is %s by content, not %s by suffix; using content",
+                    path.name,
+                    mime,
+                    suffix_mime,
+                )
+>>>>>>> upstream/main
             downscaled = downscale_image_block(
                 raw_bytes, mime, max_edge=max_image_edge, max_b64_bytes=max_image_b64_bytes
             )
@@ -351,6 +442,7 @@ def build_prompt_blocks(
                 # encoded ceiling at the minimum edge): leave the path as text
                 # rather than inline a payload the backend rejects on this and
                 # every later turn. A tool-capable agent can still open it.
+                notes[raw] = IMAGE_SIZE_NOTE
                 logger.warning(
                     "acp prompt: image %s could not be rendered within the "
                     "dimension and encoded-size caps - sending path, not inline",
@@ -359,11 +451,113 @@ def build_prompt_blocks(
                 continue
             out_bytes, out_mime = downscaled
             data = base64.b64encode(out_bytes).decode("ascii")
-            seen.add(raw)
+            if prompt_b64_bytes + len(data) > max_prompt_image_b64_bytes:
+                # Past what one prompt may carry: the path stays usable text
+                # and says so, exactly as a picture over the per-image cap does.
+                notes[raw] = PROMPT_LIMIT_NOTE
+                logger.warning(
+                    "acp prompt: image %s is past this prompt's limit of %d base64 bytes - "
+                    "sending path, not inline",
+                    path.name,
+                    max_prompt_image_b64_bytes,
+                )
+                continue
+            marker_count[path.name] = marker_count.get(path.name, 0) + 1
+            nth = marker_count[path.name]
+            marker = f"[image: {path.name}]" if nth == 1 else f"[image: {path.name} ({nth})]"
             images.append({"type": "image", "data": data, "mimeType": out_mime})
-            text = text.replace(raw, f"[image: {path.name}]")
+            markers[raw] = marker
+            raw_digests[raw_digest] = marker
+            prompt_b64_bytes += len(data)
+        if past_block_cap:
+            logger.warning(
+                "acp prompt: %d image(s) past this prompt's limit of %d blocks - "
+                "sending paths, not inline",
+                past_block_cap,
+                max_prompt_image_blocks,
+            )
+        text = _rewrite_text(message, candidates, markers, notes)
+    else:
+        # The path stays as written, but a typed marker must not claim an
+        # attachment on a backend that takes none either.
+        text = _rewrite_text(message, [], {}, {})
 
     return [{"type": "text", "text": text}, *images]
+
+
+def _sniffs_as_raster(path: Path) -> bool:
+    """Whether the first bytes of *path* are a supported raster's, read through
+    the gate and bounded to the sniff window, for a file too large to read whole.
+
+    The bounded reader refuses a hardlinked file, so such a picture earns no
+    note: a missing note is the fail-safe direction, a wrong claim is not.
+    """
+    try:
+        head = safe_read_file_bytes_nolink(str(path), max_bytes=SNIFF_BYTES, allow_truncate=True)
+    except Exception:
+        return False
+    if head is None or len(head) < SNIFF_BYTES:
+        return False
+    return sniff_raster_mime(head) in IMAGE_MEDIA_TYPES.values()
+
+
+#: What may follow a path inside a markdown destination: an optional closing
+#: angle bracket, an optional quoted title, then the parenthesis.
+_DESTINATION_TAIL_RE = re.compile(r">?(?:[ \t]+\"[^\"\n]*\")?\)")
+
+
+def _markdown_destination_close(message: str, start: int, end: int) -> int | None:
+    """Index just past the ``)`` closing a markdown destination that holds
+    ``message[start:end]``, or ``None`` when the span is not such a destination."""
+    opened = message[start - 2 : start] == "](" or message[start - 3 : start] == "](<"
+    if start < 2 or not opened:
+        return None
+    tail = _DESTINATION_TAIL_RE.match(message, end)
+    if tail is None:
+        return None
+    return tail.end()
+
+
+def _rewrite_text(
+    message: str,
+    candidates: list[tuple[int, int, str]],
+    markers: dict[str, str],
+    notes: dict[str, str],
+) -> str:
+    """*message* with inlined candidates replaced by their marker, kept-out
+    pictures followed by their note, and typed marker-shaped tokens escaped.
+
+    One pass over the grammar's own match spans plus the typed-marker spans, in
+    text order, so a marker lands exactly where a candidate the grammar
+    recognised stood -- never inside a URL or another path that merely contains
+    the same characters, which a whole-text ``str.replace`` would also rewrite.
+    """
+    edits: list[tuple[int, int, str]] = []
+    for start, end, raw in candidates:
+        marker = markers.get(raw)
+        if marker is not None:
+            edits.append((start, end, marker))
+            continue
+        note = notes.get(raw)
+        if note is not None:
+            close = _markdown_destination_close(message, start, end)
+            if close is not None:
+                # Inside a markdown destination the note would corrupt the link:
+                # it follows the whole reference instead.
+                edits.append((close, close, f" {note}"))
+            else:
+                edits.append((start, end, f"{raw} {note}"))
+    edits.extend((m.start(), m.start(), "\\") for m in _TYPED_MARKER_RE.finditer(message))
+    if not edits:
+        return message
+    out: list[str] = []
+    pos = 0
+    for start, end, replacement in sorted(edits):
+        out.append(message[pos:start])
+        out.append(replacement)
+        pos = end
+    out.append(message[pos:])
+    return "".join(out)
 
 
 #: Block ``type`` values that get a dedicated counter in the structure summary.
@@ -397,8 +591,8 @@ def summarize_prompt_structure(blocks: object) -> dict:
       than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
-    therefore cannot leak credentials or user data. That is a hard requirement
-    (issue #6022) -- the kiro-cli data dir is fenced precisely because it holds
+    therefore cannot leak credentials or user data. That is a hard
+    requirement -- the kiro-cli data dir is fenced precisely because it holds
     SSO tokens, so the outbound-request diagnostics must expose counts, types,
     and sizes ONLY, never the bytes themselves.
 

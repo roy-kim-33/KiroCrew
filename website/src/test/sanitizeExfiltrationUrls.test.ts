@@ -39,61 +39,63 @@ function expectRedacted(url: string): void {
   expect(out).not.toContain(url)
 }
 
-describe('sanitizeExfiltrationUrls: the reported false positive', () => {
-  it('keeps a long prefilled GitHub issue link', () => {
+describe('sanitizeExfiltrationUrls: no shape waives redaction of model-authored text', () => {
+  it('redacts a long prefilled GitHub issue link to this project own tracker', () => {
+    // This block used to assert the opposite. Two waivers were tried (#7824 on
+    // shape, then pinned to this repository) and both are exfiltration primitives:
+    // what this function sanitizes is MODEL-AUTHORED text, so injected content can
+    // steer the model into emitting a prefill URL whose `body` carries encoded
+    // private context. The user submits it and the issue is PUBLIC, so pinning the
+    // repository changes who reads the payload from the attacker to everyone,
+    // including the attacker. The feature is served by the backend's structured
+    // `github_issue_url` field instead, which no redactor scans.
     expect(LONG_BENIGN_QUERY.length).toBeGreaterThanOrEqual(200)
-    expectKept(ISSUE_URL)
+    expectRedacted(ISSUE_URL)
   })
 
-  it('keeps it when the host case differs', () => {
-    // RFC 4343: DNS host case is not significant, so `GitHub.com` is the same
-    // destination and must be validated the same way.
-    expectKept(`https://GitHub.com/kirodotdev/KiroCrew/issues/new?${LONG_BENIGN_QUERY}`)
+  it('redacts it when the host case differs', () => {
+    // RFC 4343 leaves DNS host case insignificant; with no waiver it changes nothing.
+    expectRedacted(`https://GitHub.com/kirodotdev/KiroCrew/issues/new?${LONG_BENIGN_QUERY}`)
   })
 
-  it('keeps a short query at any host, as before the narrowing', () => {
+  it('keeps a short query at any host, so only the length signal moved', () => {
     expectKept('https://example.com/page?ref=chat&tab=1')
   })
 
-  it('keeps it for a dot-leading repository name', () => {
-    // `.github` is an ordinary repository, so refusing a leading dot outright
-    // (while still refusing `..`) would carve out less than the shape allows.
-    expectKept(`https://github.com/kirodotdev/.github/issues/new?${LONG_BENIGN_QUERY}`)
+  it('redacts a prefill link to an attacker-owned repository', () => {
+    expectRedacted(`https://github.com/attacker/exfil-sink/issues/new?${LONG_BENIGN_QUERY}`)
+  })
+
+  it('redacts the other long-query host the same report names', () => {
+    // #7820 reports monitorportal.amazon.com alongside the prefill link. Both stay
+    // redacted: narrowing this heuristic is a per-host decision on its own merits,
+    // not a per-shape escape hatch.
+    expectRedacted(
+      'https://monitorportal.amazon.com/metrics?namespace=AWS/SageMaker' +
+        '&metricName=Invocations&dimensions=EndpointName%3Dmy-endpoint' +
+        '&startTime=2026-09-01T00%3A00%3A00Z&period=300&stat=Sum&region=us-west-2' +
+        '&accountId=123456789012&view=timeSeries&label=long+enough+to+pass+two+hundred',
+    )
   })
 })
 
-describe('sanitizeExfiltrationUrls: every span of the validated shape is load-bearing', () => {
-  it('redacts an unvalidated path at the same host', () => {
+describe('sanitizeExfiltrationUrls: the length signal applies to every host', () => {
+  // These used to prove each span of a validated exempt SHAPE was load-bearing.
+  // With no exempt shape they prove the simpler and stronger property: a >=200-char
+  // query is redacted wherever it appears, with no path, port or scheme exception.
+  it('redacts a long query at this project own repository', () => {
     expectRedacted(`https://github.com/kirodotdev/KiroCrew/settings?${LONG_BENIGN_QUERY}`)
   })
 
-  it('redacts a deeper path that merely ends in issues/new', () => {
-    expectRedacted(`https://github.com/a/b/c/issues/new?${LONG_BENIGN_QUERY}`)
-  })
-
-  it('redacts an unknown query parameter smuggled alongside the known ones', () => {
-    expectRedacted(`https://github.com/o/r/issues/new?${LONG_BENIGN_QUERY}&leak=${'x'.repeat(8)}`)
-  })
-
-  it('redacts a parameter whose key is empty', () => {
-    expectRedacted(`https://github.com/o/r/issues/new?${LONG_BENIGN_QUERY}&=payload`)
-  })
-
-  it('redacts an owner/repo segment spelled as a `..` traversal', () => {
-    // A browser normalises `..` away before sending, so this names a path
-    // github.com never served — an unaccounted-for component like any other.
-    expectRedacted(`https://github.com/../../issues/new?${LONG_BENIGN_QUERY}`)
-  })
-
-  it('redacts an explicit port on the exempt host', () => {
+  it('redacts an explicit port on github.com', () => {
     expectRedacted(`https://github.com:8080/o/r/issues/new?${LONG_BENIGN_QUERY}`)
   })
 
-  it('redacts the plaintext-http spelling of the exempt shape', () => {
+  it('redacts the plaintext-http spelling', () => {
     expectRedacted(`http://github.com/o/r/issues/new?${LONG_BENIGN_QUERY}`)
   })
 
-  it('does NOT treat a suffix look-alike host as the exempt host', () => {
+  it('does NOT treat a suffix look-alike host as github.com', () => {
     const url = `https://github.com.evil.example/o/r/issues/new?${LONG_BENIGN_QUERY}`
     const out = sanitizeExfiltrationUrls(`leak: ${url}`)
     expect(out).not.toContain(url)
@@ -109,10 +111,9 @@ describe('sanitizeExfiltrationUrls: every span of the validated shape is load-be
 })
 
 describe('sanitizeExfiltrationUrls: no pattern signal is waived', () => {
-  // The carve-out waives the aggregate-length signal alone. Each case below puts
-  // a pattern signal inside the fully validated exempt shape and asserts it still
-  // redacts, which is what bounds the narrowing: an unbounded payload cannot ride
-  // through on a validated destination.
+  // These predate the carve-out and outlive it. Each puts a pattern signal in a
+  // prefill-shaped URL to this project's own tracker and asserts it still redacts,
+  // independent of the length signal.
   const validPrefix = 'https://github.com/kirodotdev/KiroCrew/issues/new?body='
 
   it('redacts a base64 blob inside the validated shape', () => {
@@ -156,34 +157,151 @@ describe('sanitizeExfiltrationUrls: no pattern signal is waived', () => {
   })
 })
 
-describe('sanitizeExfiltrationUrls: the `+`-encoded prose body is still redacted', () => {
+describe('sanitizeExfiltrationUrls: both spellings of a prose body are redacted', () => {
+  // The two cases below are the same logical prefilled issue link spelled two ways,
+  // and they are redacted by DIFFERENT signals — which is why the pair is worth
+  // keeping now that nothing is waived.
+  //
   // `+` is the form-encoded spelling of a space — what `URLSearchParams` emits —
   // and it is inside EXFIL_B64_RE's class, so ~7 words of unpunctuated prose in a
-  // `+`-encoded `body=` are one 40+ char run and the URL is redacted before
-  // isPrefilledIssueUrl() is ever consulted. This is DELIBERATE, not an oversight:
-  // the two ways to stop it — dropping `+` from the class, or splitting the query
-  // on `+` before testing — both let an attacker `+`-chunk a 40+ char secret
-  // straight past the signal, and a chunking bypass costs more than a placeholder
-  // on a prose link. So the carve-out covers the `%20` spelling of a prefilled
-  // issue link and not the `+` spelling, and these tests pin that boundary so it
-  // is a documented limit rather than a surprise.
+  // `+`-encoded `body=` are one 40+ char run. That fires regardless of length, and
+  // it is DELIBERATE: the two ways to stop it — dropping `+` from the class, or
+  // splitting the query on `+` before testing — both let an attacker `+`-chunk a
+  // 40+ char secret straight past the signal.
+  //
+  // The `%20` spelling breaks that run, so it reaches the aggregate-length signal
+  // instead and is redacted there. It used to be KEPT, by the withdrawn
+  // `isPrefilledIssueUrl` waiver; a validated shape no longer earns an exception,
+  // because the shape of a URL says nothing about who authored it.
   const PLUS_PROSE_URL =
     'https://github.com/kirodotdev/KiroCrew/issues/new?title=Dashboard+chat+drops+long+links' +
     '&body=The+dashboard+chat+redaction+fires+on+ordinary+prefilled+issue+links+and+replaces' +
     '+them+with+a+placeholder&labels=bug'
 
-  it('redacts it even though the query is UNDER the length threshold', () => {
-    // Proof the base64 signal, not the length signal, is what fires: waiving
-    // length could not have changed this verdict.
+  it('redacts the `+` spelling even though the query is UNDER the length threshold', () => {
+    // Proof the base64 signal, not the length signal, is what fires here.
     const query = PLUS_PROSE_URL.slice(PLUS_PROSE_URL.indexOf('?') + 1)
     expect(query.length).toBeLessThan(200)
     expectRedacted(PLUS_PROSE_URL)
   })
 
-  it('keeps the same link once its spaces are `%20`, which breaks the run', () => {
-    // The other side of the boundary, and the shape a realistic prefilled link
-    // has once any parameter carries a percent-escape (see the `%20`/`%2C` mix in
-    // MarkdownRenderer.longUrlLinkify's fixture).
-    expectKept(ISSUE_URL)
+  it('redacts the `%20` spelling on length once the base64 run is broken', () => {
+    // The other side of the boundary: no 40+ char base64 run, so this one is
+    // caught by aggregate query length alone. Asserting both properties keeps it
+    // from passing for the wrong reason if the fixture ever changes.
+    const query = ISSUE_URL.slice(ISSUE_URL.indexOf('?') + 1)
+    expect(query.length).toBeGreaterThanOrEqual(200)
+    expect(/[A-Za-z0-9+/]{40,}={0,2}/.test(query)).toBe(false)
+    expectRedacted(ISSUE_URL)
+  })
+})
+
+describe('sanitizeExfiltrationUrls: a `)` in the path does not end the scan (#8638)', () => {
+  const key = 'AKIAIOSFODNN7EXAMPLE'
+
+  it('redacts a secret query that follows a `)` in the path', () => {
+    const url = `https://evil.example.com/a)b?token=${key}`
+    const out = sanitizeExfiltrationUrls(`see ${url} for details`)
+    expect(out).not.toContain(key)
+    expect(out).not.toContain('b?token=')
+  })
+
+  it('keeps the wrapper `)` and trailing punctuation outside the redacted span', () => {
+    const out = sanitizeExfiltrationUrls(`(see https://evil.example.com/y?q=${key}).`)
+    expect(out).not.toContain(key)
+    expect(out.endsWith(').')).toBe(true)
+    expect(out.startsWith('(see ')).toBe(true)
+  })
+
+  it('redacts a balanced `(...)` path segment through to its query', () => {
+    const out = sanitizeExfiltrationUrls(`(https://evil.example.com/wiki/A_(b)?q=${key})`)
+    expect(out).not.toContain(key)
+    expect(out.endsWith(')')).toBe(true)
+    expect(out).not.toContain('(b)')
+  })
+
+  it('ends a match where a `)` opens the next URL, so each URL is judged alone', () => {
+    const badge = 'https://img.shields.io/badge/x.svg'
+    const out = sanitizeExfiltrationUrls(`[![b](${badge})](https://ci.evil.example.com/r?t=${key})`)
+    expect(out).not.toContain(key)
+    expect(out).toContain(`[![b](${badge})](`)
+    expect(out).toContain('ci.evil.example.com')
+    expect(out).not.toContain('img.shields.io]')
+  })
+
+  it('ends a markdown link target where markdown does, keeping a glued next link', () => {
+    const out = sanitizeExfiltrationUrls(`[a](https://evil.example.com/x?q=${key})[docs](/help)`)
+    expect(out).not.toContain(key)
+    expect(out.startsWith('[a](')).toBe(true)
+    expect(out.endsWith(')[docs](/help)')).toBe(true)
+  })
+
+  it('still scans a URL glued after a markdown link target', () => {
+    const out = sanitizeExfiltrationUrls(`[a](https://example.com/p)*https://evil.example.com/?q=${key}*`)
+    expect(out).not.toContain(key)
+    expect(out.startsWith('[a](https://example.com/p)*')).toBe(true)
+  })
+
+  it('still scans the query after a `)` when a bare `](` is not a real link', () => {
+    const out = sanitizeExfiltrationUrls(`x](https://evil.example.com/a)b?leak=${key}`)
+    expect(out).not.toContain('https://evil.example.com')
+  })
+
+  it('judges a real link target alone, leaving plain text after it', () => {
+    const tail = `?d=${'A'.repeat(48)}`
+    const text = `[docs](https://docs.example.com/guide)${tail}`
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
+  })
+
+  it('redacts the flagged URL, not an earlier mention of the same text', () => {
+    const out = sanitizeExfiltrationUrls(`see https://e.example.com/p and [a](https://e.example.com/p?t=${key})`)
+    expect(out.startsWith('see https://e.example.com/p and [a](')).toBe(true)
+    expect(out).not.toContain(key)
+  })
+
+  it('scans a markdown link target through balanced parens to its query', () => {
+    const out = sanitizeExfiltrationUrls(`[a](https://evil.example.com/w/A_(b)?q=${key})`)
+    expect(out).not.toContain(key)
+    expect(out.endsWith(')')).toBe(true)
+  })
+
+  it('keeps glued CJK prose after a `(`-wrapped URL verbatim', () => {
+    const text = `(https://docs.example.com/guide?v=2)${'説明'.repeat(150)}`
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
+  })
+
+  it('keeps glued `**note**` after a `(`-wrapped redacted URL verbatim', () => {
+    const blob = 'A'.repeat(40)
+    const out = sanitizeExfiltrationUrls(`(https://docs.example.com/guide?sig=${blob})**note**`)
+    expect(out).not.toContain(blob)
+    expect(out.startsWith('(')).toBe(true)
+    expect(out.endsWith(')**note**')).toBe(true)
+  })
+
+  it('still redacts a secret after a `)` in the path when a prose `(` opens the URL', () => {
+    const out = sanitizeExfiltrationUrls(`(https://evil.example.com/a)b?token=${key}`)
+    expect(out).not.toContain(key)
+  })
+
+  it('keeps an escaped `\\)` inside a markdown link target, so its query is scanned', () => {
+    const out = sanitizeExfiltrationUrls(`[a](https://evil.example.com/a\\)b?q=${key})`)
+    expect(out).not.toContain(key)
+    expect(out.endsWith(')')).toBe(true)
+  })
+
+  it('keeps glued CJK prose after a space-led `(see url)` verbatim', () => {
+    const text = `(see https://docs.example.com/guide?v=2)${'\u8aac\u660e'.repeat(150)}`
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
+  })
+
+  it('still redacts a secret past a `)` when a benign query comes before it', () => {
+    const out = sanitizeExfiltrationUrls(`see https://evil.example.com/p?a=1)b?token=${key} ok`)
+    expect(out).not.toContain(key)
+    expect(out.endsWith(' ok')).toBe(true)
+  })
+
+  it('leaves a wrapped URL with no query untouched', () => {
+    const text = '(see https://example.com/y)'
+    expect(sanitizeExfiltrationUrls(text)).toBe(text)
   })
 })

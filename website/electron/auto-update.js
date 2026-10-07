@@ -16,9 +16,22 @@
  * forced OFF (see configureUpdater) and every install path goes through
  * stopGateway() first.
  *
+<<<<<<< HEAD
  * Pure helpers (buildFeedBase) are dependency-free and tested directly.
  * initAutoUpdate takes the electron + electron-updater surfaces injected so
  * it stays testable without an Electron runtime.
+=======
+ * Pure helpers (channelForFlavor, channelForVersion, resolveChannel,
+ * buildFeedBase) are dependency-free and tested directly. initAutoUpdate takes
+ * the electron + electron-updater surfaces injected so it stays testable
+ * without an Electron runtime.
+ *
+ * The policy stays here: channels and their publish lanes, the feed and
+ * download URLs, the update-policy flags, the externally-managed marker and the
+ * install-shape probes. initAutoUpdate gates on them and then composes one of
+ * two lanes from runtime/update/: the electron-updater feed lane, or the
+ * marker-driven managed lane, both reporting through one state reporter.
+>>>>>>> upstream/main
  */
 
 // Default update feed host: updates.crew.kiro.dev, the pointer hostname of the
@@ -37,7 +50,373 @@ const {
   containingDirForBundle,
   canInstallUpdates,
 } = require("./bundle-location");
+const { createUpdateReporter } = require("./runtime/update/state-reporter");
+const { createManagedLane } = require("./runtime/update/managed-lane");
+const { createFeedLane } = require("./runtime/update/feed-lane");
 
+<<<<<<< HEAD
+=======
+// The Linux package formats this app ships. A format is BOTH the feed
+// sub-directory a package install reads its channel file from AND the download
+// extension its manual-reinstall link must use, so one set serves both: the
+// format has to be known rather than assumed, because `package-type` is the only
+// signal that names it and the resourcesPath fallback in classifyLinuxInstall()
+// proves only that this IS a package. An unnamed format therefore stays empty,
+// canUpdateLinuxInstall() refuses, and the download link falls back to the
+// AppImage — instead of pointing an rpm install at deb bytes either way.
+const LINUX_PACKAGE_EXTENSIONS = new Set(["deb", "rpm"]);
+
+// The two single-arch macOS builds, spelled the way electron-builder spells
+// the arch (its ${arch} artifact macro) and the way sign-and-notarize.yml names
+// the per-arch feed directory and DMG suffix. The universal build is the
+// absence of a stamp, never a third value, so the default path stays the
+// universal one.
+const MAC_DIST_ARCHES = new Set(["arm64", "x64"]);
+
+/**
+ * Which macOS build this app is: "" for the universal DMG, "arm64" / "x64" for
+ * a single-arch one. Read from the app's OWN package.json, where
+ * packaging/build-desktop.sh stamps `desktopDistArch` via electron-builder's
+ * extraMetadata on the single-arch legs and nothing on the universal one.
+ *
+ * WHY a build-time stamp and not process.arch: a universal app and an
+ * arm64-only app both answer "arm64" on Apple Silicon, yet they must follow
+ * different feeds -- a universal client fed the arm64-only zip would lose its
+ * x86_64 slice on the next update, silently, and the reverse would double the
+ * download the single-arch install was chosen to avoid. Only the build knows
+ * which one it produced.
+ *
+ * Fail-safe direction: an unreadable package.json or an unknown value resolves
+ * to "" -- the universal feed, which every mac install could run -- rather than
+ * throwing on the one path that exists to keep the app updatable.
+ *
+ * @param {object} [o]
+ * @param {() => any} [o.readPackageJson] injected for tests; defaults to the
+ *   app's package.json, resolved relative to this module (inside app.asar when
+ *   packaged), which is where extraMetadata lands.
+ * @returns {string}
+ */
+function resolveMacDistArch({ readPackageJson = () => require("./package.json") } = {}) {
+  let value = "";
+  try {
+    value = String((readPackageJson() || {}).desktopDistArch || "");
+  } catch {
+    return "";
+  }
+  return MAC_DIST_ARCHES.has(value) ? value : "";
+}
+
+/**
+ * Which Linux install shape is running, resolved from the three signals that
+ * exist at runtime. I/O-bearing (it reads the package-type file), so it sits
+ * here rather than in the pure bundle-location module, and every input is
+ * injectable so tests never touch a real filesystem.
+ *
+ * @param {object} [o]
+ * @param {object} [o.env=process.env]
+ * @param {string} [o.resourcesPath=process.resourcesPath]
+ * @returns {{kind:string, format:string, appImagePath:string}}
+ */
+function resolveLinuxInstall({ env = process.env, resourcesPath = process.resourcesPath } = {}) {
+  const appImagePath = (env && env.APPIMAGE) || "";
+  let packageType = "";
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    packageType = fs.readFileSync(path.join(resourcesPath || "", "package-type"), "utf8").trim();
+  } catch {
+    // Absent on an AppImage and on any build whose target had no publish config
+    // — the other two signals cover both, so this is a normal case, not a fault.
+    packageType = "";
+  }
+  const kind = classifyLinuxInstall({ appImagePath, packageType, resourcesPath });
+  const format = kind === "package" && LINUX_PACKAGE_EXTENSIONS.has(packageType) ? packageType : "";
+  return { kind, format, appImagePath };
+}
+
+// The externally-managed marker, named after the PEP 668 precedent: a distro or
+// enterprise packager that owns this install's update lifecycle drops this file
+// into the packaged resources (beside `package-type` and `backend-dist`, the
+// established outside-asar packager surface). Its PRESENCE is the whole signal;
+// the JSON body only adds display metadata.
+const EXTERNALLY_MANAGED_MARKER = "EXTERNALLY-MANAGED";
+// Read cap for the marker and display caps for its fields. The marker is an
+// operator/packager-owned local file, but this code runs synchronously during
+// main-process startup: an unbounded read of a huge file (or a symlink into a
+// FIFO/device) must not be able to stall or exhaust the app. An over-cap or
+// non-regular entry still counts as MANAGED — presence is the signal — just
+// with no metadata to show.
+const EXTERNALLY_MANAGED_MAX_BYTES = 8192;
+const MANAGED_BY_MAX_CHARS = 128;
+const UPDATE_COMMAND_MAX_CHARS = 512;
+const CHECK_COMMAND_MAX_CHARS = 512;
+
+/**
+ * Is this install's update lifecycle owned by an external package manager?
+ *
+ * Lookup order: the `KIROCREW_EXTERNALLY_MANAGED` env var (a path to a marker
+ * file, or any other non-empty value to mark the install managed with no
+ * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`, and
+ * honored ONLY on an unpackaged build: in a packaged app one env var in the
+ * launch environment would otherwise name the file whose body we execute), then
+ * the BAKED marker `<app code>/EXTERNALLY-MANAGED` (inside app.asar, next to
+ * this file — placed there at build time by `packaging/build-desktop.sh` when
+ * `KIROCREW_MANAGED_INSTALL_MARKER` names one; read on a PACKAGED build only,
+ * since in a dev checkout that directory is writable source), then the LOOSE marker
+ * `<resourcesPath>/EXTERNALLY-MANAGED` a repackager drops beside the app.
+ * I/O-bearing and fully injectable, like resolveLinuxInstall above.
+ *
+ * The two on-disk shapes differ in WHO put the file there, which is what its
+ * authority rests on. The loose marker is a post-build affordance for a distro
+ * packager, so it is gated on provenance (below). The baked marker is part of
+ * the application's own code: it ships in the same archive as main.js and this
+ * module, so anyone positioned to rewrite it is already positioned to rewrite
+ * the code that reads it, and no ownership probe can add anything to that. It
+ * is therefore trusted as code is trusted — on every platform, Windows
+ * included — and it outranks a loose marker when both exist, because a
+ * build-time declaration by the edition that produced the binary is a stronger
+ * statement than a file dropped next to it afterwards. On macOS the baked
+ * marker is additionally sealed by codesign for free.
+ *
+ * The marker body is optional JSON `{managedBy, updateCommand, checkCommand}`:
+ * `managedBy` names the owning system for the About panel, `updateCommand` is
+ * the command the panel offers to copy AND (when the managed auto-update path
+ * is active) the command run to apply an update, and `checkCommand` is the
+ * optional command run to discover whether an update is available. Every
+ * degenerate marker — empty, unparsable,
+ * over-cap, a directory, a symlink, a dangling symlink — still means MANAGED:
+ * an operator who dropped SOMETHING at that name gets the safe behavior
+ * (updater off) even when the metadata is wrong, never a silent fallback to
+ * self-updating. Entries are `lstat`ed and only regular files are read, so a
+ * symlink can never route this startup-path read into a FIFO or device.
+ *
+ * INTEGRITY (loose marker only): the metadata is only parsed when neither the
+ * marker nor its directory is OWNED by this euid or writable by group/other (see
+ * canRewriteMarker) — `updateCommand`/`checkCommand` are SHELLED, so a marker
+ * anything running as this user could rewrite is a marker that names arbitrary
+ * code to run. A rewritable marker still means MANAGED, just with no metadata:
+ * the same degenerate shape as an empty body, which leaves the updater off and
+ * nothing to execute. Windows always takes that answer for a loose marker (no
+ * POSIX owner to read); a baked marker is not probed on any platform.
+ *
+ * @param {object} [o]
+ * @param {object} [o.env=process.env]
+ * @param {string} [o.resourcesPath=process.resourcesPath]
+ * @param {boolean} [o.isPackaged]  packaged app? gates the env-var seam off
+ * @param {(p:string)=>boolean} [o.probeMarkerRewritable=canRewriteMarker]
+ * @param {string} [o.bakedMarkerPath]  where the in-code marker lives; defaults
+ *   to `EXTERNALLY-MANAGED` beside this module (inside app.asar when packaged)
+ * @returns {{managedBy:string, updateCommand:string, checkCommand:string}|null} null when not managed
+ */
+function readExternallyManaged({
+  env = process.env,
+  resourcesPath = process.resourcesPath,
+  // Is this a PACKAGED app? Only the env-var seam consults it, and only to
+  // refuse. Resolved lazily so the module still loads outside Electron: a
+  // runtime with no `electron.app` is by definition not the packaged desktop
+  // app, which is exactly when the harness seam is allowed.
+  isPackaged = (() => {
+    try {
+      const electronApp = require("electron").app;
+      return !!(electronApp && electronApp.isPackaged);
+    } catch {
+      return false;
+    }
+  })(),
+  // Marker-integrity probe, injected for the same reason as the other probes in
+  // this module: assertable without a real read-only install directory.
+  probeMarkerRewritable = canRewriteMarker,
+  // The in-code marker. `__dirname` is inside app.asar in a packaged build
+  // (Electron's fs shim reads through the archive), and the module directory
+  // in a dev checkout, where the file simply does not exist.
+  bakedMarkerPath = require("path").join(__dirname, EXTERNALLY_MANAGED_MARKER),
+} = {}) {
+  let raw = null;
+  let markerPath = "";
+  // Which shape was found. Only a LOOSE marker is subject to the provenance
+  // probe below; a baked one is code (see the doc comment).
+  let loose = false;
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // Present-but-unreadable (non-regular, over-cap, read error) = managed, no
+    // metadata. Absent = null. Never follows a symlink into the read.
+    const readMarkerAt = (p) => {
+      let st;
+      try {
+        st = fs.lstatSync(p);
+      } catch {
+        return null; // absent
+      }
+      if (!st.isFile() || st.size > EXTERNALLY_MANAGED_MAX_BYTES) return "";
+      try {
+        return fs.readFileSync(p, "utf8");
+      } catch {
+        return "";
+      }
+    };
+    // The env seam is a DEV/TEST affordance. In a packaged app the launch
+    // environment (shell profile, launchd plist, .desktop file) is writable by
+    // the user, so honoring it there would let one env var choose the file whose
+    // body this process shells.
+    const override = (!isPackaged && env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
+    if (override) {
+      // A value that names a marker file reads it; any other non-empty value
+      // (including a dangling path) marks the install managed with no metadata.
+      // Treated like a loose marker: the harness is exercising that path.
+      markerPath = override;
+      loose = true;
+      raw = readMarkerAt(override);
+      if (raw === null) raw = "";
+    } else {
+      // Baked first: a build-time declaration outranks a file dropped later.
+      // PACKAGED builds only. The baked path is `__dirname/EXTERNALLY-MANAGED`,
+      // and in a dev checkout `__dirname` is a plain writable source directory,
+      // not an archive: a file there has none of the provenance the trust rests
+      // on, and the managed lane below arms its launch timer before the
+      // dev-disable gate. An unpackaged run reads no baked marker; the env seam
+      // above is the harness's route.
+      markerPath = isPackaged && bakedMarkerPath ? bakedMarkerPath : "";
+      raw = markerPath ? readMarkerAt(markerPath) : null;
+      if (raw === null) {
+        markerPath = path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER);
+        loose = true;
+        raw = readMarkerAt(markerPath);
+        if (raw === null) return null;
+      }
+    }
+  } catch {
+    // fs itself unavailable (non-node runtime): nothing to read, not managed.
+    return null;
+  }
+  // Integrity gate: a LOOSE marker this process could rewrite carries no
+  // authority, so it is read as a bare marker (managed, no metadata).
+  // Deliberately BEFORE the parse, so no attacker-chosen string reaches the
+  // fields at all. A baked marker skips the probe: it is code, and its
+  // provenance is the application's own.
+  if (raw && loose && probeMarkerRewritable(markerPath)) raw = "";
+  let managedBy = "";
+  let updateCommand = "";
+  let checkCommand = "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.managedBy === "string") {
+        managedBy = parsed.managedBy.trim().slice(0, MANAGED_BY_MAX_CHARS);
+      }
+      if (typeof parsed.updateCommand === "string") {
+        updateCommand = parsed.updateCommand.trim().slice(0, UPDATE_COMMAND_MAX_CHARS);
+      }
+      if (typeof parsed.checkCommand === "string") {
+        checkCommand = parsed.checkCommand.trim().slice(0, CHECK_COMMAND_MAX_CHARS);
+      }
+    }
+  } catch {
+    // Presence alone is the signal; a bare marker means managed, no metadata.
+  }
+  return { managedBy, updateCommand, checkCommand };
+}
+
+// Can THIS process rewrite the externally-managed marker?
+//
+// The marker's `updateCommand`/`checkCommand` are handed to a shell, so the
+// marker's integrity is the whole boundary between "the packager that owns this
+// install told us how to update" and "anything that can write one file told us
+// what to run". A marker we can rewrite is one a prompt-injected agent shell
+// running as this user can rewrite, so its metadata is refused.
+//
+// The question is OWNERSHIP, not the current mode bits. `access(W_OK)` answers
+// "can I write this right now", and a POSIX owner can always `chmod +w` back —
+// so on exactly the user-owned installs this exists to defend (Homebrew,
+// `pip --user`, ~/Applications) an attacker would plant the marker, `chmod 0400`
+// it, and be handed the trusted verdict. Provenance is what the metadata's
+// authority rests on, so provenance is what is probed:
+//
+//   - a file or directory OWNED by this euid is rewritable (chmod is ours),
+//   - a group- or world-writable one is rewritable by whoever else holds it, and
+//   - one the KERNEL says we can write is rewritable however that was granted.
+//
+// The third arm is not redundant with the second: POSIX mode bits do not model
+// ACLs, so a root-owned 0755 directory carrying a macOS `chmod +a` (or Linux
+// setfacl) entry for this user is writable while every mode bit reads safe.
+// access(W_OK) is the only check that sees that grant.
+//
+// Both the marker and its directory are checked, because either one controls the
+// content: a writable directory allows replacing the file outright, and a file
+// we own is rewritable even inside a directory we do not.
+//
+// Fail-CLOSED — the OPPOSITE direction to isBundleContainerWritable below. There
+// a probe that cannot run must not disable updates; here a marker whose
+// provenance cannot be established must not be executed. The cost of the safe
+// answer is only "no metadata", which is the historical bare-marker behavior.
+// Windows takes that answer UNCONDITIONALLY and by declaration: it has no POSIX
+// owner to read, and `access(W_OK)` there does not model ACLs, so there is no
+// honest verdict to give. A Windows install therefore never honors a LOOSE
+// marker's commands; a packager that needs them there bakes the marker into the
+// app at build time, where this probe does not apply (see readExternallyManaged
+// and docs/build/desktop-app.md).
+function canRewriteMarker(markerPath) {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // No POSIX ownership to read: declared fail-closed (see note above).
+    if (process.platform === "win32" || typeof process.geteuid !== "function") return true;
+    const euid = process.geteuid();
+    // root owns everything and can chmod anything, so nothing is un-rewritable.
+    if (euid === 0) return true;
+    for (const target of [markerPath, path.dirname(markerPath)]) {
+      let st;
+      try {
+        st = fs.lstatSync(target);
+      } catch {
+        return true; // cannot establish provenance
+      }
+      if (st.uid === euid) return true;          // ours: chmod +w is ours too
+      if ((st.mode & 0o022) !== 0) return true;  // group- or world-writable
+      try {
+        fs.accessSync(target, fs.constants.W_OK);
+        return true;                             // ACL-granted write
+      } catch {
+        // Not writable by any grant the kernel knows about.
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// The narrowed, non-user-writable PATH every marker command runs under: an
+// agent-writable entry on the user's own PATH cannot shadow a command. The
+// marker's commands must name ABSOLUTE binaries (a bare name will not resolve
+// here) — mirrors CommandProvider. Read per call, so it follows SystemRoot.
+const managedPath = () =>
+  process.platform === "win32"
+    ? [
+        `${process.env.SystemRoot || "C:\\Windows"}\\System32`,
+        process.env.SystemRoot || "C:\\Windows",
+      ].join(";")
+    : "/usr/bin:/bin:/usr/sbin:/sbin";
+
+// Can the AppImage replace itself, i.e. is the directory HOLDING the image
+// writable? AppImageUpdater stages the new image beside the old one and `mv`s it
+// over the original, so the containing directory — not the mounted, read-only
+// squashfs the app runs from — is what must be writable. Same fail-safe TRUE as
+// isBundleContainerWritable: a probe that cannot run must not read as
+// "un-updatable".
+function isAppImageContainerWritable(appImagePath) {
+  const dir = containingDirForAppImage(appImagePath);
+  if (!dir) return true;
+  try {
+    const fs = require("fs");
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+>>>>>>> upstream/main
 // Can the macOS installer write the directory holding our .app (i.e. replace
 // the bundle)? electron-updater does NOT install on macOS itself: MacUpdater
 // serves the downloaded .zip over a loopback HTTP server and delegates to
@@ -69,7 +448,6 @@ const GITHUB_REPO = "KiroCrew";
 const DOWNLOAD_BASE = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest/download`;
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // every 4h while running
 const LAUNCH_CHECK_DELAY_MS = 30 * 1000; // let startup settle first
-const FORCE_EXIT_AFTER_MS = 5 * 1000; // failsafe: guarantee exit after quitAndInstall
 
 /**
  * Platforms with a working publish lane + updater. win32 is packaged as NSIS
@@ -94,7 +472,22 @@ const SUPPORTED_PLATFORMS = new Set(["darwin", "linux"]);
  * update harness (KIROCREW_UPDATE_FEED=http://127.0.0.1:PORT/feed) works;
  * cleartext update metadata over a real network stays rejected.
  *
+<<<<<<< HEAD
  * @param {{base:string, channel:string}} o
+=======
+ * `variant` adds one path segment below the channel, which is how a Linux
+ * package install reaches its OWN channel file: electron-updater derives the
+ * file NAME from platform and arch with no hook to change it, so two formats
+ * cannot share a directory without one overwriting the other's metadata.
+ * Separating them by directory leaves that derivation — including the
+ * `-arm64` suffix — completely untouched. The single-arch macOS builds ride
+ * the same seam: electron-updater appends NO arch suffix on darwin, so
+ * feed/<channel>/arm64/ and feed/<channel>/x64/ (written by
+ * sign-and-notarize.yml's mac_variant legs) are the only way an arm64-only
+ * app and the universal app can each read their own latest-mac.yml.
+ *
+ * @param {{base:string, channel:string, variant?:string}} o
+>>>>>>> upstream/main
  * @returns {string}
  * @throws {Error} on a missing base, or a non-HTTPS, non-loopback base
  */
@@ -126,12 +519,52 @@ function buildFeedBase({ base, channel }) {
  *
  * @param {string} version    pending version to download
  * @param {string} osPlatform process.platform value
+<<<<<<< HEAD
  * @returns {string|null}
  */
 function manualDownloadUrl(version, osPlatform) {
   if (!version) return null;
   const file = osPlatform === "darwin"
     ? `RoyCrew-${version}-arm64.dmg`
+=======
+ * @param {string} [osArch]   process.arch value; defaults to the running arch
+ * @param {string} [linuxFormat] resolved package format ("deb"/"rpm"), or "" for
+ *        an AppImage / unknown shape
+ * @param {string} [macDistArch] which macOS build this is: "" (universal) or
+ *        "arm64" / "x64" (see resolveMacDistArch)
+ * @returns {string|null}
+ */
+function manualDownloadUrl(channel, osPlatform, osArch = process.arch, linuxFormat = "", macDistArch = "") {
+  if (!channelHasLane(channel)) return null;
+  // On darwin the arch comes from the BUILD, not the host: the universal DMG
+  // runs anywhere, so a universal install is offered KiroCrew.dmg whatever
+  // process.arch says, and a single-arch install is offered its own DMG
+  // (KiroCrew-arm64.dmg / KiroCrew-x64.dmg, the latest aliases
+  // sign-and-notarize.yml's mac_variant legs write) so a reinstall keeps the
+  // install the user chose. Linux has no universal
+  // binary: publish-linux.yml publishes one artifact per arch per format under
+  // the basenames below, so handing a user the wrong one is an immediate
+  // "cannot execute binary file" — or, for a package, one dpkg/rpm refuses.
+  // An arch with no published lane returns null rather than guessing x86_64.
+  // The format must match how they installed: offering an AppImage to someone
+  // whose files are managed by a package manager invites two parallel installs,
+  // so every recognised package format keeps its own extension and only an
+  // AppImage (or a shape we could not name) falls back to the image.
+  const linuxArch = { x64: "x86_64", arm64: "aarch64" }[osArch];
+  const linuxExt = LINUX_PACKAGE_EXTENSIONS.has(linuxFormat) ? linuxFormat : "AppImage";
+  // A published artifact FILENAME, not prose: the joined form is what
+  // publish-linux.yml writes to the CDN, and the arch and extension are
+  // interpolated because there are now six (arch, format) pairs to name.
+  const linuxFile = linuxArch ? `KiroCrew-${linuxArch}.${linuxExt}` : null; // brand-ok
+  // Windows ships x64 only. build-windows.yml has no arm64 leg, and Windows has
+  // exactly one channel file whatever the arch (electron-updater appends an arch
+  // suffix for linux alone), so a second arch means another entry in the same
+  // latest.yml rather than another feed.
+  const windowsFile = { x64: "KiroCrew-Setup.exe" }[osArch];
+  const macFile = MAC_DIST_ARCHES.has(macDistArch) ? `KiroCrew-${macDistArch}.dmg` : "KiroCrew.dmg"; // brand-ok
+  const file = osPlatform === "darwin"
+    ? macFile
+>>>>>>> upstream/main
     : osPlatform === "linux"
       ? `RoyCrew-${version}.AppImage`
       : null;
@@ -268,6 +701,19 @@ function classifyError(err) {
  * @param {() => Promise<void>} deps.stopGateway - graceful, awaitable gateway stop
  * @param {string} [deps.platform]             - display arch, e.g. "darwin-arm64"
  * @param {string} [deps.osPlatform]           - process.platform override (tests)
+<<<<<<< HEAD
+=======
+ * @param {string} [deps.osArch]               - process.arch override (tests). Picks the
+ *   per-arch Linux AppImage for the manual-reinstall link; darwin ignores it
+ *   (which mac DMG to offer is a property of the BUILD, see macDistArch).
+ * @param {string} [deps.macDistArch]          - which macOS build this is: "" for the
+ *   universal DMG, "arm64" / "x64" for a single-arch one. Selects the feed
+ *   directory and the manual-reinstall DMG. Defaults to the stamp in the app's
+ *   own package.json (resolveMacDistArch); injected so tests can assert the
+ *   per-arch routing without a packaged build.
+ * @param {string} [deps.platform]             - display platform override (tests);
+ *   defaults to `${osPlatform}-${osArch}`
+>>>>>>> upstream/main
  * @param {string} [deps.resourcesPath]        - process.resourcesPath override
  *   (tests). Used only to classify where the bundle runs FROM, so a
  *   translocated / read-only-volume install can be refused an update lane.
@@ -309,6 +755,22 @@ function initAutoUpdate(deps) {
     osPlatform = process.platform,
     resourcesPath = process.resourcesPath,
     probeBundleWritable = isBundleContainerWritable,
+<<<<<<< HEAD
+=======
+    // Linux install shape + its AppImage writability probe, injected for the
+    // same reason as probeBundleWritable: the verdict must be assertable in a
+    // test without a real AppImage mount or a real /opt install.
+    linuxInstall = null,
+    probeAppImageWritable = isAppImageContainerWritable,
+    // Which macOS build this is (see resolveMacDistArch). Resolved once: it
+    // is a build-time constant, and it must exist before getInfo() is defined
+    // for the same temporal-dead-zone reason as `linux` below.
+    macDistArch = osPlatform === "darwin" ? resolveMacDistArch() : "",
+    // Externally-managed verdict, injected for the same reason as linuxInstall:
+    // assertable in tests without a real marker file. undefined = read the
+    // marker from disk; null = not managed; object = managed.
+    externallyManaged = undefined,
+>>>>>>> upstream/main
     // Electron's NATIVE autoUpdater, used only to observe
     // `before-quit-for-update` -- the signal that the platform installer has
     // actually taken over (see forceExitFailsafe). electron-updater drives it
@@ -327,6 +789,7 @@ function initAutoUpdate(deps) {
   // When the in-app UI is wired (onUpdateState provided), it owns the prompt;
   // the native dialog stays as the fallback for headless / no-renderer cases.
   const uiDriven = typeof onUpdateState === "function";
+<<<<<<< HEAD
   // Last lifecycle payload handed to the UI. Pushed state dies with the
   // renderer: the post-install-failure recovery path reloads the window, and a
   // fresh mount that only ever LISTENS would render as if nothing happened --
@@ -376,6 +839,66 @@ function initAutoUpdate(deps) {
     };
   }
 
+=======
+  // The channel, lane pair, lifecycle pushes and replayable info payload both
+  // lanes report through. Created BEFORE any gate for the same temporal-dead-
+  // zone reason as `linux` and `managed`: every stub below hands getInfo out.
+  const reporter = createUpdateReporter({
+    app,
+    getFlavor,
+    getChannelPreference,
+    getAutoDownloadPreference,
+    onUpdateState,
+    uiDriven,
+    log,
+    osPlatform,
+    osArch,
+    platform,
+    managed,
+    linux,
+    macDistArch,
+    channelForFlavor,
+    channelForVersion,
+    resolveChannel,
+    isNewerVersion,
+    manualDownloadUrl,
+  });
+  const { currentChannel, getInfo } = reporter;
+
+  // An operator or distro packager that dropped the EXTERNALLY-MANAGED marker
+  // owns this install's update lifecycle: the external package manager replaces
+  // the whole install, so a self-update would fight it (each overwriting the
+  // other's bytes) and a feed check would compare against releases the owner
+  // never ships. FIRST gate on purpose: the marker is an intentional operator
+  // override, so it wins over every runtime detection below — the updater is
+  // never armed and the feed is never contacted.
+  if (managed) {
+    // A BARE marker (present, but no updateCommand) means "someone else owns
+    // updates and gave us nothing to run": keep the historical no-op behavior.
+    if (!managed.updateCommand) {
+      log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — auto-update disabled`);
+      return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "externally-managed" };
+    }
+
+    // MANAGED AUTO-UPDATE (marker-driven): the marker's own commands discover
+    // and apply updates instead of electron-updater and the feed.
+    return createManagedLane({
+      managed,
+      app,
+      emit: reporter.emit,
+      getInfo,
+      getAutoDownloadPreference,
+      stopGateway,
+      onInstallDispatched,
+      onInstallFailed,
+      classifyError,
+      managedPath,
+      launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
+      checkIntervalMs: CHECK_INTERVAL_MS,
+      log,
+    });
+  }
+>>>>>>> upstream/main
   // Updating requires an installed, signed bundle (macOS code signature
   // validation is mandatory for Squirrel.Mac; Linux AppImage needs the
   // AppImage runtime), so dev builds have no update lane.
@@ -426,6 +949,7 @@ function initAutoUpdate(deps) {
   configureUpdater(autoUpdater);
   autoUpdater.logger = log;
 
+<<<<<<< HEAD
   let updateReady = false;
   let downloading = false;
   let stagedVersion = null; // version electron-updater has downloaded + staged
@@ -821,6 +1345,34 @@ function initAutoUpdate(deps) {
     getInfo,
     isReady: () => updateReady,
   };
+=======
+  return createFeedLane({
+    app,
+    autoUpdater,
+    dialog,
+    Notification,
+    getAutoDownloadPreference,
+    notifyUpdateFound,
+    stopGateway,
+    onInstallDispatched,
+    onInstallFailed,
+    osPlatform,
+    linux,
+    macDistArch,
+    nativeAutoUpdater,
+    feedBase,
+    uiDriven,
+    log,
+    reporter,
+    buildFeedBase,
+    classifyError,
+    shouldAutoOffer,
+    resolveChannel,
+    channelForVersion,
+    launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
+    checkIntervalMs: CHECK_INTERVAL_MS,
+  });
+>>>>>>> upstream/main
 }
 
 module.exports = {
@@ -829,6 +1381,14 @@ module.exports = {
   configureUpdater,
   classifyError,
   manualDownloadUrl,
+<<<<<<< HEAD
+=======
+  resolveLinuxInstall,
+  resolveMacDistArch,
+  readExternallyManaged,
+  canRewriteMarker,
+  DEFAULT_FEED_BASE,
+>>>>>>> upstream/main
   DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,
 };

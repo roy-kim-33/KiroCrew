@@ -12,6 +12,29 @@ from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import HOOK_EVENT_AGENT_SPAWN, HOOK_EVENT_USER_PROMPT_SUBMIT, ScriptHookStore
 
 
+def _provider_mock() -> AsyncMock:
+    """A stand-in for the ACP session provider a chat turn drives.
+
+    The turn surface (``stream``, ``shutdown``, ``approve_tool`` ...) is async,
+    so the double is an ``AsyncMock``. The telemetry accessors the runner reads
+    after every turn -- ``context_usage_pct``, ``context_window_tokens``,
+    ``context_used_tokens``, ``mcp_session_report``, ``available_models``, and the
+    inner client's ``pop_pending_oauth_requests`` -- are SYNCHRONOUS on the real
+    provider and are called without ``await``. Left as
+    ``AsyncMock`` children each call would hand back a coroutine nobody awaits,
+    which the interpreter reports at garbage collection against whichever later
+    test happens to trigger it. Tests override any accessor they assert on.
+    """
+    client = AsyncMock()
+    client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_window_tokens = MagicMock(return_value=0)
+    client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
+    client.available_models = MagicMock(return_value=[])
+    client.client.pop_pending_oauth_requests = MagicMock(return_value=[])
+    return client
+
+
 def _make_state(tmp_path):
     """Create a DashboardState wired for _run_chat hook tests."""
     sessions = MagicMock(count=0)
@@ -76,16 +99,18 @@ class TestAgentSpawnHookInjection:
 
         state = _make_state(tmp_path)
         hook_store = ScriptHookStore(config_dir=tmp_path)
-        hook_store.create({
-            "name": "startup-prefs",
-            "event": HOOK_EVENT_AGENT_SPAWN,
-            "command": "echo 'Enable caveman mode'",
-            "timeout": 5,
-        })
+        hook_store.create(
+            {
+                "name": "startup-prefs",
+                "event": HOOK_EVENT_AGENT_SPAWN,
+                "command": "echo 'Enable caveman mode'",
+                "timeout": 5,
+            }
+        )
         state._hook_store = hook_store
 
         captured_message = None
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             nonlocal captured_message
@@ -108,7 +133,11 @@ class TestAgentSpawnHookInjection:
 
 class TestHookSessionKeyForwarding:
     """The chat path must forward its session key to fired hooks so downstream
-    hook scripts can attribute each turn to the correct session identity."""
+    hook scripts can attribute each turn to the correct session identity — as
+    ``session_key``, the firing session's own key. Not as ``parent_session_key``:
+    that field names the session that spawned a SUBAGENT, and a hook keyed on
+    its documented meaning took every dashboard composer turn for a subagent's
+    while the runner reused it for its own key."""
 
     @pytest.mark.asyncio
     async def test_session_key_passed_to_fire(self, tmp_path, monkeypatch):
@@ -124,7 +153,7 @@ class TestHookSessionKeyForwarding:
         hook_store.fire = AsyncMock(return_value=[])
         state._hook_store = hook_store
 
-        fake_client = AsyncMock()
+        fake_client = _provider_mock()
 
         async def _stream(msg):
             yield LLMEvent(kind="text_chunk", text="ok")
@@ -138,7 +167,10 @@ class TestHookSessionKeyForwarding:
         slot = state.get_or_create_slot("s1")
         await _run_chat(state, slot, "hello")
 
-        # _history_key_for("s1") == "dashboard:s1" — every fired hook must carry it.
+        # _history_key_for("s1") == "dashboard:s1" — every fired hook must carry it
+        # as the session's OWN key, and never as a subagent's parent pointer.
         assert hook_store.fire.await_count > 0
         for call in hook_store.fire.await_args_list:
-            assert call.kwargs.get("parent_session_key") == "dashboard:s1"
+            assert call.kwargs.get("session_key") == "dashboard:s1"
+            assert call.kwargs.get("parent_session_key") is None
+            assert call.kwargs.get("subagent_id") is None

@@ -28,6 +28,11 @@ from pathlib import Path
 
 import pytest
 
+# One xdist worker for the whole module: every test here derives from ONE module-cached
+# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
+# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
+# per full run for this file alone. Grouping keeps the cache single-copy per run.
+pytestmark = pytest.mark.xdist_group(name="tree_scan_test_agent_sdk_boundary")
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "scripts" / "check_agent_sdk_boundary.py"
 BASELINE = ROOT / ".github" / "agent-sdk-boundary-baseline.txt"
@@ -43,7 +48,31 @@ def _gate():
 
 @pytest.fixture(scope="module")
 def gate():
-    return _gate()
+    """The gate module, with ``_scan`` memoized for the module's lifetime.
+
+    ``_scan(("src",))`` walks and ``ast.parse``s every module under ``src/`` --
+    ~9s a call -- so one real scan is shared across the module's callers
+    (``test_every_recorded_violation_still_exists`` today; the seed test pins its
+    own edge set and never reaches the walk). Patched on the module object rather
+    than wrapped at the call site so ``seed_baseline``'s own bare-name call -- which
+    resolves ``_scan`` through this module's globals at call time -- goes
+    through the memo too. Keyed on ``targets`` even though every caller here
+    passes ``DEFAULT_TARGETS``, so a future test with a different target set
+    still gets a real scan instead of the wrong cached answer.
+    """
+    module = _gate()
+    memo: dict[tuple[str, ...], dict[str, dict[int, str]]] = {}
+    uncached = module._scan
+
+    def scan(targets: tuple[str, ...]) -> dict[str, dict[int, str]]:
+        if targets not in memo:
+            memo[targets] = uncached(targets)
+        # A copy of the outer dict (and of each inner one) so a caller that
+        # mutates its result cannot poison the memo for the next caller.
+        return {rel: dict(lines) for rel, lines in memo[targets].items()}
+
+    module._scan = scan
+    return module
 
 
 def test_the_sdk_package_exists_and_is_exempt(gate):
@@ -407,13 +436,24 @@ def test_seeding_refuses_to_overwrite_an_existing_baseline(gate):
     assert "already exists" in str(excinfo.value)
 
 
-def test_seeding_outside_the_checkout_reports_the_file_it_wrote(gate, tmp_path, capsys):
+def test_seeding_outside_the_checkout_reports_the_file_it_wrote(
+    gate, tmp_path, capsys, monkeypatch
+):
     """`--baseline` takes any path, so the success line must not assume repo-relative.
 
     The seed wrote the file and THEN rendered its name with `relative_to(ROOT)`,
     which raises for a target outside the checkout: the baseline existed on disk
     but the command died with a bare ValueError and a non-zero exit.
+
+    "Outside the checkout" is constructed, not assumed: `tmp_path` can itself sit
+    under the checkout (a developer's `TMPDIR=./tmp`), which would render the
+    target repo-relative and never reach the `relative_to` failure this pins. The
+    gate's `ROOT` is therefore pointed at a sibling directory the target is NOT
+    under, and the scan -- which walks `ROOT/src` -- is pinned to a fixed edge set
+    so the seed exercises only the rendering path.
     """
+    monkeypatch.setattr(gate, "ROOT", tmp_path / "checkout")
+    monkeypatch.setattr(gate, "_scan", lambda targets: {"src/kiro_crew/x.py": {3: "kiro_crew.acp"}})
     target = tmp_path / "outside-the-checkout.txt"
     assert gate.seed_baseline(target) == 0
     assert target.is_file() and target.read_text(encoding="utf-8").strip()

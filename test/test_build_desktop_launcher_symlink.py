@@ -11,10 +11,10 @@ exec the interpreter sitting next to it (``$DIR/python3.12``).  The naive form::
 is wrong whenever the launcher is reached through a symlink, because
 ``${BASH_SOURCE[0]}`` is the *symlink* path, not its target.  The gateway plants
 exactly such a symlink at ``~/.local/bin/kirocrew`` on every start
-(``agent.ensure_kirocrew_on_path``), so on a packaged install ``$DIR`` became
-``~/.local/bin`` and the launcher exec'd a non-existent
+(``agent.ensure_kirocrew_on_path``), so on a packaged install a naive ``$DIR``
+becomes ``~/.local/bin`` and the launcher execs a non-existent
 ``~/.local/bin/python3.12`` — every ``kirocrew ...`` invocation from a shell
-failed (issue #845).  The fix (#188) walks the symlink chain first.
+fails.  The launcher walks the symlink chain first to prevent that.
 
 Why this test exists
 --------------------
@@ -109,7 +109,7 @@ def test_resolves_when_invoked_directly(tmp_path):
 
 
 def test_resolves_through_absolute_symlink(tmp_path):
-    """The issue #845 case: reached via the PATH symlink the gateway plants.
+    """The PATH-symlink case: reached via the symlink the gateway plants.
 
     This is the assertion that goes red on a revert to the naive
     ``dirname "${BASH_SOURCE[0]}"`` form, which would resolve ``$DIR`` to the
@@ -191,8 +191,9 @@ def test_resolves_through_symlink_chain(tmp_path):
 def test_forwards_arguments_through_symlink(tmp_path):
     """Resolution is worthless if the argv is mangled on the way through.
 
-    Asserts the module invocation contract (``-s -m kiro_crew``) and that a
-    quoted argument containing a space survives as ONE argument.
+    Asserts the module invocation contract (``-s -P -m kiro_crew``: no user
+    site, launch directory kept off ``sys.path``) and that a quoted argument
+    containing a space survives as ONE argument.
     """
     bundle = tmp_path / "bundle"
     launcher = _make_bundle(bundle)
@@ -202,7 +203,7 @@ def test_forwards_arguments_through_symlink(tmp_path):
     proc = _invoke(shim, "config", "set", "a b")
 
     assert proc.returncode == 0, proc.stderr
-    assert "ARGS=-s -m kiro_crew config set a b" in proc.stdout, proc.stdout
+    assert "ARGS=-s -P -m kiro_crew config set a b" in proc.stdout, proc.stdout
 
     # And the word-splitting guard: "$@" (not $@) keeps "a b" a single argv entry.
     stub = bundle / "bin" / "python3.12"
@@ -210,8 +211,8 @@ def test_forwards_arguments_through_symlink(tmp_path):
     stub.chmod(0o755)
     proc = _invoke(shim, "config", "set", "a b")
     assert proc.returncode == 0, proc.stderr
-    # -s, -m, kiro_crew, config, set, "a b" == 6
-    assert "COUNT=6" in proc.stdout, proc.stdout
+    # -s, -P, -m, kiro_crew, config, set, "a b" == 7
+    assert "COUNT=7" in proc.stdout, proc.stdout
 
 
 def test_launcher_keeps_the_symlink_walk(tmp_path):

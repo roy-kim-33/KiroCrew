@@ -517,6 +517,207 @@ async def test_handle_stop_confirm_uses_stop_turn(orch_fixture: MagicMock) -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_stop_confirm_declined_by_a_compaction_arms_this_pressers_repeat(
+    orch_fixture: MagicMock,
+) -> None:
+    """The decline reply promises that a repeat !stop forces; the button decline
+    must therefore arm the marker, for the presser who read the promise."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.slack import interactions
+    from kiro_crew.slack.handler import set_allowed_users, set_owner_id
+
+    sl._stop_declined_markers.clear()
+    set_owner_id("U123")
+    set_allowed_users({"U123"})
+
+    orch = orch_fixture
+    orch.sessions.has_session = MagicMock(return_value=True)
+    orch.sessions.stop_turn = AsyncMock(return_value="compacting")
+    task = MagicMock()
+    orch._session_tasks = {"100.0": task}
+
+    payload = {
+        "type": "block_actions",
+        "user": {"id": "U123"},
+        "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "response_url": "",
+        "message": {"ts": "200.0", "thread_ts": "100.0", "blocks": []},
+        "actions": [
+            {
+                "action_id": "mc_stop_confirm",
+                "value": "",
+                "text": {"type": "plain_text", "text": "Confirm"},
+            }
+        ],
+    }
+
+    with patch.object(interactions, "sel") as mock_sel:
+        mock_sel.return_value = MagicMock()
+        await interactions.dispatch(payload)
+
+    assert orch._session_tasks == {"100.0": task}, "nothing was stopped"
+    task.cancel.assert_not_called()
+    assert sl.consume_stop_declined("100.0", "U999") is False, "not another presser's"
+    assert sl.consume_stop_declined("100.0", "U123") is True
+    sl._stop_declined_markers.clear()
+
+
+@pytest.mark.asyncio
+async def test_handle_stop_confirm_repeat_press_forces_after_a_decline(
+    orch_fixture: MagicMock,
+) -> None:
+    """The decline reply promises a repeat forces; a repeat press of the button by
+    the same presser inside the window, while the compaction still holds the
+    session, passes ``force=True``. A press with no marker does not."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.slack import interactions
+    from kiro_crew.slack.handler import set_allowed_users, set_owner_id
+
+    sl._stop_declined_markers.clear()
+    set_owner_id("U123")
+    set_allowed_users({"U123"})
+
+    orch = orch_fixture
+    orch.sessions.has_session = MagicMock(return_value=True)
+    orch.sessions.is_compacting = MagicMock(return_value=True)
+    orch.sessions.stop_turn = AsyncMock(return_value="hard")
+    orch._session_tasks = {}
+
+    def payload(user: str) -> dict:
+        return {
+            "type": "block_actions",
+            "user": {"id": user},
+            "team": {"id": "T1"},
+            "channel": {"id": "C1"},
+            "response_url": "",
+            "message": {"ts": "200.0", "thread_ts": "100.0", "blocks": []},
+            "actions": [
+                {
+                    "action_id": "mc_stop_confirm",
+                    "value": "",
+                    "text": {"type": "plain_text", "text": "Confirm"},
+                }
+            ],
+        }
+
+    with patch.object(interactions, "sel") as mock_sel:
+        mock_sel.return_value = MagicMock()
+        await interactions.dispatch(payload("U123"))
+        assert orch.sessions.stop_turn.await_args.kwargs.get("force") is None, "no marker"
+        sl.note_stop_declined("100.0", "U123")
+        await interactions.dispatch(payload("U123"))
+        assert orch.sessions.stop_turn.await_args.kwargs["force"] is True
+        assert orch.sessions.stop_turn.await_args.kwargs["preserve_queue"] is True
+    sl._stop_declined_markers.clear()
+
+
+@pytest.mark.asyncio
+async def test_handle_stop_confirm_arms_nothing_when_the_decline_reaches_nobody(
+    orch_fixture: MagicMock,
+) -> None:
+    """With no response url the card cannot be replaced, so the decline falls back
+    to a thread message. When that fails too the presser was never warned, and
+    their next press must not be the reset the warning would have promised."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.slack import interactions
+    from kiro_crew.slack.handler import set_allowed_users, set_owner_id
+
+    sl._stop_declined_markers.clear()
+    set_owner_id("U123")
+    set_allowed_users({"U123"})
+
+    orch = orch_fixture
+    orch.sessions.has_session = MagicMock(return_value=True)
+    orch.sessions.stop_turn = AsyncMock(return_value="compacting")
+    orch.slack.post_message = AsyncMock(side_effect=RuntimeError("slack 503"))
+    orch._session_tasks = {}
+
+    payload = {
+        "type": "block_actions",
+        "user": {"id": "U123"},
+        "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "response_url": "",
+        "message": {"ts": "200.0", "thread_ts": "100.0", "blocks": []},
+        "actions": [
+            {
+                "action_id": "mc_stop_confirm",
+                "value": "",
+                "text": {"type": "plain_text", "text": "Confirm"},
+            }
+        ],
+    }
+
+    with patch.object(interactions, "sel") as mock_sel:
+        mock_sel.return_value = MagicMock()
+        await interactions.dispatch(payload)
+
+    orch.slack.post_message.assert_awaited()
+    assert sl._stop_declined_markers == {}, "the retry is a first press again"
+    assert sl.consume_stop_declined("100.0", "U123") is False
+    sl._stop_declined_markers.clear()
+
+
+@pytest.mark.asyncio
+async def test_handle_stop_confirm_arms_nothing_when_the_card_post_is_rejected(
+    orch_fixture: MagicMock,
+) -> None:
+    """A response url expires. An expired one answers 4xx with a body instead of
+    raising, so the card post returns normally having shown the presser nothing.
+    The marker must read that status: a 410 leaves their next press a first
+    press, and only a 2xx arms the reset the warning promises."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.slack import interactions
+    from kiro_crew.slack.handler import set_allowed_users, set_owner_id
+
+    set_owner_id("U123")
+    set_allowed_users({"U123"})
+
+    orch = orch_fixture
+    orch.sessions.has_session = MagicMock(return_value=True)
+    orch.sessions.stop_turn = AsyncMock(return_value="compacting")
+    # The thread fallback runs only when the card itself did not land, so it
+    # must fail here too for the status to be the thing under test.
+    orch.slack.post_message = AsyncMock(return_value="")
+    orch._session_tasks = {}
+
+    payload = {
+        "type": "block_actions",
+        "user": {"id": "U123"},
+        "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "response_url": "https://hooks.slack.com/actions/T1/expired",
+        "message": {"ts": "200.0", "thread_ts": "100.0", "blocks": []},
+        "actions": [
+            {
+                "action_id": "mc_stop_confirm",
+                "value": "",
+                "text": {"type": "plain_text", "text": "Confirm"},
+            }
+        ],
+    }
+
+    def aio(status: int) -> AsyncMock:
+        sess = AsyncMock()
+        sess.__aenter__ = AsyncMock(return_value=sess)
+        sess.__aexit__ = AsyncMock(return_value=None)
+        sess.post = AsyncMock(return_value=MagicMock(status=status))
+        return sess
+
+    for status, armed in ((410, False), (200, True)):
+        sl._stop_declined_markers.clear()
+        with (
+            patch.object(interactions, "sel") as mock_sel,
+            patch("aiohttp.ClientSession", return_value=aio(status)),
+        ):
+            mock_sel.return_value = MagicMock()
+            await interactions.dispatch(payload)
+        assert sl.consume_stop_declined("100.0", "U123") is armed, f"status {status}"
+    sl._stop_declined_markers.clear()
+
+
+@pytest.mark.asyncio
 async def test_handle_stop_confirm_rejects_unauthorized(orch_fixture: MagicMock) -> None:
     """_handle_stop_confirm enforces is_allowed_user() — deny-by-default.
 
@@ -560,8 +761,8 @@ async def test_handle_stop_confirm_rejects_unauthorized(orch_fixture: MagicMock)
 # ---------------------------------------------------------------------------
 # Home Tab Resume — Slack views.publish payloads have empty channel +
 # response_url, so _handle_session_resume must fall back to opening a DM
-# with the user. Regression for the silent failure where the spinner
-# resolved with no visible Resume confirmation.
+# with the user. Without the fallback the spinner resolves with no visible
+# Resume confirmation.
 # ---------------------------------------------------------------------------
 
 
@@ -672,7 +873,7 @@ class TestTransportApprovalAuth:
             "user": {"id": user_id},
             "channel": {"id": "C1"},
             "message": {"ts": "200.0"},
-            "actions": [{"action_id": action_id, "value": "rq1", "text": {"text": "x"}}],
+            "actions": [{"action_id": action_id, "value": "rq1|nonce-rq1", "text": {"text": "x"}}],
         }
 
     @pytest.mark.asyncio
@@ -703,20 +904,19 @@ class TestTransportApprovalAuth:
         monkeypatch.setattr(SlackApprovalDecider, "resolve_global", spy)
 
         await interactions.dispatch(self._payload("mc_tool_approve_rq1", "U_OWNER"))
-        spy.assert_called_once_with("rq1", True)
+        spy.assert_called_once_with("rq1", True, nonce="nonce-rq1")
         orch_fixture.slack.update_message.assert_awaited()
 
     @pytest.mark.asyncio
     async def test_channels_deny_drops_transport_approval(
         self, orch_fixture: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        # HIGH (GPT round-8) + MEDIUM (GPT round-13 #3): an AUTHORIZED user's
-        # APPROVE click on the transport path must not EXECUTE the governed tool
-        # when a channels policy denies slack. Originally the gate silently returned
-        # without resolving — but that STRANDS the kiro-cli approval future until it
-        # times out (~300s). The fix resolves the pending future as DENIED (False)
-        # so the tool is refused promptly and never executes. Assert the resolve was
-        # a denial, not that it never happened.
+        # An AUTHORIZED user's APPROVE click on the transport path must not
+        # EXECUTE the governed tool when a channels policy denies slack. The gate
+        # must resolve the pending future as DENIED (False) rather than return
+        # without resolving: an unresolved future STRANDS the kiro-cli approval
+        # until it times out (~300s). The tool is refused promptly and never
+        # executes. Assert the resolve was a denial, not that it never happened.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -755,10 +955,10 @@ class TestTransportApprovalAuth:
     async def test_channels_deny_still_resolves_transport_reject(
         self, orch_fixture: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        # MEDIUM (GPT round-13 #3): a REJECT click on a denied channel must STILL
-        # resolve the pending approval as refused (False) — a reject is a denial,
-        # exactly what a channels-deny wants, and dropping it would strand the
-        # kiro-cli future until timeout. The reject is NOT gated out.
+        # A REJECT click on a denied channel must STILL resolve the pending
+        # approval as refused (False) — a reject is a denial, exactly what a
+        # channels-deny wants, and dropping it would strand the kiro-cli future
+        # until timeout. The reject is NOT gated out.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -794,10 +994,9 @@ class TestTransportApprovalAuth:
     async def test_channels_deny_drops_review_approve(
         self, orch_fixture: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        # HIGH (GPT round-9 #3): a review-mode APPROVE posts the stored agent draft
-        # to the channel. Under a slack channels deny, the dispatch gate must stop
-        # it BEFORE the handler runs — else stale agent content posts to a denied
-        # channel. Regression-locks the review-action call site.
+        # A review-mode APPROVE posts the stored agent draft to the channel.
+        # Under a slack channels deny, the dispatch gate must stop it BEFORE the
+        # handler runs — else stale agent content posts to a denied channel.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -875,11 +1074,10 @@ class TestTransportApprovalAuth:
     async def test_channels_deny_drops_dashboard_link(
         self, orch_fixture: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
-        # BLOCKING (GPT round-17): the Link-to-Dashboard button imports the Slack
-        # thread's content into a dashboard slot (_import_thread_to_slot). A channels
-        # policy denying slack must stop it BEFORE the import — else a stale link
-        # button moves denied Slack content into the dashboard. Regression-locks the
-        # LINK_DASHBOARD_ACTION call site.
+        # The Link-to-Dashboard button imports the Slack thread's content into a
+        # dashboard slot (_import_thread_to_slot). A channels policy denying slack
+        # must stop it BEFORE the import — else a stale link button moves denied
+        # Slack content into the dashboard.
         import json
 
         from kiro_crew.platform import governance_profiles as gp
@@ -919,7 +1117,9 @@ class TestTransportApprovalAuth:
 
         monkeypatch.setattr(interactions, "is_allowed_user", lambda uid: True)
         monkeypatch.setattr(
-            SlackApprovalDecider, "session_for", classmethod(lambda cls, rid: "thread-1")
+            SlackApprovalDecider,
+            "session_for",
+            classmethod(lambda cls, rid, *, nonce="": "thread-1"),
         )
         monkeypatch.setattr(SlackApprovalDecider, "resolve_global", MagicMock(return_value=True))
         grant = MagicMock()

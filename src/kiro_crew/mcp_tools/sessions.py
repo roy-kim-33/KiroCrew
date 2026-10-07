@@ -22,7 +22,7 @@ from typing import Any
 
 from kiro_crew import mcp_core
 from kiro_crew.context import RECALL_ROLES
-from kiro_crew.history import ConversationLog
+from kiro_crew.history import ConversationLog, TranscriptBusy, TranscriptWithheld
 from kiro_crew.validation import (
     GET_CHAT_SESSION_SCHEMA,
     LIST_SESSIONS_SCHEMA,
@@ -39,9 +39,11 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "Search your own past conversation transcripts (chat history) by "
                 "keyword and get back ranked, snippet-level hits. Use this to "
-                "recover context that is NOT in your injected memory — e.g. 'what "
-                "did we decide about X three weeks ago', 'the error message from "
-                "that debugging session', a name/number/path mentioned earlier. "
+                "recover the exact words of a past conversation — 'the error message "
+                "from that debugging session', a name/number/path mentioned earlier, "
+                "the verbatim evidence behind a conclusion memory_recall gave you. "
+                "For what was decided or learned, call memory_recall first: it "
+                "searches the memory store bound to this session by meaning. "
                 "Search like a human: try a query, read the snippets, then re-search "
                 "with different keywords if the first hit isn't right. Returns "
                 "metadata + a short snippet per session (NOT full transcripts) — "
@@ -155,11 +157,16 @@ def schemas() -> list[dict[str, Any]]:
 
 def search_chat_history(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SEARCH_CHAT_HISTORY_SCHEMA)
+    session_key, refusal = mcp_core.require_strict_session_key(
+        "Error: chat history requires an established session."
+    )
+    if refusal:
+        return refusal
     query = args["query"]
     limit = args.get("limit", 10)
     all_workspaces = args.get("all_workspaces", False)
-    # A supplied-but-unparseable date (e.g. 2026-02-30 passes the regex but is
-    # not a real calendar date) must ERROR, not be silently dropped — a silent
+    # A supplied-but-unparseable date (one that passes the regex but names no
+    # real calendar day, like Feb 30) must ERROR, not be silently dropped — a silent
     # drop would return the UNFILTERED set and mislead the caller.
     after_epoch = before_epoch = None
     if args.get("after"):
@@ -172,7 +179,6 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
             return "Invalid 'before' date — use a real calendar date (YYYY-MM-DD)."
 
     cl = ConversationLog()
-    session_key = mcp_core._resolve_session_key()
     # Default scoping: confine to the caller's workspace (fail-closed — unset
     # buckets to "default"). all_workspaces opts out.
     current_ws: str | None = None if all_workspaces else mcp_core._caller_workspace(cl, session_key)
@@ -191,7 +197,7 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
         # TOCTOU: the file may be unlinked (clear-sessions, rotation, concurrent
         # process) between the ranked snapshot and this read. has_log is the
         # existence gate so we never emit a ghost row for a session the read
-        # tool can no longer retrieve. Do NOT additionally require non-empty
+        # tool cannot retrieve. Do NOT additionally require non-empty
         # metadata: a legacy session whose file predates the metadata line
         # returns {} here yet get_chat_session serves it fine, so rejecting {}
         # would hide those sessions from search while they remain readable.
@@ -208,7 +214,14 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
         if before_epoch is not None and modified >= before_epoch:
             continue
 
-        snippet = mcp_core._extract_history_snippet(cl.read_messages(key), query)
+        # Through the derivation seam: the line checked above is a snapshot, and
+        # a writer can tighten it before the rows are read; the seam validates
+        # the line with the rows under one lock and refuses them together.
+        try:
+            rows_for_snippet = cl.derive_messages(key)
+        except TranscriptWithheld:
+            continue
+        snippet = mcp_core._extract_history_snippet(rows_for_snippet, query)
         results.append(
             {
                 "session_key": key,
@@ -257,10 +270,14 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
 
 def get_chat_session(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, GET_CHAT_SESSION_SCHEMA)
+    session_key, refusal = mcp_core.require_strict_session_key(
+        "Error: chat history requires an established session."
+    )
+    if refusal:
+        return refusal
     key = args["session_key"]
     max_messages = args.get("max_messages", 50)
     all_workspaces = args.get("all_workspaces", False)
-
     # Defense-in-depth on a path-bearing identifier: ConversationLog._safe_key
     # already neutralizes separators. Reject path separators outright, and ".."
     # only as a STANDALONE component — not as a substring — so legitimate keys
@@ -268,7 +285,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # allowlist regex is avoided: real keys legitimately contain ':' and '.')
     if "/" in key or "\\" in key or key in ("..", "."):
         mcp_core.sel().log_tool_invocation(
-            session_key=mcp_core._resolve_session_key(),
+            session_key=session_key,
             source="mcp",
             tool_name="get_chat_session",
             outcome="rejected_bad_key",
@@ -278,7 +295,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     cl = ConversationLog()
     if not cl.has_log(key):
         mcp_core.sel().log_tool_invocation(
-            session_key=mcp_core._resolve_session_key(),
+            session_key=session_key,
             source="mcp",
             tool_name="get_chat_session",
             outcome="not_found",
@@ -296,7 +313,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     if mcp_core._history_is_incognito(meta):
         # EB-7b: no bypass of incognito exclusion via direct fetch.
         mcp_core.sel().log_tool_invocation(
-            session_key=mcp_core._resolve_session_key(),
+            session_key=session_key,
             source="mcp",
             tool_name="get_chat_session",
             outcome="refused_incognito",
@@ -308,10 +325,10 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # from another workspace directly. Unset/non-string workspaces bucket as
     # "default" via _ws_bucket.
     if not all_workspaces:
-        caller_ws = mcp_core._caller_workspace(cl, mcp_core._resolve_session_key())
+        caller_ws = mcp_core._caller_workspace(cl, session_key)
         if mcp_core._ws_bucket(meta.get("workspace")) != caller_ws:
             mcp_core.sel().log_tool_invocation(
-                session_key=mcp_core._resolve_session_key(),
+                session_key=session_key,
                 source="mcp",
                 tool_name="get_chat_session",
                 outcome="denied_cross_workspace",
@@ -328,10 +345,32 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # from RECALL_ROLES, so passing no roles at all would not be equivalent --
     # recent() treats a falsy roles as "no filter" and would admit internal
     # rows here.
-    messages = cl.recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+    # Through the derivation seam: the line checked above is a snapshot, and a
+    # writer can tighten it before the rows are read; the seam validates the
+    # line with the rows under one lock. Same refusal as above.
+    try:
+        messages = cl.derive_recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+    except TranscriptBusy:
+        # The seam could not take the transcript lock in time (its own save, a
+        # cron append, a second gateway). Not private -- say retry, not refused.
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key,
+            source="mcp",
+            tool_name="get_chat_session",
+            outcome="busy",
+        )
+        return "That conversation is being written right now; try again in a moment."
+    except TranscriptWithheld:
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key,
+            source="mcp",
+            tool_name="get_chat_session",
+            outcome="refused_incognito",
+        )
+        return "That conversation is private (incognito/temporary) and cannot be read."
     if not messages:
         mcp_core.sel().log_tool_invocation(
-            session_key=mcp_core._resolve_session_key(),
+            session_key=session_key,
             source="mcp",
             tool_name="get_chat_session",
             outcome="empty",
@@ -347,7 +386,7 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
 
     output = mcp_core._redact_history_output("\n".join(lines))
     mcp_core.sel().log_tool_invocation(
-        session_key=mcp_core._resolve_session_key(),
+        session_key=session_key,
         source="mcp",
         tool_name="get_chat_session",
         outcome="success",
@@ -358,12 +397,16 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
 
 def list_sessions(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, LIST_SESSIONS_SCHEMA)
+    session_key, refusal = mcp_core.require_strict_session_key(
+        "Error: session listing requires an established session."
+    )
+    if refusal:
+        return refusal
     limit = args.get("limit", 20)
     all_workspaces = args.get("all_workspaces", False)
     summarize = args.get("summarize", False)
 
     cl = ConversationLog()
-    session_key = mcp_core._resolve_session_key()
     list_ws: str | None = None if all_workspaces else mcp_core._caller_workspace(cl, session_key)
 
     rows: list[dict] = []
@@ -401,6 +444,7 @@ def list_sessions(name: str, args: dict[str, Any]) -> str:
             "/api/sessions/summarize",
             {"keys": [r["key"] for r in rows]},
             timeout=120,
+            session_key=session_key,
         )
         if isinstance(resp, dict) and isinstance(resp.get("summaries"), dict):
             summaries = {str(k): str(v) for k, v in resp["summaries"].items() if v}

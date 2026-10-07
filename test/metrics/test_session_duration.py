@@ -13,6 +13,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -159,6 +160,32 @@ def _duration_calls(rec):
     return [c for c in rec.hist if c["name"] == "kirocrew.session.duration"]
 
 
+#: Two generations of one key, explicit instants rather than two wall-clock reads
+#: (see :func:`_stamp_starts`). The sub-millisecond fraction and the 1 ms gap are
+#: what keep the exact checks sharp: a start that rounds its reading, or treats a
+#: start this close behind the live one as the same generation, fails them.
+_FIRST_START = 1_700_000_000.123456
+_SECOND_START = _FIRST_START + 0.001
+
+
+def _stamp_starts(monkeypatch, *instants):
+    """Hand each ``record_session_started`` the next of *instants* as its start.
+
+    Through the module's own ``time`` binding, never the stdlib's. A sleep between
+    two real starts does not separate them: on Windows CPython 3.11 and 3.12
+    ``time.time()`` steps in 15.6 ms ticks while ``time.sleep`` is a high-resolution
+    timer, so a 10 ms sleep leaves both starts on one tick and the second is not
+    "later" at all.
+    """
+    readings = list(instants)
+
+    def _wall():
+        assert readings, "a start read the clock more often than the test stamped it"
+        return readings.pop(0)
+
+    monkeypatch.setattr(sess, "time", SimpleNamespace(time=_wall))
+
+
 class TestStart:
     def test_start_counts_and_leaves_a_crumb(self, home, rec):
         _start("dashboard:chat-1")
@@ -179,19 +206,19 @@ class TestStart:
         assert len(crumbs) == 1
         assert "passwd" not in crumbs[0].name
 
-    def test_a_second_start_overwrites_the_first(self, home, rec):
-        """Deliberate reversal, found in review round 2.
+    def test_a_second_start_overwrites_the_first(self, home, rec, monkeypatch):
+        """A key re-entering the registry begins a new session with its own lifetime.
 
         Registry removal has no single choke point and not every remover records
         an end, so a stale entry is possible. A key re-entering the registry is a
         NEW session whose lifetime must be its own -- keeping the predecessor's
         start would report a lifetime spanning two sessions.
         """
+        _stamp_starts(monkeypatch, _FIRST_START, _SECOND_START)
         _start("dashboard:chat-1")
-        first = sess._live_starts["dashboard:chat-1"]
-        time.sleep(0.01)
+        assert sess._live_starts["dashboard:chat-1"] == _FIRST_START
         _start("dashboard:chat-1")
-        assert sess._live_starts["dashboard:chat-1"] > first
+        assert sess._live_starts["dashboard:chat-1"] == _SECOND_START
 
     def test_empty_key_is_a_no_op(self, home, rec):
         _start("")
@@ -230,7 +257,7 @@ class TestEnd:
         assert _crumbs(home) == [], "the end must consume the crumb"
 
     def test_no_crumb_unlink_runs_on_the_event_loop(self, home, rec, monkeypatch):
-        """#7537: one ``unlink`` against a slow data home parked every gateway task.
+        """A single ``unlink`` against a slow data home must not park every gateway task.
 
         Teardown runs on the paths a person is waiting on -- closing a tab,
         resetting a slot, shutting the gateway down -- so a stalled syscall there is
@@ -360,7 +387,7 @@ class TestEnd:
         assert len(_duration_calls(rec)) == 1, "the sample must survive the cancellation"
 
     def test_a_cancelled_end_lets_its_callers_post_pop_cleanup_run(self, home, rec, monkeypatch):
-        """GPT round 1 on PR #7809, against ``session_lifecycle.destroy``.
+        """A cancelled end lets its callers' post-pop cleanup run.
 
         ``destroy`` pops the registry and records the end INSIDE the registry lock,
         then opens a ``try`` whose ``finally`` deletes the session-map entry. An end
@@ -413,7 +440,7 @@ class TestEnd:
         assert _crumbs(home) == [], "and the crumb must still be consumed"
 
     def test_a_cancelled_end_consumes_its_crumb_even_when_the_hop_never_started(self, home, rec):
-        """GPT round 2 on PR #7809: submitted is not started.
+        """A cancelled end consumes its crumb even when the hop was only submitted, not started.
 
         ``asyncio.to_thread`` hands the work to the default executor and suspends,
         but on a saturated pool the item is still QUEUED. Cancelling the await
@@ -467,11 +494,11 @@ class TestEnd:
         assert len(_duration_calls(rec)) == 1, "the sample must survive the cancellation"
 
     def test_the_hop_is_shielded_and_never_becomes_a_task(self):
-        """Round 3 settled this line; both halves of the shape are load-bearing.
+        """Both halves of the shape are load-bearing: shielded, and never a task.
 
         Shielded, so a cancellation cannot reach the queued work item and drop it
-        (round 2), and never unlinked inline, so a cancellation cannot put the
-        syscall back on the event loop (round 3). A BARE future rather than a
+        and it is never unlinked inline, so a cancellation cannot put the
+        syscall back on the event loop. A BARE future rather than a
         shielded ``to_thread`` coroutine, because ``shield`` would wrap a coroutine
         in a Task and ``_cancel_all_tasks`` at loop teardown would cancel it,
         dropping a still-queued item after all.
@@ -550,9 +577,9 @@ class TestEnd:
     def test_the_end_record_touches_no_disk(self):
         """It runs in the same tick as the registry pop, so it cannot block.
 
-        Review round 2: reading the crumb here forced the call to the end of
+        Reading the crumb here forces the call to the end of
         teardown, and a replacement session registering under the same key during
-        those awaits had its start consumed by its predecessor.
+        those awaits has its start consumed by its predecessor.
         """
         import inspect
 
@@ -650,7 +677,7 @@ class TestCrashedBackfill:
     def test_a_corrupt_crumb_is_consumed_here_without_emitting(self, home, rec):
         """The backfill owns this now, because it is the only reader of the files.
 
-        The end path used to consume an unparseable crumb as a side effect of
+        The end path does not consume an unparseable crumb as a side effect of
         unlinking blind, which was the same blind unlink that could delete a live
         sibling's record. Now that an end only ever removes the generation it can
         name, the file that no session can claim is the backfill's to reap -- and
@@ -667,7 +694,7 @@ class TestWriterSelfCorrection:
     """The worker cannot be cancelled, so it has to clean up after itself."""
 
     def test_a_writer_landing_after_a_discard_leaves_no_crumb(self, home, rec):
-        """Review round 9: cancelling an ``asyncio.to_thread`` does not stop it.
+        """Cancelling an ``asyncio.to_thread`` does not stop it.
 
         The await is abandoned, the worker is not -- so the caller's rollback can
         unlink BEFORE the write lands, and the crumb the worker then writes is read
@@ -739,23 +766,24 @@ class TestWriterSelfCorrection:
         second = time.time()
         assert sess._crumb_path(key, first) != sess._crumb_path(key, second)
 
-    def test_a_superseding_start_reaps_the_generation_it_displaced(self, home, rec):
+    def test_a_superseding_start_reaps_the_generation_it_displaced(self, home, rec, monkeypatch):
         """Named generations make this a case that needs handling.
 
         Under one shared filename a second start simply overwrote the file. Now the
-        displaced generation has a name of its own that the table no longer holds,
+        displaced generation has a name of its own that the table does not hold,
         so nothing could ever unlink it again -- it would reach the next boot and be
         reported as a crash that never happened.
         """
         key = "dashboard:chat-1"
+        displaced = sess._crumb_path(key, _FIRST_START)
+        _stamp_starts(monkeypatch, _FIRST_START, _SECOND_START)
         _start(key)
-        first = sess._live_starts[key]
-        time.sleep(0.01)
+        assert sess._live_starts[key] == _FIRST_START
+        assert displaced.exists(), "the first start left no crumb to displace"
         _start(key)
-        second = sess._live_starts[key]
-        assert second > first
-        assert not sess._crumb_path(key, first).exists(), "the displaced crumb must be reaped"
-        assert sess._crumb_path(key, second).exists()
+        assert sess._live_starts[key] == _SECOND_START
+        assert not displaced.exists(), "the displaced crumb must be reaped"
+        assert sess._crumb_path(key, _SECOND_START).exists()
         assert len(_crumbs(home)) == 1
 
     def test_the_lock_order_is_io_then_table_everywhere(self):
@@ -781,7 +809,7 @@ class TestWriterSelfCorrection:
 
 
 class TestCrossProcessOwnership:
-    """Review round 7: a crumb with no owner cannot say WHOSE session it is.
+    """A crumb with no owner cannot say WHOSE session it is.
 
     ``kirocrew run`` and the eval runner each build their own SessionManager
     against the same data home, so a gateway boot sees their crumbs too. The
@@ -805,10 +833,10 @@ class TestCrossProcessOwnership:
         crumb.write_text(json.dumps(payload))
 
     def test_our_own_pid_with_a_foreign_start_id_is_a_dead_predecessor(self, home, rec):
-        """Review round 10: in a container the gateway is PID 1 on every restart.
+        """In a container the gateway is PID 1 on every restart.
 
         A crashed predecessor's crumb therefore arrives carrying THIS process's pid,
-        and the own-pid fast path used to answer "still running" without comparing
+        and the own-pid fast path must not answer "still running" without comparing
         identities at all -- so that crumb was skipped on this boot and on every
         boot after: its crash was never emitted and its file was never cleaned. The
         other review lane read this as a coincidental pid collision, but under a
@@ -988,7 +1016,7 @@ class TestReviewFixes:
         _start("dashboard:chat-1")
         assert len(_crumbs(home)) == 1
 
-    def test_a_superseded_start_leaves_only_the_successors_crumb(self, home, rec):
+    def test_a_superseded_start_leaves_only_the_successors_crumb(self, home, rec, monkeypatch):
         """Review rounds 3-5 all lived here; the inline write ended the class.
 
         A deferred write could land after its own session ended, or after a
@@ -1000,20 +1028,19 @@ class TestReviewFixes:
         removes the interleaving rather than detecting it: there is no window in
         which two starts are both mid-write.
         """
+        _stamp_starts(monkeypatch, _FIRST_START, _SECOND_START)
         _start("dashboard:chat-1")
-        first = sess._live_starts["dashboard:chat-1"]
-        time.sleep(0.01)
+        assert sess._live_starts["dashboard:chat-1"] == _FIRST_START
         _start("dashboard:chat-1")
-        current = sess._live_starts["dashboard:chat-1"]
-        assert current > first
+        assert sess._live_starts["dashboard:chat-1"] == _SECOND_START
         crumbs = _crumbs(home)
         assert len(crumbs) == 1, "one key is one crumb, whatever the generation"
-        assert json.loads(crumbs[0].read_text())["started_at"] == current
+        assert json.loads(crumbs[0].read_text())["started_at"] == _SECOND_START
 
     def test_the_end_unlinks_off_the_loop_without_ever_dropping_the_unlink(self):
-        """Review round 4 rejected a POOLED unlink; #7537 rejected an inline one.
+        """A pooled unlink can be dropped; an inline one parks the loop.
 
-        Both rejections stand, and awaiting is the shape that survives both. Queued
+        Awaiting is the shape that survives both. Queued
         on the maintenance pool, the unlink is dropped at ``close_all`` --
         ``shutdown_maintenance_executor`` drains with ``cancel_futures=True``, so a
         cleanly ended session's crumb is left for the next boot to call
@@ -1037,7 +1064,7 @@ class TestReviewFixes:
         assert not hasattr(sess, "_submit"), "the fire-and-forget pool submitter must stay gone"
 
     def test_the_discard_also_leaves_the_loop(self):
-        """#7537 named both end paths; a rollback is still a filesystem syscall.
+        """Both end paths matter: a rollback is still a filesystem syscall.
 
         It absorbs a cancellation, as both end paths do, because its
         caller re-raises the failure that started the rollback on the next line --
@@ -1138,13 +1165,11 @@ class TestReviewFixes:
         assert _crumbs(home), "a session start must leave a crumb"
 
     def test_no_crumb_is_written_without_telemetry_consent(self, home):
-        """First Principles round 6: an unopted install must write nothing.
+        """An unopted install must write nothing.
 
         The crumb feeds only ``kirocrew.session.duration``, which is a no-op
         without consent -- so writing one on an unopted host persists state that
         nothing can ever read, against a documented default of collecting nothing.
-        Round 5 relaxed the spec sentence to permit it; that was the wrong
-        direction, and this pins the behaviour instead.
         """
 
         class _Off:
@@ -1170,9 +1195,9 @@ class TestReviewFixes:
 class TestEveryRegistryRemovalRecordsAnEnd:
     """A fail-closed gate over the whole source tree, not a hand-kept list.
 
-    Review round 5 found FOUR registry removals with no end record, and the
-    hand-maintained list in ``TestTeardownPathsAreWired`` could not have caught
-    any of them: it enumerates six methods of one module by name, so a seventh
+    A hand-maintained list cannot catch every registry removal: the
+    list in ``TestTeardownPathsAreWired`` enumerates six methods of one module by
+    name, so a seventh
     path -- or any pop outside that module -- is invisible to it. That is the
     wrong shape for this invariant, because an unrecorded removal is not a lost
     sample. The start crumb survives it, and the next boot reports the session as
@@ -1227,6 +1252,25 @@ class TestEveryRegistryRemovalRecordsAnEnd:
         found = []
         for path in sorted(root.rglob("*.py")):
             if "__pycache__" in path.parts:
+                continue
+            rel_parts = path.relative_to(root).parts
+            # A container image's build context, under ``apps/builtins/<app>/crew/runtime/**``.
+            # This walk hands each hit to ``importlib.import_module``, and that tree is the
+            # one place under ``src/kiro_crew`` that must never be imported from here:
+            # ``test_spawn_audit.py::test_container_image_assets_are_not_imported`` forbids
+            # it, and the tree could not satisfy the import anyway, since it assumes the
+            # image's installed layout and its modules import the image's own runtime
+            # dependencies (httpx, fastapi), which ``container/requirements.txt`` marks as
+            # deliberately absent from this application's environment.
+            #
+            # This does not weaken the discovered-not-listed property the docstring
+            # defends. That property is about GATEWAY removal paths, and nothing in an
+            # image that runs on Fargate participates in this process's session registry.
+            if (
+                rel_parts[:2] == ("apps", "builtins")
+                and "crew" in rel_parts
+                and "runtime" in rel_parts
+            ):
                 continue
             try:
                 if "_sessions" not in path.read_text(encoding="utf-8"):
@@ -1313,6 +1357,31 @@ class TestEveryRegistryRemovalRecordsAnEnd:
         assert removals, "the AST walk found no registry removals at all"
         assert "drain_all_providers" in removals, "the mass-pop path must be in scope"
 
+    def test_the_container_image_tree_is_excluded_and_that_exclusion_is_needed(self):
+        """The image-tree skip must be load-bearing, not a line that matches nothing.
+
+        An exclusion matching no file would pass this gate while protecting nothing, and
+        would quietly stop protecting it the day the tree grew a match. So assert both
+        halves: files under the image tree DO contain the registry name this walk keys
+        on, and none of them reached the discovered list, where ``import_module`` would
+        have tried to import a tree that cannot be imported from this process.
+        """
+        import kiro_crew
+
+        root = Path(kiro_crew.__file__).resolve().parent
+        image_root = root / "apps" / "builtins" / "aws_control" / "crew" / "runtime"
+        matching = [
+            p
+            for p in image_root.rglob("*.py")
+            if "__pycache__" not in p.parts and "_sessions" in p.read_text(encoding="utf-8")
+        ]
+        assert matching, (
+            "no file under the image tree mentions the registry, so the skip in "
+            "_owning_modules is vacuous -- remove it or re-point it"
+        )
+        leaked = [m for m in self._owning_modules() if "crew.runtime" in m]
+        assert not leaked, f"the image tree reached an import-based walk: {leaked}"
+
 
 class TestTeardownPathsAreWired:
     """Each teardown path must record, with a reason of its own.
@@ -1387,7 +1456,7 @@ class TestTeardownPathsAreWired:
         # more: review showed an inline pre-ready scan delays readiness in
         # proportion to accumulated crumbs, so it moved to a worker thread. What
         # replaces the ordering requirement is the process-start cutoff, which
-        # TestReviewFixes pins directly -- the scan can no longer mistake a
+        # TestReviewFixes pins directly -- the scan does not mistake a
         # session THIS process opened for a casualty of the last one.
         assert "_telemetry_backfill_cutoff" in src
 

@@ -1,7 +1,12 @@
 # Steering
 
-Source: https://kiro.dev/docs/steering/ (the former `/docs/cli/steering/` now
-redirects there — CLI and IDE steering are documented as one page).
+Source: https://kiro.dev/docs/steering/ (fetched 2026-09-06; the former
+`/docs/cli/steering/` redirects there — steering is documented as one page across
+every surface).
+
+> **Carries local additions.** The kiro-cli inclusion-mode measurement (2.19.1
+> over ACP) and the two corollaries for this repo have no upstream counterpart;
+> they are measured here. A re-fetch must preserve them.
 
 Persistent project knowledge via markdown files. Instead of explaining conventions every chat, steering files ensure Kiro follows your patterns.
 
@@ -12,7 +17,10 @@ Persistent project knowledge via markdown files. Instead of explaining conventio
 | `.kiro/steering/` | Workspace | Project-specific patterns |
 | `~/.kiro/steering/` | Global | Personal conventions across all projects |
 
-Workspace steering takes priority over global on conflicts.
+Workspace steering takes priority over global on conflicts. Global steering is
+also the team mechanism: files pushed to `~/.kiro/steering` by MDM or Group
+Policy, or pulled from a central repository, apply to every workspace on that
+machine.
 
 ## Inclusion modes
 
@@ -25,9 +33,17 @@ fileMatchPattern: "src/**/*.ts"
 ---
 ```
 
-`always` (the default), `fileMatch` + `fileMatchPattern`, `manual` (referenced
-from chat as `#<file-name>`), and `auto` + `name` + `description` (included when
-the request matches the description).
+`always` (the default), `fileMatch` + `fileMatchPattern` (a single glob or an
+array of them), `manual` (referenced from chat as `#<file-name>`), and `auto` +
+`name` + `description` (included when the request matches the description). A
+`manual` or `auto` document also appears as a slash command, so typing `/`
+followed by its name includes it explicitly.
+
+**Upstream now documents the CLI as not honoring any of this**: its steering page
+states that inclusion modes are not currently supported on Kiro CLI and that
+every file in `.kiro/steering/` is loaded automatically. The measurement below
+disagrees on one row — `manual` — so treat both as claims about specific
+versions, not as a standing property.
 
 **What kiro-cli actually does with them differs from the IDE.** Measured against
 **2.19.1** over ACP, driven with `acp --agent <name>` + `session/set_mode` and the
@@ -57,7 +73,8 @@ conditions", never as a standing property of the harness.
 The one row both measurements agree on is `manual`: kiro-cli has no way to bring
 such a document into a turn.
 
-So on the ACP path as measured at 2.19.1 `manual` is honored (kiro-cli 2.19.0 fixed that), `fileMatch`
+So on the ACP path as measured at 2.19.1 `manual` inclusion is respected (the
+document is not auto-loaded), `fileMatch`
 is withheld and never applies, and `auto` behaves as `always` — consistent with
 an unrecognized value falling through to the default rather than being matched.
 `#[[file:...]]` references inside a loaded document are not expanded either.
@@ -67,17 +84,18 @@ Two corollaries for this repo:
 - **The agent config's `resources` glob does not gate any of this.** An agent
   declaring `resources: []` receives exactly the same documents as one carrying
   `file://.kiro/steering/**/*.md`; kiro-cli scans both steering directories
-  itself. See the comment on the seed in `agent.py`.
+  itself.
 - **Below 2.19.0 the semantics differ** — `inclusion` was applied only on the
   `chat --no-interactive` path, so every document loaded regardless
   ([kirodotdev/Kiro#10794](https://github.com/kirodotdev/Kiro/issues/10794), and
   [#3026](https://github.com/kirodotdev/KiroCrew/issues/3026) where that was
-  experienced here). Nothing pins a minimum kiro-cli version, so check the
-  installed one before diagnosing a steering problem.
+  experienced here). Kiro Crew's kiro-cli version floors gate individual
+  features, not startup, so check the installed version before diagnosing a
+  steering problem.
 
 ## Viewing and editing in Kiro Crew
 
-The dashboard surfaces both locations under **Agent Capabilities → Steering**: it lists every `.md` file in `~/.kiro/steering` and the active project's `.kiro/steering`, renders the content, and supports creating, editing and deleting files. See `docs/system-specs/features/steering-viewer.md`.
+The dashboard surfaces both locations under **Customize → Steering**: it lists every `.md` file in `~/.kiro/steering` and the active project's `.kiro/steering`, renders the content, and supports creating, editing and deleting files. See `docs/system-specs/modules/steering-viewer.md`.
 
 ## Foundational steering files
 
@@ -105,7 +123,11 @@ empty `resources` list still receives both steering roots.
 
 ## AGENTS.md
 
-Kiro supports `AGENTS.md` files (always included). Place in `~/.kiro/steering/` or workspace root.
+Kiro supports `AGENTS.md` files (always included; the file format carries no
+inclusion modes). Place one in `~/.kiro/steering/`, at the workspace root, or in
+any subdirectory beside the code it describes — upstream documents subdirectory
+discovery throughout the workspace, so `services/api/AGENTS.md` and
+`packages/ui/AGENTS.md` are each loaded as steering context.
 
 ## Best practices
 

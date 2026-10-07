@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -84,20 +86,14 @@ class _FakeReader:
         return self._line
 
 
-def _pool_key(server: str = "demo-mcp", agent: str = "cov-agent", env_hash: str = "e" * 8) -> PoolKey:
+def _pool_key(server: str = "demo-mcp", env_hash: str = "e" * 8) -> PoolKey:
     return PoolKey(
         server_name=server,
-        agent_name=agent,
         command_args_hash="a" * 8,
         effective_env_hash=env_hash,
         work_dir="/tmp/cov",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="b" * 8,
-        approval_mode="reads",
-        trust_all_tools=False,
-        config_snapshot_hash="c" * 8,
     )
 
 
@@ -769,6 +765,21 @@ class TestReadFirstFrame:
     async def test_non_object_json_is_refused(self, line):
         assert await gw._read_first_frame(cast(Any, _FakeReader(line=line))) is None
 
+    @pytest.mark.asyncio
+    async def test_a_frame_nested_past_the_decoder_is_refused_not_raised(self):
+        """``RecursionError`` is not a ``JSONDecodeError``: the frame closes one
+        connection cleanly instead of raising out of the connection handler."""
+        from stray_line_helpers import too_deep_line
+
+        assert await gw._read_first_frame(cast(Any, _FakeReader(line=too_deep_line()))) is None
+
+    def test_the_ping_probe_reads_every_stray_frame_as_not_a_ping(self):
+        from stray_line_helpers import STRAY_LINES
+
+        for make in STRAY_LINES.values():
+            assert gw._is_ping_frame(make()) is False
+        assert gw._is_ping_frame(b'{"type":"ping"}\n') is True
+
 
 class TestWriteJsonLine:
     @pytest.mark.asyncio
@@ -913,12 +924,18 @@ class TestDrainInboxToStub:
 # --- declared env + target resolution ---------------------------------------
 
 
+#: The agent these sidecars are written for. The daemon reads it off the
+#: Register frame, not off the PoolKey, so a test writing a sidecar names it the
+#: same way the rewriter does.
+_DECLARING_AGENT = "demo-agent"
+
+
 class TestDeclaredNonSecretEnv:
     def _write_sidecar(self, key: PoolKey, payload: dict[str, str]) -> Path:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / env_sidecar_name(key.agent_name, key.server_name)
+        path = directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
@@ -943,7 +960,7 @@ class TestDeclaredNonSecretEnv:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / env_sidecar_name(key.agent_name, key.server_name)).write_text(
+        (directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)).write_text(
             "{not json", encoding="utf-8"
         )
         assert gw._declared_non_secret_env(key) == {}
@@ -997,30 +1014,59 @@ class TestEnvTargetResolver:
         assert isinstance(env, dict)
         assert work_dir == key.work_dir
 
-    def test_python_env_prefixes_are_stripped_from_spawned_env(self, monkeypatch):
-        """PYTHONPATH/PYTHONHOME/PYTHONPYCACHEPREFIX must not reach a pooled
-        Python-based MCP backend: the first two cause import conflicts, and
-        PYTHONPYCACHEPREFIX would make the backend mirror its stdlib into the
-        shared bytecode cache (see pycache_gc.py). This scrub reuses
-        sandbox._PYTHON_ENV_PREFIXES rather than a hand-listed set of keys, so
-        it can't silently drift from the kiro-cli/agent spawn path's scrub.
+    def test_python_namespace_is_stripped_from_managed_spawn_env(self, monkeypatch):
+        """Control-plane resolution and the token fence share a closed namespace rule.
+
+        This pins the RESOLVER's output, which is what the classifier reads:
+        no inherited ``PYTHON*`` key survives for a control-plane backend. The
+        child's final environment is a separate step -- the spawn site re-applies
+        Kiro Crew's own UTF-8 pair after the verdict -- and is pinned by the
+        spawn-site tests.
         """
-        key = _pool_key(server="pyenv-mcp")
-        monkeypatch.delenv("KIROCREW_MCP_TARGET_PYENV_MCP", raising=False)
-        monkeypatch.setenv("MC_MCP_TARGET_PYENV_MCP", "py-backend --stdio")
-        monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
-        monkeypatch.setenv("PYTHONHOME", "/host/python")
-        monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/host/cache/pycache")
-        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+        key = _pool_key(server="kirocrew-core")
+        monkeypatch.delenv("KIROCREW_MCP_TARGET_KIROCREW_CORE", raising=False)
+        monkeypatch.setenv("MC_MCP_TARGET_KIROCREW_CORE", "kirocrew mcp-core")
+        python_env = {
+            "PYTHONPATH": "/host/site-packages",
+            "PYTHONHOME": "/host/python",
+            "PYTHONPYCACHEPREFIX": "/host/cache/pycache",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUSERBASE": "/host/user-site",
+            "PYTHONSTARTUP": "/host/startup.py",
+            "PYTHONEXECUTABLE": "/host/python",
+            "PYTHON_FUTURE_IMPORT_ROOT": "/host/future",
+        }
+        for env_key, value in python_env.items():
+            monkeypatch.setenv(env_key, value)
 
         resolved = gw.env_target_resolver(key)
         assert resolved is not None
         _command, _args, env, _work_dir = resolved
 
-        for leaked_key in (
-            "PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE",
+        assert not [env_key for env_key in env if env_key.upper().startswith("PYTHON")]
+
+    def test_third_party_keeps_benign_python_env(self, monkeypatch):
+        """A third-party backend keeps Python settings outside the four-key scrub."""
+        key = _pool_key(server="third-party-mcp")
+        monkeypatch.setenv("MC_MCP_TARGET_THIRD_PARTY_MCP", "python third_party_server.py")
+        monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/host/python")
+        monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/host/cache/pycache")
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+        monkeypatch.setenv("PYTHONUNBUFFERED", "1")
+
+        resolved = gw.env_target_resolver(key)
+        assert resolved is not None
+        _command, _args, env, _work_dir = resolved
+
+        assert env.get("PYTHONUNBUFFERED") == "1"
+        for env_key in (
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONPYCACHEPREFIX",
+            "PYTHONDONTWRITEBYTECODE",
         ):
-            assert leaked_key not in env
+            assert env_key not in env
 
 
 # --- backend acquire / respawn ----------------------------------------------
@@ -1066,6 +1112,111 @@ class TestAcquireBackend:
         )
 
         assert _await_kwargs(spawn)["env"]["A"] == "declared"
+        await _drain_task(backend._stdout_task)
+        await pool.shutdown_all(timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_secret_temp_skips_raw_precheck_and_reaches_spawn_backend(
+        self, monkeypatch, caplog
+    ) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+
+        pool = BackendPool(max_backends=2)
+        key = _pool_key(server="secret-temp-mcp")
+        backend = _fake_backend(key)
+        captured: dict[str, Any] = {}
+
+        async def _spawn_backend(**kwargs: Any) -> Backend:
+            captured.update(kwargs)
+            captured["env"] = dict(kwargs["env"])
+            return backend
+
+        monkeypatch.setattr(gw, "spawn_backend", AsyncMock(side_effect=_spawn_backend))
+        raw_reference = "secret://../../../../run/x\nFORGED"
+        monkeypatch.setattr(
+            gw,
+            "_declared_env_to_forward",
+            lambda _key: {"TMPDIR": raw_reference},
+        )
+        classified: list[str] = []
+
+        def _sealed(path: str) -> str:
+            classified.append(path)
+            return "sealed"
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
+
+        def _resolve(env: dict[str, str], _config: Path):
+            if "TMPDIR" not in env:
+                return dict(env), set()
+            return {**env, "TMPDIR": "/resolved/secret"}, {"TMPDIR"}
+
+        monkeypatch.setattr(gw, "resolve_secret_uris", _resolve)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
+            await gw._acquire_backend(
+                pool,
+                key,
+                lambda _key: ("demo-bin", [], {}, "/tmp/cov"),
+            )
+
+        assert classified == []
+        assert raw_reference not in caplog.text
+        assert captured["env"]["TMPDIR"] == "/resolved/secret"
+        assert captured["declared_temp_keys"] == ("TMPDIR",)
+        assert captured["secret_env_keys"] == ("TMPDIR",)
+        await _drain_task(backend._stdout_task)
+        await pool.shutdown_all(timeout=0.1)
+
+    @pytest.mark.asyncio
+    async def test_sealed_declared_temp_is_removed_before_spawn(self, monkeypatch, caplog) -> None:
+        from kiro_crew import sandbox as sandbox_mod
+
+        pool = BackendPool(max_backends=2)
+        key = _pool_key(server="sealed-temp-mcp")
+        backend = _fake_backend(key)
+        spawn = AsyncMock(return_value=backend)
+        monkeypatch.setattr(gw, "spawn_backend", spawn)
+        declared = "/sealed/runtime/tmp\nFORGED"
+        monkeypatch.setattr(
+            gw,
+            "_declared_env_to_forward",
+            lambda _key: {"TMPDIR": declared, "A": "declared"},
+        )
+        loop_thread = threading.get_ident()
+        classifier_threads: list[int] = []
+
+        def _sealed(_path: str) -> str:
+            classifier_threads.append(threading.get_ident())
+            return "sealed"
+
+        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
+            await gw._acquire_backend(
+                pool,
+                key,
+                lambda _key: (
+                    "demo-bin",
+                    [],
+                    {"TMPDIR": "/ambient/tmp", "A": "inherited"},
+                    "/tmp/cov",
+                ),
+            )
+
+        kwargs = _await_kwargs(spawn)
+        assert declared not in kwargs["env"].values()
+        assert not [key for key in kwargs["env"] if key.upper() in ("TMPDIR", "TMP", "TEMP")]
+        assert kwargs["declared_temp_keys"] == ()
+        assert classifier_threads and all(thread != loop_thread for thread in classifier_threads)
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "ignoring spec-declared" in record.getMessage()
+        )
+        assert f"TMPDIR={declared!r}" in warning
+        assert "\nFORGED" not in warning
+        assert "inside the sandbox-sealed runtime parent" in warning
         await _drain_task(backend._stdout_task)
         await pool.shutdown_all(timeout=0.1)
 
@@ -1376,7 +1527,7 @@ class TestRespawnBackendForStub:
         _backend, _inbox, task = out
         await _drain_task(task)
 
-    # --- validating the replacement's tool set (#6294) -----------------------
+    # --- validating the replacement's tool set ------------------------------
 
     @staticmethod
     def _surface_pair(*, served, published, stub="stub-r8"):
@@ -1463,7 +1614,94 @@ class TestRespawnBackendForStub:
         )
 
         assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r9")
+        # ``agent`` carries the dead backend's per-stub label onto the
+        # replacement, so a render spooled after the respawn still names its
+        # producing agent. Empty here: this double declares none.
+        fresh.attach_stub.assert_awaited_once_with("stub-r9", agent="")
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_the_respawn_carries_the_agent_read_before_the_detach(self, monkeypatch):
+        """The replacement inherits the dead backend's per-stub agent.
+
+        ORDERING is the whole test, which is why ``detach_stub`` is left REAL
+        here while the sibling tests mock it: detach prunes ``_stub_agents``
+        with the inbox, so reading the agent after it would hand the replacement
+        ``""`` and every render spooled through the respawned backend would name
+        no producing agent and have its callbacks refused. The read therefore
+        sits beside the ``replay_uris``/``old_surface`` captures, before the
+        detach.
+        """
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r21")
+        # Real detach, and a real attach to populate what it prunes.
+        del old.detach_stub
+        await old.attach_stub("stub-r21", agent="gpu-dev")
+        assert old.agent_for_stub("stub-r21") == "gpu-dev", "premise: the agent is recorded"
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r21",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        fresh.attach_stub.assert_awaited_once_with("stub-r21", agent="gpu-dev")
+        # And the detach really did run, so the pass above is about ordering
+        # rather than about a detach that never happened.
+        assert old.agent_for_stub("stub-r21") == ""
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_the_respawn_acquire_carries_the_agent_too(self, monkeypatch):
+        """The SPAWN needs the agent, not just the attach that follows it.
+
+        The declared-env sidecar of a connection-private backend is named for
+        the agent that declared it, and the spawn is where that env is read
+        (``_declared_env_for_private_backend``). A respawn that named the stub
+        but not its agent would look the sidecar up under ``""``, find none, and
+        bring the replacement up with no declared env -- so every server that
+        needs one dies at prime and the transparent recovery fails. The attach
+        happens after the spawn, so carrying it only there is too late.
+        """
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r22")
+        del old.detach_stub
+        await old.attach_stub("stub-r22", agent="gpu-dev")
+        acquire = AsyncMock(return_value=(fresh, True))
+        monkeypatch.setattr(gw, "_acquire_backend", acquire)
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r22",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        assert acquire.await_args is not None
+        assert acquire.await_args.kwargs.get("declaring_agent") == "gpu-dev", (
+            "the respawn spawned without its declaring agent, so a private "
+            "backend's replacement would come up with no declared env"
+        )
         await _drain_task(out[2])
 
     @pytest.mark.asyncio
@@ -1499,7 +1737,7 @@ class TestRespawnBackendForStub:
     async def test_an_owner_rekeyed_mid_respawn_is_not_adopted(self, monkeypatch):
         """A claim can retarget this connection during the probe. Both sides of
         the comparison belong to the CAPTURED caller, so across a rekey it
-        describes a principal that no longer owns the stub — and re-probing would
+        describes a principal that does not own the stub — and re-probing would
         race the same way."""
         pool = BackendPool(max_backends=2)
         pool.unreserve = MagicMock()  # type: ignore[method-assign]
@@ -1549,7 +1787,7 @@ class TestRespawnBackendForStub:
         owner = CallerContext(session_key="dashboard:old-owner")
         conn = gw._StubConn("stub-r18", [], "pool", owner)
 
-        async def _attach_then_rekey(stub_uuid):
+        async def _attach_then_rekey(stub_uuid, *, agent=""):
             # The claim lands during the adoption await, past the early check.
             conn.caller = CallerContext(session_key="dashboard:new-owner")
             return asyncio.Queue()
@@ -1576,7 +1814,7 @@ class TestRespawnBackendForStub:
 
         # The stub it had just attached is released, or the refcount holds a stub
         # that is about to be told the adoption failed.
-        fresh.attach_stub.assert_awaited_once_with("stub-r18")
+        fresh.attach_stub.assert_awaited_once_with("stub-r18", agent="")
         fresh.detach_stub.assert_awaited_once_with("stub-r18")
 
     @pytest.mark.asyncio
@@ -1606,7 +1844,7 @@ class TestRespawnBackendForStub:
         )
 
         assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r15")
+        fresh.attach_stub.assert_awaited_once_with("stub-r15", agent="")
         await _drain_task(out[2])
 
     @pytest.mark.asyncio
@@ -1840,10 +2078,9 @@ class TestReadRssKb:
         assert got == -1 or got > 0
 
     def test_delegates_to_the_shared_current_rss_reader(self, monkeypatch):
-        # The per-platform duplicate that used to live here read ru_maxrss on
-        # macOS -- a peak that never falls. There is now one reader, and this
-        # pins the delegation (and the bytes -> KB conversion) so a second
-        # implementation cannot quietly reappear.
+        # One shared reader backs this. The macOS ru_maxrss variant (a peak
+        # that never falls) must not reappear, so pin the delegation and the
+        # bytes -> KB conversion against a second implementation.
         monkeypatch.setattr(gw, "_proc_rss_bytes", lambda: 4096)
         assert gw._read_rss_kb() == 4
 
@@ -1976,15 +2213,14 @@ class TestZombieDiagnostic:
 
     @pytest.mark.asyncio
     async def test_zombie_dump_survives_a_windows_sharing_violation(self, monkeypatch, tmp_path):
-        # Regression for the Windows write race: the probe baseline and the
-        # zombie dump used to be two back-to-back open-append-close cycles,
-        # and on Windows the second open can land while the first writer's
-        # handle is still closing, failing with a sharing violation
-        # (a PermissionError) that the never-raises writer swallows — losing
-        # the zombie_detected record. Simulate that deterministically by
-        # failing every open of the diagnostic file after the first: with the
-        # records batched through a single open, the dump still lands; with
-        # the old unserialized double-write, it is dropped and this test reds.
+        # The probe baseline and the zombie dump share one open-append-close
+        # cycle. On Windows two back-to-back cycles can collide: the second
+        # open lands while the first writer's handle is still closing and
+        # fails with a sharing violation (a PermissionError) the never-raises
+        # writer swallows, losing the zombie_detected record. Simulate that
+        # by failing every open of the diagnostic file after the first: with
+        # the records batched through a single open, the dump still lands; an
+        # unserialized double-write drops it and this test reds.
         diag = tmp_path / "diag.jsonl"
         monkeypatch.setattr(gw, "_zombie_diagnostic_path", lambda: diag)
         monkeypatch.setattr(gw, "_ZOMBIE_PROBE_INTERVAL_SECS", 0.01)
@@ -2007,10 +2243,34 @@ class TestZombieDiagnostic:
             return real_open(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "open", sharing_violation_open)
-        await asyncio.wait_for(
-            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop),
-            timeout=5,
+        # Wait on the watchdog's own completion signal, not the coroutine: the
+        # watchdog swallows CancelledError, so on Python 3.11+ a timed-out
+        # ``asyncio.wait_for(coro, ...)`` cannot raise TimeoutError -- the
+        # cancellation never propagates, wait_for returns None, and the later
+        # assertions fail in misleading ways (FileNotFoundError on diag.jsonl
+        # or an unset stop event, depending on where the cancel landed). A
+        # genuinely slow runner now fails legibly at the bounded wait below.
+        task = asyncio.create_task(
+            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop)
         )
+        stop_wait = asyncio.create_task(stop.wait())
+        try:
+            # Waiting on BOTH means a watchdog that raises before setting stop
+            # surfaces its exception immediately instead of hiding behind the
+            # full 30s budget.
+            done, _ = await asyncio.wait(
+                {task, stop_wait}, timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert done, "watchdog neither set stop nor finished within 30s"
+            if task in done:
+                await task  # surface any exception the watchdog raised
+        finally:
+            # Never leak the watchdog past monkeypatch teardown: cancel and
+            # drain whatever is still pending (the watchdog swallows
+            # CancelledError, so the drain terminates promptly).
+            task.cancel()
+            stop_wait.cancel()
+            await asyncio.gather(task, stop_wait, return_exceptions=True)
 
         records = [json.loads(line) for line in diag.read_text().strip().splitlines()]
         tags = [record["tag"] for record in records]

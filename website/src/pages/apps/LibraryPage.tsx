@@ -20,7 +20,7 @@ import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
   Package, Bot, Zap, Clock, Lock, Trash2, X, ArrowUp, Compass,
-  AlertTriangle, PowerOff,
+  AlertTriangle, PowerOff, Eye, EyeOff,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { appNavTarget } from '../../appNav'
@@ -32,6 +32,7 @@ import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import { toggleAppNavHidden, useAppNavHidden } from '../../lib/appNavHidden'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
 import useAppsData from './useAppsData'
 import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
@@ -46,10 +47,20 @@ type UserInstalledDep = UninstallPreview['dependencies']['userInstalled'][number
 
 export default function LibraryPage() {
   const navigate = useNavigate()
+  // The reader's view control. Persisted in THIS origin's localStorage and
+  // live-synced across tabs by `usePersistedBool`; it does NOT follow the reader
+  // to a new origin. The growth-gap that once made adding keys to
+  // `DURABLE_PREF_KEYS` unsafe is closed (issue 9491's reconcile pass in
+  // lib/uiPrefs.ts), so keeping this origin-local is now purely a product
+  // decision -- a per-machine browsing-view toggle, not a preference the reader
+  // would expect to follow them. Off by
+  // default so a fresh visit shows the apps the reader enabled, not the ~20
+  // default-off builtins the wheel ships.
+  const [showAll, setShowAll] = usePersistedBool('mc-apps-library-show-all', false)
   const {
     apps, appsLoading, appsError, registryError,
-    browseApps, installedApps, updatables, announceAppsChanged,
-  } = useAppsData()
+    browseApps, installedApps, disabledCount, updatables, announceAppsChanged,
+  } = useAppsData({ showAll })
 
   const [query, setQuery] = useState('')
   const [successMsg, setSuccessMsg] = useState('')
@@ -86,13 +97,14 @@ export default function LibraryPage() {
   // at once. The module's own event covers same-tab writes (this page's
   // toggles included, via the module's dispatch-on-write); the `storage`
   // listener covers a toggle made in ANOTHER tab — the same two-listener
-  // shape App.tsx's sidebar filter uses.
+  // shape the sidebar filter in shell/nav/appRail.tsx uses.
   const navHidden = useAppNavHidden()
 
   // Pin toggle — resolve the tile's app to the SAME nav id the sidebar rows
   // carry (`appNavTarget(app).id`, the rail's own derivation) and flip it in
   // the persisted hidden set. The module's write dispatches the sync event,
-  // which feeds the state above and App.tsx's sidebar filter — no local
+  // which feeds the state above and the sidebar filter in
+  // shell/nav/appRail.tsx — no local
   // set-state here. A tile without a nav target never offers the toggle
   // (`pinnable` below), so the null branch is only a race guard.
   const togglePin = (name: string) => {
@@ -125,6 +137,23 @@ export default function LibraryPage() {
       || (a.manifest?.tags || []).some(t => t.toLowerCase().includes(q)))
   }, [installedApps, query])
 
+  // One definition of the view control, rendered both above the grid and inside
+  // the empty enabled-only view. `aria-pressed` reflects the show-all state; the
+  // label carries the hidden count so an empty list reads differently from a
+  // filtered one.
+  const revealToggle = (
+    <button
+      type="button"
+      onClick={() => setShowAll(!showAll)}
+      aria-pressed={showAll}
+      className="inline-flex items-center gap-1.5 text-[13px] text-muted hover:text-text"
+    >
+      {showAll
+        ? <><EyeOff size={13} className="shrink-0" aria-hidden /> {i18nT('pages.appsPage.show_enabled_only')}</>
+        : <><Eye size={13} className="shrink-0" aria-hidden /> {i18nT('pages.appsPage.show_disabled', { count: disabledCount })}</>}
+    </button>
+  )
+
   // ---- Actions --------------------------------------------------------------
   // Detail navigation, update routing, the trust-consent target, and the
   // single enable path come from useAppActions — shared with DiscoverPage so
@@ -138,7 +167,10 @@ export default function LibraryPage() {
         setUninstallTarget(app)
         setKeepData(true)
         setKeepSpecific(new Set())
-        // Fetch uninstall preview (best-effort — dialog works without it)
+        // The preview is optional UI enrichment: when the request succeeds the
+        // dialog shows the dependency classification, and when it fails the
+        // dialog still works — just without the dependency panel. No error toast:
+        // the primary action must not depend on the preview.
         try {
           setUninstallPreview(await api.uninstallPreview(name))
         } catch {
@@ -202,13 +234,15 @@ export default function LibraryPage() {
       />
 
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        {/* Notifications. No hand-off on the error notice: management actions
-            share this page — navigating away would discard in-flight state. */}
+        {/* Notifications. askAgent on: this page holds no text draft — the search box
+            is a filter and the uninstall confirm's keep-data checkboxes reset on close —
+            so the hand-off destroys nothing. */}
         {displayError && (
           <ErrorNotice
             message={displayError}
             onDismiss={dismissError}
             className="mb-4 animate-rise"
+            askAgent
           />
         )}
         {successMsg && (
@@ -246,6 +280,8 @@ export default function LibraryPage() {
           app={trust.target}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}
@@ -258,7 +294,7 @@ export default function LibraryPage() {
             interaction, hence the scoped disables. */}
         {uninstallTarget && (
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+          <div className="fixed inset-0 z-[100] flex items-center justify-center bg-bg/60 backdrop-blur-xs animate-rise"
             onClick={() => { setUninstallTarget(null); setUninstallPreview(null) }}
             onKeyDown={e => { if (e.key === 'Escape') { setUninstallTarget(null); setUninstallPreview(null) } }}
             tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appsPage.confirm_uninstall')}
@@ -386,22 +422,44 @@ export default function LibraryPage() {
         {appsLoading ? (
           <div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div>
         ) : filteredInstalled.length === 0 ? (
-          <EmptyState
-            icon={<Package size={36} />}
-            title={installedApps.length === 0 ? i18nT('pages.appsPage.no_apps_installed_yet') : i18nT('pages.appsPage.no_matching_apps')}
-            subtitle={installedApps.length === 0
-              ? i18nT('pages.appsPage.find_apps_in_the_discover_tab_or_install_from_a')
-              : i18nT('pages.appsPage.try_a_different_search_term')}
-            action={installedApps.length === 0
-              ? (
-                <Link to="/apps" className="text-accent text-sm font-medium hover:underline inline-flex items-center gap-1.5">
-                  <Compass size={14} className="lucide-inline" /> {i18nT('nav.discover')}
-                </Link>
-              )
-              : undefined}
-          />
+          // The enabled-only view can be empty while disabled builtins wait
+          // behind the toggle (a fresh install enables nothing). Falling through
+          // to the "no apps installed" dead-end would strand those builtins with
+          // no way to reveal them — the #4882 failure. So when the ONLY reason
+          // the list is empty is the filter, keep the labelled reveal control.
+          !query.trim() && !showAll && disabledCount > 0 ? (
+            <div className="py-12 flex flex-col items-center gap-3 text-center animate-rise">
+              <Package size={36} className="text-muted" aria-hidden />
+              <span className="text-sm text-muted">{i18nT('pages.appsPage.no_enabled_apps')}</span>
+              {revealToggle}
+            </div>
+          ) : (
+            <EmptyState
+              icon={<Package size={36} />}
+              title={installedApps.length === 0 ? i18nT('pages.appsPage.no_apps_installed_yet') : i18nT('pages.appsPage.no_matching_apps')}
+              subtitle={installedApps.length === 0
+                ? i18nT('pages.appsPage.find_apps_in_the_discover_tab_or_install_from_a')
+                : i18nT('pages.appsPage.try_a_different_search_term')}
+              action={installedApps.length === 0
+                ? (
+                  <Link to="/apps" className="text-accent text-sm font-medium hover:underline inline-flex items-center gap-1.5">
+                    <Compass size={14} className="lucide-inline" /> {i18nT('nav.discover')}
+                  </Link>
+                )
+                : undefined}
+            />
+          )
         ) : (
           <>
+            {/* Enabled-only / show-all view control (shared with the empty-view
+                fallback above via `revealToggle`). A filter, not a hide: every
+                row stays reachable through this toggle, so a default-off builtin
+                with no Discover row is still enable-able (the reachability
+                #4882 is about). Hidden while a search query is active — the
+                search already filters the full installed set. */}
+            {!query.trim() && (showAll || disabledCount > 0) && (
+              <div className="mb-4 flex items-center animate-rise">{revealToggle}</div>
+            )}
             {updatables.length > 0 && (
               /* Light hint, not a banner: the update WORKLIST (rows, version
                  diffs, Update All) lives on the Discover Updates sub-page —

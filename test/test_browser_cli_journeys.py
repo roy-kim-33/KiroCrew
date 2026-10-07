@@ -9,8 +9,10 @@ configuration the operator owns.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -123,11 +125,15 @@ class TestOperatorConfigIsNotOurs:
 
         assert config.read_text(encoding="utf-8") == before
 
-    def test_an_update_leaves_the_config_alone(self, home: Path):
+    def test_an_update_leaves_the_config_alone(self, home: Path, monkeypatch: pytest.MonkeyPatch):
         config = _operator_cli_config(home)
         before = config.read_text(encoding="utf-8")
 
-        # An update re-runs detection. Detection is a PATH and version read.
+        # An update re-runs detection. Detection is a PATH and version read -- pinned
+        # here, the same way the sibling cases pin it, so it never runs the host's
+        # ``node``/``playwright-cli``; the property under test is that it WRITES nothing.
+        monkeypatch.setattr(install, "cli_path", lambda: None)
+        monkeypatch.setattr(install, "_node_version", lambda: "22.1.0")
         install.detect()
 
         assert config.read_text(encoding="utf-8") == before
@@ -169,6 +175,14 @@ class TestBothOnboardingPaths:
 
     def test_an_existing_install_is_used_as_is(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(install, "cli_path", lambda: "/usr/local/bin/playwright-cli")
+        monkeypatch.setattr(
+            install,
+            "cli_command",
+            lambda cli=None: [
+                "/usr/local/bin/node",
+                "/usr/local/lib/node_modules/@playwright/cli/playwright-cli.js",
+            ],
+        )
         monkeypatch.setattr(install, "_first_version", lambda text: "0.1.18")
         monkeypatch.setattr(install, "_node_version", lambda: "22.1.0")
         monkeypatch.setattr(install, "_run", lambda argv, timeout: (0, "0.1.18", ""))
@@ -287,7 +301,7 @@ class TestBrowserMutationsAreOwnerOnly:
             # Attributes read by the browser GET handler (avoids MagicMock
             # leaking into JSON serialization).
             state._browser_install_task = None
-            state._browser_install_error = None
+            state._browser_install_job = None
             self.app = {"state": state}
             self.path = path
             self._claims: dict[str, str] = {"app": app_claim, "user": user}
@@ -361,6 +375,32 @@ class TestBrowserMutationsAreOwnerOnly:
             resp = self._run(
                 msg.api_browser_token_put,
                 self._non_owner_request("/api/browser/token", {"token": "x"}),
+            )
+        assert resp.status == 403
+
+    def test_non_owner_cli_install_refused(self):
+        """A non-owner cannot start CLI setup, which runs registry code on the host."""
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        with patch.object(msg, "_sel", return_value=MagicMock()):
+            resp = self._run(
+                msg.api_browser_install_start,
+                self._non_owner_request("/api/browser/install", {}),
+            )
+        assert resp.status == 403
+
+    def test_non_owner_engine_download_refused(self):
+        """A non-owner cannot start an engine download."""
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        with patch.object(msg, "_sel", return_value=MagicMock()):
+            resp = self._run(
+                msg.api_browser_engine_install,
+                self._non_owner_request("/api/browser/engine", {"engine": "firefox"}),
             )
         assert resp.status == 403
 
@@ -544,7 +584,7 @@ class TestOneInstallSlotIsNotAFoldedLie:
             state.owner_id = "the-owner"
             never_done = asyncio.get_running_loop().create_future()
             state._browser_install_task = never_done
-            state._browser_install_error = None
+            state._browser_install_job = None
             req = self._app_request({"engine": "webkit"})
             req.app = {"state": state}
             resp = await msg.api_browser_engine_install(req)
@@ -566,15 +606,67 @@ class TestOneInstallSlotIsNotAFoldedLie:
         assert _json.loads(resp.text)["code"] == "install_already_running"
 
 
+def _owner_install_request(state, body: dict | None = None, path: str = "/api/browser/install"):
+    """Configured-owner request stub shared by the install-error tests.
+
+    One copy on purpose: two hand-rolled owner-claims mocks drift independently,
+    and a change to the owner predicate would fix one class while the other kept
+    asserting against a stale request shape.
+    """
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.path = path
+    _claims = {"app": "", "user": "the-owner"}
+    req.get = lambda key, default=None: _claims.get(key, default)
+    req.__contains__ = lambda self_inner, key: key in _claims
+    req.__getitem__ = lambda self_inner, key: _claims[key]
+
+    async def _json():
+        return body or {}
+
+    req.json = _json
+    req.app = {"state": state}
+    return req
+
+
+def _drive_install_error(monkeypatch, handler_name: str, body: dict | None = None) -> str | None:
+    """Drive one install handler on a fresh state and return its ``last_error``.
+
+    The caller monkeypatches ``install`` / ``install_browser`` first; this
+    helper stubs only the status GET the handlers answer with.
+    """
+    import asyncio
+
+    from kiro_crew.dashboard.handlers import messaging as msg
+
+    monkeypatch.setattr(msg.browser_cli_install, "detect", lambda: {"installed": True})
+    monkeypatch.setattr(msg.browser_cli_token, "has_token", lambda: False)
+
+    async def _go():
+        state = type("S", (), {})()
+        state.owner_id = "the-owner"
+        state._browser_install_task = None
+        state._browser_install_job = None
+        await getattr(msg, handler_name)(_owner_install_request(state, body))
+        task = state._browser_install_task
+        # A missing task means the handler refused before doing any work; a
+        # `None`-asserting caller must not read that as "no error produced".
+        assert task is not None, f"{handler_name} never started the install task"
+        await task
+        return msg._browser_install_status(state)["last_error"]
+
+    return asyncio.run(_go())
+
+
 class TestARecoveredStepIsNotReportedAsAnError:
     """A step can fail and be RECOVERED, so "any step failed" is not the verdict.
 
-    ``--with-deps`` is refused by sudo policy on a managed workstation; the
-    browser download is then retried without it and succeeds. That first attempt
-    stays in ``steps`` so the operator can see what was tried, which means
-    scanning every step for ``ok=False`` raises a permanent error banner quoting
-    a sudo refusal on a host where browsing now works. The panel renders
-    ``last_error`` with no gate of its own, so the verdict is made here.
+    The installer does not retry a refused package step, but a result that
+    carries a failed attempt followed by a successful one must still read as a
+    success: the LAST step decides. Scanning every step for ``ok=False`` would
+    raise a permanent error banner on a host where browsing works. The panel
+    renders ``last_error`` with no gate of its own, so the verdict is made here.
     """
 
     #: What ``install()`` returns once a refused package step has been recovered.
@@ -598,44 +690,11 @@ class TestARecoveredStepIsNotReportedAsAnError:
         ],
     }
 
-    def _owner_request(self, state):
-        from unittest.mock import MagicMock
-
-        req = MagicMock()
-        req.path = "/api/browser/install"
-        _claims = {"app": "", "user": "the-owner"}
-        req.get = lambda key, default=None: _claims.get(key, default)
-        req.__contains__ = lambda self_inner, key: key in _claims
-        req.__getitem__ = lambda self_inner, key: _claims[key]
-
-        async def _json():
-            return {}
-
-        req.json = _json
-        req.app = {"state": state}
-        return req
-
     def _last_error(self, monkeypatch, result):
-        import asyncio
-
         from kiro_crew.dashboard.handlers import messaging as msg
 
-        monkeypatch.setattr(msg.browser_cli_install, "install", lambda: result)
-        monkeypatch.setattr(msg.browser_cli_install, "detect", lambda: {"installed": True})
-        monkeypatch.setattr(msg.browser_cli_token, "has_token", lambda: False)
-
-        async def _go():
-            state = type("S", (), {})()
-            state.owner_id = "the-owner"
-            state._browser_install_task = None
-            state._browser_install_error = None
-            await msg.api_browser_install_start(self._owner_request(state))
-            task = state._browser_install_task
-            if task is not None:
-                await task
-            return state._browser_install_error
-
-        return asyncio.run(_go())
+        monkeypatch.setattr(msg.browser_cli_install, "install", lambda on_stage=None: result)
+        return _drive_install_error(monkeypatch, "api_browser_install_start")
 
     def test_a_recovered_with_deps_refusal_leaves_no_error(self, monkeypatch: pytest.MonkeyPatch):
         assert self._last_error(monkeypatch, self._RECOVERED) is None
@@ -701,6 +760,122 @@ class TestARecoveredStepIsNotReportedAsAnError:
         assert "sudo dnf install -y nss" in error
 
 
+class TestInstallErrorStringsGetNpmAwareRedaction:
+    """Every carrier of the install error string masks a bare ``_authToken=``.
+
+    Step ``stderr`` is scrubbed at the source (``browser_cli.install._step``),
+    but the ``error`` fallback and the ``except Exception`` arms are composed in
+    the handlers, where the module-local two-pass ``_redact`` does NOT know the
+    npm shapes. These tests pin all four assignment sites to the npm-aware
+    ``redact_install_output``.
+    """
+
+    _SECRET = "deadbeefcafe1234secret"
+    _NPM_LINE = f"//npm.internal.example/:_authToken={_SECRET}"
+
+    def _drive(self, monkeypatch, handler_name: str, body: dict | None = None) -> str | None:
+        return _drive_install_error(monkeypatch, handler_name, body)
+
+    def _assert_token_masked(self, error: str | None) -> None:
+        assert error is not None
+        # The secret value is gone...
+        assert self._SECRET not in error
+        # ...but the key survives with the marker, so the operator can still
+        # see WHAT kind of line failed without seeing the credential.
+        assert "_authToken" in error
+        assert "[REDACTED" in error
+
+    def test_a_cli_install_exception_masks_a_bare_authtoken(self, monkeypatch: pytest.MonkeyPatch):
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        def _boom(on_stage=None):
+            raise RuntimeError(f"npm config set {self._NPM_LINE} failed")
+
+        monkeypatch.setattr(msg.browser_cli_install, "install", _boom)
+        self._assert_token_masked(self._drive(monkeypatch, "api_browser_install_start"))
+
+    def test_an_engine_install_exception_masks_a_bare_authtoken(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        def _boom(engine, on_stage=None):
+            raise RuntimeError(f"npm config set {self._NPM_LINE} failed")
+
+        monkeypatch.setattr(msg.browser_cli_install, "install_browser", _boom)
+        self._assert_token_masked(
+            self._drive(monkeypatch, "api_browser_engine_install", {"engine": "chromium"})
+        )
+
+    def test_a_step_whose_only_diagnostic_is_error_masks_the_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The ``error`` fallback never passes through ``_step``'s stderr scrub,
+        so its redaction happens ONLY at the handler."""
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        failed = {
+            "ok": False,
+            "steps": [
+                {
+                    "name": "npm-install-global",
+                    "ok": False,
+                    "returncode": 1,
+                    # No `stderr` key at all: the handler must fall back to
+                    # `error`, which carries the npm line verbatim.
+                    "error": f"npm config set {self._NPM_LINE} failed",
+                },
+            ],
+        }
+        monkeypatch.setattr(msg.browser_cli_install, "install", lambda on_stage=None: failed)
+        self._assert_token_masked(self._drive(monkeypatch, "api_browser_install_start"))
+
+    def test_a_credential_straddling_a_pre_redaction_cut_is_still_masked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Redaction must see the FULL exception text before any truncation.
+
+        A pre-redaction cut splits `user:secret@host` so the `@` anchor is
+        gone and no pattern matches -- and because the npm lines BEFORE the
+        credential collapse ~20x under redaction, the surviving cleartext
+        fragment lands well inside the 2000-char window the panel renders.
+        This message is built so the secret sits entirely before offset 8000
+        and its `@` after it: the test fails on any pre-redaction cut at 8000
+        and passes on redact-then-truncate.
+        """
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        filler = f"//r.example/:_authToken={'z' * 200}\n"
+        head = filler * 35  # 7875 chars, ends with a newline so the URL owns its line
+        secret_url = "http://admin:LEAKED_SECRET" + "x" * 110 + "@proxy.example.com"
+        message = head + secret_url + " refused"
+        # The full secret value ends before 8000; the `@` anchor sits after it.
+        assert message.index("LEAKED_SECRET") + len("LEAKED_SECRET") < 8000
+        assert message.index("@proxy") > 8000
+
+        def _boom(on_stage=None):
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(msg.browser_cli_install, "install", _boom)
+        error = self._drive(monkeypatch, "api_browser_install_start")
+        assert error is not None
+        assert "LEAKED_SECRET" not in error
+        assert "[REDACTED" in error
+
+    def test_the_inline_credential_url_case_still_masks(self, monkeypatch: pytest.MonkeyPatch):
+        """No regression: the shape the OLD redactor did catch stays caught."""
+        from kiro_crew.dashboard.handlers import messaging as msg
+
+        def _boom(on_stage=None):
+            raise RuntimeError("proxy https://user:sup3rs3cret@proxy.example.com/ refused")
+
+        monkeypatch.setattr(msg.browser_cli_install, "install", _boom)
+        error = self._drive(monkeypatch, "api_browser_install_start")
+        assert error is not None
+        assert "sup3rs3cret" not in error
+        assert "[REDACTED" in error
+
+
 def test_non_object_json_is_a_validation_error_not_a_500():
     """`body.get()` on valid-but-non-object JSON raises AttributeError.
 
@@ -741,6 +916,10 @@ def test_every_browser_route_has_a_deliberate_app_token_stance():
         "api_browser_engine_install": "owner",  # mutates the machine (browser download)
         "api_browser_view_get": "owner",  # returns the unauthenticated dashboard URL
         "api_browser_view_start": "owner",  # launches the browser AND returns that URL
+        # Opens an owner-typed URL in the gateway's browser: a spawn driven by
+        # request input, owner-only, and it refuses internal-secret callers too
+        # (agent browsing must stay behind the shell approval ladder).
+        "api_browser_open": "owner",
         # Presence/version reporting only. No credential, no URL, no mutation --
         # and an app that cannot read it cannot tell "absent" from "broken".
         "api_browser_install_get": "open",
@@ -814,10 +993,26 @@ class TestViewSubprocessesReceiveNodeEnv:
 
         fake_env = {"PATH": "/nvm/bin:/usr/bin", "HOME": "/home/test"}
         monkeypatch.setattr(view_mod, "cli_env", lambda: fake_env)
+        monkeypatch.setattr(view_mod, "installed_cli_version", lambda command: "0.1.99")
+        monkeypatch.setattr(
+            view_mod,
+            "_capture_root_process_identity",
+            lambda pid: view_mod.platform_compat.ProcessDescendantIdentity(
+                pid,
+                0,
+                "start-1",
+                view_mod.platform_compat.ProcessIdentitySource.ATOMIC,
+            ),
+        )
 
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
-            view_mod._spawn("/n/pw", 9999)
+            mock_popen.return_value.stdout = io.BytesIO(b"Listening on http://127.0.0.1:9999\n")
+            proc = view_mod._spawn(["/n/pw"], 9999)
+
+        assert proc is not None
+        proof = proc.binding
+        assert proof.reported.wait(timeout=1), "listener-proof reader never consumed stdout"
 
         mock_popen.assert_called_once()
         _, kwargs = mock_popen.call_args
@@ -836,7 +1031,9 @@ class TestViewSubprocessesReceiveNodeEnv:
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         fake_proc.pid = 12345
-        view_mod._proc = fake_proc
+        view_mod._child = view_mod._Child(
+            proc=fake_proc, binding=view_mod._BindingProof(port=0, reported=threading.Event())
+        )
 
         with patch.object(view_mod.subprocess, "run") as mock_run:
             monkeypatch.setattr(
@@ -846,12 +1043,11 @@ class TestViewSubprocessesReceiveNodeEnv:
             )
             view_mod.stop()
 
-        # stop() no longer issues any subprocess.run call (no global --kill).
+        # stop() issues no subprocess.run call at all (no global --kill).
         mock_run.assert_not_called()
 
         # Cleanup.
-        view_mod._proc = None
-        view_mod._info = None
+        view_mod._child = None
 
 
 class TestStopGuardsAgainstUnownedProcesses:
@@ -866,8 +1062,7 @@ class TestStopGuardsAgainstUnownedProcesses:
 
         monkeypatch.setattr(view_mod, "cli_path", lambda: "/n/pw")
         # No owned process.
-        view_mod._proc = None
-        view_mod._info = None
+        view_mod._child = None
 
         with patch.object(view_mod.subprocess, "run") as mock_run:
             view_mod.stop()
@@ -887,8 +1082,11 @@ class TestStopGuardsAgainstUnownedProcesses:
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         fake_proc.pid = 55555
-        view_mod._proc = fake_proc
-        view_mod._info = view.ShowInfo(url="http://127.0.0.1:9999", port=9999)
+        view_mod._child = view_mod._Child(
+            proc=fake_proc,
+            binding=view_mod._BindingProof(port=0, reported=threading.Event()),
+            info=view.ShowInfo(url="http://127.0.0.1:9999", port=9999),
+        )
 
         reaped: list[int] = []
         monkeypatch.setattr(
@@ -903,7 +1101,7 @@ class TestStopGuardsAgainstUnownedProcesses:
         # No global --kill issued; the owned child was reaped via its tree.
         mock_run.assert_not_called()
         assert 55555 in reaped
-        assert view_mod._proc is None
+        assert view_mod._child is None
 
     def test_stop_reaps_owned_child_even_when_tree_kill_raises(
         self, monkeypatch: pytest.MonkeyPatch
@@ -918,8 +1116,11 @@ class TestStopGuardsAgainstUnownedProcesses:
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         fake_proc.pid = 66666
-        view_mod._proc = fake_proc
-        view_mod._info = view.ShowInfo(url="http://127.0.0.1:8888", port=8888)
+        view_mod._child = view_mod._Child(
+            proc=fake_proc,
+            binding=view_mod._BindingProof(port=0, reported=threading.Event()),
+            info=view.ShowInfo(url="http://127.0.0.1:8888", port=8888),
+        )
 
         def _exploding_kill(pid, sig=None):
             raise OSError("boom")
@@ -933,8 +1134,7 @@ class TestStopGuardsAgainstUnownedProcesses:
         # stop() must not propagate the exception; the child is still cleared.
         view_mod.stop()
 
-        assert view_mod._proc is None
-        assert view_mod._info is None
+        assert view_mod._child is None
 
     def test_stop_is_idempotent_across_two_calls(self, monkeypatch: pytest.MonkeyPatch):
         from unittest.mock import MagicMock
@@ -947,8 +1147,11 @@ class TestStopGuardsAgainstUnownedProcesses:
         fake_proc = MagicMock()
         fake_proc.poll.return_value = None
         fake_proc.pid = 77777
-        view_mod._proc = fake_proc
-        view_mod._info = view.ShowInfo(url="http://127.0.0.1:7777", port=7777)
+        view_mod._child = view_mod._Child(
+            proc=fake_proc,
+            binding=view_mod._BindingProof(port=0, reported=threading.Event()),
+            info=view.ShowInfo(url="http://127.0.0.1:7777", port=7777),
+        )
 
         kill_calls: list[int] = []
         monkeypatch.setattr(
@@ -962,5 +1165,4 @@ class TestStopGuardsAgainstUnownedProcesses:
 
         # The tree kill fires only once (the first call); the second is a no-op.
         assert kill_calls == [77777]
-        assert view_mod._proc is None
-        assert view_mod._info is None
+        assert view_mod._child is None

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from test_gate_tiers import ALL_SCENARIOS, gate_world, judge_scenario  # noqa: F401
 
 from kiro_crew.metrics import events as ev
 
@@ -32,6 +33,12 @@ def rec():
     r = _CapturingRecorder()
     with patch("kiro_crew.metrics.provider.get_recorder", return_value=r):
         yield r
+
+
+def _admission_modules():
+    """Every module of the admission package, relative to the package root."""
+    pkg = Path(ev.__file__).resolve().parent.parent / "subagent_manager" / "admission"
+    return sorted(f"subagent_manager/admission/{p.name}" for p in pkg.glob("*.py"))
 
 
 def _named(rec, name):
@@ -94,67 +101,85 @@ class TestApprovalDecisions:
         after = len(_named(rec, ev.APPROVAL_DECISIONS))
         assert after == before, "one consultation must count once, not once per object"
 
-    def test_every_gate_exit_is_counted(self):
-        """All 18 returns in on_tool_call go through a factory; nothing else does."""
-        import ast
-        import inspect
+    @pytest.mark.usefixtures("gate_world")
+    @pytest.mark.parametrize("scenario", ALL_SCENARIOS)
+    def test_every_judgement_is_counted_exactly_once(self, rec, scenario):
+        """One consultation, one counted decision, whichever tier decided and by which
+        of its branches (the scenarios reach every reachable verdict of every row):
+        a verdict built directly would count zero and one built twice would count
+        two."""
+        verdict = judge_scenario(scenario)
+        calls = _named(rec, ev.APPROVAL_DECISIONS)
+        assert len(calls) == 1, f"tier {scenario.tier!r} counted {len(calls)} decisions"
+        assert calls[0]["attrs"] == {
+            "decision": verdict.action,
+            "security_deny": verdict.security_deny if verdict.action == "deny" else False,
+        }
 
+    def test_a_refusal_the_gate_makes_of_itself_is_counted_once(self, rec, monkeypatch):
+        """The two verdicts no tier returns -- a crash, and an unsound table -- are
+        counted decisions too."""
         from kiro_crew import hooks
+        from kiro_crew.hooks import HookManager, ToolCall
 
-        tree = ast.parse(inspect.getsource(hooks))
-        factories = set()
-        direct = 0
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "on_tool_call":
-                for call in ast.walk(node):
-                    if not isinstance(call, ast.Call):
-                        continue
-                    fn = call.func
-                    if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
-                        if fn.value.id == "ToolHookResult":
-                            factories.add(fn.attr)
-                    elif isinstance(fn, ast.Name) and fn.id == "ToolHookResult":
-                        direct += 1
-        assert factories, "the gate must return through the counted factories"
-        assert factories <= {"allow", "auto_approve", "deny", "deny_policy"}
-        assert direct == 0, "a direct construction inside the gate would go uncounted"
+        call = ToolCall(title="Running: ls -la", is_shell=True, command="ls -la")
+
+        def boom(*_args, **_kwargs):
+            raise SystemError("boom")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(hooks.current_context().security, "is_denied", boom)
+            HookManager().judge(call)
+        with monkeypatch.context() as patched:
+            patched.setattr(hooks, "_GATE_TABLE_PROBLEMS", ("unsound",))
+            HookManager().judge(call)
+        assert [c["attrs"] for c in _named(rec, ev.APPROVAL_DECISIONS)] == [
+            {"decision": "deny", "security_deny": True}
+        ] * 2
+
+    def test_a_consultation_inside_uncounted_gate_counts_nothing(self, rec):
+        from kiro_crew.hooks import HookManager, ToolCall, uncounted_gate
+
+        with uncounted_gate():
+            HookManager().judge(ToolCall(title="Running: ls -la", is_shell=True, command="ls -la"))
+        assert _named(rec, ev.APPROVAL_DECISIONS) == []
 
 
 class TestSpawnCounterPlacement:
     """Found in review: the admission-time emit counted rejected spawns."""
 
     def test_the_counter_sits_at_the_confirmed_start_funnel(self):
-        import ast
-        import inspect
+        """Every module of the admission package, not just the one that emits.
 
+        Admission is a package, so the funnel is only guaranteed if no sibling
+        module emits the counter from its own -- necessarily earlier -- frame.
+        """
         from kiro_crew.subagent_manager import admission
 
-        tree = ast.parse(inspect.getsource(admission))
         holders = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                for sub in ast.walk(node):
-                    if not isinstance(sub, ast.Call):
-                        continue
-                    fn = sub.func
-                    name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
-                    if name == "emit_counter":
-                        holders.append(node.name)
+        for module in sorted(Path(admission.__file__).resolve().parent.glob("*.py")):
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for sub in ast.walk(node):
+                        if not isinstance(sub, ast.Call):
+                            continue
+                        fn = sub.func
+                        name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                        if name == "emit_counter":
+                            holders.append(node.name)
         assert holders == ["_log_spawned_impl"], (
             "the spawn counter must live at _log_spawned_impl, which every path "
-            f"reaches only after approval; found in {holders}"
+            "reaches only after approval, and no other admission module may emit "
+            f"it; found in {holders}"
         )
 
     def test_it_sits_beside_the_repo_s_own_spawn_stat(self):
         import inspect
 
-        from kiro_crew.subagent_manager import admission
+        from kiro_crew.subagent_manager.admission.pump import _PumpMixin
 
-        body = (
-            inspect.getsource(admission._SpawnAdmission._log_spawned_impl)
-            if hasattr(admission, "_SpawnAdmission")
-            else inspect.getsource(admission)
-        )
+        body = inspect.getsource(_PumpMixin._log_spawned_impl)
         assert "inc_subagent_spawned" in body
         assert "SUBAGENTS_SPAWNED" in body
 
@@ -175,7 +200,12 @@ class TestCompactions:
             _recycling={"k": object()} if recycling else {},
             mark_needs_reinjection=lambda key: None,
         )
-        stub.state = SimpleNamespace(on_compacted=None)
+        # ``uncompactable_recycles`` is the set that tells a "nothing could compact
+        # this" recycle apart from a "the compaction failed" one, which the callback
+        # reports as different outcomes. This case is the FAILED one, so the set is
+        # empty -- present rather than absent, because the real ``CompactionState``
+        # always has it and a double without it would pass by accident.
+        stub.state = SimpleNamespace(on_compacted=None, uncompactable_recycles=set())
         asyncio.run(
             CompactionCoordinator._fire_compact_callback(coordinator, "k", 0.9, success=success)
         )
@@ -189,7 +219,7 @@ class TestCompactions:
         assert _named(rec, ev.CONTEXT_COMPACTIONS)[-1]["attrs"] == {"success": False}
 
     def test_a_failed_compact_that_recycles_is_not_counted_successful(self, rec):
-        """Review round 6: the counter's success is not the callback's success.
+        """The counter's success is not the callback's success.
 
         ``_recycle_held`` is reached exactly when an in-place ``/compact`` FAILED
         and the provider had to be replaced instead, yet it fires this funnel with
@@ -213,20 +243,33 @@ class TestCallSitesAreWired:
     """Each counter must be referenced by the module that owns its event."""
 
     OWNERS = {
-        "SUBAGENTS_SPAWNED": "subagent_manager/admission.py",
+        "SUBAGENTS_SPAWNED": "subagent_manager/admission/pump.py",
         "CRON_FIRES": "cron.py",
         "ARTIFACTS_CREATED": "artifacts.py",
         "WORKFLOW_RUNS": "workflows/runner.py",
         "CONTEXT_COMPACTIONS": "session_compaction.py",
         "MCP_RECONNECTS": "mcp_gateway/stub.py",
         "APPROVAL_DECISIONS": "hooks.py",
+        "ADAPTIVE_DECISIONS": "adaptive/controller.py",
+        # Overload-resilience series (RFC §10). Sampled ones are emitted by the
+        # structured health sampler; the recovery ones by the ladder; the
+        # completion counter at the one funnel every terminal task write crosses.
+        "TASKQ_DEPTH": "dashboard/session_health.py",
+        "TASKQ_OLDEST_WAIT_SECS": "dashboard/session_health.py",
+        "TASKQ_EFFECTIVE_CAP": "dashboard/session_health.py",
+        "TASKQ_PRESSURE_REASON": "dashboard/session_health.py",
+        "TASKQ_COMPLETIONS": "taskq/store.py",
+        "RECOVERY_ATTEMPTS": "recovery/ladder.py",
+        "RECOVERY_ESCALATIONS": "recovery/ladder.py",
+        "RECOVERY_DURATION_SECS": "recovery/ladder.py",
+        "RESTARTS_TOTAL": "recovery/ladder.py",
     }
 
     @pytest.mark.parametrize("const,rel", sorted(OWNERS.items()))
     def test_the_owning_module_emits_the_counter(self, const, rel):
         src = (Path(ev.__file__).resolve().parent.parent / rel).read_text(encoding="utf-8")
         assert const in src, f"{rel} must emit {const}"
-        assert "emit_counter" in src
+        assert "emit_counter" in src or "emit_histogram" in src
 
     def test_every_declared_counter_has_an_owner(self):
         """A constant with no call site is a metric nobody can read."""
@@ -251,13 +294,21 @@ class TestAttributeValuesAreBounded:
     @pytest.mark.parametrize(
         "rel",
         [
-            "subagent_manager/admission.py",
+            # Every module of the admission package: before the split one file
+            # carried the whole area, so naming only the emitting module would
+            # leave a sibling's future emit unscanned.
+            *_admission_modules(),
             "cron.py",
             "artifacts.py",
             "workflows/runner.py",
             "session_compaction.py",
             "mcp_gateway/stub.py",
+            "mcp_gateway/manager.py",
             "hooks.py",
+            "adaptive/controller.py",
+            "dashboard/session_health.py",
+            "taskq/store.py",
+            "recovery/ladder.py",
         ],
     )
     def test_no_emit_passes_an_f_string_or_a_concatenation(self, rel):
@@ -268,11 +319,46 @@ class TestAttributeValuesAreBounded:
                 continue
             func = node.func
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-            if name != "emit_counter":
+            if name not in ("emit_counter", "emit_histogram"):
                 continue
-            attrs = node.args[1] if len(node.args) > 1 else None
+            # emit_counter(name, attrs) / emit_histogram(name, value, attrs)
+            attrs_index = 1 if name == "emit_counter" else 2
+            attrs = node.args[attrs_index] if len(node.args) > attrs_index else None
             assert isinstance(attrs, ast.Dict), f"{rel}: attrs must be a literal dict"
             for value in attrs.values:
                 assert not isinstance(
                     value, (ast.JoinedStr, ast.BinOp)
                 ), f"{rel}: an interpolated attribute value is unbounded"
+
+
+class TestOverloadSeriesNames:
+    """The RFC §10 names exist, validate, and carry only closed-set attributes."""
+
+    NAMES = [
+        "TASKQ_DEPTH",
+        "TASKQ_OLDEST_WAIT_SECS",
+        "TASKQ_COMPLETIONS",
+        "TASKQ_EFFECTIVE_CAP",
+        "TASKQ_PRESSURE_REASON",
+        "HOST_PROCS_PEAK",
+        "HOST_FDS_PEAK",
+        "HOST_RSS_PEAK_MB",
+        "LOOP_LAG_MS",
+        "RECOVERY_DURATION_SECS",
+        "RECOVERY_ATTEMPTS",
+        "RECOVERY_ESCALATIONS",
+        "RESTARTS_TOTAL",
+    ]
+
+    @pytest.mark.parametrize("const", NAMES)
+    def test_name_is_declared_and_valid(self, const):
+        from kiro_crew.metrics.schema import validate_name
+
+        value = getattr(ev, const)
+        assert value.startswith("kirocrew.")
+        assert validate_name(value) == value
+
+    def test_emit_histogram_never_raises(self, rec):
+        ev.emit_histogram(ev.RECOVERY_DURATION_SECS, 1.5, {"layer": "L1_tool_call"}, unit="s")
+        with patch("kiro_crew.metrics.provider.get_recorder", side_effect=RuntimeError("x")):
+            ev.emit_histogram(ev.TASKQ_DEPTH, 1.0, {"state": "queued"})

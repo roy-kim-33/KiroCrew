@@ -13,7 +13,7 @@
  */
 import { memo, useId } from 'react'
 import { Bot, CheckCircle2, AlertCircle, Square, ChevronDown, CircleDashed } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import type { ChatMessage } from '../../types'
@@ -94,6 +94,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   onSessionOpen,
   sessions,
   activeSession,
+  messageTs,
   disclosureKey,
   onOpenPanel,
 }: {
@@ -104,6 +105,9 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
    *  assistant row passes. Omitted by hosts with no slot roster. */
   onSessionOpen?: (key: string) => void
   sessions?: ReadonlyMap<string, string>
+  /** When this row was written, ISO. The session chip's SHORT-name form needs it:
+   *  slot numbers are reused, so without a write time no short name resolves. */
+  messageTs?: string
   activeSession?: string
   disclosureKey?: string
   /** Opens the Subagents side panel. Omitted by hosts that have no side panel
@@ -113,8 +117,8 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const parsed = parseSubagentCompletionMessage(message)
   const failed = parsed !== null && (parsed.kind === 'single' ? parsed.outcome === 'failed' : parsed.failed > 0)
-  // A restart orphan: the run was cut short but its result survived on disk, so
-  // it warns rather than alarming (failure) or reassuring (success).
+  // A run a gateway restart cut off mid-turn: a fragment of its output is on
+  // disk, so it warns rather than alarming (failure) or reassuring (success).
   const interrupted = parsed !== null && parsed.kind === 'single' && parsed.outcome === 'interrupted'
   // Anything that did not simply succeed opens expanded. The header can only say
   // THAT it failed or was cut short; the reason — an error, or where the orphaned
@@ -273,7 +277,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
               aria-label={i18nT('pages.chat.subagentCompletionCard.open_in_the_subagents_panel')}
               className="pi-morph flex items-center gap-1 text-[11px] leading-4 text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-accent/10 transition-colors"
             >
-              <PanelRightSolid size={13} />
+              <SidePanelGlyph size={13} />
               <span className="hidden sm:inline">{i18nT('pages.chat.subagentCompletionCard.panel')}</span>
             </button>
           )}
@@ -327,7 +331,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
         // bottom) — pre-fix, the only indicator was the UA :focus-visible
         // outline reduced to a hairline on the top edge alone (WCAG 2.4.7).
         <div
-          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
           data-testid="subagent-completion-body"
           role="region"
           aria-labelledby={headlineId}
@@ -345,6 +349,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
             onSessionOpen={onSessionOpen}
             sessions={sessions}
             activeSession={activeSession}
+            messageTs={messageTs}
             softBreaks
           />
         </div>

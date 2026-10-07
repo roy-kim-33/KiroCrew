@@ -25,6 +25,12 @@ export interface ConfirmOptions {
   body?: ReactNode
   /** Restates the action ("Discard changes", "Destroy site") — never "OK". */
   confirmLabel: string
+  /** Every earlier caller confirms a destructive act, so danger styling is the
+   *  default. Pass `false` for a weighty but non-destructive confirm (a grant). */
+  danger?: boolean
+  /** `top` paints the prompt above a full-screen overlay (`z-[9999]`) the
+   *  caller may be raising it from; see `Modal`'s `layer`. */
+  layer?: 'dialog' | 'top'
 }
 
 interface PendingConfirm {
@@ -89,12 +95,13 @@ export function useConfirm(): {
       onClose={() => settle(false)}
       title={opts.title}
       maxWidth={440}
+      layer={opts.layer}
       footer={
         <>
           <Btn onClick={() => settle(false)}>
             {i18nT('components.confirmDialog.cancel')}
           </Btn>
-          <Btn danger onClick={() => settle(true)}>
+          <Btn danger={opts.danger !== false} onClick={() => settle(true)}>
             {opts.confirmLabel}
           </Btn>
         </>

@@ -45,7 +45,7 @@ const PROJECT = `${WORKSPACE}/Product Guide`
 const RELEASE_NOTES = `${PROJECT}/release-notes.md`
 const OVERVIEW = `${PROJECT}/src/overview.md`
 
-const DIRS = new Set([PROJECT, WORKSPACE])
+const DIRS = new Set([PROJECT, WORKSPACE, `${PROJECT}/src`])
 
 /** Unicode paths — issue #6483: none of these classified before PATH_SHAPE_RE
  *  gained `\p{L}\p{M}\p{N}` + the `u` flag, so the probe was never issued. The
@@ -67,7 +67,12 @@ const realFetch = globalThis.fetch.bind(globalThis)
 globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
   if (url.startsWith('/api/file-read')) {
-    const p = decodeURIComponent(new URLSearchParams(url.split('?')[1] || '').get('path') || '')
+    let p = decodeURIComponent(new URLSearchParams(url.split('?')[1] || '').get('path') || '')
+    // The real endpoint runs os.path.realpath, which drops a trailing separator
+    // before stat, so `/dir/` and `/dir` are the same file to the backend. Mirror
+    // that here so a trailing-slash directory chip classifies as the dir it names
+    // (issue #9409, directory-chip half).
+    if (p.length > 1 && (p.endsWith('/') || p.endsWith('\\'))) p = p.slice(0, -1)
     if (DIRS.has(p)) {
       return Promise.resolve(new Response(null, { status: 404, headers: { 'X-Path-Kind': 'dir' } }))
     }
@@ -111,6 +116,34 @@ api.projectTree = (async () => ({
 })) as typeof api.projectTree
 api.projectGitStatus = (async () => ({ repo: false, files: [] })) as typeof api.projectGitStatus
 
+// The truncated-tree scene: the server capped the listing, so the tree holds only
+// the rows inside the cap and the search box hands its query to the server-side
+// search. The search answers after a pause so the frame between "typed" and
+// "answered" can be captured.
+if (scene === 'folder-truncated') {
+  api.projectTree = (async () => ({
+    root: PROJECT,
+    paths: ['README.md', 'docs/getting-started.md', 'src/overview.md'],
+    directories: ['data', 'docs', 'src'],
+    truncatedDirectories: ['', 'data'],
+    hiddenOnlyDirectories: [],
+    unreadableDirectories: [],
+    linkedDirectories: [],
+    truncated: true,
+    repo: false,
+  })) as typeof api.projectTree
+  api.fileSearch = (async (query: string) => {
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    return {
+      root: PROJECT,
+      results: [
+        { path: `${PROJECT}/data/2024/q3/readme.txt`, name: 'readme.txt', size: 1, mtime: 0, kind: 'file' },
+        { path: `${PROJECT}/data/archive/README.md`, name: 'README.md', size: 1, mtime: 0, kind: 'file' },
+      ].filter(r => r.name.toLowerCase().includes(query.toLowerCase())),
+    }
+  }) as typeof api.fileSearch
+}
+
 // The reveal scene mounts the real MarkdownPanel, which asks whether this path is
 // already tracked as an artifact. Answer "no" rather than let it hit the dev
 // server and render an error state over the editor we are trying to photograph.
@@ -124,6 +157,7 @@ const TRANSCRIPT = [
   '',
   'Shared resources live under `/Demo Workspace` and the readme is at',
   '`/Demo Workspace/Product Guide/README.md`.',
+  'The source lives under `/Demo Workspace/Product Guide/src/` (trailing slash).',
   'A path that is gone: `/Demo Workspace/deleted-notes.md`.',
 ].join('\n')
 
@@ -314,7 +348,7 @@ function Scene() {
       </div>
     )
   }
-  if (scene === 'folder') {
+  if (scene === 'folder' || scene === 'folder-truncated') {
     return (
       <div data-capture-root style={{ width: 420, height: 340 }} className="bg-bg">
         <FolderPanel

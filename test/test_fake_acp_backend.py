@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import time
 from typing import Any
@@ -23,6 +24,7 @@ def _capture(monkeypatch) -> io.StringIO:
     """Redirect the fake's stdout to a buffer for the duration of the test."""
     buf = io.StringIO()
     monkeypatch.setattr(fake.sys, "stdout", buf)
+    monkeypatch.setattr(fake, "_SESSIONS", {"s1": ([], "")})
     return buf
 
 
@@ -96,6 +98,7 @@ def test_tool_prompt_emits_tool_call_without_permission(monkeypatch):
             "id": 5,
             "method": "session/prompt",
             "params": {
+                "sessionId": "s1",
                 "prompt": [{"type": "text", "text": f"go {fake.TOOL_TRIGGER} now"}]
             },
         }
@@ -138,7 +141,10 @@ def test_permission_prompt_raises_request_permission(monkeypatch):
             "jsonrpc": "2.0",
             "id": 6,
             "method": "session/prompt",
-            "params": {"prompt": [{"type": "text", "text": fake.PERMISSION_TRIGGER}]},
+            "params": {
+                "sessionId": "s1",
+                "prompt": [{"type": "text", "text": fake.PERMISSION_TRIGGER}],
+            },
         }
     )
     msgs = _messages(buf)
@@ -188,6 +194,23 @@ def test_main_answers_readiness_probes(monkeypatch):
     monkeypatch.setattr(fake.sys, "argv", ["fake_acp_backend", "whoami"])
     fake.main()
     assert buf.getvalue().strip() == fake.FAKE_IDENTITY
+
+
+def test_main_answers_list_models_with_a_catalog(monkeypatch):
+    """``chat --list-models`` prints the fixed catalog in the shape ``api_models``
+    accepts: a dict whose ``models`` is a list of rows carrying ``model_name``.
+    A silent child here is a 503 behind the dashboard's model picker."""
+    buf = _capture(monkeypatch)
+    monkeypatch.setattr(
+        fake.sys,
+        "argv",
+        ["fake_acp_backend", "chat", "--list-models", "--format", "json", "--no-interactive"],
+    )
+    fake.main()
+    data = json.loads(buf.getvalue())
+    assert isinstance(data["models"], list) and data["models"]
+    assert all(row["model_name"] and row["model_id"] for row in data["models"])
+    assert data == fake.FAKE_MODEL_CATALOG
 
 
 def test_main_processes_messages_until_eof(monkeypatch):
@@ -383,6 +406,113 @@ def test_slow_lateack_acks_even_if_the_stream_ends_first(monkeypatch):
     assert _messages(buf)[-1]["result"]["stopReason"] == "cancelled"
 
 
+# [[SLOW_HOLD:<token>]]: a slow stream held after one chunk until released.
+
+
+@pytest.fixture
+def hold_dir(tmp_path, monkeypatch, fast_slow_stream):
+    """A release directory the fake reads, and a hold that polls without waiting.
+
+    The wait ceiling is cut to 5 s so a hold the code under test never releases
+    fails the turn by name instead of running out the 60 s production bound.
+    """
+    monkeypatch.setenv(fake.SLOW_HOLD_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(fake, "SLOW_HOLD_CHUNK_DELAY_SECS", 0)
+    monkeypatch.setattr(fake, "SLOW_HOLD_WAIT_SECS", 5.0)
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0.001)
+    return tmp_path
+
+
+def _chunk_count(buf: io.StringIO) -> int:
+    return sum(1 for m in _messages(buf) if m.get("method") == "session/update")
+
+
+def test_slow_hold_waits_after_one_chunk_until_released(monkeypatch, fast_slow_stream):
+    """The hold is asked only once ``SLOW_HOLD_AFTER_CHUNKS`` chunks are out,
+    nothing streams while it answers False, and the stream resumes on True."""
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0)
+    buf = _capture(monkeypatch)
+    seen: list[int] = []
+
+    def hold() -> bool:
+        seen.append(_chunk_count(buf))
+        return len(seen) == 3  # released on the third poll
+
+    assert fake._stream_slowly("s1", cancel_aware=True, hold=hold, delay=0) is False
+    assert seen == [fake.SLOW_HOLD_AFTER_CHUNKS] * 3
+    assert _chunk_count(buf) == fake.SLOW_CHUNKS
+
+
+def test_a_cancel_during_the_hold_ends_the_stream_as_cancelled(monkeypatch, fast_slow_stream):
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0)
+    buf = _capture(monkeypatch)
+
+    def hold() -> bool:
+        # The cancel arrives while the stream is held; the hold never releases.
+        fake._INBOX.put(
+            {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}}
+        )
+        return False
+
+    assert fake._stream_slowly("s1", cancel_aware=True, hold=hold, delay=0) is True
+    assert _chunk_count(buf) == fake.SLOW_HOLD_AFTER_CHUNKS
+
+
+def test_slow_hold_marker_waits_on_the_last_tokens_release_file(monkeypatch, hold_dir):
+    """Each marker line names a token; the last one holds, on the file of that
+    name in the hold directory. Released in advance, the turn streams it all."""
+    (hold_dir / "second").touch()
+    buf = _capture(monkeypatch)
+    text = f"{fake.slow_hold_trigger('first')}\n{fake.slow_hold_trigger('second')}"
+    fake._handle(_prompt(text))
+    assert _chunk_count(buf) == fake.SLOW_CHUNKS
+    assert _messages(buf)[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_a_hold_nobody_releases_fails_the_turn_by_name(monkeypatch, hold_dir):
+    monkeypatch.setattr(fake, "SLOW_HOLD_WAIT_SECS", 0)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(fake.slow_hold_trigger("never")))
+    msgs = _messages(buf)
+    assert _chunk_count(buf) == fake.SLOW_HOLD_AFTER_CHUNKS
+    assert msgs[-1]["id"] == 100
+    assert "result" not in msgs[-1]
+    assert msgs[-1]["error"]["message"] == (
+        "fake ACP backend: slow hold 'never' was not released within 0s"
+    )
+
+
+def test_a_hold_without_its_directory_is_refused(monkeypatch, fast_slow_stream):
+    monkeypatch.delenv(fake.SLOW_HOLD_DIR_ENV, raising=False)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(fake.slow_hold_trigger("tok")))
+    (msg,) = _messages(buf)
+    assert msg["error"]["message"] == (
+        f"fake ACP backend: a slow hold needs {fake.SLOW_HOLD_DIR_ENV}"
+    )
+
+
+def test_a_quoted_hold_marker_holds_nothing(monkeypatch):
+    """Line-anchored: a transcript quoting the prompt is not a hold."""
+    monkeypatch.delenv(fake.SLOW_HOLD_DIR_ENV, raising=False)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(f"User: {fake.slow_hold_trigger('tok')}"))
+    msgs = _messages(buf)
+    assert "error" not in msgs[-1]
+    assert msgs[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_slow_hold_trigger_and_path_spell_the_marker_and_release_file():
+    assert fake.slow_hold_trigger("A-z_09") == "[[SLOW_HOLD:A-z_09]]"
+    assert fake.slow_hold_path("holds", "tok") == os.path.join("holds", "tok")
+
+
+@pytest.mark.parametrize("token", ["", "has space", "x" * 65, "a]]b", "../up"])
+def test_slow_hold_trigger_refuses_a_token_the_marker_cannot_carry(token):
+    with pytest.raises(ValueError, match="slow-hold token"):
+        fake.slow_hold_trigger(token)
+
+
 def _permission_answer(option_id: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -473,3 +603,167 @@ def test_pump_stdin_forwards_messages_then_the_eof_sentinel(monkeypatch):
     fake._pump_stdin()
     assert fake._INBOX.get_nowait()["id"] == 1
     assert fake._INBOX.get_nowait() is None
+
+
+# --------------------------------------------------------------------------- #
+# KAS relay spawn: managed MCP readiness on the wire.
+# --------------------------------------------------------------------------- #
+
+_KAS_NEW_PARAMS = {
+    "cwd": "/w",
+    "mcpServers": [{"name": "kirocrew-dashboard", "command": "x", "args": []}],
+    "_meta": {
+        "kiro": {
+            "customAgents": [
+                {
+                    "id": "kirocrew",
+                    "mcpServers": {"kirocrew-core": {}, "kirocrew-cron": {}},
+                    "tools": ["@kirocrew-core", "@kirocrew-cron", "@kirocrew-dashboard"],
+                },
+                {"id": "other", "mcpServers": {"kirocrew-computer": {}}},
+            ]
+        }
+    },
+}
+
+
+def _kas_session(monkeypatch, buf: io.StringIO) -> str:
+    monkeypatch.setattr(fake, "_KAS_RELAY", True)
+    monkeypatch.setattr(fake, "_SESSION_AGENTS", {})
+    fake._handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": _KAS_NEW_PARAMS})
+    return fake._SESSION_ID
+
+
+def test_relay_flag_is_the_one_build_kas_argv_renders():
+    from kiro_crew.acp.kas_transport import KAS_RELAY_ENGINE_FLAG, build_kas_argv
+
+    assert fake.KAS_RELAY_FLAG == KAS_RELAY_ENGINE_FLAG
+    assert fake.KAS_RELAY_FLAG in build_kas_argv("/bin/kiro-cli")
+
+
+def test_kas_relay_reports_every_declared_server_connected_on_session_new(monkeypatch):
+    buf = _capture(monkeypatch)
+    sid = _kas_session(monkeypatch, buf)
+    msgs = _messages(buf)
+    assert msgs[0]["result"] == {"sessionId": sid}
+    status, tags = msgs[1], msgs[2]
+    assert status["method"] == "_kiro/mcp/status"
+    assert status["params"]["sessionId"] == sid
+    # Session-level array first, then each declared agent's block, deduplicated.
+    assert [s["name"] for s in status["params"]["servers"]] == [
+        "kirocrew-dashboard",
+        "kirocrew-core",
+        "kirocrew-cron",
+        "kirocrew-computer",
+    ]
+    for server in status["params"]["servers"]:
+        assert server["status"] == "connected"
+        assert server["_meta"]["kiro"]["resource"]["source"]["origin"] == "client"
+        assert server["tools"][0]["name"] == fake.MCP_CATALOG_TOOL
+    assert tags["method"] == "_kiro/tools/didChange"
+    assert {t["tag"] for t in tags["params"]["tags"]} >= {
+        "@kirocrew-core/ping",
+        "@kirocrew-dashboard/ping",
+    }
+
+
+def test_kas_relay_set_mode_answers_then_reports_the_active_agent_roster(monkeypatch):
+    buf = _capture(monkeypatch)
+    sid = _kas_session(monkeypatch, buf)
+    buf.seek(0)
+    buf.truncate()
+    fake._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/set_mode",
+            "params": {"sessionId": sid, "modeId": "kirocrew"},
+        }
+    )
+    msgs = _messages(buf)
+    assert msgs[0] == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    assert msgs[1]["method"] == "_kiro/mcp/status"
+    # The switched-to agent's servers, not the other declared agent's.
+    assert [s["name"] for s in msgs[1]["params"]["servers"]] == [
+        "kirocrew-dashboard",
+        "kirocrew-core",
+        "kirocrew-cron",
+    ]
+
+
+def test_kas_relay_report_satisfies_the_host_readiness_barrier(monkeypatch):
+    """The frames the fake emits are the ones KasMcpReadiness stops waiting on."""
+    from kiro_crew.acp.mcp_session_report import KasMcpReadiness, required_managed_servers
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    buf = _capture(monkeypatch)
+    sid = _kas_session(monkeypatch, buf)
+    buf.seek(0)
+    buf.truncate()
+    fake._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/set_mode",
+            "params": {"sessionId": sid, "modeId": "kirocrew"},
+        }
+    )
+    required = required_managed_servers(_KAS_NEW_PARAMS, "kirocrew")
+    assert set(required) == {"kirocrew-core", "kirocrew-cron", "kirocrew-dashboard"}
+    ready = KasMcpReadiness(
+        sid,
+        required,
+        tool_policy=_KAS_NEW_PARAMS["_meta"]["kiro"]["customAgents"][0],
+        injected=frozenset({"kirocrew-dashboard"}),
+    )
+    assert ready.pending
+    for m in _messages(buf):
+        if "method" in m:
+            ready.record(JsonRpcMessage(method=m["method"], params=m["params"]))
+    assert ready.pending == ""
+    assert ready.failure == ""
+
+
+def test_kiro_spawn_reports_no_mcp_readiness(monkeypatch):
+    """Without the relay flag the wire is kiro-cli v2's: set_mode answers {} and nothing else."""
+    buf = _capture(monkeypatch)
+    monkeypatch.setattr(fake, "_KAS_RELAY", False)
+    monkeypatch.setattr(fake, "_SESSION_AGENTS", {})
+    fake._handle({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": _KAS_NEW_PARAMS})
+    fake._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/set_mode",
+            "params": {"sessionId": fake._SESSION_ID, "modeId": "kirocrew"},
+        }
+    )
+    assert [m.get("method") for m in _messages(buf)] == [None, None]
+
+
+def test_main_arms_the_relay_from_argv(monkeypatch):
+    buf = _capture(monkeypatch)
+    monkeypatch.setattr(fake, "_SESSION_AGENTS", {})
+    monkeypatch.setattr(fake, "_KAS_RELAY", False)
+    monkeypatch.setattr(
+        fake.sys,
+        "argv",
+        ["fake_acp_backend", "acp", fake.KAS_RELAY_FLAG, "v3", "--auth-method", "cli"],
+    )
+    monkeypatch.setattr(
+        fake.sys,
+        "stdin",
+        io.StringIO(
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"session/new",'
+            '"params":{"mcpServers":[{"name":"kirocrew-core"}]}}\n'
+        ),
+    )
+    fake.main()
+    assert [m.get("method") for m in _messages(buf)] == [
+        None,
+        None,
+        "_kiro/mcp/status",
+        "_kiro/tools/didChange",
+    ]
+    assert fake._KAS_RELAY is True

@@ -26,6 +26,13 @@ describe('agent switch failure feedback', () => {
     expect(agentSwitchFailureMessage(error)).toBe('not found')
   })
 
+  it('preserves the new-conversation instruction for a pinned private chat', () => {
+    const message = 'This conversation belongs to its original member. Start a new conversation to choose a different member.'
+    const error = new ApiError(409, message, JSON.stringify({ error: message, code: 'member_session_pinned' }))
+    expect(agentSwitchFailureMessage(error)).toBe(message)
+    expect(isTurnInFlightError(error)).toBe(false)
+  })
+
   it('maps a 409 turn_in_flight to the specific retry-later copy', () => {
     // The keyboard cycles (Alt+Shift model/agent cycling) have no disabled
     // state, so this copy is the only way the user learns the switch was
@@ -52,13 +59,13 @@ describe('agent switch failure feedback', () => {
   })
 
   it('matches on the structured code, not the 409 status alone', () => {
-    // A different 409 (e.g. slot_orchestrating) keeps its own server message.
+    // A different 409 (e.g. slot_busy) keeps its own server message.
     const other409 = new ApiError(
       409,
-      'slot is orchestrating',
-      JSON.stringify({ error: 'slot is orchestrating', code: 'slot_orchestrating' }),
+      'slot is busy',
+      JSON.stringify({ error: 'slot is busy', code: 'slot_busy' }),
     )
-    expect(agentSwitchFailureMessage(other409)).toBe('slot is orchestrating')
+    expect(agentSwitchFailureMessage(other409)).toBe('slot is busy')
     expect(isTurnInFlightError(other409)).toBe(false)
   })
 

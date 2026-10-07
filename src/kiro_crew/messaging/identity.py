@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from typing import Any
 
 from kiro_crew.executors import governance_executor, maintenance_executor
@@ -29,12 +30,61 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.session_pid_sig import publish_session_pid
+from kiro_crew.session_token_sig import publish_session_token
 
 logger = logging.getLogger(__name__)
 
 
+def _sessions_on_pid(sessions: Any, pid: int) -> list[str]:
+    """Every session key the manager currently reports on *pid*.
+
+    Read from ``SessionManager.runtime_pids()``, the one snapshot that already
+    pairs each live session with the pid of the runtime serving it. Nothing here
+    probes the OS.
+
+    That snapshot is NOT all sessions. After its per-session rows it appends one
+    row per manager-owned companion RUNTIME — the background runtime, and each
+    registered subagent runtime — and those carry a human label in ``key``
+    ("Background runtime", "Subagent runtime (<parent>)") because their consumer
+    is a table a person reads. A subagent runtime is frequently the very runtime
+    a session is already served by, registered after ownership transfers, so its
+    row repeats that session's pid. Counting it would record TWO tenants for a
+    pid hosting ONE session, and every reader would then refuse to name a
+    session that is not in fact shared — a pid hosting one session is the common
+    case, so that is a denial in ordinary operation, not an edge.
+
+    Rows are therefore filtered to the ones that describe a session, by the
+    presence of the ``sid`` field: it carries the ACP session id and only the
+    per-session rows have it. The test for a session is a field only a session
+    has, rather than the shape of a label, because the labels are display text
+    and free to change.
+
+    Returns an empty list when the answer cannot be obtained, and the publisher
+    then records no tenant section — absence must read as UNKNOWN rather than as
+    "this pid hosts one session", or a manager that cannot answer would make
+    every reader confident about a pid it has no evidence for.
+    """
+    try:
+        rows = sessions.runtime_pids()
+    except Exception:
+        logger.debug("runtime_pids unavailable while publishing identity", exc_info=True)
+        return []
+    keys: list[str] = []
+    try:
+        for row in rows:
+            if row.get("pid") != pid or "sid" not in row:
+                continue
+            key = row.get("key")
+            if isinstance(key, str) and key and key not in keys:
+                keys.append(key)
+    except Exception:
+        logger.debug("runtime_pids snapshot unreadable", exc_info=True)
+        return []
+    return keys
+
+
 async def publish_turn_identity(sessions: Any, session_key: str) -> None:
-    """Publish this turn's ``session_pid_<pid>.txt`` mapping (+ HMAC sidecar).
+    """Publish this turn's identity mappings: the pid file AND the session token.
 
     Keyed by the session's kiro-cli host PID (via ``sessions.get_pid``) so the
     gateway PID-walk resolves ``X-Session-Key``. Offloaded to the maintenance
@@ -42,15 +92,117 @@ async def publish_turn_identity(sessions: Any, session_key: str) -> None:
     replacements — blocking filesystem work that must not run on the event
     loop. Fail-safe: a missing pid (session not yet spawned) or any filesystem
     error is swallowed so identity publication can never break a turn.
+
+    The same turn boundary re-pushes this session's gateway claim
+    (:meth:`AcpClient.reclaim`), for the same reason the pid file is rewritten
+    here rather than once at spawn: the mapping lives outside this process and
+    can be lost while the session is alive. gatewayd holds the token ->  session
+    binding in memory only, so a daemon respawn leaves every live session's
+    stubs carrying a token nothing names — refused, not resolved from the shared
+    process tree — and this is what re-binds it, bounding the outage to the turn
+    it happened in.
+
+    The mapping also records WHICH sessions share the pid, because one kiro-cli
+    process hosts several ACP sessions — a ``spawn_run`` subagent on its
+    parent's runtime, a workflow pool worker — while the mapping names one.
+    Without that, a reader on such a pid resolves whichever session published
+    last, and a shared subagent's tool call is attributed to its parent. The
+    count comes from the session manager's own process-identity snapshot, so it
+    is the gateway's view of the runtime rather than anything a reader infers.
     """
     try:
         pid = sessions.get_pid(session_key)
         if isinstance(pid, int):
-            await asyncio.get_running_loop().run_in_executor(
-                maintenance_executor(), publish_session_pid, pid, session_key
+            co_tenants = _sessions_on_pid(sessions, pid)
+            # A pid hosting ONE session is published exactly as it is today,
+            # down to the call's own shape: same two positional arguments, same
+            # file bytes. The tenancy argument appears only for a pid that is
+            # genuinely shared, which is the only case whose record changes.
+            write = (
+                partial(publish_session_pid, pid, session_key, co_tenants=co_tenants)
+                if len(co_tenants) > 1
+                else partial(publish_session_pid, pid, session_key)
             )
+            await asyncio.get_running_loop().run_in_executor(maintenance_executor(), write)
     except Exception:
         logger.debug("publish_turn_identity failed for %s", session_key, exc_info=True)
+    # ONE provider lookup for both steps below. Resolving it twice puts a second
+    # call on a per-turn hot path for no gain, and what a session manager does on a
+    # lookup is its own business rather than something this function should invoke
+    # more often than it needs to.
+    provider = None
+    try:
+        provider = sessions.get_provider(session_key)
+    except Exception:
+        logger.debug("provider lookup failed for %s", session_key, exc_info=True)
+    try:
+        await _publish_session_token(provider, session_key)
+    except Exception:
+        # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure - logs the session key, never the token, which is not in scope here  # noqa: E501
+        logger.debug("identity mapping publication failed for %s", session_key, exc_info=True)
+    try:
+        _reclaim_gateway_stubs(provider)
+    except Exception:
+        logger.debug("stub re-claim failed for %s", session_key, exc_info=True)
+
+
+def _provider_inner(provider: Any) -> Any:
+    """The object carrying the ACP-provider surface, or ``None``.
+
+    Both steps below reach it the same way and through ``getattr``: only the ACP
+    providers expose ``reclaim`` and ``session_identity_token``, and every other
+    provider and test double simply has neither and is left alone.
+    """
+    if provider is None:
+        return None
+    return getattr(provider, "client", None) or getattr(provider, "_client", None) or provider
+
+
+async def _publish_session_token(provider: Any, session_key: str) -> None:
+    """Publish this session's TOKEN -> key mapping, if its provider carries a token.
+
+    The pid mapping above answers "which session owns this PROCESS", and on a
+    session-SHARING runtime that is the parent's answer for every subagent on it.
+    The token answers "which session is THIS one" — it is minted per ACP
+    ``session/new`` and rides that session's own MCP elements — so the two are
+    published together rather than one standing in for the other.
+
+    Republished every turn for the same reason the pid file is: a warm-pool process
+    is re-keyed to a new session while its MCP children keep the token they were
+    spawned with, so the FILE is what has to move to the new owner. ``rekey()``
+    publishes it at claim time and this bounds how long a missed publication (a
+    transient write failure, a trust root restored since) can cost identity — one
+    turn.
+
+    Takes the ALREADY-RESOLVED provider rather than the session manager, so this
+    step adds no lookup of its own — see the caller.
+
+    Offloaded: publication is a key read plus an ``atomic_write``.
+    """
+    inner = _provider_inner(provider)
+    if inner is None:
+        return
+    token = getattr(inner, "session_identity_token", "")
+    if not isinstance(token, str) or not token:
+        return
+    await asyncio.get_running_loop().run_in_executor(
+        maintenance_executor(), publish_session_token, token, session_key
+    )
+
+
+def _reclaim_gateway_stubs(provider: Any) -> None:
+    """Ask this session's provider to re-push its gateway claim, if it has one.
+
+    Takes the ALREADY-RESOLVED provider, so the turn pays one lookup rather than
+    two. Fire-and-forget inside ``reclaim`` itself, so this adds no await to the
+    turn's critical path.
+    """
+    inner = _provider_inner(provider)
+    if inner is None:
+        return
+    reclaim = getattr(inner, "reclaim", None)
+    if callable(reclaim):
+        reclaim()
 
 
 def _channel_inbound_permitted_sync(channel_type: str) -> bool:
@@ -164,4 +316,104 @@ async def channel_inbound_permitted(channel_type: str) -> bool:
     """
     return await asyncio.get_running_loop().run_in_executor(
         governance_executor(), _channel_inbound_permitted_sync, channel_type
+    )
+
+
+def _channel_outbound_permitted_sync(channel_type: str) -> bool:
+    """Blocking ``channels`` governance check for an OUTBOUND send (worker only).
+
+    Reads the SAME ``channels`` ScopedMap ``members`` allowlist as its inbound
+    sibling :func:`_channel_inbound_permitted_sync`, on the host surface
+    (``HOST_SESSION_KEY``) with ``fail_closed=True``, and differs from it in exactly
+    one way, the one the direction dictates: the audit row names the direction it
+    decided, ``outbound:<channel_type>``. A send and a received message are separate
+    decisions about separate traffic, and an egress refusal filed under an ingress
+    name is unreadable to whoever later asks why a message did not go out.
+
+    Everything else matches the sibling deliberately, criticality included. A
+    governed ALLOW is written ``critical=True`` and unguarded, so an SEL that cannot
+    record it raises into the handler below and the answer degrades to a refusal: a
+    governed allow nobody can record is not an allow, and an egress decision is the
+    one a reader needs most. A DENY is best-effort, because the refusal already
+    stands and audit-store health must not convert it into anything else.
+
+    Fail-CLOSED throughout: a governance-evaluation error, and an unrecordable
+    governed allow alike, return False, because the caller is about to write to a
+    destination whose standing it cannot establish. Default OSS build (no ``channels``
+    policy) permits, so sends are unchanged, and an ungoverned permit writes no row.
+    Does blocking profile-file I/O, so callers MUST offload it (see
+    :func:`channel_outbound_permitted`).
+    """
+    try:
+        decision = governance_permits(
+            "channels", channel_type, session_key=HOST_SESSION_KEY, fail_closed=True
+        )
+        permitted = bool(getattr(decision, "permitted", False))
+        layer = getattr(decision, "layer", "")
+        governed = layer in ("policy", "profile", "both")
+        # Same disposition as the inbound sibling for WHICH decisions are recorded --
+        # every governed decision and every deny, never an ungoverned default-permit,
+        # which is not a decision and would append a row per send on installs with no
+        # governance configured. The criticality matches it too: a governed ALLOW that
+        # cannot be recorded is not an allow, so the write is critical and unguarded,
+        # and the handler below turns the failure into a degraded refusal.
+        if governed and permitted:
+            sel().log_governance_decision(
+                session_key=HOST_SESSION_KEY,
+                tool_name=f"outbound:{channel_type}",
+                scope="channels",
+                item=channel_type,
+                outcome="allowed",
+                rule=getattr(decision, "rule", ""),
+                layer=layer,
+                reason=getattr(decision, "reason", ""),
+                critical=True,
+            )
+        elif not permitted:
+            # A deny is recorded best-effort: the refusal already stands, so audit
+            # disk health must not convert it into anything else.
+            try:
+                sel().log_governance_decision(
+                    session_key=HOST_SESSION_KEY,
+                    tool_name=f"outbound:{channel_type}",
+                    scope="channels",
+                    item=channel_type,
+                    outcome="denied",
+                    rule=getattr(decision, "rule", ""),
+                    layer=layer,
+                    reason=getattr(decision, "reason", ""),
+                )
+            except Exception:
+                logger.debug("outbound governance deny audit failed", exc_info=True)
+        return permitted
+    except PlatformCompositionError:
+        # A broken CPP composition must surface rather than silently denying every
+        # send, matching the inbound sibling and the host gate.
+        raise
+    except Exception:
+        try:
+            audit_governance_degraded(
+                f"outbound:{channel_type}",
+                session_key=HOST_SESSION_KEY,
+                scope="channels",
+                failed_closed=True,
+            )
+        except Exception:
+            logger.debug("outbound governance degrade audit failed", exc_info=True)
+        return False
+
+
+async def channel_outbound_permitted(channel_type: str) -> bool:
+    """Return True only if the ``channels`` policy permits outbound via *channel_type*.
+
+    Off-loop wrapper around :func:`_channel_outbound_permitted_sync`, on the same
+    dedicated ``governance_executor`` (``mc-gov``) its inbound sibling uses: the
+    check walks the ProfileStore (blocking filesystem I/O), so it must not run on
+    the event loop.
+
+    Callers are mid-send re-checks taken after a bounded wait, so the rows and the
+    executor slots are paced by rate limits and back-offs rather than by traffic.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        governance_executor(), _channel_outbound_permitted_sync, channel_type
     )

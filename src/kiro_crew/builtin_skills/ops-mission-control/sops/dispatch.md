@@ -58,7 +58,8 @@ as the tool takes them.
       improvise with raw HTTP: launch the investigator with `spawn_run`
       instead, passing the same investigation kickoff (incident id, signal
       title, operating mode, and the `ops-mission-control` skill reference) as
-      the task. The incident panel shows "no session yet" without the
+      the task -- the investigator must start from the kickoff alone, not
+      from this dispatch turn's view of the other incidents. The incident panel shows "no session yet" without the
       conventional slot key, but the investigation genuinely runs and its
       outcome lands through the transition in (d).
 
@@ -72,8 +73,8 @@ as the tool takes them.
       for the whole stale window.
 
       Because the user is watching that panel, they can also approve tool calls
-      from it: an approval card rendered in the embed resolves through
-      `/api/approvals/<id>/approve`. So when you need permission for a read-only
+      from it: an approval card rendered in the embed resolves through the
+      slot route, `/api/chat/slots/<slot>/approve`. So when you need permission for a read-only
       probe, ASK — do not silently skip the step.
 
    d. `POST /incident/transition` to

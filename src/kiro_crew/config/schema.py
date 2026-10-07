@@ -67,6 +67,10 @@ class ConfigEntry:
     enum_values: list | None
     default_value: object  # JSON-serializable or None
     nullable: bool = False  # True when the underlying JSON Schema type allows null
+    # True when a running gateway cannot adopt a new value (a bound socket, a
+    # re-exec jail). Declared per field with ``_meta(..., restart=True)``; every
+    # other field is hot-applied by the config watcher (``config.live``).
+    requires_restart: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +125,17 @@ def _optional_inner(tp: type) -> tuple[type, bool]:
     return tp, False
 
 
+def _scalar_union_types(tp: type) -> list[str] | None:
+    """JSON types of a union of two or more scalar annotations, else ``None``."""
+    origin = typing.get_origin(tp)
+    if origin is not typing.Union and getattr(origin, "__name__", "") != "UnionType":
+        return None
+    args = [a for a in typing.get_args(tp) if a is not type(None)]  # noqa: E721
+    if len(args) < 2 or any(a not in (int, str, float, bool) for a in args):
+        return None
+    return [_TYPE_MAP[a] for a in args]
+
+
 def _json_type_for_value(tp: type) -> str | list[str]:
     """JSON Schema ``type`` for a dict/list value annotation.
 
@@ -159,6 +174,7 @@ def _build_field_schema(
     tags: list[str] = meta.get("tags", [])
     sensitive: bool = meta.get("sensitive", False)
     deprecated: bool = meta.get("deprecated", False)
+    requires_restart: bool = bool(meta.get("restart", False))
     enum_values: list | None = meta.get("enum", None)
 
     tp: type = resolved_type if resolved_type is not None else str
@@ -179,6 +195,12 @@ def _build_field_schema(
         schema = _build_object_schema(tp)
         if nullable:
             schema["type"] = ["object", "null"]
+    elif (scalar_union := _scalar_union_types(tp)) is not None:
+        # ``int | str`` (an integer knob that also takes a keyword such as
+        # "auto"): both JSON types, so neither spelling is stripped to the
+        # default by validation. The first member leads, so a flattened entry
+        # still reads as the numeric type.
+        schema["type"] = scalar_union + (["null"] if nullable else [])
     else:
         json_type = _python_type_to_json(tp)
         # Emitting the plain single-type form when the field is not nullable
@@ -234,6 +256,10 @@ def _build_field_schema(
         "sensitive": sensitive,
         "deprecated": deprecated,
     }
+    if requires_restart:
+        # Emitted only when set so the schema baseline of every hot field is
+        # byte-identical to before the flag existed.
+        schema["x-meta"]["restart"] = True
 
     return schema
 
@@ -342,6 +368,7 @@ def _flatten_recurse(
     tags: list[str] = x_meta.get("tags", [])
     sensitive: bool = x_meta.get("sensitive", False)
     deprecated: bool = x_meta.get("deprecated", False)
+    requires_restart: bool = bool(x_meta.get("restart", False))
     enum_values: list | None = node.get("enum", None)
     default_value: object = node.get("default", None)
 
@@ -363,6 +390,7 @@ def _flatten_recurse(
             enum_values=list(enum_values) if enum_values is not None else None,
             default_value=default_value,
             nullable=nullable,
+            requires_restart=requires_restart,
         )
         out.append(entries_entry)
 
@@ -410,6 +438,7 @@ def config_entry_to_dict(entry: ConfigEntry) -> dict:
         "enumValues": entry.enum_values,
         "defaultValue": entry.default_value,
         **({"nullable": True} if entry.nullable else {}),
+        **({"requiresRestart": True} if entry.requires_restart else {}),
     }
 
 
@@ -422,3 +451,21 @@ JSON_SCHEMA: dict = build_json_schema(KiroCrewConfig)
 
 SCHEMA_REGISTRY: list[ConfigEntry] = flatten_to_entries(JSON_SCHEMA)
 """Flat list of ``ConfigEntry`` records for all config paths."""
+
+_RESTART_PATHS: frozenset[str] = frozenset(e.path for e in SCHEMA_REGISTRY if e.requires_restart)
+
+
+def requires_restart(path: str) -> bool:
+    """Whether a write to dotted *path* needs a gateway restart to take effect.
+
+    Resolves the exact registry entry or, for a path the registry does not
+    name (a key inside a free-form dict, a whole section), its nearest ancestor
+    that does: a ``restart=True`` section marks everything beneath it. A path
+    with no marked entry on its chain is hot -- the config watcher applies it.
+    """
+    p = path.strip(".")
+    while p:
+        if p in _RESTART_PATHS:
+            return True
+        p = p.rpartition(".")[0]
+    return False

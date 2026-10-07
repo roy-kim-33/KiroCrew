@@ -1,13 +1,14 @@
 ---
 title: Session Tag-Change Event as a server-side signal on lane transitions
-status: draft
+status: in-review
 author: (issue #7663 author)
 created: 2026-09-02
 last-audited: 2026-09-02
 audited-at: 6581a04ee
-doc-pr: null
-implementation-prs: []
-tracking-issues: [7663]
+doc-pr: 10930
+implementation-prs: [7669]
+implementation-scope: partial — 7669 ships the delta-only payload and the dispatcher, and defers every emit site and re-entrancy
+tracking-issues: [13865]
 supersedes: []
 superseded-by: []
 ---
@@ -22,6 +23,12 @@ session enters **Done**. It argues for reusing the existing script-hook engine
 rather than adding a subsystem, and settles the four design questions the issue
 flagged as expensive to reverse once anything subscribes. It is a design of
 record only: nothing here is on main.
+
+> **Event name.** This document proposes the event as `SessionTagsChanged`; the
+> implementation ships it as **`SessionLaneChanged`**, because the event fires on a
+> change to a session's **status** tags — a board-lane transition — and not on a
+> change to its tags generally. The name below is the proposal as written; read
+> every `SessionTagsChanged` in this document as `SessionLaneChanged`.
 
 ## Summary
 
@@ -45,11 +52,11 @@ adding a subsystem. The positions this RFC takes, one line each:
 4. **Re-entrancy** is settled now, not deferred: the event carries **advisory
    provenance**, following the in-repo precedent that `Stop` self-limits by
    advisory `hook_continuation_count` / `stop_hook_active`
-   (`src/kiro_crew/hooks.py:4213-4221`) rather than an enforced cap.
+   (`ScriptHookStore.fire`'s `Stop` payload in `src/kiro_crew/hooks.py`) rather than an enforced cap.
 5. **Placement** is a **sixth `HOOK_EVENTS` entry** (a `SessionTagsChanged`
    script-hook event), because the ask is to *run an automation now* on the
    transition, which is precisely what the script-hook engine does, not to
-   fold a log after the fact, which is what `src/kiro_crew/events/` is for.
+   fold a log after the fact, which is what an append-only event log is for.
 
 ## Motivation
 
@@ -94,7 +101,7 @@ Three neighbouring issues sit around this one; none asks for it:
   reaction raised a trust question about executing hook definitions that arrive
   inside a project checkout. **That concern does not apply here**: hook
   definitions live in a single global, user-authored store
-  (`_HOOKS_FILE = "hooks.json"`, `src/kiro_crew/hooks.py:3939`), not per-agent and
+  (`_HOOKS_FILE = "hooks.json"` in `src/kiro_crew/hooks.py`), not per-agent and
   not from a checkout.
 - **[#1861](https://github.com/kirodotdev/KiroCrew/issues/1861)** (closed,
   completed), an agent auto-tags its own session from context, shipped as
@@ -110,17 +117,18 @@ Three neighbouring issues sit around this one; none asks for it:
 
 - **Global, user-authored store, not per-agent.** A tag change has no agent and
   no turn, so a per-agent config would have been a blocker; the global
-  `hooks.json` store (`hooks.py:3939`) is not.
+  `hooks.json` store (`_HOOKS_FILE` in `hooks.py`) is not.
 - **No new capability surface.** Script hooks are already governance-gated by
   `capabilities.script_hooks`, default OFF, via
-  `_script_hooks_capability_denied` (`src/kiro_crew/hooks.py:3671-3690`, checked
-  inside `run_script_hook` at `:3743`). A tag-change hook rides that same gate;
+  `_script_hooks_capability_denied` (`src/kiro_crew/hook_runtime/governance_gate.py:163-198`, checked
+  inside `run_script_hook` (`src/kiro_crew/hooks.py`, offloaded through its
+  `asyncio.to_thread` call)). A tag-change hook rides that same gate;
   the capability surface does not widen.
 - **Dispatch from an HTTP handler with no agent turn is already supported.**
   `api_hook_test` (`src/kiro_crew/dashboard/handlers/hooks.py:307`) calls
   `run_script_hook` (`:337`) with a synthesized payload, and `run_script_hook`
-  (`src/kiro_crew/hooks.py:3728`) builds a default `hook_event` itself when passed
-  `None` (`hooks.py:3761`), requiring no session and no agent config. A tag-write
+  (`src/kiro_crew/hooks.py`) builds a default `hook_event` itself when passed
+  `None`, requiring no session and no agent config. A tag-write
   handler firing a hook is the same shape.
 
 ## Goals
@@ -208,7 +216,7 @@ This follows the settled in-repo precedent: `Stop` controls its own re-entrancy
 with **advisory** signals, not an enforced cap. `hook_continuation_count` (the
 depth of the current continuation run) and `stop_hook_active` (its boolean
 shorthand) are stamped on the `Stop` payload unconditionally
-(`src/kiro_crew/hooks.py:4213-4221`) precisely so a hook *may* self-limit while a
+(`ScriptHookStore.fire` in `src/kiro_crew/hooks.py`) precisely so a hook *may* self-limit while a
 real gate hook checks its own condition and ignores them. The comment there is
 explicit: *"Kiro's Stop contract defines no cap ... a hook may self-limit,
 diagnose, or surface the count."* We adopt the same stance: the runtime provides
@@ -230,16 +238,19 @@ path (`api_hook_test` → `run_script_hook`), its capability gate
 tuple (`hooks.py:93-99`) and the `ALLOWED_HOOK_EVENTS` frozenset
 (`validation.py:92-94`); existing hooks are unaffected.
 
-**Option B: a session-domain kind in `src/kiro_crew/events/`.** That package
-already has a `session` domain (`session/message`, `events/kinds.py:40`), and
-`rfc-mcp-lifecycle-event-log.md` is settling its first-emitter precedents right
-now (per-`key` monotonic `seq`, one gateway append writer, fail-open because "the
-log is observability, not audit"). A `session/tags-changed` kind would fit its
-envelope (`{v, kind, src, key, ts_ms, data}`, additive-only, opaque `key`,
-`RawEvent` tolerance, `events/base.py`).
+**Option B: a session-domain kind in a global lifecycle-event package.** The package
+this option named is deleted, so the option needs a base before it can be taken at
+all. It had a `session` domain already, and `rfc-mcp-lifecycle-event-log.md` was
+settling its first-emitter precedents (per-`key` monotonic `seq`, one gateway append
+writer, fail-open because "the log is observability, not audit"). A
+`session/tags-changed` kind would have fit its envelope (`{v, kind, src, key, ts_ms,
+data}`, additive-only, opaque `key`, unknown-kind tolerance). The surviving
+append-only stream is the per-unit crew log, whose scope is one crew or one session --
+a cross-session tag transition has no unit to belong to, so this option would need
+the `gateway` kind that stream does not yet define.
 
-**Recommendation: Option A.** The decisive difference is what the ask *does*. The
-`events/` log is an **observe-after-the-fact** surface, a fold/read that a
+**Recommendation: Option A.** The decisive difference is what the ask *does*. An
+event log is an **observe-after-the-fact** surface, a fold/read that a
 consumer polls or replays (its own contract says ordering and the write path
 "arrive with the first emitter", and its consumers "fold the log"). The request
 here is to **run an automation now**, at the moment of transition, exactly the
@@ -273,8 +284,8 @@ write `slot.tags` at HEAD `6581a04ee`:
 |---|---|---|---|
 | `api_chat_slot_tags` | `chat_tags.py:507` → `slot.tags` at `:562` | user set-tags API | **yes** |
 | `api_chat_slot_drop` | `chat_tags.py:902` → `slot.tags` at `:983` | user drag-to-lane API | **yes** |
-| folder inheritance | `chat_handlers.py:2259-2260` (`slot.tags.append`), ids from `validate_folder_tag_ids` (`chat_tags.py:60`) | a new slot inherits a folder's tags | **yes** |
-| channel first-file / restore | `channel_slots.py:372-373` and `:392-393` (`slot.tags.append`) | channel slot filing | **yes** |
+| folder inheritance | `_read_folder_tags` (`slot.tags.append`), ids from `validate_folder_tag_ids` (`chat_tags.py:60`) | a new slot inherits a folder's tags | **yes** |
+| channel first-file / restore | both `slot.tags.append` sites in `surface_channel_session` | channel slot filing | **yes** |
 | slot restore (bulk) | `chat_handlers.py:6394` / `:6402` (`slot.tags = ...`) | reconstruct from stored value | **no** (load-time) |
 | fork | `chat_fork.py:699` (`new_slot.tags = list(slot.tags)`) | fork inherits parent tags | see below |
 | persistence load/prune | `chat_persistence.py:990` / `:1002` and `:1470` / `:1482` | load-time reconstruction | **no** (load-time) |
@@ -285,7 +296,7 @@ The folder-inherited path is the one the issue's two-handler framing misses:
 (must be a list of strings) and **vocabulary** (intersected with the live
 `state._tags` when authoritative) but **not** `status: true`. So an inherited
 folder status tag can put a session into a lane through
-`chat_handlers.py:2259-2260` **without either named handler running**. Any design
+`_read_folder_tags` **without either named handler running**. Any design
 that emits only from the two handlers would miss lane entries. This site must
 emit.
 
@@ -312,6 +323,44 @@ docstring warns about for its consolidation. Per-site emits are rejected: they a
 the shape that let review miss call sites twice during #7366 (as the
 mcp-lifecycle RFC records) and would re-open that finding here.
 
+**Amendment — what the implementation PR carries, and how it differs from the above.** The
+recommendation stands as the target shape, but the implementation PR (#7669) does
+**not** implement it. #7669 ships the dispatcher, `dispatch_session_lane_changed_bulk`, with
+no emit site: it touches neither `chat_tags.py` nor `chat_handlers.py`, so no writer calls
+the dispatcher and the event cannot fire. Per-writer emits — the two `chat_tags.py`
+writers, and closing-order step 1, the folder inheritance in `_read_folder_tags` reached
+from `api_chat_slot_create` (`chat_handlers.py`) — are deferred to a follow-up PR. The two
+`slot.tags.append` sites in `surface_channel_session` (`channel_slots.py`) stay silent
+after that follow-up too, until closing-order step 2.
+
+The blocker is authorization, not scheduling. The dispatch helper itself needs no
+request — `_lane_dispatch_queue()` takes its loop from `asyncio.get_running_loop()`
+and `dispatch_session_lane_changed_bulk` has no request parameter — so those three
+callers could reach it as they stand. What needs a request is the PERMIT GATE,
+`_lane_dispatch_is_permitted`, which is what confines dispatch to the dashboard
+user. Routing folder filing, channel-slot filing and app-token moves through the
+dispatch means deciding what authorizes a fire on a path with no dashboard caller
+to check, and that decision belongs with the choke point rather than ahead of it. Until then a session can still enter a lane without the event firing — through
+every writer, since none emits yet — which is the exact
+failure mode this section was written to prevent. It is an open gap, and the choke
+point remains the shape to build.
+
+**Closing order.** Each writer gains emission when its own authorization question has an answer, so
+the order below is set by that dependency rather than by convenience:
+
+1. **Folder inheritance** (`_read_folder_tags`, reached from `api_chat_slot_create`) goes first,
+   because it already runs under a dashboard request: `_lane_dispatch_is_permitted` applies to it
+   unchanged, so it needs no new authorization rule and closes the folder-inherit gap on its own.
+   It is deferred from #7669, the implementation PR, to a follow-up PR — and is not in
+   the docs-only PR that adds this amendment.
+2. **Channel first-filing** (both `slot.tags.append` sites in `surface_channel_session`) goes
+   second, because it has no
+   dashboard caller. It needs a stated rule for what authorizes a fire on a channel surface, and
+   settling that is the prerequisite the choke point then inherits.
+3. **The choke point** goes last. Once both callers have an authorization answer the emit moves
+   under `tags_write_lock`, and the two per-writer emits in `chat_tags.py` are deleted rather than
+   joined — so the per-writer shape is a step on the way to the target, never a rival to it.
+
 ## Migration plan
 
 Design of record; nothing on main. Phases are independently shippable.
@@ -321,8 +370,8 @@ Design of record; nothing on main. Phases are independently shippable.
 Add `SessionTagsChanged` to `HOOK_EVENTS` (`hooks.py:93-99`) and
 `ALLOWED_HOOK_EVENTS` (`validation.py:92-94`), and add one status-tag-delta emit
 helper that the two `chat_tags.py` handlers, the folder-inheritance path
-(`chat_handlers.py:2259-2260`), and the channel filing path
-(`channel_slots.py:372-373` / `:392-393`) call. Fire-and-forget through
+(`_read_folder_tags`), and the channel filing path
+(`surface_channel_session`) call. Fire-and-forget through
 `run_script_hook`; load-time sites stay silent.
 
 **Exit criteria:** a hook registered for `SessionTagsChanged` fires with a
@@ -368,10 +417,10 @@ and the emit helper.
 
 - **No new capability surface.** The event rides the existing
   `capabilities.script_hooks` gate (default OFF,
-  `hooks.py:3671-3690`); a deployment that has not enabled script hooks sees no
+  `hook_runtime/governance_gate.py:163-198`); a deployment that has not enabled script hooks sees no
   new behavior.
 - **No new trust decision.** Hook definitions remain in the global user-authored
-  `hooks.json` (`hooks.py:3939`); nothing executes definitions that arrive with a
+  `hooks.json` (`_HOOKS_FILE` in `hooks.py`); nothing executes definitions that arrive with a
   project checkout (the [#1487](https://github.com/kirodotdev/KiroCrew/issues/1487)
   concern does not apply).
 - **Minimal payload.** The event carries the session key and status tag ids
@@ -386,12 +435,12 @@ and the emit helper.
 - **Poll `GET /api/chat/slots` and diff (status quo).** Rejected: reaction
   latency equals the poll interval, and every consumer reimplements the diff and
   first-run baselining. This is the problem, not a solution.
-- **A `session/tags-changed` kind in `src/kiro_crew/events/` as the primary
+- **A `session/tags-changed` kind in a global lifecycle-event log as the primary
   mechanism.** Rejected as *primary* because the ask is run-now automation, and the
   log is an observe-after-the-fact fold; routing through it needs a separate
-  consumer that then dispatches a hook. May be added later as a *secondary*
-  history/observability emit once the lifecycle log has a live writer (that RFC's
-  Phase 1); this RFC does not block it.
+  consumer that then dispatches a hook. The package that option named is deleted, so
+  a secondary history/observability emit would first need a stream with a unit a
+  cross-session transition can belong to; this RFC does not block one.
 - **A vetoing / blocking variant (`PreToolUse`-style exit-2 block).** Rejected per
   Question 3: the user already performed the drag, and a broken hook must not make
   the board unusable.
@@ -401,7 +450,7 @@ and the emit helper.
 - **Enforced re-entrancy suppression.** Rejected per Question 4: it would swallow
   legitimate rapid transitions and would be the only enforced re-entrancy control
   in the hook engine, contradicting the advisory `Stop` precedent
-  (`hooks.py:4213-4221`).
+  (`ScriptHookStore.fire`'s `Stop` payload in `hooks.py`).
 
 ## Open questions
 

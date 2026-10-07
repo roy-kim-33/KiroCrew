@@ -3,6 +3,7 @@ import { twMerge } from 'tailwind-merge'
 import { motion, useMotionValue, useSpring, useMotionTemplate, useReducedMotion } from 'framer-motion'
 import InfoTip from './InfoTip'
 import { i18nT } from '../i18n/t'
+import { haptic } from '../lib/haptic'
 
 /* ── Shared UI primitives ── */
 
@@ -137,7 +138,7 @@ export function IconButtonGroup({ reveal, className, children }: { reveal?: bool
     <div
       className={twMerge(
         'flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm transition-all',
-        reveal ? 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
+        reveal ? 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
         className,
       )}
     >
@@ -150,7 +151,7 @@ export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttribute
   ({ className = '', ...props }, ref) => (
     <input
       ref={ref}
-      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 min-w-0 transition-colors focus-ring', className)}
+      className={twMerge('bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-hidden flex-1 min-w-0 transition-colors focus-ring', className)}
       {...props}
     />
   )
@@ -161,7 +162,7 @@ export function SearchInput({ className = '', ...props }: React.InputHTMLAttribu
     <div className={`relative ${className}`}>
       <svg className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted pointer-events-none stroke-current fill-none" viewBox="0 0 24 24" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
       <input
-        className="w-full bg-bg-elevated border border-border rounded-md pl-7 pr-3 py-1.5 text-text text-[13px] font-body outline-none transition-all focus-ring placeholder:text-muted/50"
+        className="w-full bg-bg-elevated border border-border rounded-md pl-7 pr-3 py-1.5 text-text text-[13px] font-body outline-hidden transition-all focus-ring placeholder:text-muted/50"
         {...props}
       />
     </div>
@@ -176,19 +177,28 @@ export function Badge({ variant, children, className, ...rest }: { variant: 'ok'
     : variant === 'muted' ? 'bg-[var(--bg-hover)] text-[var(--muted)]'
     : 'bg-warn-subtle text-warn'
   return (
-    <span className={twMerge(`inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono whitespace-nowrap hover:scale-105 transition-transform ${cls}`, className)} {...rest}>
+    // No hover transform: a Badge is a non-interactive status label, so growing
+    // it under the cursor announced an affordance that isn't there.
+    <span className={twMerge(`inline-flex items-center gap-1 px-2 py-[2px] rounded-full text-[13px] font-medium font-mono whitespace-nowrap ${cls}`, className)} {...rest}>
       {children}
     </span>
   )
 }
 
-export function SourceBadge({ source }: { source: string }) {
+/** `source` picks the colour; pass `children` to show a translated label instead
+ *  of the raw field value, which is an internal identifier in every language.
+ *  `tone="neutral"` forces the grey style for every source — used where several
+ *  of these sit together (the template list) and one coloured chip among grey
+ *  peers reads as "why is this one different?" rather than as a category. */
+export function SourceBadge({ source, children, tone = 'auto', title }: { source: string; children?: React.ReactNode; tone?: 'auto' | 'neutral'; title?: string }) {
+  const neutral = 'bg-bg-elevated text-muted border-border'
   const cls =
-    source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
-    : source === 'kirocrew' ? 'bg-bg-elevated text-muted border-border'
+    tone === 'neutral' ? neutral
+    : source === 'package' ? 'bg-aim-subtle text-aim border-aim/30'
+    : source === 'kirocrew' ? neutral
     : source === 'project' ? 'text-ok border-ok/30'
-    : 'bg-bg-elevated text-muted border-border'
-  return <span className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{source}</span>
+    : neutral
+  return <span title={title} className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{children ?? source}</span>
 }
 
 export function StatCard({ label, value, accent, colorClass, delay, onClick, active, title, className, ...rest }: { label: string; value?: string | number | null; accent?: boolean; colorClass?: string; delay?: number; onClick?: () => void; active?: boolean; title?: string } & Omit<React.ComponentPropsWithoutRef<'div'>, 'title' | 'onClick' | 'dangerouslySetInnerHTML'>) {
@@ -199,7 +209,7 @@ export function StatCard({ label, value, accent, colorClass, delay, onClick, act
     // the conditional role, hence the scoped disables.
     /* eslint-disable-next-line jsx-a11y/no-static-element-interactions */
     <div
-      className={twMerge(`stat-accent relative overflow-hidden bg-card rounded-md px-4 py-3.5 border shadow-[inset_0_1px_0_var(--card-hl)] animate-rise hover:border-border-strong hover:-translate-y-0.5 hover:shadow-md transition-all ${active ? 'border-accent ring-1 ring-accent/40' : 'border-border'} ${onClick ? 'cursor-pointer' : ''}`, className)}
+      className={twMerge(`stat-accent relative overflow-hidden bg-card rounded-md px-4 py-3.5 border shadow-[inset_0_1px_0_var(--card-hl)] animate-rise hover:border-border-strong hover:shadow-md transition-all ${active ? 'border-accent ring-1 ring-accent/40' : 'border-border'} ${onClick ? 'cursor-pointer' : ''}`, className)}
       style={delay ? { animationDelay: `${delay}ms` } : undefined}
       onClick={onClick}
       role={onClick ? 'button' : undefined}
@@ -401,7 +411,7 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
     // read worse -- the title then sat inside the cards directly beneath it. The
     // defect was always in the chrome, not in the content column.
     //
-    // Measured budget and the full rationale: website/docs/page-layout.md.
+    // Measured budget and the full rationale: website/docs/narrow-viewport.md.
     <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-4 md:px-6 pt-2 pb-3" data-testid="page-header">
       <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
@@ -427,8 +437,10 @@ export function Toggle({ checked, onChange, disabled, label, describedBy, tone =
       // user hears it before acting rather than discovering it by exploring.
       aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
-      onClick={() => !disabled && onChange(!checked)}
-      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
+      // A switch is the one control whose physical twin clicks under the thumb, so
+      // it gets a tap where the device can give one (phones); elsewhere no-op.
+      onClick={() => { if (!disabled) { haptic(); onChange(!checked) } }}
+      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); haptic(); onChange(!checked) } }}
       // `muted` is for a LIST of switches, where an accent fill on every row
       // shouts and duplicates a state the row's own grouping already carries.
       // The knob position still reads the state, so nothing is lost by dropping
@@ -460,8 +472,15 @@ export interface SliderProps {
   ticks?: boolean
   /** When true, the knob pulses an accent halo while parked at the max notch. */
   emphasizeMax?: boolean
+  /** Independent reference marker on the same axis, such as a configured default. */
+  markerValue?: number
+  /** Visible and accessible label for markerValue. */
+  markerLabel?: string
   className?: string
   'aria-label'?: string
+  /** Id of a description the slider reads out after its name, such as why it
+   *  is disabled -- a `title` on a wrapper reaches only a hovering pointer. */
+  'aria-describedby'?: string
 }
 
 /** macOS-style range slider: accent fill, circular knob, optional step ticks.
@@ -470,7 +489,8 @@ export interface SliderProps {
  *  (arrows = step, Shift+arrow / PageUp-Down = ×10, Home/End = min/max). */
 export function Slider({
   value, onChange, min = 0, max = 100, step = 1, disabled,
-  label, showValue, formatValue, ticks, emphasizeMax, className = '', 'aria-label': ariaLabel,
+  label, showValue, formatValue, ticks, emphasizeMax, markerValue, markerLabel, className = '', 'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
 }: SliderProps) {
   const trackRef = React.useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = React.useState(false)
@@ -490,6 +510,13 @@ export function Slider({
   const pct = ((current - min) / range) * 100
   const display = formatValue ? formatValue(current) : String(current)
   const atMax = emphasizeMax && current >= max
+  const markerCurrent = markerValue === undefined ? null : clamp(markerValue)
+  const markerFrac = markerCurrent === null ? null : (markerCurrent - min) / range
+  const markerTransform = markerCurrent === min
+    ? 'translateX(0)'
+    : markerCurrent === max
+      ? 'translateX(-100%)'
+      : 'translateX(-50%)'
 
   // Discrete-stepper detection: a small, even number of steps. Discrete sliders
   // render tick marks AND spring to each notch even while dragging; continuous
@@ -526,6 +553,27 @@ export function Slider({
     if (next !== value) onChange(next)
   }
 
+  // Armed only when setPointerCapture is missing or throws on pointer-down:
+  // window-level up/cancel listeners for that specific pointerId, so an
+  // uncaptured drag can always terminate — the same acquisition-side
+  // fallback the shared usePointerDrag hook arms.
+  const fallbackRef = React.useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = React.useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Single-fire end path shared by the element handlers, the capture-loss
+  // handler and the window fallback below.
+  const terminateDrag = React.useCallback(() => {
+    if (!pointerDown.current) return
+    pointerDown.current = false
+    disarmFallback()
+    setDragging(false)
+  }, [disarmFallback])
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  React.useEffect(() => disarmFallback, [disarmFallback])
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (disabled) return
     e.preventDefault()
@@ -533,7 +581,30 @@ export function Slider({
     // focus the track explicitly — otherwise arrow keys after a click-to-seek go
     // to whatever had focus before instead of the slider.
     trackRef.current?.focus()
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    // A new press replaces whatever gesture was in flight, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
+    // Capture is best-effort (missing or throwing): the seek below still runs.
+    // But an uncaptured drag gets no retargeting, so without a fallback a
+    // release outside the track strands `pointerDown` with the slider pressed.
+    let captured = true
+    try { (e.target as Element).setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        terminateDrag()
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
     pointerDown.current = true
     // A click (down without move) is a discrete seek — leave `dragging` false
     // so the knob springs to the new spot. Movement below flips into drag mode.
@@ -556,9 +627,8 @@ export function Slider({
   const onPointerLeave = () => { if (!pointerDown.current) setHoverVal(null) }
   const endDrag = (e: React.PointerEvent) => {
     if (!pointerDown.current) return
-    pointerDown.current = false
-    ;(e.target as Element).releasePointerCapture?.(e.pointerId)
-    setDragging(false)
+    try { (e.target as Element).releasePointerCapture(e.pointerId) } catch { /* best-effort */ }
+    terminateDrag()
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -595,6 +665,7 @@ export function Slider({
         ref={trackRef}
         role="slider"
         aria-label={ariaLabel || label}
+        aria-describedby={ariaDescribedBy}
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={current}
@@ -607,13 +678,17 @@ export function Slider({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        // A capture steal (another element capturing mid-drag) stops
+        // retargeting pointerup here with no further event: end the drag on
+        // the loss itself, as the shared usePointerDrag hook does.
+        onLostPointerCapture={endDrag}
         onPointerLeave={onPointerLeave}
-        // outline-none is CORRECT here and must stay: the knob below already
+        // outline-hidden is CORRECT here and must stay: the knob below already
         // carries the replacement cue (`group-focus-visible:ring-2`), which
         // points at the current value instead of boxing the whole track. Letting
         // the global :focus-visible outline through as well would paint two
         // indicators on one control.
-        className={`group relative h-[18px] flex items-center select-none touch-none outline-none ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
+        className={`group relative h-[18px] flex items-center select-none touch-none outline-hidden ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {/* groove */}
         <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-1 rounded-full bg-border" />
@@ -654,13 +729,34 @@ export function Slider({
             the value; the inner circle owns press/drag scale + focus ring. */}
         <motion.div aria-hidden className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2" style={{ left: motionPos }}>
           <motion.div
-            className="relative w-[18px] h-[18px] rounded-full bg-white border border-black/10 shadow-[0_1px_3px_rgba(0,0,0,.3),0_0.5px_1px_rgba(0,0,0,.2)] group-focus-visible:ring-2 group-focus-visible:ring-[var(--ring)] group-focus-visible:ring-offset-1 group-focus-visible:ring-offset-[var(--bg)]"
+            className="relative w-[18px] h-[18px] rounded-full bg-white border border-black/10 group-hover:border-black/30 shadow-[0_1px_3px_rgba(0,0,0,.3),0_0.5px_1px_rgba(0,0,0,.2)] group-focus-visible:ring-2 group-focus-visible:ring-[var(--ring)] group-focus-visible:ring-offset-1 group-focus-visible:ring-offset-[var(--bg)]"
             animate={{ scale: reduceMotion ? 1 : (dragging ? 1.15 : 1), boxShadow: dragging ? '0 2px 7px rgba(0,0,0,.4)' : atMax ? '0 0 10px var(--accent)' : '0 1px 3px rgba(0,0,0,.3)' }}
-            whileHover={disabled || reduceMotion ? undefined : { scale: 1.12 }}
+            // The knob is the visual grab target, so pointing at the slider has to
+            // say so — the removed `whileHover` scale was its only cue. It darkens
+            // its BORDER via `group-hover` rather than deepening its shadow, because
+            // `animate` above owns `boxShadow` as an INLINE style and an inline style
+            // beats any class, so a shadow cue would simply never paint. Nothing
+            // animates borderColor, so the two cannot fight, and no geometry changes.
+            // `group` is the same one the focus ring already keys on.
             whileTap={disabled || reduceMotion ? undefined : { scale: 1.2 }}
             transition={reduceMotion ? { duration: 0 } : { type: 'spring', stiffness: 500, damping: 26 }}
           />
         </motion.div>
+        {/* Rendered AFTER the knob on purpose: the focus-cue gate looks for the
+            knob's `group-focus-visible:` ring within a fixed window below the
+            track's opening tag, and this block would push it out. z-10 keeps the
+            label above the knob regardless of DOM order. */}
+        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
+          <span
+            role="img"
+            aria-label={markerLabel}
+            data-slider-marker
+            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-muted"
+            style={{ left: center(markerFrac), transform: markerTransform }}
+          >
+            {markerLabel}
+          </span>
+        )}
       </div>
 
       {/* discrete tick marks under the groove (static reference; the hover

@@ -6,7 +6,7 @@
  * still activates) against a rendered ChatSidebar.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, fireEvent } from '@testing-library/react'
+import { render, fireEvent, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -94,21 +94,22 @@ function renderSidebar(slots: ChatSlot[]) {
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
-  const utils = render(
+  const view = (nextSlots: ChatSlot[]) => (
     <QueryClientProvider client={qc}>
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
             <ChatSidebar
-              slots={slots} activeSlot={null} unreadSlots={[]}
+              slots={nextSlots} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
           </MemoryRouter>
         </ThemeProvider>
       </Provider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
-  return { ...utils, store }
+  const utils = render(view(slots))
+  return { ...utils, store, rerenderSlots: (nextSlots: ChatSlot[]) => utils.rerender(view(nextSlots)) }
 }
 
 const THREE = [
@@ -124,7 +125,10 @@ function row(key: string): HTMLElement {
   return el
 }
 
-beforeEach(() => localStorage.clear())
+beforeEach(() => {
+  localStorage.clear()
+  chatConfig.tagColumnsEnabled = false
+})
 afterEach(() => vi.clearAllMocks())
 
 describe('sessionRowNav', () => {
@@ -184,6 +188,56 @@ describe('sessionRowNav', () => {
     expect(sessionRowsInScope(first).map(el => el.dataset.sessionRow)).toEqual(['a', 'c'])
     expect(siblingSessionRow(first, 1)?.dataset.sessionRow).toBe('c')
   })
+
+  /**
+   * A row in a folder carries `scroll-margin-top` for the pinned header stack
+   * above it. jsdom has no layout, so the row and lane rects are stubbed: the
+   * lane's top edge is at 100 and the row either sits under the headers (17px
+   * into a 56px margin) or clear of them (80px in).
+   */
+  function pinnedLaneDom(rowOffset: number, margin: string, scrollPadding = '') {
+    const lane = document.createElement('div')
+    lane.style.overflowY = 'auto'
+    if (scrollPadding) lane.style.scrollPaddingTop = scrollPadding
+    const from = mkRow('a', 'list')
+    const to = mkRow('b', 'list')
+    to.style.scrollMarginTop = margin
+    lane.append(to, from)
+    document.body.appendChild(lane)
+    lane.getBoundingClientRect = () => ({ top: 100 } as DOMRect)
+    to.getBoundingClientRect = () => ({ top: 100 + rowOffset } as DOMRect)
+    const scrolls: Array<ScrollIntoViewOptions | boolean | undefined> = []
+    to.scrollIntoView = (arg?: ScrollIntoViewOptions | boolean) => { scrolls.push(arg) }
+    return { from, scrolls }
+  }
+
+  it('re-aligns a row the pinned folder headers cover', () => {
+    const { from, scrolls } = pinnedLaneDom(17, '56px')
+    expect(focusSiblingSessionRow(from, -1)).toBe(true)
+    expect(scrolls).toEqual([{ block: 'nearest' }, { block: 'start' }])
+  })
+
+  it('counts the pinned band from the lane\'s scroll-padding, where the floating search dock pushes the headers', () => {
+    // Dock 44px tall: the headers pin just above the padding edge, so a row 60px
+    // in is still under a 56px stack (band ends at 44 + 56 = 100).
+    const covered = pinnedLaneDom(60, '56px', '44px')
+    expect(focusSiblingSessionRow(covered.from, -1)).toBe(true)
+    expect(covered.scrolls).toEqual([{ block: 'nearest' }, { block: 'start' }])
+    document.body.replaceChildren()
+    const clear = pinnedLaneDom(104, '56px', '44px')
+    expect(focusSiblingSessionRow(clear.from, -1)).toBe(true)
+    expect(clear.scrolls).toEqual([{ block: 'nearest' }])
+  })
+
+  it('leaves a row clear of the pinned headers, or with no margin, where nearest put it', () => {
+    const clear = pinnedLaneDom(80, '56px')
+    expect(focusSiblingSessionRow(clear.from, -1)).toBe(true)
+    expect(clear.scrolls).toEqual([{ block: 'nearest' }])
+    document.body.replaceChildren()
+    const unfiled = pinnedLaneDom(0, '')
+    expect(focusSiblingSessionRow(unfiled.from, -1)).toBe(true)
+    expect(unfiled.scrolls).toEqual([{ block: 'nearest' }])
+  })
 })
 
 describe('chat sidebar — session list arrow navigation', () => {
@@ -231,6 +285,80 @@ describe('chat sidebar — session list arrow navigation', () => {
     fireEvent.keyDown(row('k1'), { key: 'ArrowDown', altKey: true })
     expect(document.activeElement).toBe(row('k1'))
   })
+
+  it('persists the initial complete pinned order after authoritative slots load', async () => {
+    const pins = [
+      { key: 'k1', title: 'older', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' },
+      { key: 'k2', title: 'newer', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' },
+    ]
+    renderSidebar(pins)
+
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k1']))
+  })
+
+  it('seeds the baseline when pins arrive after an initially empty roster', async () => {
+    const { rerenderSlots } = renderSidebar([])
+    await waitFor(() => expect(localStorage.getItem('mc-pinned-session-order')).toBeNull())
+
+    rerenderSlots([
+      { key: 'k1', title: 'older', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' },
+      { key: 'k2', title: 'newer', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' },
+    ])
+
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k1']))
+  })
+
+  it('prunes remote unpins and appends later remote re-pins', async () => {
+    const a = { key: 'a', title: 'A', running: false, messages: 1, pinned: true, last_ts: '2026-03-01T00:00:00Z' }
+    const b = { key: 'b', title: 'B', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' }
+    const c = { key: 'c', title: 'C', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' }
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'b', 'c']))
+    const { rerenderSlots } = renderSidebar([a, b, c])
+
+    rerenderSlots([a, c])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'c']))
+
+    rerenderSlots([a, b, c])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'c', 'b']))
+  })
+
+  it('does not write back a storage-originated membership reconciliation', async () => {
+    const a = { key: 'a', title: 'A', running: false, messages: 1, pinned: true, last_ts: '2026-03-01T00:00:00Z' }
+    const c = { key: 'c', title: 'C', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' }
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'c']))
+    renderSidebar([a, c])
+
+    await act(async () => {
+      localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'b', 'c']))
+      window.dispatchEvent(new StorageEvent('storage', { key: 'mc-pinned-session-order' }))
+      await Promise.resolve()
+    })
+
+    expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'b', 'c'])
+  })
+
+  it('reorders against the next rendered pin instead of a filtered-out peer', async () => {
+    const pins = [
+      { key: 'k1', title: 'keep first', running: false, messages: 1, pinned: true },
+      { key: 'k2', title: 'drop second', running: false, messages: 1, pinned: true },
+      { key: 'k3', title: 'keep third', running: false, messages: 1, pinned: true },
+    ]
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['k1', 'k2', 'k3']))
+    const { findByText, getByPlaceholderText, queryByText } = renderSidebar(pins)
+    await findByText('drop second')
+
+    fireEvent.change(getByPlaceholderText(/search/i), { target: { value: 'keep' } })
+    await waitFor(() => expect(queryByText('drop second')).toBeNull())
+    fireEvent.keyDown(row('k1'), { key: 'ArrowDown', altKey: true })
+
+    expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k3', 'k1'])
+  })
 })
 
 /**
@@ -246,8 +374,8 @@ describe('chat sidebar — board column arrow navigation', () => {
   const boardColumns = [{ id: COL, name: 'Blocked', tag_ids: [TAG], mode: 'any', order: 0 }]
   const boardFolders = [{ id: FOLDER, name: 'CDF', order: 0, collapsed: false }]
   const boardSlots = [
-    { key: 'b1', title: 'in folder', running: false, messages: 1, tags: [TAG], folder_id: FOLDER },
-    { key: 'b2', title: 'at column root', running: false, messages: 1, tags: [TAG] },
+    { key: 'b1', title: 'in folder', running: false, messages: 1, tags: [TAG], folder_id: FOLDER, pinned: true },
+    { key: 'b2', title: 'at column root', running: false, messages: 1, tags: [TAG], pinned: true },
   ]
 
   function renderBoard() {
@@ -265,20 +393,22 @@ describe('chat sidebar — board column arrow navigation', () => {
     qc.setQueryData(['chat-tags'], boardTags)
     qc.setQueryData(['tag-columns'], boardColumns)
     qc.setQueryData(['chat-folders'], boardFolders)
-    return render(
+    const view = (slots: typeof boardSlots) => (
       <QueryClientProvider client={qc}>
         <Provider store={store}>
           <ThemeProvider>
             <MemoryRouter>
               <ChatSidebar
-                slots={boardSlots} activeSlot={null} unreadSlots={[]}
+                slots={slots} activeSlot={null} unreadSlots={[]}
                 history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               />
             </MemoryRouter>
           </ThemeProvider>
         </Provider>
-      </QueryClientProvider>,
+      </QueryClientProvider>
     )
+    const utils = render(view(boardSlots))
+    return { ...utils, rerenderSlots: (slots: typeof boardSlots) => utils.rerender(view(slots)) }
   }
 
   beforeEach(() => {
@@ -303,5 +433,29 @@ describe('chat sidebar — board column arrow navigation', () => {
     expect(rooted.dataset.sessionScope).toBe(COL)
     // …and the rove therefore reaches across the boundary in one step.
     expect(siblingSessionRow(foldered, 1)).toBe(rooted)
+  })
+
+  it('reconciles remote board membership after rank authority exists', async () => {
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['b1', 'b2']))
+    const { rerenderSlots } = renderBoard()
+
+    rerenderSlots([boardSlots[0]])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['b1']))
+
+    rerenderSlots(boardSlots)
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['b1', 'b2']))
+  })
+
+  it('does not advertise or execute pinned ordering in a board projection', async () => {
+    const { findByText } = renderBoard()
+    await findByText('in folder')
+    const foldered = document.querySelector<HTMLElement>('[data-session-row="b1"]')!
+    expect(foldered.getAttribute('aria-keyshortcuts')).toBeNull()
+
+    fireEvent.keyDown(foldered, { key: 'ArrowDown', altKey: true })
+
+    expect(localStorage.getItem('mc-pinned-session-order')).toBeNull()
   })
 })

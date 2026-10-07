@@ -23,7 +23,8 @@ import { sseSlots } from '../src/store/dashboardSlice'
 import { hydrateSlotMessages, sseChatMessage } from '../src/store/chatSlice'
 import '../src/index.css'
 
-/** Mirrors chatSlice's (unexported) SlotState — the capture drives two of them. */
+/** Mirrors SlotState from state.ts in store/chat (the chatSlice facade does
+ *  not re-export it) — the capture drives two of them. */
 type PaneState = 'idle' | 'tool_running'
 
 const params = new URLSearchParams(location.search)
@@ -74,6 +75,14 @@ if (state === 'tool_running') {
     }),
   )
 }
+// Fired by a capture script AFTER mount to record the idle -> busy transition
+// of the pane's composer (a still frame cannot show the flip).
+window.addEventListener('capture:frame', (e) => {
+  const d = (e as CustomEvent<{ kind: string }>).detail
+  if (d.kind === 'busy') {
+    store.dispatch(sseChatMessage({ slot: SLOT, role: 'tool', content: '🔧 gh issue list --state open', ts: new Date().toISOString(), meta: { kind: 'shell' } }))
+  }
+})
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
