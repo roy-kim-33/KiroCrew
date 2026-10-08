@@ -165,8 +165,13 @@ describe('McpTab Integration Tests', () => {
     )
     expect(builderRow).toBeDefined()
 
+<<<<<<< HEAD
     const mcBadge = within(builderRow as HTMLElement).getByRole('button', {
       name: /RoyCrew.*click to disable/i,
+=======
+    const mcBadge = within(builderRow as HTMLElement).getByRole('switch', {
+      name: /Kiro Crew.*click to turn off/i,
+>>>>>>> upstream/main
     })
     await user.click(mcBadge)
 

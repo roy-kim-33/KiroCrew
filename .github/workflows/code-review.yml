@@ -18,7 +18,7 @@ concurrency:
 jobs:
   autosde-rules:
     name: Automated Rule Check
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,7 +51,13 @@ jobs:
       # Deterministic replication of the blocking rules from
       # website/AUTOSDE.yaml. These catch the unambiguous cases; the semantic
       # half (aria-label on icon-only buttons, no-emoji, template-literal HTML)
-      # is covered by the auto-running Opus 4.8 review in claude-review.yml.
+      # is covered by the auto-running Opus 5.5 review in claude-review.yml.
+      # Line regexes cannot see multi-line tags, <li>/<tr>, motion.div or a
+      # misused role="presentation"; eslint-plugin-jsx-a11y in frontend-lint
+      # covers part of that. This workflow runs on `pull_request`, so these
+      # greps come from the PR's own copy: an edit that weakens one is judged
+      # by CODEOWNERS review and the LLM lanes, which load their rules from
+      # the base branch.
       - name: Check frontend blocking rules
         if: contains(steps.changed.outputs.files, 'website/src/')
         working-directory: website
@@ -60,35 +66,40 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "::group::use-lucide-icons — no inline SVGs"
-          # Brand-asset components (mascot / logo) are exempt: they render a
-          # bespoke brand SVG that has no lucide-react equivalent. The rule still
-          # blocks inline SVGs in every other component.
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' \
+          # website/AUTOSDE.yaml says this gate applies in every .tsx file with
+          # no exception (brand marks are image assets). KiroGhost.tsx is the one
+          # existing inline brand SVG kept as legacy; no other file is excluded.
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' \
                ':(exclude)src/components/KiroGhost.tsx' \
-               ':(exclude)src/**/*Logo.tsx' \
-               ':(exclude)src/**/*Ghost.tsx' \
-             | grep -n '^\+.*<svg[^>]*viewBox'; then
+             | grep -nP '^\+.*<svg[^>]*viewBox'; then
             echo "::error::Use lucide-react icons instead of inline SVGs"
             exit 1
           fi
           echo "::endgroup::"
 
           echo "::group::accessible-interactive-elements — no <div/span onClick> without role"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' | grep -nP '^\+.*<(div|span)(?![^>]*role=)[^>]*onClick'; then
+          # ':(glob)' so '**/' also matches zero directories: the plain pathspec
+          # 'src/**/*.tsx' needs a second '/' and skips src/App.tsx, src/main.tsx.
+          # The pattern skips comment lines, treats '=>' as part of a tag, and
+          # needs whitespace before role=/onClick (so data-role= does not count).
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' | grep -nP '^\+(?!\s*(?://|/?\*)).*<(div|span)\b(?!(?:=>|[^>])*\srole=)(?:=>|[^>])*\sonClick'; then
             echo "::error::Use <Clickable> component instead of <div onClick>"
             exit 1
           fi
           echo "::endgroup::"
 
-          echo "::group::frontend-security — no .innerHTML"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -nP '^\+.*\.innerHTML\s*='; then
-            echo "::error::Never assign .innerHTML — use textContent, createElement, or React elements"
+          echo "::group::frontend-security — no .innerHTML / .outerHTML / insertAdjacentHTML"
+          # ':(glob)' so 'src/**/' also matches files directly under src/
+          # (App.tsx, main.tsx): without it the pathspec needs a second '/'.
+          # (?!=) keeps an '===' comparison from tripping the assignment check.
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' | grep -nP '^\+.*(?:(?:\.|\[\s*['"'"'"])(?:inner|outer)HTML(?:['"'"'"]\s*\])?\s*\+?=(?!=)|\.insertAdjacentHTML\s*\()'; then
+            echo "::error::Never write HTML via innerHTML/outerHTML/insertAdjacentHTML — use textContent, createElement, replaceChildren, or React elements"
             exit 1
           fi
           echo "::endgroup::"
 
           echo "::group::frontend-security — Mermaid securityLevel must be 'strict'"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -nP "^\+.*securityLevel:\s*['\"]loose['\"]"; then
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' | grep -nP "^\+.*['\"]?securityLevel['\"]?\s*:\s*['\"](?:loose|antiscript)['\"]"; then
             echo "::error::Mermaid securityLevel must be 'strict' (never 'loose' — it allows JS execution from diagrams)"
             exit 1
           fi
@@ -102,25 +113,27 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::frontend-security (advisory) — dangerouslySetInnerHTML without sanitize/md/DOMPurify"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -nP '^\+.*dangerouslySetInnerHTML' | grep -vP 'sanitize\(|\bmd\(|DOMPurify'; then
-            echo "::warning::dangerouslySetInnerHTML must go through sanitize()/md() (DOMPurify). The Opus 4.8 review will block if unsanitized."
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' | grep -nP '^\+.*dangerouslySetInnerHTML' | grep -vP 'sanitize\(|\bmd\(|DOMPurify'; then
+            echo "::warning::dangerouslySetInnerHTML must go through sanitize()/md() (DOMPurify). The Opus 5.5 review will block if unsanitized."
           fi
           echo "::endgroup::"
 
+          # The advisory greps below skip comment lines (// and * prefixes) so
+          # a mention in prose does not warn.
           echo "::group::use-design-tokens (advisory) — no hardcoded Tailwind colors"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -nP '^\+.*(?:bg|text|border)-(?:gray|slate|zinc|neutral|stone)-\d'; then
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' | grep -nP '^\+(?!\s*(?://|/?\*)).*\b(?:bg|text|border)-(?:gray|slate|zinc|neutral|stone)-\d'; then
             echo "::warning::Prefer CSS custom property design tokens over hardcoded Tailwind colors"
           fi
           echo "::endgroup::"
 
           echo "::group::use-framer-motion (advisory) — no new CSS @keyframes"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -n '^\+.*@keyframes'; then
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' ':(glob)src/**/*.css' | grep -nP '^\+(?!\s*(?://|/?\*)).*@keyframes'; then
             echo "::warning::Prefer Framer Motion over CSS @keyframes for component animations"
           fi
           echo "::endgroup::"
 
           echo "::group::no-text-below-minimum (advisory) — no text-[0-9px]"
-          if git diff "$BASE".."$HEAD" -- 'src/**/*.tsx' 'src/**/*.ts' | grep -nP '^\+.*text-\[[0-9]px\]'; then
+          if git diff "$BASE".."$HEAD" -- ':(glob)src/**/*.tsx' ':(glob)src/**/*.ts' | grep -nP '^\+(?!\s*(?://|/?\*)).*\btext-\[[0-9](?:\.[0-9]+)?px\]'; then
             echo "::warning::Minimum usable text size is 10px; text-[0px]..text-[9px] is not accessible"
           fi
           echo "::endgroup::"
@@ -132,9 +145,9 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "::group::sensitive-path reads must go through is_sensitive_path()"
-          SENSITIVE_PATHS='\.aws/|\.ssh/|\.gnupg/|\.docker/|\.kube/|\.npmrc|\.pypirc|\.netrc|\.git-credentials|\.kirocrew/security_policy|\.kirocrew/admission_policy'
+          SENSITIVE_PATHS='\.aws/|\.ssh/|\.gnupg/|\.docker/|\.kube/|\.npmrc|\.pypirc|\.netrc|\.git-credentials|\.kirocrew/security_policy|\.kirocrew/admission_policy|\.kirocrew/\.env|\.kiro/crew/security_policy|\.kiro/crew/admission_policy|\.kiro/crew/\.env'
           # Best-effort: covers open()/Path.open()/read_text()/os.open()/aiofiles.
-          # The authoritative control is security.py/hooks.py + their unit tests;
+          # The authoritative control is the security/ package + hooks.py + their unit tests;
           # this grep is a fast pre-filter, not the guarantee.
           if git diff "$BASE".."$HEAD" -- 'src/**/*.py' | grep -nP "^\+.*(open\(|\.open\(|read_text\(|read_bytes\(|os\.open\().*($SENSITIVE_PATHS)"; then
             echo "::error::Sensitive credential/keystone paths must go through hooks.py is_sensitive_path()"
@@ -146,16 +159,16 @@ jobs:
           # The opt-out state (denied_commands.json) is a security ceiling: it
           # MUST live on _SENSITIVE_HOME_DIRS so the agent can neither read nor
           # write its own deny ceiling. Guard the invariant: it must be listed in
-          # security.py's sensitive floor AND in the governance boot-integrity
+          # security/paths.py's sensitive floor AND in the governance boot-integrity
           # required tuple. Fast tripwire — the authoritative controls are
-          # security.py + governance.py + their unit tests.
+          # the security/ package + governance.py + their unit tests.
           #
-          # The data home moved to ~/.kiro/crew, so security.py now GENERATES the
+          # The data home moved to ~/.kiro/crew, so security/paths.py GENERATES the
           # sensitive floor by expanding each secret leaf (denied_commands.json
           # among them, in _CREW_SECRET_LEAVES) under every crew-home prefix
           # (_CREW_HOME_PREFIXES). Assert the leaf is in that list; the governance
           # boot tuple carries the resolved ".kiro/crew/denied_commands.json".
-          if ! grep -q '"denied_commands.json"' src/kiro_crew/security.py; then
+          if ! grep -qr '"denied_commands.json"' src/kiro_crew/security/; then
             echo "::error::denied_commands.json must be in security._SENSITIVE_HOME_DIRS (via _CREW_SECRET_LEAVES; agent must not read/write its own deny ceiling)"
             exit 1
           fi
@@ -170,7 +183,7 @@ jobs:
           # (disable_all etc.) must be parsed with _coerce_bool, never bare bool()
           # (bool("false") is True — would silently disable every protection).
           # (?<![_\w]) so bare ``bool(`` matches but ``_coerce_bool(`` does not.
-          if git diff "$BASE".."$HEAD" -- 'src/kiro_crew/hooks.py' | grep -nP "^\+.*(?<![_\w])bool\(\s*(dc|data|denied)\.get\(\s*['\"](disable_all|auto_approve_subagent|enabled)"; then
+          if git diff "$BASE".."$HEAD" -- 'src/kiro_crew/hooks.py' 'src/kiro_crew/hook_runtime/' 'src/kiro_crew/dashboard/handlers/security.py' | grep -nP "^\+.*(?<![_\w])bool\(\s*(dc|data|denied)\.get\(\s*['\"](disable_all|auto_approve_subagent|enabled)"; then
             echo "::error::Parse operator-editable boolean opt-out fields with _coerce_bool(), not bare bool() (bool('false') is truthy)"
             exit 1
           fi
@@ -179,7 +192,8 @@ jobs:
           echo "::group::model-selection — no hardcoded model id as a default/fallback"
           # A hardcoded model id fails at runtime for accounts not entitled to it
           # (free-tier gets a subset). Use the "auto" sentinel or
-          # agent.role_models.<role> (see AGENTS.md → Model selection).
+          # agent.role_models.<role> (see
+          # docs/system-specs/common/model-selection.md).
           # model_registry.py IS the id source-of-truth (excluded); the CC-seam
           # fallback (_BACKGROUND_CC_MODEL) and *_FALLBACK_* maps are the one
           # documented exception. tests live outside src/kiro_crew.
@@ -187,7 +201,7 @@ jobs:
                ':(exclude)src/kiro_crew/model_registry.py' \
              | grep -nP "^\+.*(=|\":)\s*[\"'](claude-(opus|sonnet|haiku|fable)|opus-[0-9]|sonnet-[0-9]|haiku-[0-9]|fable-[0-9]|gpt-[0-9])" \
              | grep -vP "_BACKGROUND_CC_MODEL|_FALLBACK_"; then
-            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see AGENTS.md → Model selection)."
+            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see docs/system-specs/common/model-selection.md)."
             exit 1
           fi
           echo "::endgroup::"
@@ -201,7 +215,7 @@ jobs:
   # separately — this gate prevents new ones from landing.
   inclusive-language:
     name: Inclusive Language
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -354,9 +368,16 @@ jobs:
   # ── PR Hygiene ───────────────────────────────────────────────────────
   # Enforces: (1) conventional commit message format on PR title,
   # (2) at most two commits per PR (squash review-round noise before merge).
+  #
+  # Every step assembles its `::error::` prefix at runtime through `err()` rather
+  # than writing it literally. Actions echoes each `run:` block's source into the
+  # log whether the branch executes or not, so a literal annotation string is
+  # printed by PASSING runs too, where it reads as a second, real failure. The
+  # annotation a failing run emits is identical either way; only the inert source
+  # line stops impersonating one.
   pr-hygiene:
     name: PR Hygiene
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -372,9 +393,10 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
+          err() { printf '::%s::%s\n' error "$*"; }
           PATTERN='^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([a-z0-9_-]+\))?!?: .+'
           if ! echo "$PR_TITLE" | grep -qE "$PATTERN"; then
-            echo "::error::PR title must follow conventional commits format."
+            err "PR title must follow conventional commits format."
             echo ""
             echo "  Expected: type(scope): description"
             echo "  Examples:"
@@ -402,21 +424,65 @@ jobs:
           # merge-base fix (#4968), which deliberately left this site alone.
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          # The branch NAME, for the remedy text. Spelling `origin/main` literally
+          # is the wrong command for a PR opened against any other base, and sends
+          # the contributor to rebase onto a branch they are not targeting.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           MAX_COMMITS: "2"
         run: |
+          err() { printf '::%s::%s\n' error "$*"; }
           COMMIT_COUNT=$(git rev-list --count "$BASE".."$HEAD")
           if [ "$COMMIT_COUNT" -lt 1 ] || [ "$COMMIT_COUNT" -gt "$MAX_COMMITS" ]; then
-            echo "::error::PR must contain 1 or $MAX_COMMITS commits (has $COMMIT_COUNT). Squash before pushing:"
+            err "PR must contain 1 or $MAX_COMMITS commits (has $COMMIT_COUNT). Rebase, do not merge:"
+            echo ""
+            echo "  Do NOT plain-click 'Update branch' on this page, and do not merge"
+            echo "  $BASE_REF into your branch. Both add a merge commit, which counts"
+            echo "  here and will re-trip this check. The button's dropdown carries an"
+            echo "  'Update with rebase' option that is safe; its default click is not."
             echo ""
             echo "  git fetch origin"
-            echo "  git rebase origin/main"
-            echo "  git reset --soft origin/main"
-            echo "  git commit -m 'type(scope): description'"
-            echo "  git push --force-with-lease"
+            echo "  git rebase refs/remotes/origin/$BASE_REF"
+            echo "  Then squash your own commits (never a soft reset plus a commit,"
+            echo "  which takes whatever the index holds):"
+            echo "    git rebase -i refs/remotes/origin/$BASE_REF, marking later commits 'fixup'."
+            echo "  Or, with the kirocrew-prepare-pr skill, write the message to a file, then"
+            echo "    python3 <kirocrew-prepare-pr skill dir>/scripts/push_guard.py --base $BASE_REF --max-ahead $COMMIT_COUNT --squash <that file>"
+            echo "    (without a file it reads <git-dir>/prepare-pr-commit-msg-<branch>.txt, / as -)."
+            echo "    For commits made by hand it refuses first: it counts and lists the paths"
+            echo "    it did not commit, and writes them to a list file. Read each one's diff."
+            echo "    Only when every one is your own change, re-run that command with"
+            echo "    --paths-from-file <that list>. A count beyond what your PR changes"
+            echo "    means a stale tree: name none of them."
+            echo "  git push --force-with-lease=<branch>:<sha you last pushed> origin <branch>"
             echo ""
             exit 1
           fi
           echo "Commit count verified ($COMMIT_COUNT of at most $MAX_COMMITS)."
+
+      # ── Frozen goal sections ────────────────────────────────────────
+      # Every PR states its goal once, at open: a `**Goal:**` line under
+      # Problem / Motivation, plus Why it matters and Not a goal. The rules
+      # live in one script shared with fork-pr-description.yml, so fork and
+      # same-repo PRs are held to the same list. Dependabot writes its own
+      # body and has no goal to freeze.
+      - name: Require the PR template sections
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          err() { printf '::%s::%s\n' error "$*"; }
+          out="$(mktemp)"
+          PR_DRAFT=false PR_CALLER=pr-hygiene GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh
+          if grep -qx 'conclusion=failure' "$out"; then
+            # The annotation names the missing parts AND the fix, because it
+            # is the line a coding agent reads first; the full steps go to the
+            # log and the job summary page.
+            err "$(sed -n 's/^annotation=//p' "$out")"
+            sed -n '/^summary<<__FORK_PR_DESCRIPTION__$/,/^__FORK_PR_DESCRIPTION__$/p' "$out" | sed '1d;$d' \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "PR template sections present."
 
       # ── Pattern harvest on fix PRs ──────────────────────────────────
       # Every fix is a chance to retire its whole defect class. Fix/revert
@@ -429,12 +495,13 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          err() { printf '::%s::%s\n' error "$*"; }
           if ! echo "$PR_TITLE" | grep -qiE '^(fix|revert)([(!:]|$)'; then
             echo "Not a fix/revert PR; Pattern harvest section not required."
             exit 0
           fi
           if ! printf '%s' "$PR_BODY" | grep -qiE '^##+ *Pattern harvest'; then
-            echo "::error::Fix/revert PRs must carry a '## Pattern harvest' section."
+            err "Fix/revert PRs must carry a '## Pattern harvest' section."
             echo ""
             echo "  State either a rule candidate or why the defect is a one-off:"
             echo ""
@@ -450,7 +517,41 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$PR_BODY" | grep -qiE '^ *(Rule candidate|Not generalizable) *:'; then
-            echo "::error::The Pattern harvest section must contain a 'Rule candidate:' or 'Not generalizable:' line."
+            err "The Pattern harvest section must contain a 'Rule candidate:' or 'Not generalizable:' line."
             exit 1
           fi
           echo "Pattern harvest section present."
+
+      # ── Reader list on take-away diffs ──────────────────────────────
+      # A diff that hides, deletes, tightens or migrates something must list
+      # every reader of it under "## Backwards compatibility" as `Reader:`
+      # lines (#13273 and #12798 both passed CI and broke readers nobody
+      # listed). Detection and format live in the script; presence/format
+      # only, the content is the reviewers' job. See
+      # docs/system-specs/common/take-away-changes.md.
+      - name: Resolve diff base (merge-base)
+        id: diffbase
+        env:
+          BASE_TIP: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          err() { printf '::%s::%s\n' error "$*"; }
+          # base.sha is the base branch tip when the PR event fired, not the
+          # branch-off point, so diffing it directly pulls in sibling commits.
+          if ! MERGE_BASE=$(git merge-base "$BASE_TIP" "$HEAD_SHA"); then
+            err "Could not resolve the merge-base of $BASE_TIP and $HEAD_SHA (this job needs fetch-depth: 0)"
+            exit 1
+          fi
+          echo "Diff base: $MERGE_BASE"
+          echo "sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Require a reader list on take-away diffs
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        env:
+          MERGE_BASE: ${{ steps.diffbase.outputs.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          diff_file="$(mktemp)"
+          git diff "$MERGE_BASE" "$HEAD_SHA" > "$diff_file"
+          python3 .github/scripts/take_away_check.py "$diff_file"

@@ -35,6 +35,7 @@ import {
 import SpecStatePanel from './SpecStatePanel'
 import { ChatColumnSkeleton } from './Shimmer'
 import Modal from '../../../components/Modal'
+import ErrorNotice from '../../../components/ErrorNotice'
 
 import { i18nT } from '../../../i18n/t'
 export interface ReviewComment {
@@ -255,9 +256,13 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
   // Delete must NOT refetch this spec: the entry is gone, and a 404 here would
   // paint an error banner over a successful removal. Drop the detail cache and
   // refresh the list; the workspace clears the selection via onDeleted.
+  //
+  // No `onError` -> setErr here: the page-top banner sits BEHIND the confirm
+  // dialog's dimmed backdrop while focus is trapped inside the dialog, so a
+  // failed delete looked like nothing happened. The failure renders inside the
+  // dialog itself (ErrorNotice below), where the user actually is.
   const deleteMutation = useMutation({
     mutationFn: (id: SpecIdentity) => specApi.remove(name, id),
-    onError: (e) => setErr((e as Error).message),
     onSuccess: () => {
       setPendingRemove(null)
       void queryClient.removeQueries({ queryKey: ['spec-builder', 'spec', name] })
@@ -463,6 +468,7 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
                   ? i18nT(a.pendingKey)
                   : <><Play className="lucide-inline" /> {i18nT(a.labelKey)}</>}
               primary={!waiting}
+              nowrap
               disabled={
                 advancing
                 || messageMutation.isPending
@@ -506,15 +512,15 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
   )
 
   // Doc column header: shared segmented tabs + expand + phase-gated actions.
-  // On a desktop this matches the chat column header's height and bottom border
-  // so the two line up. While narrow the columns are STACKED, so that alignment
-  // buys nothing and the fixed height costs the phase control: at 390px the row
-  // measures 414px against a 390px viewport, and the `overflow-hidden` on the
-  // pane clips the action with no way to scroll to it. Wrapping puts the action
-  // on its own line instead, fully reachable.
+  // It wraps at every width. While the row fits, it is one 52px line that lines
+  // up with the chat column header. When it does not, the phase button drops to
+  // a second line and the two headers no longer line up; that costs less than a
+  // clipped control. A fixed height used to squeeze the button instead: at a
+  // 1440px window the docs column (default 44%) is too narrow for the tabs plus
+  // `Approve -> Design`, and at 390px the pane's `overflow-hidden` cut it off with
+  // no way to scroll to it.
   const docTabsHeader = (fullscreen: boolean) => (
-    <div className={`flex gap-1.5 items-center px-2.5 border-b border-border shrink-0 ${
-      isMobile && !fullscreen ? 'flex-wrap min-h-[52px] py-1.5' : 'h-[52px]'}`}>
+    <div className="flex flex-wrap gap-1.5 items-center min-h-[52px] py-1.5 px-2.5 border-b border-border shrink-0">
       <SegmentedControl<DocTabId>
         segments={docSegments}
         value={tab}
@@ -575,7 +581,7 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
           so the column is anchored instead of floating under a page-wide title
           band. Issue Radar's detail column does the same: every column owns its
           header, and the headers line up. */}
-      <section className="flex-1 min-w-0 flex flex-col">
+      <section className="flex-1 min-w-0 min-h-0 flex flex-col">
         <header className="shrink-0 h-[52px] px-4 border-b border-border flex items-center gap-2.5">
           {isMobile
             ? (
@@ -675,7 +681,12 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
                   <DropdownMenuItem
                     aria-label={i18nT('apps.specBuilder.components.specDetail.delete_spec_named', { name })}
                     disabled={deleteMutation.isPending}
-                    onSelect={() => setPendingRemove(specId())}
+                    onSelect={() => {
+                      // A failure from a previous attempt would otherwise greet
+                      // the freshly opened dialog as if this attempt had failed.
+                      deleteMutation.reset()
+                      setPendingRemove(specId())
+                    }}
                   >
                     <Trash2 className="lucide-inline shrink-0 text-danger" />
                     <span className="text-danger">
@@ -915,7 +926,7 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
           aria-label={i18nT('apps.specBuilder.components.specDetail.review_document_named', { document: tab, name })}
           tabIndex={-1}
           ref={overlayRef}
-          className="absolute inset-0 z-[60] bg-bg flex flex-col outline-none"
+          className="absolute inset-0 z-[60] bg-bg flex flex-col outline-hidden"
           style={{ padding: '14px 26px 20px' }}
         >
           <style>{DOC_CSS}</style>
@@ -984,6 +995,19 @@ export default function SpecDetail({ name, setErr, onDeleted, onDuplicated }: Sp
           <p className="text-[13px] leading-relaxed text-text m-0 break-words">
             {i18nT('apps.specBuilder.components.specDetail.remove_spec_body', { name })}
           </p>
+          {/* The failure lives where the user is looking. The page-top banner
+              sits behind this dialog's dimmed backdrop with focus trapped in
+              here, so a failed delete used to read as the button silently
+              reverting — inviting blind retries. */}
+          {/* No hand-off: the agent chat navigation unmounts this whole view,
+              and SpecDetail can be holding stacked unsent review comments and
+              an in-progress DocView draft — the hand-off would silently
+              discard both. */}
+          <ErrorNotice
+            className="mt-2.5"
+            title={i18nT('apps.specBuilder.components.specDetail.couldn_t_remove_this_spec_try_again')}
+            message={deleteMutation.error ? (deleteMutation.error as Error).message : null}
+          />
         </Modal>
       )}
     </div>

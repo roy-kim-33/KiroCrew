@@ -106,10 +106,16 @@ const PapyrusEditor = forwardRef<PapyrusEditorHandle, PapyrusEditorProps>(functi
     onChange(v)
   }, [onChange])
 
-  // Contents track the live buffer so the rendered rows stay in step with the
-  // text; the cacheKey stays pinned to the seed so the caret survives typing.
+  // Contents track the live buffer; the seed `cacheKey` stays stable so it is the
+  // editing SESSION identity (Pierre keeps the caret across keystrokes) and the
+  // React remount key below. PierreEditorImpl owns Pierre's `file` contract: it
+  // keeps a seed key that moves only on an outside change and one session file
+  // object whose contents it mirrors on edit, so this caller does not.
   const liveFile = useMemo(
-    () => ({ ...initialRef.current!.file, contents: value }),
+    () => {
+      const seed = initialRef.current!.file
+      return { ...seed, contents: value }
+    },
     [value],
   )
 

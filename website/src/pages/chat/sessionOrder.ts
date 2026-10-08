@@ -1,5 +1,6 @@
 import { i18nT } from '../../i18n/t'
 import { compareText, fmtDateFields } from '../../i18n/format'
+import { safeGetItem } from '../../utils/safeStorage'
 
 /**
  * Session ordering + timestamp formatting, shared by the session sidebar and
@@ -10,6 +11,16 @@ import { compareText, fmtDateFields } from '../../i18n/format'
  * flyout would keep claiming "recent" while ranking by something else — so
  * there is one definition and both surfaces import it.
  */
+
+export const SESSION_SORT_STORAGE_KEY = 'mc-session-sort'
+const SORT_KEYS = new Set<SortKey>([
+  'date-desc', 'date-asc', 'created-desc', 'created-asc', 'name-asc', 'name-desc',
+])
+
+export function readSessionSortKey(): SortKey {
+  const stored = safeGetItem(SESSION_SORT_STORAGE_KEY)
+  return stored && SORT_KEYS.has(stored as SortKey) ? stored as SortKey : 'date-desc'
+}
 
 export type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc'
 
@@ -27,7 +38,7 @@ export interface Sortable {
 
 /** Settled activity instant of an ACTIVE slot, as the ISO string the backend
  *  sent. `last_turn_ts` moves only when a prompt arrives or a turn ends, whereas
- *  `last_ts` is the newest row of any role and advances on every streamed tool
+ *  `last_ts` is the newest saved row of any role and advances on every streamed tool
  *  call — ranking or labelling a row by that makes the list churn while agents
  *  work. Display, date segmenting and the recency tint all read THIS so a row's
  *  visible timestamp cannot disagree with the position it was sorted into. */
@@ -102,10 +113,16 @@ export function comparePinnedThenSort(
   b: Sortable,
   key: SortKey,
   pinned: ReadonlySet<string>,
+  pinnedRank?: ReadonlyMap<string, number>,
 ): number {
-  const pa = pinned.has(a.key) ? 0 : 1
-  const pb = pinned.has(b.key) ? 0 : 1
-  if (pa !== pb) return pa - pb
+  const aPinned = pinned.has(a.key)
+  const bPinned = pinned.has(b.key)
+  if (aPinned !== bPinned) return aPinned ? -1 : 1
+  if (aPinned && bPinned && pinnedRank) {
+    const rankDiff = (pinnedRank.get(a.key) ?? Number.MAX_SAFE_INTEGER)
+      - (pinnedRank.get(b.key) ?? Number.MAX_SAFE_INTEGER)
+    if (rankDiff !== 0) return rankDiff
+  }
   return compareBySort(a, b, key)
 }
 
@@ -130,7 +147,7 @@ export function comparePinnedThenSort(
  * two day indices allocates no `Date` where re-probing three midnights did.
  * It is the shape the command palette's own relative-time formatter already uses.
  */
-function localDaysAgo(now: Date, then: Date): number {
+export function localDaysAgo(now: Date, then: Date): number {
   const DAY_MS = 86_400_000
   const nowDay = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS)
   const thenDay = Math.floor(Date.UTC(then.getFullYear(), then.getMonth(), then.getDate()) / DAY_MS)

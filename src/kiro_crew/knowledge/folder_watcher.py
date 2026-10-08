@@ -9,11 +9,12 @@ import logging
 import math
 import os
 from datetime import datetime
-from fnmatch import fnmatch
+from fnmatch import fnmatch, fnmatchcase
 from pathlib import Path
 from typing import Callable
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
@@ -53,9 +54,9 @@ DEFAULT_MAX_FILES = 5000
 MAX_SCAN_ATTEMPTS = 3
 
 # How many discovered files a scan processes between ``scan_paused`` re-reads.
-# The check used to run per file, i.e. one on-loop sqlite SELECT against
-# ``sources`` for every discovered file (up to ``max_files``). Re-reading on this
-# interval keeps a mid-scan pause responsive while bounding the query count at
+# Running the check per file would be one on-loop sqlite SELECT against ``sources``
+# for every discovered file (up to ``max_files``); re-reading on this interval
+# instead keeps a mid-scan pause responsive while bounding the query count at
 # ceil(files / _PAUSE_RECHECK_FILES) + 1.
 _PAUSE_RECHECK_FILES = 100
 
@@ -335,13 +336,22 @@ class FolderWatcher:
         self.pipeline = pipeline
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def scan_source(self, source: dict, *, chunk_budget: int | None = None) -> dict:
+    async def scan_source(
+        self,
+        source: dict,
+        *,
+        chunk_budget: int | None = None,
+        embed_priority: int = PRIORITY_NORMAL,
+    ) -> dict:
         """Scan a folder source. Returns {new, changed, deleted, skipped, capped}.
 
         ``chunk_budget`` stops the scan once that many chunks have been ingested
         in THIS sweep, leaving the rest for later sweeps. ``None`` is unbounded.
         Callers resolve the value with :func:`folder_chunk_budget`, capped by the
         watcher's global ``knowledge.sweep_chunk_budget``.
+
+        ``embed_priority`` is forwarded per scan. Scheduled sweeps choose the
+        bulk pool while dashboard-triggered scans retain the normal default.
 
         **A source Kiro Crew registered itself is refused here, not scanned.** The two
         paths that registered folders on their own are gone, and with them the
@@ -382,9 +392,19 @@ class FolderWatcher:
         if source_id not in self._locks:
             self._locks[source_id] = asyncio.Lock()
         async with self._locks[source_id]:
-            return await self._do_scan(source, chunk_budget=chunk_budget)
+            return await self._do_scan(
+                source,
+                chunk_budget=chunk_budget,
+                embed_priority=embed_priority,
+            )
 
-    async def _do_scan(self, source: dict, *, chunk_budget: int | None = None) -> dict:
+    async def _do_scan(
+        self,
+        source: dict,
+        *,
+        chunk_budget: int | None = None,
+        embed_priority: int = PRIORITY_NORMAL,
+    ) -> dict:
         source_id = source["id"]
         uri = source["uri"]
         props = json.loads(source.get("properties") or "{}") if isinstance(
@@ -556,6 +576,7 @@ class FolderWatcher:
 
             item_ids, outcome = await self._ingest_file(
                 file_path, source_id, namespace, props, old_ids, root=uri,
+                embed_priority=embed_priority,
                 on_duplicate=lambda text_hash: self._record_deduped_state(
                     source_id, file_path, content_hash, mtime, now, text_hash))
             if item_ids is None:
@@ -675,7 +696,6 @@ class FolderWatcher:
             # Windows: the `.`-prefix hidden check is POSIX-centric — Windows marks
             # hidden via the NTFS hidden attribute, not a dotfile name, so some
             # dirs that are hidden on Windows aren't pruned (benign over-ingestion).
-            # Tracked as follow-on work.
             dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
             if kiroignore is not None:
                 # Excluded directories are PRUNED, not filtered per file, so a huge
@@ -696,7 +716,17 @@ class FolderWatcher:
                 # Patterns are written with "/" separators, so the path has to be
                 # normalized before matching or every pattern containing a
                 # separator silently never matches on Windows.
-                if any(fnmatch(rel_path.replace(os.sep, "/"), pat) for pat in ignore_patterns):
+                #
+                # `fnmatchcase`, NOT `fnmatch`: `fnmatch` runs both operands
+                # through `os.path.normcase`, which folds case on Windows and is
+                # the identity on POSIX. These patterns are persisted source
+                # configuration, so a case-folding match makes one stored
+                # property select different files depending on which supported
+                # host runs the scan -- on Windows `SECURITY.md` would also
+                # swallow `security.md`. The pattern is authoritative on every
+                # host. The "/" normalization above is what carries separator
+                # patterns, since `fnmatchcase` folds neither operand.
+                if any(fnmatchcase(rel_path.replace(os.sep, "/"), pat) for pat in ignore_patterns):
                     continue
                 if kiroignore is not None and kiroignore.is_ignored(
                         _rel_posix(rel_dir, fname), is_dir=False):
@@ -852,17 +882,12 @@ class FolderWatcher:
             "INSERT OR REPLACE INTO folder_file_state (source_id, file_path, content_hash, text_hash, mtime, item_ids, last_seen, status, error_message, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (source_id, file_path, content_hash, text_hash, mtime, item_ids, now, status, error_message, attempts))
 
-    def _update_last_seen(self, source_id: str, file_path: str, now: str):
-        self.store.db.execute(
-            "UPDATE folder_file_state SET last_seen = ? WHERE source_id = ? AND file_path = ?",
-            (now, source_id, file_path))
-
     def _flush_last_seen(self, batch: list[tuple[str, str, str]]):
         """Apply accumulated ``(now, source_id, file_path)`` last_seen touches.
 
         One executemany instead of one execute per unchanged file. Clears
-        *batch* so a caller can flush more than once in a scan (the pause
-        early-return does).
+        *batch* once applied, so flushing the same list again re-applies
+        nothing.
         """
         if not batch:
             return
@@ -935,6 +960,7 @@ class FolderWatcher:
                            old_item_ids: list[str],
                            root: str = "",
                            on_duplicate: Callable[[str], None] | None = None,
+                           embed_priority: int = PRIORITY_NORMAL,
                            ) -> tuple[list[str] | None, str]:
         """Ingest one file.
 
@@ -1009,10 +1035,9 @@ class FolderWatcher:
         #   under cancellation) and only where nothing was committed.
         #   `test_knowledge_ingest_scan_off_loop.py` ratchets both properties.
         #
-        # `on_committed` fires only on the fully-successful branch, so it also
-        # replaces the `sources.sync_status` read that used to detect a partial
-        # rollback -- and it does so per call, rather than reading a column a
-        # concurrent ingest on the same source can flip.
+        # `on_committed` fires only on the fully-successful branch, so it detects
+        # a partial rollback per call, rather than reading a `sources.sync_status`
+        # column a concurrent ingest on the same source can flip.
         committed: list[str] | None = None
 
         def _record_committed(item_ids: list[str]) -> None:
@@ -1073,8 +1098,8 @@ class FolderWatcher:
 
         # The pre-ingest gate reports a refusal the same way the commit path reports
         # its ids: through a callback invoked INSIDE the gate's own transaction, on
-        # its worker thread. Latching it here replaces the `get_job_status` read-back
-        # this frame used to do after the pipeline returned -- a synchronous sqlite
+        # its worker thread. Latching it here avoids a `get_job_status` read-back
+        # after the pipeline returns -- a synchronous sqlite
         # round-trip on the event loop for every ingested file, which is exactly
         # the class of call the store's on-loop guard flags. The callback is the
         # only place `DUPLICATE_JOB_STATUS` is ever written, so the latch is the
@@ -1098,7 +1123,9 @@ class FolderWatcher:
                 original_name=Path(file_path).name,
                 old_item_ids=old_item_ids,
                 on_committed=_record_committed,
-                on_duplicate=_record_refused)
+                on_duplicate=_record_refused,
+                embed_priority=embed_priority,
+                count_toward_import_budget=False)
 
             if refused:
                 return [], "deduped"

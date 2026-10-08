@@ -14,8 +14,39 @@ function queued(content: string, queueId: string): ChatMessage {
 function openEditor() {
   const pencil = screen.getByLabelText('Edit queued message')
   fireEvent.click(pencil)
-  return screen.getByLabelText('Edit queued message') as HTMLInputElement
+  return screen.getByLabelText('Edit queued message') as HTMLTextAreaElement
 }
+
+describe('QueueStack quoting entry', () => {
+  it('previews and edits what the user typed; the quote block goes back on the head when the edit commits', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
+    const block = '> the quoted reply\n> — quoting an earlier message from the assistant'
+    const onEdit = vi.fn()
+    render(<QueueStack messages={[{ role: 'queued', content: `${block}\n\nwhy though?`, cls: '', ts: 't', meta: { queueId: 'q1', quote } }]} onCancel={() => {}} onEdit={onEdit} />)
+    expect(screen.getByText('why though?')).toBeInTheDocument()
+    expect(screen.queryByText(/quoting an earlier message/)).not.toBeInTheDocument()
+    const input = openEditor()
+    expect(input.value).toBe('why though?')
+    fireEvent.change(input, { target: { value: 'why not?' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onEdit).toHaveBeenCalledWith('q1', `${block}\n\nwhy not?`)
+  })
+})
+
+describe('QueueStack quote-only entry', () => {
+  it('previews the quoted excerpt instead of a blank line, but the editor opens empty and an edit keeps the block', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
+    const block = '> the quoted reply\n> — quoting an earlier message from the assistant'
+    const onEdit = vi.fn()
+    render(<QueueStack messages={[{ role: 'queued', content: block, cls: '', ts: 't', meta: { queueId: 'q1', quote } }]} onCancel={() => {}} onEdit={onEdit} />)
+    expect(screen.getByText('the quoted reply')).toBeInTheDocument()
+    const input = openEditor()
+    expect(input.value).toBe('')
+    fireEvent.change(input, { target: { value: 'now with words' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onEdit).toHaveBeenCalledWith('q1', `${block}\n\nnow with words`)
+  })
+})
 
 describe('QueueStack inline edit', () => {
   it('commits a real change on Enter', () => {
@@ -53,6 +84,48 @@ describe('QueueStack inline edit', () => {
     fireEvent.change(input, { target: { value: 'changed but cancelled' } })
     fireEvent.keyDown(input, { key: 'Escape' })
     expect(onEdit).not.toHaveBeenCalled()
+  })
+
+  it('is a textarea that keeps the newlines between attachment markers through an edit', () => {
+    // The serializer writes one `[attached_file N] path` marker per line. A
+    // single-line <input> drops every newline from its value, which would
+    // glue the markers together and make the queue edit prune all but the
+    // last attachment (a card resolving to a path the agent never received).
+    const onEdit = vi.fn()
+    const twoFiles = 'caption\n[attached_file 1] /tmp/a.pdf\n[attached_file 2] /tmp/My Report.pdf'
+    render(<QueueStack messages={[queued(twoFiles, 'q1')]} onEdit={onEdit} />)
+    const editor = openEditor()
+    expect(editor.tagName).toBe('TEXTAREA')
+    expect(editor.value).toBe(twoFiles)
+    // The card is a fixed-height stack slot, so the editor stays one visible row.
+    expect(editor.getAttribute('rows')).toBe('1')
+    // Only the caption line is selected: a retype replaces the caption, never
+    // the marker lines hidden below the visible row.
+    expect(editor.selectionStart).toBe(0)
+    expect(editor.selectionEnd).toBe('caption'.length)
+    // The hidden lines are named next to the editor so the value below the
+    // fold is never a surprise -- and named as what they are: every hidden
+    // line here is an attachment marker, so the cue says attachments.
+    expect(screen.getByTestId('queue-edit-hidden-lines').textContent).toBe('+2 attachments')
+    const edited = 'new caption\n[attached_file 1] /tmp/a.pdf\n[attached_file 2] /tmp/My Report.pdf'
+    fireEvent.change(editor, { target: { value: edited } })
+    fireEvent.keyDown(editor, { key: 'Enter' })
+    expect(onEdit).toHaveBeenCalledWith('q1', edited)
+  })
+
+  it('counts hidden lines generically when they are not all attachment markers', () => {
+    const mixed = 'first line\nsecond line of prose\n[attached_file 1] /tmp/a.pdf'
+    render(<QueueStack messages={[queued(mixed, 'q1')]} onEdit={vi.fn()} />)
+    openEditor()
+    expect(screen.getByTestId('queue-edit-hidden-lines').textContent).toBe('+2 lines')
+  })
+
+  it('shows no hidden-line cue on a single-line entry and selects the whole value', () => {
+    render(<QueueStack messages={[queued('one line', 'q1')]} onEdit={vi.fn()} />)
+    const editor = openEditor()
+    expect(screen.queryByTestId('queue-edit-hidden-lines')).toBeNull()
+    expect(editor.selectionStart).toBe(0)
+    expect(editor.selectionEnd).toBe('one line'.length)
   })
 
   it('commits only once when Enter is followed by the trailing blur', () => {

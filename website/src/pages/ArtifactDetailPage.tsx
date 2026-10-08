@@ -5,17 +5,20 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
-import { ArrowLeft, AlertTriangle, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, AlertTriangle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/useTheme'
 import { type IframeSelection } from '../hooks/useCommentBridge'
-import { useAppDispatch, useAppSelector } from '../store'
+import { useAppDispatch, useAppSelector, useAppStore } from '../store'
 import { switchSlot } from '../store/chatSlice'
-import { fetchSlots, addSlotOptimistic, removeSlotOptimistic } from '../store/dashboardSlice'
+import { fetchSlots, addSlotOptimistic, removeSlotOptimistic, armConfirmedCloseHold } from '../store/dashboardSlice'
 import { safeHttpUrl } from '../lib/safeUrl'
-import { sanitizeCssValue } from '../lib/cssSanitize'
-import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
+import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
+import { sendTurn } from '../chat-core/transport/sendTurn'
+import { slotBusySteer } from '../components/chat-input/busySend'
+import { useJevAutoSend } from './chat/useJevAutoSend'
 import { PageHeader, Card, Badge, Btn, Input } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import { useConfirm } from '../components/ConfirmDialog'
@@ -25,14 +28,22 @@ import { useReadingWidth } from '../hooks/useReadingWidth'
 import { useArtifactFolders, useMoveArtifactToFolder } from '../hooks/useArtifactFolders'
 import { FolderPickerItems } from '../components/FolderMoveSubmenu'
 import { folderBreadcrumb } from '../utils/artifactFolderTree'
-import { CommentPopover } from '../components/CommentOverlay'
+import SelectionToolbar, { type SelectionAction } from '../components/SelectionToolbar'
 import { CommentsSidebar } from '../components/CommentsSidebar'
+import { SubmitBar } from '../components/ArtifactPanel'
+import { formatArtifactCommentsMessage } from '../components/CommentOverlay'
 import { ArtifactChatPanel } from '../components/ArtifactChatPanel'
 import { CommentThreadPopover } from '../components/CommentThreadPopover'
 import { findCoords, resolveSourcePos } from '../components/MarkdownPanel'
+import { containedSelectionRange } from '../utils/selectionContainment'
+import { anchorFromRange } from '../utils/selectionAnchor'
+import { paintAnnotationHighlight } from '../utils/annotationHighlight'
+import { useSelectionComposerAnchor } from '../hooks/useSelectionComposerAnchor'
 // Artifact body renderers, extracted here so the chat side panel shares them.
 import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage, artifactAssetUrl, isEditableKind } from '../components/ArtifactBody'
+import { filterCommentsForForward } from '../lib/commentFilter'
 import { useArtifactPopouts } from '../hooks/useArtifactPopouts'
+import { useArtifactLiveReload } from '../hooks/useArtifactLiveReload'
 import { forwardToMain, type NavIntent } from '../utils/artifactPopout'
 import { writePrefill } from '../utils/navIntent'
 import { announceCommentsChanged, onCommentsChanged } from '../utils/artifactCommentsSync'
@@ -40,36 +51,53 @@ import { setArtifactEditing } from '../utils/artifactEditGuard'
 import { consumeJustCreatedBlank } from '../lib/blankHandoff'
 import { hasPendingArtifactWrite } from '../lib/artifactWrites'
 import { USER_SELECTABLE_KINDS } from '../lib/artifactKinds'
-import { PublishHub } from '../components/PublishHub'
+import { PublishHub, publishNoticeKey } from '../components/PublishHub'
 import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { errMessage } from '../utils/thunkError'
+import { byRecentActivity } from '../utils/slotRecency'
 import { fmtDateFields } from '../i18n/format'
 import ErrorNotice from '../components/ErrorNotice'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+
+/** The selection an open comment composer annotates, resolved while it was
+ *  still live. `anchor` is the trimmed quote; line/column point at the source
+ *  for the agent prompt; the offsets pin the highlight to this occurrence. */
+interface PendingAnchor {
+  anchor: string
+  line?: number
+  column?: number
+  prefix?: string
+  suffix?: string
+  startOffset?: number
+  endOffset?: number
+}
+
+/** Human text for a rejected query/mutation, so every ErrorNotice on this page reads the same shape. */
 /**
  * The artifact's active companion session: the bound slot for `slug`, or the most
  * recently active one if a race or a History-page resume left more than one.
  * Module-level so `openCompanionChat` can apply the identical rule to a freshly
  * fetched slots payload, not just the Redux snapshot.
  */
+/** Sent-to-chat comment ids for one artifact. A corrupt or absent entry reads
+ *  as "nothing sent yet", which only ever over-counts the pending batch. */
+function readSentIds(key: string): Set<string> {
+  try { return new Set<string>(JSON.parse(localStorage.getItem(key) || '[]')) }
+  catch { return new Set<string>() }
+}
+
 function pickBoundSlot(slots: ChatSlot[] | undefined, slug: string): ChatSlot | null {
   const matches = (slots ?? []).filter((x) => x.artifact === slug)
   if (matches.length <= 1) return matches[0] ?? null
-  return [...matches].sort((a, b) =>
-    (b.last_activity_ts || '').localeCompare(a.last_activity_ts || ''))[0]
+  // "Most recently active" has to be decided on INSTANTS. `last_activity_ts` is
+  // the raw transcript `ts` and is not guaranteed to be one format, so comparing
+  // the text can hand back the older session — which is the one case this
+  // resolver exists to avoid, and the tie-break "New chat" depends on below.
+  return [...matches].sort(byRecentActivity)[0]
 }
 
-function readThemeVars(): Record<string, string> {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return {}
-  const computed = getComputedStyle(document.documentElement)
-  const out: Record<string, string> = {}
-  for (const name of THEME_VAR_NAMES) {
-    const v = sanitizeCssValue(computed.getPropertyValue(name))
-    if (v) out[name] = v
-  }
-  return out
-}
 
 export { isEditableKind }
 
@@ -283,6 +311,18 @@ function ArtifactPopoutControl({ slug, name }: { slug: string; name: string }) {
   )
 }
 
+/** The live `current_token` from a stale-write 409 (see ArtifactConflictError), or
+ * `undefined` when `err` is anything else. */
+function conflictToken(err: unknown): string | undefined {
+  if (!(err instanceof ApiError) || err.status !== 409) return undefined
+  try {
+    const token = (JSON.parse(err.body) as { current_token?: unknown }).current_token
+    return typeof token === 'string' ? token : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export default function ArtifactDetailPage({ popout = false }: { popout?: boolean } = {}) {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
@@ -357,6 +397,23 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   const [editedContent, setEditedContent] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // Identifies the artifact and edit session that owns an async write. Navigation
+  // and each new edit advance it, so late completions cannot mutate a newer editor.
+  const editGenerationRef = useRef(0)
+  // Token of the content this edit started from (Artifact.content_token). Pinned at
+  // edit start and advanced only by this page's own successful save, so a
+  // background refetch can never re-base a stale buffer onto newer content.
+  const editBaseTokenRef = useRef<string | undefined>(undefined)
+  // The live token from a 409. Only the explicit Save sends it, as the deliberate
+  // overwrite its relabelled button offers; every other write keeps the base
+  // token and keeps being refused.
+  const overwriteTokenRef = useRef<string | undefined>(undefined)
+  // Set while a write carrying one of those tokens is on the wire. Only its own
+  // response advances the base token, so a second write sent before it settles
+  // (Cmd+S pressed twice) would be refused as stale with this tab the only
+  // writer. A save skipped here leaves the buffer dirty, so nothing is lost.
+  const tokenWriteInFlightRef = useRef(false)
+  const [saveConflict, setSaveConflict] = useState(false)
   const [showPublish, setShowPublish] = useState(false)
   // Tag editing: tags shown in the header are editable inline. Adding a tag
   // posts metadata-only (no version bump). Removing a tag works the same way.
@@ -376,7 +433,19 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // on every render. React Query keeps `data` referentially stable between
   // refetches that resolve deep-equal, so this changes only on real data.
   const durableComments = useMemo(() => commentsQuery.data?.comments ?? [], [commentsQuery.data?.comments])
-  const commentCount = durableComments.length
+  // Two counts, deliberately distinct.
+  //
+  // `displayCommentCount` drives what the human sees — the toggle badge, the
+  // sidebar auto-reveal and the "add one" tip — so it counts every durable
+  // comment: a resolved thread is still there to be revealed and read.
+  const displayCommentCount = durableComments.length
+  // `commentCount` is what the AGENT is told about, so it omits resolved
+  // threads: counting those re-asks the agent to act on its own completed work.
+  // It keeps the shorter name because the prompt copy below interpolates it.
+  const commentCount = useMemo(
+    () => filterCommentsForForward(durableComments).length,
+    [durableComments],
+  )
   const remoteSyncError = commentsQuery.data?.remote_sync_error ?? null
   // Right-hand panel state machine: the comments sidebar and the companion
   // chat panel share the same flex space, icon-toggled and mutually exclusive.
@@ -388,6 +457,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // global pin re-opening empty panels everywhere.
   const isMobile = useIsMobile()
   const [panel, setPanel] = useState<'none' | 'comments' | 'chat'>('none')
+  // On a narrow viewport an open side panel takes the whole width and the
+  // document body is hidden — a comment box portalled to <body> would otherwise
+  // keep floating over the panel, anchored to text that is no longer on screen.
+  const narrowPanelOpen = isMobile && panel !== 'none'
   // Flipped once the user manually toggles, so the comment-driven auto-reveal
   // below stops overriding an explicit choice — but only for the current
   // artifact (cleared on navigation; see the effect).
@@ -397,8 +470,8 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     setPanel(p => (p === 'comments' ? 'none' : 'comments'))
   }, [])
   // Auto-reveal the comments panel when the artifact has comments; collapse it
-  // when it has none. Reacts to commentCount so adding the first comment reveals
-  // the panel and removing the last collapses it — unless the user has taken
+  // when it has none. Reacts to displayCommentCount so adding the first comment
+  // reveals the panel and removing the last collapses it — unless the user has taken
   // manual control via a toggle, and NEVER by auto-switching away from an open
   // chat panel (the chat panel only opens on explicit action, so yanking it for
   // a comment default would discard user intent). React Router reuses this
@@ -421,17 +494,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // find first. Auto-reveal was written for the side-by-side layout, where
       // the body stayed visible beside it. A manual open still survives, via the
       // user-toggled override this effect returns on above.
-      return commentCount > 0 && !isMobile ? 'comments' : 'none'
+      return displayCommentCount > 0 && !isMobile ? 'comments' : 'none'
     })
-  }, [slug, commentCount, isMobile])
-  const [popover, setPopover] = useState<{ x: number; y: number; anchor: string; line?: number; column?: number; prefix?: string; suffix?: string; startOffset?: number; endOffset?: number } | null>(null)
+  }, [slug, displayCommentCount, isMobile])
   // Bidirectional anchor↔comment linking: flash a sidebar row when
   // its in-iframe highlight is clicked; scroll the iframe highlight when a
   // sidebar comment is clicked. Nonce forces a re-trigger on repeat clicks.
   const [iframeScrollTarget, setIframeScrollTarget] = useState<{ id: string; nonce: number } | null>(null)
   const previewRef = useRef<HTMLDivElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
-  const selectingRef = useRef(false)
+  const iframeBodyRef = useRef<HTMLDivElement>(null)
 
   // Reset version selection AND any in-progress edit when navigating between
   // artifacts. React Router v6 reuses the component instance for parameterized
@@ -439,6 +511,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // to another would attempt to fetch v5 of the new artifact (which may not
   // exist), and stale edit state would leak into the new artifact.
   useEffect(() => {
+    editGenerationRef.current += 1
     setSelectedVersion(null)
     setEditing(false)
     setEditedContent('')
@@ -447,7 +520,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     // into a rendered preview.
     setPreviewDuringEdit(false)
     setSaveError(null)
-    setPopover(null)
+    editBaseTokenRef.current = undefined
+    overwriteTokenRef.current = undefined
+    setSaveConflict(false)
     setAddingTag(false)
     setNewTag('')
     setRenaming(false)
@@ -472,6 +547,13 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     queryFn: () => api.artifactEvents(slug),
     enabled: !!slug,
   })
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead. Bound to
+  // detailQuery (the Live record) rather than the selected snapshot, so a
+  // historical view still tracks the pointer it will return to. This also covers
+  // /popout/artifact/:slug, which renders this page in its own window.
+  useArtifactLiveReload(slug, detailQuery.data?.source_path)
 
   const versions = versionsQuery.data?.versions || []
   const effectiveVersion = selectedVersion ?? detailQuery.data?.version ?? null
@@ -505,6 +587,30 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // versions or events queries.
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err))
+    }
+  }, [artifact, queryClient, slug])
+
+  const [reprobing, setReprobing] = useState(false)
+  const [reprobeError, setReprobeError] = useState<string | null>(null)
+  /** Re-check the destination behind a publish notice, and clear it if it no longer holds. */
+  const reprobeNotice = useCallback(async () => {
+    if (!artifact) return
+    setReprobeError(null)
+    setReprobing(true)
+    try {
+      await api.reprobeArtifactNotice(artifact.slug)
+      // The record may now carry no notice at all, so the banner's own condition has
+      // to be re-evaluated from fresh data -- and the library indicators read the same
+      // fields, so they are invalidated too.
+      await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
+      await queryClient.invalidateQueries({ queryKey: ['artifacts'] })
+    } catch (err) {
+      // A reprobe failure is NOT a save failure. Routing it to `setSaveError` put it in
+      // the editor's save channel, whose surrounding copy tells the user their edit did
+      // not persist -- untrue, and it sends them to re-save content nothing touched.
+      setReprobeError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setReprobing(false)
     }
   }, [artifact, queryClient, slug])
 
@@ -612,7 +718,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // ── Edit / save / cancel / revert handlers ────────────────────────────────
   const startEditing = useCallback(() => {
     if (!artifact || !editable) return
+    editGenerationRef.current += 1
     setEditedContent(artifact.content ?? '')
+    editBaseTokenRef.current = artifact.content_token
+    overwriteTokenRef.current = undefined
+    setSaveConflict(false)
     setEditing(true)
     setSaveError(null)
   }, [artifact, editable])
@@ -715,11 +825,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     setEditing(false)
     setEditedContent('')
     setSaveError(null)
+    setSaveConflict(false)
     setPreviewDuringEdit(false)
   }, [dirty, confirm])
 
-  const handleSave = useCallback(async (snapshot = false) => {
-    if (!artifact || !dirty) return
+  // `overwrite` is passed ONLY by the relabelled Save button's own click after a
+  // 409. Every other save path (Cmd+S, Cmd+Shift+S, Snapshot) keeps the base
+  // token, so it is refused again instead of silently replacing newer content.
+  const handleSave = useCallback(async (snapshot = false, overwrite = false) => {
+    if (!artifact || !dirty || tokenWriteInFlightRef.current) return
+    const editGeneration = editGenerationRef.current
+    const writeSlug = artifact.slug
+    tokenWriteInFlightRef.current = true
     // Same race as commitRename: the discard snapshot still reads empty until
     // the query refetches, so disarm synchronously or an unmount landing
     setSaving(true)
@@ -728,11 +845,21 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // snapshot=true → bumps version (creates a new numbered snapshot).
       // snapshot=false → silently updates the live state without versioning,
       // matching the explicit-snapshot model.
-      await api.updateArtifact(artifact.slug, { content: editedContent, snapshot })
-      await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
+      const saved = await api.updateArtifact(writeSlug, {
+        content: editedContent,
+        snapshot,
+        expected_token: overwrite ? overwriteTokenRef.current : editBaseTokenRef.current,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
       if (snapshot) {
-        await queryClient.invalidateQueries({ queryKey: ['artifact-versions', slug] })
-        await queryClient.invalidateQueries({ queryKey: ['artifact-events', slug] })
+        await queryClient.invalidateQueries({ queryKey: ['artifact-versions', writeSlug] })
+        await queryClient.invalidateQueries({ queryKey: ['artifact-events', writeSlug] })
+      }
+      if (editGenerationRef.current !== editGeneration) return
+      editBaseTokenRef.current = saved?.content_token
+      overwriteTokenRef.current = undefined
+      setSaveConflict(false)
+      if (snapshot) {
         // Snapshot is a deliberate checkpoint — drop out of edit mode
         // so the user sees the result. Plain Save (silent) keeps the
         // user in the editor: after the query
@@ -743,11 +870,23 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         setPreviewDuringEdit(false)
       }
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      const liveToken = conflictToken(err)
+      if (liveToken !== undefined) {
+        await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+        if (editGenerationRef.current !== editGeneration) return
+        // Nothing was written. Keep the draft, arm the explicit Save as a
+        // deliberate overwrite, and refresh what the page shows.
+        overwriteTokenRef.current = liveToken
+        setSaveConflict(true)
+        setSaveError(i18nT('pages.artifactDetailPage.save_conflict_changed_since_read'))
+      } else if (editGenerationRef.current === editGeneration) {
+        setSaveError(err instanceof Error ? err.message : String(err))
+      }
     } finally {
+      tokenWriteInFlightRef.current = false
       setSaving(false)
     }
-  }, [artifact, dirty, editedContent, queryClient, slug])
+  }, [artifact, dirty, editedContent, queryClient])
 
   // Stash for the keyboard handler effect — keeps deps minimal.
   const handleSaveRef = useRef(handleSave)
@@ -758,7 +897,36 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // data-loss path where pulling mid-edit discarded the working buffer.
   const flushLiveEdits = useCallback(async () => {
     if (!editing || !dirty || !artifact) return
-    await api.updateArtifact(artifact.slug, { content: editedContent, snapshot: false })
+    const editGeneration = editGenerationRef.current
+    const writeSlug = artifact.slug
+    // Holds off a save for as long as this flush is on the wire. The banner
+    // cannot start a flush during a save: it is disabled while `saving`.
+    tokenWriteInFlightRef.current = true
+    try {
+      await api.updateArtifact(writeSlug, {
+        content: editedContent,
+        snapshot: false,
+        expected_token: editBaseTokenRef.current,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+    } catch (err) {
+      // A stale flush must not overwrite newer content ahead of a pull: stay in
+      // the editor with the conflict shown, and let the caller abort. Retrying
+      // the pull stays refused; only the explicit Save may overwrite.
+      const liveToken = conflictToken(err)
+      if (liveToken !== undefined) {
+        await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+        if (editGenerationRef.current === editGeneration) {
+          overwriteTokenRef.current = liveToken
+          setSaveConflict(true)
+          setSaveError(i18nT('pages.artifactDetailPage.save_conflict_changed_since_read'))
+        }
+      }
+      throw err
+    } finally {
+      tokenWriteInFlightRef.current = false
+    }
+    if (editGenerationRef.current !== editGeneration) return
     // Drop out of edit mode after flushing. The buffer is now persisted (and a
     // subsequent pull checkpoints it as a version), so once the post-mutate
     // refetch lands the pulled/overwritten content the viewer must render
@@ -768,8 +936,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     setEditing(false)
     setEditedContent('')
     setPreviewDuringEdit(false)
-    await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
-  }, [editing, dirty, artifact, editedContent, queryClient, slug])
+  }, [editing, dirty, artifact, editedContent, queryClient])
 
   // Snapshot the current live state without an edit. Used by the Snapshot
   // button when not editing — captures whatever is on disk / current.html
@@ -837,10 +1004,22 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
       // draft the user is about to confirm discarding.
       if (confirmOpen) return
-      if ((e.metaKey || e.ctrlKey) && e.key === 's' && dirty) {
+      // Own the save chord whenever editing, not only when dirty, so it never
+      // falls through to AppKit's default (selecting the word under the cursor).
+      // Match case-insensitively: with Shift held e.key is 'S', so an exact
+      // 's' match makes the Cmd+Shift+S snapshot branch unreachable. Read the
+      // Shift state from e.shiftKey (Cmd+Shift+S → snapshot, Cmd+S → silent
+      // save) and only issue the write when dirty so a clean buffer does not
+      // trigger a redundant save.
+      //
+      // Do NOT gate on !e.defaultPrevented here. This editor mounts no onSave
+      // into Pierre, yet Pierre's capture handler still preventDefaults the
+      // chord and then no-ops (onSaveRef is undefined) — so an already-prevented
+      // event carries no save. Standing down on it would drop both the save and
+      // the snapshot. This document handler is the only one that actually saves.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
         e.preventDefault()
-        // Cmd+Shift+S → snapshot (creates a new version), Cmd+S → silent save.
-        handleSaveRef.current(e.shiftKey)
+        if (dirty) handleSaveRef.current(e.shiftKey)
       }
       if (e.key === 'Escape') cancelEditing()
     }
@@ -893,25 +1072,31 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // markdown AND text: both now render behind a `previewRef` (ContentRenderer
   // attaches it to the markdown DOM and to the <pre> used for text), so a
   // selection has a root to map back to source in either. Do not add a kind here
-  // without confirming its renderer attaches the ref, or the popover silently
-  // never opens.
+  // without confirming its renderer attaches the ref, or the composer opens
+  // with an anchor that is only the quote.
   const commentable = !!artifact && !editing && isCurrent && (
     artifact.kind === 'markdown' || artifact.kind === 'text'
   )
   const isMarkdown = artifact?.kind === 'markdown'
   const sourceContent = artifact?.content ?? ''
 
-  const handleMouseUp = useCallback(() => {
-    if (!commentable) return
+  /** The live DOM selection inside the rendered body as a durable anchor, or
+   *  null when there is none (collapsed, blank, or outside the preview). */
+  const resolveSelectionAnchor = useCallback((highlightOwner: object): PendingAnchor | null => {
     const sel = window.getSelection()
-    const raw = sel?.toString() ?? ''
-    if (!sel || sel.isCollapsed || !raw.trim()) return
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null
     const root = previewRef.current
-    if (!root || !sel.anchorNode || !root.contains(sel.anchorNode)) return
-    const range = sel.getRangeAt(0)
-    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return
-    const anchor = raw.trim()
-    const rect = range.getBoundingClientRect()
+    if (!root) return null
+    // The SAME containment predicate the toolbar opened the composer with, so
+    // a selection it accepted is never rejected here (a triple-click on the
+    // last block ends at a boundary point OUTSIDE the preview); the returned
+    // range is clamped to the preview, so the offsets below are measured in it.
+    const range = containedSelectionRange(sel.getRangeAt(0), root)
+    if (!range) return null
+    const derived = anchorFromRange(root, range)
+    if (!derived) return null
+    const raw = range.toString()
+    const anchor = derived.quote
     // For markdown, walk the rendered DOM to map (anchorNode, offset) back to
     // (line, col) in the source via data-sourcepos. For text artifacts the
     // rendered text equals the source so findCoords is exact.
@@ -922,16 +1107,26 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     // highlighter's indexTextNodes/rangeForAnchor use — pins the highlight to
     // THIS occurrence when the quote repeats (line/col drive the agent prompt;
     // the offset drives the visual anchor).
-    const preRange = document.createRange()
-    preRange.setStart(root, 0)
-    preRange.setEnd(range.startContainer, range.startOffset)
-    const startOffset = preRange.toString().length + (raw.length - raw.trimStart().length)
-    setPopover({ x: rect.left, y: rect.bottom, anchor, line: coords?.line, column: coords?.column, startOffset, endOffset: startOffset + anchor.length })
-  }, [commentable, isMarkdown, sourceContent])
+    // The box is about to take focus and collapse the selection: paint the
+    // passage so the reader can still see what the open box is attached to.
+    paintAnnotationHighlight(highlightOwner, range)
+    // prefix/suffix ride along: `rangeForAnchor` scores a repeated quote by its
+    // neighbours, so a comment on the second "beta" re-anchors to the second.
+    return { anchor, line: coords?.line, column: coords?.column, prefix: derived.prefix, suffix: derived.suffix, startOffset: derived.startOffset, endOffset: derived.endOffset }
+  }, [isMarkdown, sourceContent])
 
   const invalidateComments = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['artifact-comments', slug] })
   }, [queryClient, slug])
+  // Last failed comment write (post/reply/resolve/review/reopen/delete/edit).
+  // Rendered via ErrorNotice near the top of the page; cleared by the next
+  // successful write or by dismissal.
+  const [commentActionError, setCommentActionError] = useState<string | null>(null)
+  // Per document, like the edit state reset above: the route element is reused
+  // across artifacts, and a refused-after-close notice names a passage of the
+  // artifact it was typed on -- carried into the next one it would point at
+  // text that is not there (the draft itself waits under that artifact's key).
+  useEffect(() => { setCommentActionError(null) }, [slug])
 
   // Cross-window mirroring: a popout and the main window are separate JS
   // contexts with separate query caches, so a comment posted in one wouldn't
@@ -939,6 +1134,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // and refetch on announcements from other windows — comments mirror
   // immediately in both directions.
   const invalidateAndAnnounce = useCallback(() => {
+    setCommentActionError(null)
     invalidateComments()
     announceCommentsChanged(slug)
   }, [invalidateComments, slug])
@@ -948,13 +1144,24 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   }, [slug, invalidateComments])
 
   // Writes go through useMutation (use-react-query guideline): errors surface
-  // instead of being swallowed and cache invalidation is centralized. Errors
-  // invalidate locally only (safety-net refetch) — a failed mutation didn't
-  // change server state, so there's nothing for other windows to sync.
-  const onMutErr = useCallback(() => invalidateComments(), [invalidateComments])
+  // through `commentActionError` (rendered as an ErrorNotice) and cache
+  // invalidation is centralized. Errors invalidate locally only (safety-net
+  // refetch) — a failed mutation didn't change server state, so there's
+  // nothing for other windows to sync.
+  const onMutErr = useCallback((e: unknown) => {
+    setCommentActionError((errMessage(e) || i18nT('components.errorBoundary.something_went_wrong')))
+    invalidateComments()
+  }, [invalidateComments])
   const postCommentMut = useMutation({
     mutationFn: (vars: { text: string; scope?: string; anchor?: object }) => api.postArtifactComment(slug, vars),
     onSuccess: invalidateAndAnnounce, onError: onMutErr,
+  })
+  // The composer's own post: its refusal is reported INSIDE the box (text kept,
+  // retry offered), so it does not also raise the page's failure banner — one
+  // failure, one notice, and the raw server reason stays out of the page.
+  const postAnchoredMut = useMutation({
+    mutationFn: (vars: { text: string; scope?: string; anchor?: object }) => api.postArtifactComment(slug, vars),
+    onSuccess: invalidateAndAnnounce, onError: invalidateComments,
   })
   const replyCommentMut = useMutation({
     mutationFn: (vars: { parentId: string; text: string }) => api.replyArtifactComment(slug, vars.parentId, { text: vars.text }),
@@ -978,42 +1185,92 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   const removeCommentMut = useMutation({ mutationFn: (id: string) => api.deleteArtifactComment(slug, id), onSuccess: invalidateAndAnnounce, onError: onMutErr })
   const editCommentMut = useMutation({ mutationFn: (vars: { id: string; text: string }) => api.editArtifactComment(slug, vars.id, { text: vars.text }), onSuccess: invalidateAndAnnounce, onError: onMutErr })
 
-  // Anchored add (from the inline selection popover, markdown/text only).
-  const addComment = useCallback((text: string) => {
-    if (!popover) return
+  // Anchored add (from the selection toolbar's composer).
+  const submitAnchored = useCallback((text: string, pending: PendingAnchor): Promise<boolean> => {
     let anchor: CommentAnchor | undefined
-    if (popover.anchor) {
-      anchor = { quote: popover.anchor, prefix: popover.prefix, suffix: popover.suffix }
+    if (pending.anchor) {
+      anchor = { quote: pending.anchor, prefix: pending.prefix, suffix: pending.suffix }
       // Native text selections carry an offset; iframe selections omit it.
-      if (popover.startOffset != null) {
-        anchor.start_offset = popover.startOffset
-        anchor.end_offset = popover.endOffset ?? popover.startOffset + popover.anchor.length
+      if (pending.startOffset != null) {
+        anchor.start_offset = pending.startOffset
+        anchor.end_offset = pending.endOffset ?? pending.startOffset + pending.anchor.length
       }
     }
-    postCommentMut.mutate({
+    // Resolve, never throw: on `false` the toolbar keeps the typed text and its
+    // persisted draft and shows the in-box notice (this mutation deliberately
+    // skips the page banner so a refusal is reported once); the panel reveal
+    // below is a reaction to a STORED comment, so it waits for success.
+    return postAnchoredMut.mutateAsync({
       text,
       scope: 'private',
       anchor,
-    })
-    // Adding a comment hands control back to the comment-driven default: reveal
-    // the panel now, and clear the manual override so the auto effect can
-    // collapse it again if every comment is later removed.
-    //
-    // EXCEPT when the chat panel is open. An anchored add is reachable while
-    // chatting (the body stays visible in the left column), and switching panels
-    // would yank the conversation out from under the user. The toolbar's comment
-    // badge already increments, so the add is still visibly acknowledged. Same
-    // rationale as the auto-reveal guard in the panel effect above.
-    // Narrow: keep the override SET. Clearing it hands control back to the
-    // auto-reveal effect, which is gated off while narrow -- so the panel the
-    // user just posted into would be closed again the moment `commentCount`
-    // changes. Revealing it here is a user-initiated open, which is exactly what
-    // the override means.
-    sidebarUserToggledRef.current = isMobile
-    setPanel(p => (p === 'chat' ? p : 'comments'))
-    setPopover(null)
-    window.getSelection()?.removeAllRanges()
-  }, [popover, postCommentMut, isMobile])
+    }).then(() => {
+      // Adding a comment hands control back to the comment-driven default: reveal
+      // the panel now, and clear the manual override so the auto effect can
+      // collapse it again if every comment is later removed.
+      //
+      // EXCEPT when the chat panel is open. An anchored add is reachable while
+      // chatting (the body stays visible in the left column), and switching panels
+      // would yank the conversation out from under the user. The toolbar's comment
+      // badge already increments, so the add is still visibly acknowledged. Same
+      // rationale as the auto-reveal guard in the panel effect above.
+      // Narrow: keep the override SET. Clearing it hands control back to the
+      // auto-reveal effect, which is gated off while narrow -- so the panel the
+      // user just posted into would be closed again the moment
+      // `displayCommentCount` changes. Revealing it here is a user-initiated open,
+      // which is exactly what the override means.
+      sidebarUserToggledRef.current = isMobile
+      setPanel(p => (p === 'chat' ? p : 'comments'))
+      return true
+    }, () => false)
+  }, [postAnchoredMut, isMobile])
+
+  const confirmDiscardDraft = useCallback(() => confirm({
+    title: i18nT('components.markdownPanel.discard_unsaved_comment'),
+    confirmLabel: i18nT('components.markdownPanel.discard_comment_button'),
+    // The composer it guards is a body portal at z-[9999]; the prompt must
+    // take the layer above it or the box swallows clicks on its buttons.
+    layer: 'top',
+  }), [confirm])
+  const quoteOf = useCallback((a: PendingAnchor) => a.anchor, [])
+  const quoteOnly = useCallback((anchor: string): PendingAnchor => ({ anchor }), [])
+  // A composer post refused after its box was closed: the page's comment
+  // failure banner says so (the draft waits in the store).
+  const onRefusedAfterClose = useCallback((quote: string) => {
+    setCommentActionError(i18nT('components.selectionToolbar.comment_post_failed_closed', { quote }))
+  }, [])
+  // The shared composer wiring (pending/staged anchors, external selection,
+  // highlight, draft mirror + guard). The draft store is per artifact, per
+  // passage — the same record the side panel uses for this artifact, so a draft
+  // started in one surface comes back in the other. Edit mode and a version
+  // switch unmount the toolbar (and the box with it), so both run
+  // `guardCommentDraft` first — in the draft's own words, since "unsaved
+  // changes" would read as file edits at risk.
+  const {
+    selectionComposer, iframeSelection, stageIframeSelection, clearSelectionState, guardCommentDraft,
+  } = useSelectionComposerAnchor<PendingAnchor>({
+    resolveDomAnchor: resolveSelectionAnchor, quoteOf, quoteOnly, submit: submitAnchored,
+    draftKey: `mc-artifact-composer-draft:${slug}`, confirmDiscard: confirmDiscardDraft, onRefusedAfterClose,
+  })
+  // Navigating between artifacts drops any anchor of the departing document.
+  useEffect(() => { clearSelectionState() }, [slug, clearSelectionState])
+  // No row action beside the composer: the box already carries Add comment and
+  // Close, and a third control would break the two-per-row cap. Copying the
+  // selection is the composer's own Cmd/Ctrl+C while its input is empty.
+  const selectionActions: SelectionAction[] = useMemo(() => [], [])
+  // In-iframe text selection (widget/html via the bridge): stage the
+  // iframe-derived anchor, then ask the toolbar to open the composer at the
+  // supplied viewport rect. Offsets are dropped on purpose — they are in the
+  // iframe body's text space, not the parent highlighter's — so the comment
+  // re-anchors by quote + prefix/suffix inside the frame.
+  const handleIframeSelect = useCallback((sel: IframeSelection) => {
+    // The bridge relays selections on a historical snapshot too; a comment is
+    // stored against the CURRENT artifact, so those are not annotatable.
+    if (editing || !isCurrent) return
+    // The frame's offset keys the draft slot (a stable passage id), though the
+    // anchor itself omits it (wrong text space for the parent highlighter).
+    stageIframeSelection({ anchor: sel.quote, prefix: sel.prefix, suffix: sel.suffix }, { text: sel.quote, x: sel.x, y: sel.y, start: sel.startOffset })
+  }, [editing, isCurrent, stageIframeSelection])
 
   // Doc-level add (from the sidebar) — works for ALL kinds, including
   // HTML/widget where in-iframe text selection isn't reachable.
@@ -1073,6 +1330,13 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   )
   const boundSlot = useMemo(() => pickBoundSlot(slots, slug), [slots, slug])
   const [chatCreating, setChatCreating] = useState(false)
+  // Gateway connection flag: the chat send path refuses silently while it is
+  // false, so the batch submit is disabled (and bails) there — same gating as
+  // the file viewer's "Submit All".
+  const connected = useAppSelector((s) => s.dashboard.connected)
+  // The batch submit takes the bound session's busy decision at press time.
+  const appStore = useAppStore()
+  const jevAutoConsented = useJevAutoSend()
   // Serializes the two session-lifecycle entry points. `chatCreating` cannot do
   // this job: it is React state (so a second handler in the same tick still sees
   // the old value) and it is only set INSIDE createBoundSession, which runs
@@ -1121,7 +1385,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // The pinned title keeps the sidebar readable.
       const res = await api.createChatSlot(
         undefined, undefined, undefined, undefined, undefined,
-        i18nT('pages.artifactDetailPage.session_title', { name: artifact.name }), undefined, artifact.slug,
+        i18nT('pages.artifactDetailPage.session_title', { name: artifact.name }), artifact.slug,
       )
       if (prefillText) writePrefill(res.key, prefillText)
       dispatch(addSlotOptimistic({
@@ -1251,6 +1515,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             return
           }
         }
+        dispatch(armConfirmedCloseHold(slot.key))
         dispatch(removeSlotOptimistic(slot.key))
       }
       await createBoundSession()
@@ -1258,6 +1523,83 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       sessionOpBusyRef.current = false
     }
   }, [boundSlots, createBoundSession, dispatch])
+
+  // ── batch submit to the companion session ──
+  // Durable comments survive a submission, so without per-id tracking every
+  // press would re-send the whole history and the count would never reset. Sent
+  // ids are persisted per artifact, mirroring the `mc-cmt-read:` key, and the
+  // set is append-only: a corrupt or absent entry reads as "nothing sent yet",
+  // which only ever over-counts the pending batch.
+  const sentKey = `mc-cmt-sent:${slug}`
+  const [sentIds, setSentIds] = useState<Set<string>>(() => readSentIds(sentKey))
+  useEffect(() => { setSentIds(readSentIds(sentKey)) }, [sentKey])
+  // Pending = forwarding-eligible AND human-authored AND not yet submitted —
+  // the same three-filter composition as ArtifactPanel, because this is the
+  // standalone-page twin of that Submit and both reach the same agent. Without
+  // filterCommentsForForward here the page would show the filtered count beside
+  // a bar that still ships resolved threads. Agent comments are dropped here AND
+  // inside formatArtifactCommentsMessage (hardened esc()); `!sentIds.has` stops
+  // an already-submitted batch being re-sent.
+  const pendingComments = useMemo(
+    () => filterCommentsForForward(durableComments).filter(c => !c.is_agent && !sentIds.has(c.id)),
+    [durableComments, sentIds],
+  )
+  const [submittingComments, setSubmittingComments] = useState(false)
+  /** Send every pending comment to the artifact's companion session as ONE
+   *  message — the standalone-page twin of the chat side panel's Submit.
+   *
+   *  Offered ONLY while a session is bound (see the render below), so the bar
+   *  never promises a send it cannot make: with none bound it would have to
+   *  decide whether this artifact has one, and a wrong answer there opens a
+   *  second companion chat. Unbound, the footer's "Ask agent to address" is the
+   *  affordance, and it says what it does. The `boundSlot` test here is the
+   *  backstop for that, not a second flow. */
+  const submitCommentsToChat = useCallback(async (extraPrompt?: string) => {
+    if (!connected || !artifact || !boundSlot || pendingComments.length === 0) return
+    const batch = pendingComments
+    setSubmittingComments(true)
+    try {
+      // A Send press on the bound session: it steers or queues per that
+      // session's busy-send mode. A steer comes back `dispatched` (steered, or
+      // a fresh turn) or `queued` (demoted), so the custody rule below holds.
+      const steer = slotBusySteer(appStore.getState(), boundSlot.key, jevAutoConsented)
+      const receipt = await sendTurn({
+        message: formatArtifactCommentsMessage(slug, artifact.name, batch, extraPrompt),
+        slot: boundSlot.key,
+        ...(steer ? { steer } : {}),
+      })
+      // Mark sent only on a receipt that PROVES the server took custody: a
+      // dispatch, a queue entry, or a 2xx whose body would not parse (accepted,
+      // only the answer was mangled). Everything else keeps the batch pending.
+      //
+      // That is stricter than the composer's rule on this transport, on purpose.
+      // ChatPage can afford to read a refusal or a late answer optimistically
+      // because its payload stays on screen — the optimistic row holds the text
+      // and says it is unconfirmed. Here the payload is a set of ids in
+      // `mc-cmt-sent:<slug>`, the set is append-only, and no UI clears it: a
+      // batch marked sent for a POST that never arrived is a review nobody can
+      // re-offer. So an abort deadline (`response-late`) and a rejected fetch
+      // (`transport-error`) both leave it pending, and the cost of being wrong
+      // is one duplicate turn the user chooses, not a submitted review that is
+      // silently gone.
+      if (receipt.status !== 'dispatched' && receipt.status !== 'queued' && receipt.status !== 'unknown') {
+        setCommentActionError(receipt.reason || i18nT('pages.artifactDetailPage.couldn_t_send_your_comments_are_still_pending'))
+        return
+      }
+      setSentIds(prev => {
+        const next = new Set(prev)
+        for (const c of batch) next.add(c.id)
+        safeSetItem(sentKey, JSON.stringify([...next]))
+        return next
+      })
+      // Show the session the batch landed in; the panels are mutually exclusive,
+      // so this is what replaces the chat's own sent-message echo.
+      sidebarUserToggledRef.current = true
+      setPanel('chat')
+    } finally {
+      setSubmittingComments(false)
+    }
+  }, [connected, artifact, pendingComments, boundSlot, slug, sentKey, appStore, jevAutoConsented])
 
   /** Full-page escape hatch — routes through sendNav so a popout forwards the
    *  intent to a main window instead of remounting the dashboard in-frame. */
@@ -1286,9 +1628,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     return () => window.removeEventListener('kirocrew:artifact-deleted', onDeleted)
   }, [slug, popout, navigate, dirty])
 
-  // Drop popover when the user switches to edit mode or pages between
-  // versions — those interactions kill the underlying selection anyway.
-  useEffect(() => { if (editing || !isCurrent) { setPopover(null) } }, [editing, isCurrent])
+  // Drop a pending in-iframe selection when the user switches to edit mode or
+  // pages between versions — those interactions kill the underlying selection
+  // anyway (the DOM toolbar unmounts with `commentable` and closes itself).
+  useEffect(() => { if (editing || !isCurrent) clearSelectionState() }, [editing, isCurrent, clearSelectionState])
 
   // ── Export helpers (Open-in-new-tab + Download) ───────────────────────────
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1374,22 +1717,24 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     const attempt = ++copyAttemptRef.current
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current)
     setCopyStatus('idle')
+    // `copyToClipboard` resolves a boolean and never rejects: `true` only once
+    // the text actually reached the clipboard. Gate the confirmation on it so a
+    // `false` shows the failure glyph instead of a tick over an unchanged
+    // clipboard. (A `.catch` here would be unreachable dead code.)
     copyToClipboard(artifact?.content ?? '')
-      .then(() => {
+      .then((ok) => {
         if (attempt !== copyAttemptRef.current) return
-        setCopyStatus('copied')
-        copiedTimerRef.current = setTimeout(() => {
-          if (attempt === copyAttemptRef.current) setCopyStatus('idle')
-        }, 1500)
-      })
-      .catch(() => {
-        if (attempt !== copyAttemptRef.current) return
-        setCopyStatus('failed')
+        setCopyStatus(ok ? 'copied' : 'failed')
         copiedTimerRef.current = setTimeout(() => {
           if (attempt === copyAttemptRef.current) setCopyStatus('idle')
         }, 1500)
       })
   }, [artifact])
+  // Copy failure stays an icon-state glyph (the button itself turns danger with
+  // an aria-live label), not an ErrorNotice: it is a browser clipboard API
+  // outcome rather than a rejected request, and the editor buffer may be dirty,
+  // so there is nothing to hand to the agent. Same decision as the copy
+  // controls in AssistantMessage / PinnedMessagesPanel.
   const copyLabel = copyStatus === 'copied'
     ? i18nT('pages.artifactDetailPage.copied')
     : copyStatus === 'failed'
@@ -1434,8 +1779,10 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
 
   if (detailQuery.isLoading || (!isCurrent && versionQuery.isLoading))
     return <div className="p-6 text-muted">{i18nT('pages.artifactDetailPage.loading')}</div>
-  if (detailQuery.error) {
-    const msg = detailQuery.error instanceof Error ? detailQuery.error.message : String(detailQuery.error)
+  // A failed historical-snapshot fetch used to fall through to "Not found"
+  // (artifact is undefined either way); surface it as the load failure it is.
+  const loadError = detailQuery.error ?? (!isCurrent ? versionQuery.error : null)
+  if (loadError) {
     return (
       <>
         <div className="sticky top-0 z-10 bg-bg border-b border-border">
@@ -1443,18 +1790,21 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         </div>
         <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="lucide-inline text-danger" />
-              <div>
-                <div className="text-sm text-danger font-medium">{i18nT('pages.artifactDetailPage.failed_to_load_artifact')}</div>
-                <div className="text-[13px] text-muted mt-1">{msg}</div>
-              </div>
-            </div>
-            <div className="mt-3">
+            {/* Load failure: no editor buffer exists yet (a version switch
+                clears it), so the hand-off risks nothing. */}
+            <ErrorNotice
+              title={i18nT('pages.artifactDetailPage.failed_to_load_artifact')}
+              message={(errMessage(loadError) || i18nT('components.errorBoundary.something_went_wrong'))}
+              askAgent
+            />
+            <div className="mt-3 flex flex-wrap gap-2">
               {/* In a popout this forwards to the main window (the popout must
                   never become the library page); in the main app it's a plain
                   local navigation. */}
               <Btn onClick={() => sendNav({ path: '/artifacts' })}>{i18nT('pages.artifactDetailPage.back_to_library')}</Btn>
+              {!detailQuery.error && (
+                <Btn onClick={() => setSelectedVersion(null)}>{i18nT('pages.artifactDetailPage.back_to_live')}</Btn>
+              )}
             </div>
           </Card>
         </div>
@@ -1575,7 +1925,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               <button
                 type="button"
                 onClick={() => removeTag(t)}
-                className="opacity-0 group-hover:opacity-100 hover:text-danger transition-opacity bg-transparent border-none cursor-pointer p-0 inline-flex items-center"
+                className="opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 hover:text-danger transition-opacity bg-transparent border-none cursor-pointer p-0 inline-flex items-center"
                 title={i18nT('pages.artifactDetailPage.remove_tag', { name: t })}
                 aria-label={i18nT('pages.artifactDetailPage.remove_tag', { name: t })}
               >
@@ -1613,7 +1963,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               })}
               autoFocus
               placeholder={i18nT('pages.artifactDetailPage.tag')}
-              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none focus-ring"
+              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-hidden focus-ring"
               style={{ width: '90px' }}
               aria-label={i18nT('pages.artifactDetailPage.add_a_tag')}
             />
@@ -1648,14 +1998,23 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                   title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
                   confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
                 }))) return
-                setEditing(false)
-                setEditedContent('')
-                if (raw === 'live') {
-                  setSelectedVersion(null)
-                } else {
-                  setSelectedVersion(parseInt(raw, 10))
-                }
+                // A typed comment draft is lost with the toolbar the switch unmounts.
+                await guardCommentDraft(() => {
+                  setEditing(false)
+                  setEditedContent('')
+                  if (raw === 'live') {
+                    setSelectedVersion(null)
+                  } else {
+                    setSelectedVersion(parseInt(raw, 10))
+                  }
+                })
               }}
+            />
+            {/* No hand-off: editor buffer editedContent may be dirty */}
+            <ErrorNotice
+              variant="inline"
+              title={i18nT('pages.artifactDetailPage.versions_failed_to_load')}
+              message={versionsQuery.error ? (errMessage(versionsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
             />
 
             {/* Revert: only meaningful when viewing a historical version */}
@@ -1679,12 +2038,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               <>
                 <button
                   type="button"
-                  onClick={() => handleSave(false)}
+                  onClick={() => handleSave(false, saveConflict)}
                   disabled={!dirty || saving}
                   className={`px-2 py-1 rounded-md text-[12px] font-medium border transition-all disabled:opacity-40 ${dirty ? 'border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover' : 'border-border text-muted cursor-default'}`}
-                  title={i18nT('pages.artifactDetailPage.save_to_live_cmd_s_updates_the_live_state_withou')}
+                  title={saveConflict
+                    ? i18nT('pages.artifactDetailPage.save_overwrite_newer_content_title')
+                    : i18nT('pages.artifactDetailPage.save_to_live_cmd_s_updates_the_live_state_withou')}
                 >
-                  {saving ? i18nT('pages.artifactDetailPage.saving') : i18nT('pages.artifactDetailPage.save')}
+                  {saving
+                    ? i18nT('pages.artifactDetailPage.saving')
+                    : saveConflict
+                      ? i18nT('pages.artifactDetailPage.save_overwrite_newer_content')
+                      : i18nT('pages.artifactDetailPage.save')}
                 </button>
                 <button
                   type="button"
@@ -1732,7 +2097,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 {editable && (
                   <button
                     type="button"
-                    onClick={startEditing}
+                    onClick={() => { void guardCommentDraft(startEditing) }}
                     className="px-2 py-1 rounded-md text-[12px] font-medium border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all"
                     title={i18nT('pages.artifactDetailPage.edit_content')}
                     aria-label={i18nT('pages.artifactDetailPage.edit_content')}
@@ -1774,8 +2139,8 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             >
               <span className="inline-flex items-center gap-1">
                 <MessageSquare size={13} />
-                {commentCount > 0 && (
-                  <span className="ml-0.5 px-1 rounded bg-accent/20 text-[10px]">{commentCount}</span>
+                {displayCommentCount > 0 && (
+                  <span className="ml-0.5 px-1 rounded bg-accent/20 text-[10px]">{displayCommentCount}</span>
                 )}
               </span>
             </button>
@@ -1824,7 +2189,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         )}
 
         {(artifact.fork_metadata || artifact.publication) && (
-          <UpstreamSyncBanner artifact={artifact} onBeforeMutate={flushLiveEdits} onPulled={() => {
+          <UpstreamSyncBanner artifact={artifact} busy={saving} onBeforeMutate={flushLiveEdits} onPulled={() => {
             queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
             queryClient.invalidateQueries({ queryKey: ['upstream-status', slug] })
           }} />
@@ -1839,17 +2204,30 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           </div>
         )}
 
-        {/* No agent hand-off here, deliberately. `saveError` is set exactly when
-            handleSave threw, so `dirty` is still true and `editedContent` was
-            never persisted — a route change unmounts this page and the buffer is
+        {/* No hand-off: editor buffer editedContent (unsaved). `saveError` is set
+            exactly when handleSave threw, so `dirty` is still true and the buffer
+            was never persisted — a route change unmounts this page and it is
             gone. Every other nav-away on this page gates on
             `dirty && confirm(discard_unsaved_changes)`, and the deleted-artifact
             handler sets `saveError` INSTEAD of navigating precisely so the user
             can copy their work out. A one-click navigation off this surface would
-            destroy it, and would bypass the beforeunload guard too. */}
+            destroy it, and would bypass the beforeunload guard too. The conflict
+            footer's link opens a NEW tab, so this page and its buffer stay put. */}
         <ErrorNotice
           message={saveError}
-          title={i18nT('pages.artifactDetailPage.save_failed')}
+          title={saveConflict
+            ? i18nT('pages.artifactDetailPage.save_conflict_title')
+            : i18nT('pages.artifactDetailPage.save_failed')}
+          footer={saveConflict && (
+            <a
+              href={`/artifacts/${encodeURIComponent(slug)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:no-underline"
+            >
+              {i18nT('pages.artifactDetailPage.save_conflict_open_newer_in_new_tab')}
+            </a>
+          )}
           className="mb-3"
         />
 
@@ -1857,10 +2235,67 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             error visible (no controls) if a publishing provider is ever
             registered. Inert in the public edition, where the registry is empty
             and `artifact.publication` is always null. */}
-        {artifact.publication?.last_error && (
-          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-md border border-danger/40 bg-danger-subtle text-[13px] text-danger">
-            <AlertCircle size={14} className="lucide-inline shrink-0 mt-0.5" />
-            <span><strong>{i18nT('pages.artifactDetailPage.publication_sync_issue')}</strong> {artifact.publication.last_error}</span>
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.publication_sync_issue')}
+          message={artifact.publication?.last_error}
+          className="mb-3"
+        />
+
+        {/* Comments that failed to LOAD would otherwise read as "no comments"
+            (the sidebar and the toolbar count both fall back to an empty list). */}
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.comments_failed_to_load')}
+          message={commentsQuery.error ? (errMessage(commentsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+          className="mb-3"
+        />
+        {/* No hand-off: comment draft (sidebar / selection composer text) */}
+        <ErrorNotice
+          title={i18nT('pages.artifactDetailPage.comment_action_failed')}
+          message={commentActionError}
+          onDismiss={() => setCommentActionError(null)}
+          className="mb-3"
+        />
+
+        {/* Notice-only publication: the publish SUCCEEDED and the link is valid,
+            it just is not reachable yet (e.g. CloudFront still rolling out). That
+            is not a failure, so it renders as a neutral/warn line -- never the
+            danger surface `last_error` drives. Suppressed when a real error is
+            present, since that is the more important thing to show. */}
+        {artifact.publication?.notice && !artifact.publication.last_error && (
+          <div className="mb-3 flex items-start gap-2 px-3 py-2 rounded-md border border-warn/30 bg-warn-subtle text-[13px] text-warn">
+            <AlertTriangle className="lucide-inline shrink-0 mt-0.5" />
+            <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
+              rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
+              distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+              notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
+            }, artifact.publication.notice_code))}</span>
+            {/* A notice is recorded once, at publish time, and the ordinary happy path
+                never revisits it -- so a link that HAS since finished rolling out kept
+                this banner forever. This asks the destination again and clears the notice
+                only when the condition really cleared. User-triggered rather than polled:
+                the answer costs a call to the destination, and a timer would either clear
+                it without checking or hammer the destination on every visit. */}
+            <Btn
+              onClick={reprobeNotice}
+              disabled={reprobing}
+              aria-label={i18nT('pages.artifactDetailPage.recheck_publication_notice')}
+            >
+              {reprobing
+                ? i18nT('pages.artifactDetailPage.rechecking')
+                : i18nT('pages.artifactDetailPage.check_again')}
+            </Btn>
+            {/* Rendered here, beside the button that triggered it: a re-check failure used
+                to be written to the editor's save-error channel, which both mislabelled it
+                and put it far from the control the user just pressed.
+                No hand-off: this panel sits on the artifact detail page alongside an
+                editable buffer, and `askAgent` navigates away and destroys unsaved edits.
+                A failed re-check is retryable in place by pressing the button again, so the
+                hand-off would cost more than it could recover. */}
+            {reprobeError && (
+              <ErrorNotice message={reprobeError} className="mt-2" />
+            )}
           </div>
         )}
 
@@ -1882,7 +2317,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               two of them splitting 390px. Hidden rather than unmounted: the body
               holds scroll position and, for markdown, an in-progress anchored
               comment selection, and rotating a phone crosses the breakpoint. */}
-          <div className={`flex-1 min-w-0 ${isMobile && panel !== 'none' ? 'hidden' : ''}`}>
+          <div className={`flex-1 min-w-0 ${narrowPanelOpen ? 'hidden' : ''}`}>
             {/* Copy raw source — its own right-aligned slot ABOVE the body (not
                 the header toolbar, which must not grow; not an overlay, which
                 could obscure a heading's trailing text or cover a top-right
@@ -1914,34 +2349,30 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             ) : artifact.kind === 'image' ? (
               <ArtifactBodyImage artifact={artifact} slug={slug} />
             ) : usesIframe ? (
-              <>
+              <div ref={iframeBodyRef}>
                 <ArtifactBodyIframe
                   artifact={artifact}
                   slug={slug}
                   comments={durableComments}
-                  onSelect={(sel: IframeSelection) => setPopover({ x: sel.x, y: sel.y, anchor: sel.quote, prefix: sel.prefix, suffix: sel.suffix })}
+                  onSelect={handleIframeSelect}
                   onOpenThread={(id: string, rect) => openThreadHandler(id, rect)}
                   scrollToCommentId={iframeScrollTarget}
                   activeId={activeCommentId}
                   unreadRootIds={unreadRootIds}
                 />
-                {popover && (
-                  <CommentPopover
-                    x={popover.x}
-                    y={popover.y}
-                    onSubmit={addComment}
-                    onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }}
-                  />
-                )}
-              </>
+                {/* The frame's selections arrive through the bridge as
+                    `iframeSelection`; the toolbar opens the same composer from
+                    it, and from nothing else — the wrapper's own text (a
+                    render-failure notice) is not part of the artifact. Gated
+                    like the native body: a comment is stored against the
+                    CURRENT artifact, so a historical snapshot takes none. */}
+                {isCurrent && !editing && <SelectionToolbar key={slug} containerRef={iframeBodyRef} actions={selectionActions} composer={selectionComposer} externalSelection={iframeSelection} externalOnly suspended={narrowPanelOpen} />}
+              </div>
             ) : (
-              // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- a passive drag-select probe over the rendered prose, not a control: the pair only brackets a selection so `handleMouseUp` can offer to comment on the quote, and there is no action to activate. Giving the wrapper a role and tabIndex would announce a phantom button around the whole artifact body and put a focus stop in front of the text.
               <div
                 ref={bodyRef}
                 className="relative"
                 style={contentWidthStyle}
-                onMouseDown={() => { selectingRef.current = true }}
-                onMouseUp={() => { selectingRef.current = false; handleMouseUp() }}
               >
                 <ArtifactBodyNative
                   kind={artifact.kind}
@@ -1959,15 +2390,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                   onActivateComment={openThreadHandler}
                   unreadRootIds={unreadRootIds}
                 />
-                {popover && (
-                  <CommentPopover
-                    x={popover.x}
-                    y={popover.y}
-                    onSubmit={addComment}
-                    onCancel={() => { setPopover(null); window.getSelection()?.removeAllRanges() }}
-                    containerRef={bodyRef}
-                  />
-                )}
+                {/* Selecting text opens the type-first comment box; mounted only
+                    while an anchored comment can be made (current version, not
+                    editing, a kind whose renderer attaches `previewRef`). It
+                    listens on the preview itself, not the wrapper: the wrapper
+                    also holds the inline-comment overlay's own text (gutter
+                    counts), which no anchor can point at. */}
+                {/* Keyed per artifact: the route element is reused across a
+                    param-only navigation, and a toolbar that survived it would
+                    submit the previous artifact's draft through this one's callbacks. */}
+                {commentable && <SelectionToolbar key={slug} containerRef={previewRef} actions={selectionActions} composer={selectionComposer} suspended={narrowPanelOpen} />}
               </div>
             )}
           </div>
@@ -1976,7 +2408,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               panel are mutually exclusive flex siblings of the artifact body —
               icon-toggled, never overlays. The comment stack is durable,
               threaded, and works for ALL kinds (doc-level add for HTML/widget;
-              anchored add for markdown/text via the inline popover above). */}
+              anchored add for markdown/text via the selection composer above). */}
           {panel === 'comments' && (
             <CommentsSidebar
               comments={durableComments}
@@ -1990,6 +2422,14 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               onDelete={removeComment}
               onRefresh={invalidateComments}
               onAskAgent={commentCount > 0 ? () => { void openCompanionChat({ address: true }) } : undefined}
+              submitBar={pendingComments.length > 0 && boundSlot ? (
+                <SubmitBar
+                  count={pendingComments.length}
+                  submitting={submittingComments}
+                  onSubmit={p => { void submitCommentsToChat(p) }}
+                  connected={connected}
+                />
+              ) : undefined}
               onClose={toggleSidebar}
               onCommentClick={activateFromSidebar}
               onEditComment={editComment}
@@ -2016,7 +2456,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             ? i18nT('pages.artifactDetailPage.showing_live_v', { version: detailQuery.data?.version ?? '?' })
             : i18nT('pages.artifactDetailPage.showing_v_historical', { version: effectiveVersion })}
           {dirty && <span className="ml-2 text-warn">{i18nT('pages.artifactDetailPage.unsaved_changes')}</span>}
-          {commentable && commentCount === 0 && (
+          {commentable && displayCommentCount === 0 && (
             <span className="ml-2 text-muted/80">{i18nT('pages.artifactDetailPage.tip_select_text_to_anchor_a_comment_or_use_the')} <strong>{i18nT('pages.artifactDetailPage.comments')}</strong> {i18nT('pages.artifactDetailPage.panel_to_add_one')}</span>
           )}
           {!commentable && !editing && isCurrent && (
@@ -2045,6 +2485,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         {/* Lifecycle event log + activity timeline. */}
         <div className="mt-6">
           <h3 className="text-[13px] font-semibold text-text-strong mb-2">{i18nT('pages.artifactDetailPage.activity')}</h3>
+          {/* No hand-off: editor buffer editedContent may be dirty */}
+          <ErrorNotice
+            title={i18nT('pages.artifactDetailPage.activity_failed_to_load')}
+            message={eventsQuery.error ? (errMessage(eventsQuery.error) || i18nT('components.errorBoundary.something_went_wrong')) : null}
+            className="mb-2"
+          />
           <ActivityTimeline
             events={eventsQuery.data?.events ?? []}
             navigateToSlot={(slotKey) => sendNav({ path: '/chat', slotKey })}
@@ -2065,7 +2511,9 @@ const _SYNC_TONES: Record<string, { wrap: string; btn: string }> = {
   danger: { wrap: 'border-danger/40 bg-danger-subtle text-danger', btn: 'border-danger/40 text-danger hover:bg-danger/10' },
 }
 
-function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: Artifact; onPulled: () => void; onBeforeMutate?: () => Promise<void> }) {
+// `busy` while the page's own save is on the wire: a flush started then would
+// re-send that save's base token and be refused as stale.
+function UpstreamSyncBanner({ artifact, busy = false, onPulled, onBeforeMutate }: { artifact: Artifact; busy?: boolean; onPulled: () => void; onBeforeMutate?: () => Promise<void> }) {
   const fm = artifact.fork_metadata
   const pub = artifact.publication
   const [pulling, setPulling] = useState(false)
@@ -2080,7 +2528,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
   // edition ships an empty registry, so providers resolves to [] and this
   // component renders nothing (an artifact can only carry fork_metadata /
   // publication once a companion provider existed to create them anyway).
-  const { data: providersData } = useQuery({
+  const { data: providersData, error: providersError } = useQuery({
     queryKey: ['publish-providers', artifact.kind],
     queryFn: () => api.getArtifactPublishProviders(artifact.kind),
     staleTime: 300_000,
@@ -2088,7 +2536,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
   const providers = providersData?.providers || []
   // Cheap, non-blocking upstream check — the local content renders immediately;
   // this only drives the "pull available" / "conflict" affordance.
-  const { data: status } = useQuery({
+  const { data: status, error: statusError } = useQuery({
     queryKey: ['upstream-status', artifact.slug],
     queryFn: () => api.upstreamStatus(artifact.slug),
     staleTime: 15_000,
@@ -2118,7 +2566,9 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         setNotice(String(res.pull_result.reason || i18nT('pages.artifactDetailPage.nothing_to_pull')))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.pull_failed'))
+      // A refused flush is already shown by the page's conflict notice.
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.pull_failed'))
     } finally {
       setPulling(false)
     }
@@ -2139,7 +2589,9 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         setError(String(res.overwrite_result.reason || i18nT('pages.artifactDetailPage.could_not_overwrite')))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.overwrite_failed'))
+      // A refused flush is already shown by the page's conflict notice.
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.overwrite_failed'))
     } finally {
       setOverwriting(false)
     }
@@ -2157,10 +2609,27 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
       if ((res as { error?: string })?.error) setError(String((res as { error?: string }).error))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.snapshot_failed'))
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.snapshot_failed'))
     } finally {
       setSnapshotting(false)
     }
+  }
+
+  // A failed provider-registry or upstream-status probe used to hide the whole
+  // banner, so a sync problem looked like "nothing to sync". Surface it instead.
+  const probeError = providersError ?? statusError
+  if (probeError) {
+    return (
+      <div className="mb-3 flex items-center gap-2 text-[13px]">
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice
+          variant="inline"
+          title={i18nT('pages.artifactDetailPage.sync_status_unavailable')}
+          message={(errMessage(probeError) || i18nT('components.errorBoundary.something_went_wrong'))}
+        />
+      </div>
+    )
   }
 
   // No registered provider → no sync surface (public edition renders nothing).
@@ -2179,11 +2648,12 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
       <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-md border text-[13px] border-warn/40 bg-warn-subtle text-warn">
         <Camera size={14} className="lucide-inline shrink-0" />
         <span className="flex-1">{i18nT('pages.artifactDetailPage.local_changes_not_yet_published_to')} {provLabel}.</span>
-        {error && <span className="text-danger">{error}</span>}
+        {/* No hand-off: editor buffer editedContent may be dirty */}
+        <ErrorNotice variant="inline" message={error} />
         <Btn
           type="button"
           onClick={handleSnapshot}
-          disabled={snapshotting}
+          disabled={snapshotting || busy}
           className="gap-1 px-2 py-0.5 text-[12px] font-medium border-warn/50 hover:bg-warn/10"
           title={i18nT('pages.artifactDetailPage.snapshot_the_current_content_as_a_new_version_an')}
         >
@@ -2237,7 +2707,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         <Btn
           type="button"
           onClick={handlePull}
-          disabled={pulling || overwriting}
+          disabled={pulling || overwriting || busy}
           className={`gap-1 px-2 py-0.5 text-[12px] font-medium ${tone.btn}`}
           title={i18nT('pages.artifactDetailPage.pull_the_latest_remote_content_as_a_new_local_ve')}
         >
@@ -2249,7 +2719,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         <Btn
           type="button"
           onClick={handleOverwrite}
-          disabled={overwriting || pulling}
+          disabled={overwriting || pulling || busy}
           className={`gap-1 px-2 py-0.5 text-[12px] font-medium ${tone.btn}`}
           title={i18nT('pages.artifactDetailPage.push_your_local_version_up_as_the_remote_s_new_v')}
         >
@@ -2257,7 +2727,8 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
           {i18nT('pages.artifactDetailPage.overwrite_remote')}
         </Btn>
       )}
-      {error && <span className="text-danger text-[11px]">{error}</span>}
+      {/* No hand-off: editor buffer editedContent may be dirty */}
+      <ErrorNotice variant="inline" message={error} />
       {notice && !error && <span className="text-muted text-[11px]">{notice}</span>}
     </div>
   )

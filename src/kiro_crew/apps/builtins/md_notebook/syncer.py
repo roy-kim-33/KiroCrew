@@ -5,13 +5,13 @@ and cancelled on ``app.on_cleanup``. Every :data:`TICK_SEC` seconds it re-reads
 ``settings.json`` and, when the configured interval has elapsed, commits, merges
 and pushes every writable vault exactly as ``POST /api/sync`` does.
 
-WHY IT LIVES HERE rather than in the page. Auto-sync used to be a
-``window.setInterval`` inside the Notes React page, so closing the tab — or
-navigating to another app — stopped syncing entirely, silently and with no
-indication that notes had stopped reaching the remote. A backup that only runs
-while you are looking at it is the one case where the user believes they are
-covered and are not. Living in the app's own backend means the interval is
-honoured while the gateway runs, with no dashboard tab open.
+WHY IT LIVES HERE rather than in the page. A ``window.setInterval`` inside the
+Notes React page stops syncing entirely when the tab closes — or the user
+navigates to another app — silently and with no indication that notes have
+stopped reaching the remote. A backup that only runs while you are looking at it
+is the one case where the user believes they are covered and are not. Living in
+the app's own backend means the interval is honoured while the gateway runs,
+with no dashboard tab open.
 
 It is NOT a cron job: it runs inside this backend process only, and stops when the
 process does.
@@ -206,20 +206,25 @@ async def _sync_vault(vault: dict[str, Any]) -> None:
     unattended run, so a repointed remote would send the user's notes somewhere
     new with no step at which they could intervene.
     """
-    result = await git_ops.sync(
-        vault["localPath"],
-        branch=vault.get("branch"),
-        pat=await server.resolve_auth(),
-        subfolder=vault.get("subfolder"),
-        trusted_remote=vault.get("remoteUrl"),
-        trusted_gitdir=vault.get("gitDir"),
-        local_only=bool(vault.get("localOnly")),
-        # A timer chose this moment, not the user, so stage notes ONLY — a stray
-        # non-note file dropped in the vault must not be committed and pushed to
-        # the remote without the user deciding to send it. The manual Sync keeps
-        # staging the whole scope because the user pressed it.
-        notes_only=True,
-    )
+    # Shared with the note writers: the merge below rewrites the working tree,
+    # and a note must not be created through a folder it is replacing — see
+    # `server.vault_write_lock`.
+    async with server.vault_write_lock(vault["localPath"]):
+        result = await git_ops.sync(
+            vault["localPath"],
+            branch=vault.get("branch"),
+            pat=await server.resolve_auth(),
+            subfolder=vault.get("subfolder"),
+            trusted_remote=vault.get("remoteUrl"),
+            trusted_gitdir=vault.get("gitDir"),
+            local_only=bool(vault.get("localOnly")),
+            # A timer chose this moment, not the user, so stage notes ONLY — a
+            # stray non-note file dropped in the vault must not be committed and
+            # pushed to the remote without the user deciding to send it. The
+            # manual Sync keeps staging the whole scope because the user pressed
+            # it.
+            notes_only=True,
+        )
     await server.rebuild_cache(vault)
     if server.synced_cleanly(result):
         await server.record_last_sync(vault["id"])

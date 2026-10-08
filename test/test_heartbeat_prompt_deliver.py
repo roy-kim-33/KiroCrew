@@ -448,7 +448,7 @@ class TestSlotPrefixMatch:
         """When multiple slots share the prefix, return the one with the largest
         trailing <timestamp> (newest) — NOT dict-insertion order. A gateway
         restart can leave a stale slot alongside the live one; iteration-order
-        tie-break used to route chat-N to the stale slot.
+        tie-break would route chat-N to the stale slot.
         """
         from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
@@ -570,3 +570,38 @@ class TestEnqueueOrRunPrompt:
             await slot.task
         except asyncio.CancelledError:
             pass
+
+    @pytest.mark.asyncio()
+    async def test_a_queued_prompt_starts_its_durable_write(self):
+        """Returning False is a receipt, so the write that makes it durable starts.
+
+        Until the drain writes the prompt's transcript row the queue is its only
+        record, so a restart inside the periodic flush interval loses a prompt the
+        caller was told had landed. ``start_queue_persist`` exists to close exactly
+        that window at every point a prompt is accepted onto a slot queue, and this
+        method is one of them, so every caller gets the write rather than one path.
+
+        Mutation guard: drop the ``start_queue_persist`` call and no write starts.
+        """
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        slot = _ChatSlot(key="chat-1")
+        # A turn still in flight, so the prompt queues.
+        slot.task = MagicMock(done=MagicMock(return_value=False))
+        state = MagicMock()
+        state._background_tasks = set()
+
+        ran = slot.enqueue_or_run_prompt("hold this durably", AsyncMock(), state)
+        # The write is started, not awaited, and runs in an executor.
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if state.flush_slot_now.call_args_list:
+                break
+
+        assert ran is False
+        assert state.flush_slot_now.call_args_list == [
+            ((slot,), {})
+        ], "the durable write for this slot's queue must have been started"

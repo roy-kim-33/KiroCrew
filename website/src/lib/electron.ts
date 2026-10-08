@@ -15,7 +15,7 @@
  * neither `.mac-electron` nor `.win-electron` applies, which is the correct
  * zero-inset layout, locked in by App.linuxElectron.test.tsx.
  */
-const mc = (window as { kirocrew?: { isElectron?: boolean; platform?: string; linuxFrameless?: boolean } }).kirocrew
+const mc = window.kirocrew
 
 export const isElectron = !!mc?.isElectron
 export const isMacElectron = isElectron && mc?.platform === 'darwin'
@@ -48,7 +48,7 @@ export const LINUX_CAPTION_CONTROLS_WIDTH = 108
  * does.
  */
 export function electronPlatform(): string | undefined {
-  return (window as { kirocrew?: { platform?: string } }).kirocrew?.platform
+  return window.kirocrew?.platform
 }
 
 /**
@@ -61,7 +61,7 @@ export function electronPlatform(): string | undefined {
  * `window.kirocrew` per-case without import-order coupling.
  */
 export function pathForFile(file: File): string {
-  const k = (window as { kirocrew?: { getPathForFile?: (f: File) => string } }).kirocrew
+  const k = window.kirocrew
   try {
     return k?.getPathForFile?.(file) || ''
   } catch {
@@ -73,7 +73,54 @@ export function pathForFile(file: File): string {
 export const TRAFFIC_LIGHT_INSET_PX = 84
 
 /**
+<<<<<<< HEAD
  * Width reserved on the right for the titleBarOverlay caption buttons
+=======
+ * Top band kept clear while the window is in macOS native fullscreen. AppKit
+ * owns the top strip there: pointing at it slides the menu bar down over the
+ * window, so a control laid out at y=0 (the header and its crew switcher) can
+ * no longer be clicked. Shifting the dashboard down by the menu bar's height
+ * puts the header below that strip.
+ */
+export const MAC_FULLSCREEN_TOP_RESERVE_PX = 24
+
+/**
+ * Whether the "Open in editor" affordance can work in this window.
+ *
+ * True only when the desktop shell's `fileOpenAPI` preload bridge is present.
+ * A plain browser tab and the PWA expose no such bridge, so the caller hides
+ * the control there and the built-in viewer stays the only handoff — matching
+ * how `browserAPI`/`zoomAPI`/`wslAPI` consumers feature-detect their bridges.
+ * Read lazily (not a module-load capture) so a test can stub `window.fileOpenAPI`
+ * per-case, exactly as `pathForFile` stubs `window.kirocrew`.
+ */
+export function canOpenFileInEditor(): boolean {
+  return typeof (window as { fileOpenAPI?: { open?: unknown } }).fileOpenAPI?.open === 'function'
+}
+
+/**
+ * Hand a filesystem PATH to the desktop shell to open in the OS default handler
+ * on the user's own machine (via shell.openPath in the main process) — never a
+ * URL scheme. Resolves the main process's { ok, error? } verdict, or
+ * { ok: false, error: 'unavailable' } when no bridge is present, so a caller in
+ * a plain browser gets a definite negative rather than a thrown error.
+ */
+export async function openFileInEditor(
+  filePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const api = (window as {
+    fileOpenAPI?: { open?: (p: string) => Promise<{ ok: boolean; error?: string }> }
+  }).fileOpenAPI
+  if (typeof api?.open !== 'function') return { ok: false, error: 'unavailable' }
+  try {
+    return await api.open(filePath)
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+/**
+ * Width reserved on the right for the Windows titleBarOverlay caption buttons
+>>>>>>> upstream/main
  * (minimize/maximize/close). The overlay is 138px wide at default DPI on
  * Windows 10/11 and on Linux desktops. The header must not place interactive
  * controls in this zone.
@@ -81,6 +128,7 @@ export const TRAFFIC_LIGHT_INSET_PX = 84
 export const WIN_CAPTION_OVERLAY_WIDTH = 138
 
 /**
+<<<<<<< HEAD
  * True on Electron desktop platforms whose title bar is an overlay of native
  * caption buttons (Windows only — see WIN_CAPTION_OVERLAY_WIDTH). macOS
  * instead insets native traffic lights on the left; frameless Linux has no
@@ -89,6 +137,41 @@ export const WIN_CAPTION_OVERLAY_WIDTH = 138
  * this to reserve the right-side strip.
  */
 export const hasCaptionOverlay = isWinElectron
+=======
+ * Height of the caption band at the top of a frameless window: the 42px header
+ * row. The Windows titleBarOverlay is sized to it (its height is derived from
+ * the header px, scaled by renderer zoom — `titleBarOverlayOptions` in
+ * electron/windows-titlebar.js:30-37, so 42 CSS px at any zoom) and the injected
+ * Linux caption controls hard-code the same 42px tall band
+ * (electron/runtime/window/linux-captions.js:49).
+ *
+ * This constant RESTATES those two values rather than deriving them, so if the
+ * header height ever changes update all three in lockstep: the Windows overlay
+ * is driven by the runtime header px, the Linux CSS hard-codes 42px, and this
+ * is the renderer-side mirror the portaled viewers read.
+ */
+export const CAPTION_BAND_HEIGHT_PX = 42
+
+/**
+ * Top clearance for the controls of a full-window overlay that is portaled to
+ * <body> (the image and diagram viewers). Those overlays sit outside the shell
+ * div that carries `.win-electron` / `.linux-electron`, so the header's CSS
+ * insets never reach them, and their top-right controls land under the OS
+ * caption buttons and inside the window drag strip. Pushing the control row
+ * below the band keeps it in the corner users expect, without parking the
+ * viewer's close button next to the window's own.
+ *
+ * Non-zero on frameless Windows, frameless Linux, and inside an embedded
+ * remote pane whose Windows host relays `.embedded-win-inset` on <html>
+ * (EmbeddedHostBridge). Read at render time, not module load, because that
+ * class toggles at runtime.
+ */
+export function overlayCaptionClearancePx(): number {
+  if (isWinElectron || isLinuxFramelessElectron) return CAPTION_BAND_HEIGHT_PX
+  if (document.documentElement.classList.contains('embedded-win-inset')) return CAPTION_BAND_HEIGHT_PX
+  return 0
+}
+>>>>>>> upstream/main
 
 /**
  * True when an app declares `platform.requiresDesktopApp` but we are in a

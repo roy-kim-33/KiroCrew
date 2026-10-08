@@ -22,7 +22,7 @@ no public endpoint, webhook, or tunnel is required.
 
 ## Setup
 
-1. Open **Settings → Channels → WeChat**.
+1. Open **Settings → Messaging Channels → WeChat**.
 2. Click **Connect via QR**.
 3. Scan the code with the WeChat mobile app and confirm on your phone.
 4. Restart the gateway. The status pill turns **Connected**.
@@ -31,7 +31,7 @@ The bot credential is written server-side (into the credential store, never
 returned to the browser); only the non-secret account id and connection status
 are exposed to the dashboard.
 
-## Access policy
+## Access control
 
 `Who can message the bot` maps to `weixin.dm_policy`:
 
@@ -45,7 +45,10 @@ The default is **`allowlist` with an empty list, which authorizes nobody** — a
 freshly connected bot ignores every DM until you add an id. This matches the
 other channels (Telegram/Discord are fail-closed the same way). An unrecognized
 value also denies. To collect a user ID, have the person DM the bot once and read
-the id from the gateway log.
+the id from the security event log (`~/.kiro/crew/security_events.jsonl`): the
+refused DM is recorded as a denied `weixin_transport.authorize` event whose
+`caller` is their user id. The gateway log does not show it, because it logs a
+sender only after the message is admitted.
 
 Dashboard delivery uses `target_id` values `user:<user-id>`. Destinations include allowed user IDs and users seen by the gateway, while actual proactive delivery is rechecked against the current `dm_policy`.
 
@@ -62,7 +65,7 @@ Context length is managed automatically: at `weixin.soft_threshold_pct` (80%) th
 bot suggests `/compact` or `/new`; at `weixin.hard_threshold_pct` (95%) it
 compacts on its own.
 
-## Behaviour notes
+## Limits
 
 - **One reply per turn.** iLink cannot edit a sent message, so the answer is
   buffered and delivered when the turn completes rather than streamed. The native
@@ -74,8 +77,12 @@ compacts on its own.
 - **No approval buttons.** iLink has no interactive controls, so the channel runs
   the approval ladder without a decider: `interactive` mode is deny-by-default,
   while `auto` / `trust` behave normally.
+- **Not an owner-DM target.** The peer list is learned from inbound traffic, so
+  "the owner" cannot be resolved to a known person here. Rather than risk
+  delivering to whoever last messaged the bot, this channel is excluded from
+  owner-DM routing: a `send_message` aimed at it will not arrive.
 
-## Configuration reference
+## Settings reference
 
 Set under `weixin` in `config.json` (or via the Settings panel):
 
@@ -102,8 +109,14 @@ credential store) and overrides `weixin.token`.
 | `errcode -2` | iLink rate limit; the poller backs off automatically |
 | Bot ignores DMs | Check `dm_policy` — under `allowlist` the sender must be listed |
 | Group messages ignored | Expected: iLink bot identities do not receive group events |
-| An image, voice note or file isn't read | The message arrived but the file was skipped — the gateway log shows `attachment_skip` with the reason. Video is never read; send a screenshot instead |
-| Startup error about `aiohttp` | Install the messaging extra |
+| An image, voice note or file isn't read | The message arrived but the file was skipped — the security event log (`~/.kiro/crew/security_events.jsonl`) has a `weixin.attachment_skip` event with the file name and the reason. Video is never read; send a screenshot instead |
+| Startup error about `aiohttp` | `aiohttp` is a core dependency, so the environment is broken; reinstall Kiro Crew |
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables
 
 ## Attribution
 

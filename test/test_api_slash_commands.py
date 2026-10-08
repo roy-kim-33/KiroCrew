@@ -22,8 +22,13 @@ from kiro_crew.dashboard.chat_utils import (
 )
 
 
+<<<<<<< HEAD
 def _fake_config(acp_backend: str):
     return SimpleNamespace(agent=SimpleNamespace(acp_backend=acp_backend))
+=======
+def _fake_config(provider: str, acp_backend: str = ""):
+    return SimpleNamespace(agent=SimpleNamespace(provider=provider, acp_backend=acp_backend))
+>>>>>>> upstream/main
 
 
 def _make_app() -> web.Application:
@@ -34,10 +39,17 @@ def _make_app() -> web.Application:
     return app
 
 
+<<<<<<< HEAD
 async def _get(acp_backend: str):
     with patch(
         "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
         return_value=_fake_config(acp_backend),
+=======
+async def _get(provider: str, acp_backend: str = ""):
+    with patch(
+        "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
+        return_value=_fake_config(provider, acp_backend),
+>>>>>>> upstream/main
     ):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/slash-commands")
@@ -55,6 +67,15 @@ def test_description_map_covers_slash_commands():
 
 
 class TestApiSlashCommands:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend,supported", [("", False), ("claude", True)])
+    async def test_acp_todos_suggestion_uses_default_backend_capability(self, backend, supported):
+        payload = await _get("acp", backend)
+        names = {item["name"] for item in payload}
+
+        assert ("/todos" in names) is supported
+        assert not names & (_BLOCKED_SLASH_COMMANDS - {"/todos"})
+
     @pytest.mark.asyncio
     async def test_default_provider_returns_described_commands(self):
         payload = await _get("")
@@ -75,22 +96,34 @@ class TestApiSlashCommands:
     async def test_blocked_commands_absent_from_suggestions(self):
         """Regression guard: no blocked command may appear in the suggestion
         payload. /tangent regressed this way once — present in _SLASH_COMMANDS
+<<<<<<< HEAD
         (so the menu offered it) but rejected at execution time."""
         payload = await _get("")
+=======
+        (so the menu offered it) but rejected at execution time. /todos is also
+        blocked because the kiro-cli ACP harness does not implement it."""
+        payload = await _get("kiro")
+>>>>>>> upstream/main
         names = {item["name"] for item in payload}
         leaked = names & _BLOCKED_SLASH_COMMANDS
         assert not leaked, f"blocked commands advertised in menu: {sorted(leaked)}"
         assert "/tangent" not in names
+        assert "/todos" not in names
 
     @pytest.mark.asyncio
-    async def test_claude_code_provider_filters_blocked_commands(self):
+    @pytest.mark.parametrize("backend,supported", [("", False), ("claude", True)])
+    async def test_claude_code_provider_filters_blocked_commands(self, backend, supported):
         """The provider-reported path applies the same gate: a harness that
         reports a blocked command must not have it forwarded to the menu."""
-        provider = SimpleNamespace(_slash_commands=["compact", "tangent", "quit", "help"])
+        provider = SimpleNamespace(_slash_commands=["compact", "tangent", "todos", "quit", "help"])
         state = SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: [provider]))
         with patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
+<<<<<<< HEAD
             return_value=_fake_config("claude"),
+=======
+            return_value=_fake_config("claude_code", backend),
+>>>>>>> upstream/main
         ):
             app = _make_app()
             app["state"] = state
@@ -102,3 +135,4 @@ class TestApiSlashCommands:
         assert "/compact" in names and "/help" in names and "/side" in names
         assert "/tangent" not in names
         assert "/quit" not in names
+        assert ("/todos" in names) is supported

@@ -12,9 +12,10 @@ Pairing state machine (read by the Settings badge + QR flow):
     connected -> logged_out (phone revoked the link; needs a fresh pairing)
     connected -> banned (WhatsApp temporary ban; reason surfaced verbatim)
 
-The session database (whatsmeow's sqlite store) lives at
-``<data home>/whatsapp/session.db`` unless ``whatsapp.db_path`` overrides it.
-Deleting the file unpairs the device from this side.
+The session database (whatsmeow's sqlite store) always lives at
+``<data home>/whatsapp/session.db`` (:func:`default_db_path`); the
+``whatsapp.db_path`` setting is read-only and does not move it. Deleting the
+file unpairs the device from this side.
 """
 
 from __future__ import annotations
@@ -207,6 +208,7 @@ class WhatsAppClient:
         self.on_qr: Callable[[list[str]], None] | None = None
         self._client: Any = None
         self._idle_task: asyncio.Task | None = None
+        self._handler_tasks: set[asyncio.Task[Any]] = set()
         self.connected_at: float | None = None
         #: latest rotating QR codes + monotonic stamp (Settings pairing UI).
         self.latest_qr: list[str] = []
@@ -362,12 +364,19 @@ class WhatsAppClient:
 
         @client.event(MessageEv)
         async def _on_message(_client: Any, event: Any) -> None:
-            if self.on_message is None:
-                return
+            task = asyncio.current_task()
+            if task is not None:
+                self._handler_tasks.add(task)
             try:
-                await self.on_message(event)
-            except Exception:  # noqa: BLE001 — one bad message must not kill inbound
-                logger.exception("whatsapp: inbound handler failed")
+                if self.on_message is None:
+                    return
+                try:
+                    await self.on_message(event)
+                except Exception:  # noqa: BLE001 — one bad message must not kill inbound
+                    logger.exception("whatsapp: inbound handler failed")
+            finally:
+                if task is not None:
+                    self._handler_tasks.discard(task)
 
         if not had_session:
             self._set_state(STATE_PAIRING, "waiting for first QR")

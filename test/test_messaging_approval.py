@@ -623,9 +623,8 @@ class TestReservationRace:
     ``TurnDriver`` dispatches ``PROMPT_CHOICE`` and only then awaits the decider,
     so the prompt is visible in the room for a whole REST round trip before
     ``decide`` would have registered anything. An answer arriving in that window
-    used to find nothing pending, fall through to the mid-turn path, and be
-    discarded — the user watched their decision do nothing and the tool denied
-    itself minutes later.
+    must still resolve the pending choice, not fall through to the mid-turn path
+    and get discarded while the user waits on a decision that does nothing.
     """
 
     @pytest.mark.asyncio
@@ -699,3 +698,33 @@ class TestReservationRace:
         assert pending.resolve("s1", True) is False
         assert task.done() is False
         task.cancel()
+
+
+class TestApprovalHoldRelease:
+    """An answered prompt resumes a loop paused for approval; silence does not."""
+
+    @pytest.mark.asyncio
+    async def test_an_answer_releases_and_a_timeout_does_not(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew import autonudge
+
+        released: list[str | None] = []
+        stalled: list[str] = []
+        monkeypatch.setattr(
+            autonudge, "release_approval_hold_for", lambda key, *, why: released.append(key)
+        )
+        monkeypatch.setattr(approval, "_notify_approval_stalled", stalled.append)
+        session = "slack:T1:C1:1700000000.000100"
+        pending = PendingApprovals("webex")
+
+        task = asyncio.create_task(pending.decide(session, _event()))
+        await _until(lambda: pending.has_pending(session))
+        assert pending.resolve(session, True) is True
+        assert await task is True
+        assert released == [autonudge.binding_key_for(session)]
+
+        monkeypatch.setattr("kiro_crew.messaging.approval.APPROVAL_TIMEOUT_S", 0.01)
+        assert await pending.decide(session, _event("req-2")) is False
+        assert released == [autonudge.binding_key_for(session)], "a timeout released the hold"
+        assert stalled == [session]

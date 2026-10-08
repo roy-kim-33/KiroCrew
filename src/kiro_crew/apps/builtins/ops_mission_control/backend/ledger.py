@@ -45,6 +45,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.models import (
 )
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ class _LedgerLock:
 
     def __enter__(self) -> _LedgerLock:
         lock_file = app_data_dir(APP_NAME) / _LOCK_FILENAME
-        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(lock_file.parent)
         self._fd = os.open(str(lock_file), os.O_CREAT | os.O_RDWR, 0o600)
         platform_compat.acquire_lock(self._fd, exclusive=True)
         return self
@@ -308,13 +309,23 @@ def _reconcile(prior: LedgerEntry, other: LedgerEntry) -> LedgerEntry:
 def _write_all(entries: list[LedgerEntry]) -> None:
     """Rewrite the whole ledger. Only the hygiene pass should call this."""
     payload = "".join(json.dumps(entry.to_dict(), sort_keys=True) + "\n" for entry in entries)
-    atomic_write(ledger_path(), payload)
+    # ``newline="\n"`` is load-bearing, not tidiness. This file is COMMITTED and PUSHED to
+    # the team's shared remote by ``ledger_sync``, and ``atomic_write`` defaults to
+    # ``newline=None`` (universal translation), so a hygiene pass on a Windows host would
+    # rewrite every line with CRLF. Reads survive it, so it is invisible locally — but on
+    # a teammate's clone the whole ledger turns into one all-lines diff, and every merge
+    # after that conflicts on lines nobody edited.
+    atomic_write(ledger_path(), payload, newline="\n")
 
 
 def _append(entry: LedgerEntry) -> None:
     path = ledger_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
+    ensure_directory(path.parent)
+    # ``newline="\n"`` for the same shared-repo reason as ``_write_all``, and this is the
+    # hotter path: it runs on every single lesson written, not once a day.
+    with open(
+        path, "a", encoding="utf-8", newline="\n", opener=owner_only_opener_for(path)
+    ) as handle:
         handle.write(json.dumps(entry.to_dict(), sort_keys=True) + "\n")
 
 
@@ -371,7 +382,7 @@ def match(
     provider_key: str = "",
     limit: int = MAX_MATCHES_PER_SIGNAL,
 ) -> list[LedgerEntry]:
-    """Entries that have previously matched this failure.
+    """Entries that match this failure.
 
     Two keys, tried in order of how much they can be trusted:
 
@@ -473,7 +484,7 @@ def record_use(entry_id: str, fingerprint: str = "", provider_key: str = "") -> 
     differently-worded alarm gets attached to the entry that already knows the
     fix. Binding the ``provider_key`` is what turns the FIRST fuzzy match into an
     exact one for every later occurrence — the entry learns the provider's own identity
-    for the failure, so the next recurrence no longer depends on the shape hash.
+    for the failure, so the next recurrence does not depend on the shape hash.
 
     Locked read-modify-write: a bare ``read_entries``/``_write_all`` here would clobber a
     concurrent ``upsert`` or hygiene rewrite. See ``_LedgerLock``.
@@ -632,8 +643,8 @@ def hygiene(*, now: datetime | None = None) -> dict[str, int]:
     - ``decayed`` — nobody needed this for ``DECAY_AFTER_DAYS``. Says nothing about
       whether the fix works; the estate moved on.
     - ``demoted`` — the fix was cited and the failure came back (``miss_count``). This is
-      evidence AGAINST the entry, which is the movement the ledger previously had no
-      mechanism for at all.
+      evidence AGAINST the entry: the one downward movement that says the entry is
+      wrong rather than merely unused.
 
     Collapsing them into one number would let "your ledger is going stale" and "your
     ledger is wrong" arrive as the same sentence.
@@ -769,14 +780,14 @@ def stats() -> dict[str, int]:
         "verified": sum(1 for e in entries if e.trust == TRUST_VERIFIED),
         "high_confidence": sum(1 for e in entries if e.confidence == CONFIDENCE_HIGH),
         "total_uses": sum(e.use_count for e in entries),
-        # ``verified`` and ``high_confidence`` are each one HALF of the old fast-path bar,
-        # so neither answers "how much of this ledger would an agent actually propose
-        # without checking". This does, and it now includes the track-record floor — which
-        # is why it can be strictly smaller than either of the two above and why showing
-        # them alone overstated the ledger's authority.
+        # ``verified`` and ``high_confidence`` are each one HALF of the fast-path bar, so
+        # neither answers "how much of this ledger would an agent actually propose
+        # without checking". This does, and it includes the track-record floor — which
+        # is why it can be strictly smaller than either of the two above, and why showing
+        # them alone overstates the ledger's authority.
         "proven": sum(1 for e in entries if entry_unlocks_fast_path(e)),
         # Entries carrying evidence their fix did not hold. The number an operator most
-        # needs and the one the app could not previously produce at all.
+        # needs, and the one no other field in this dict can express.
         "demoted": sum(1 for e in entries if is_demoted(e)),
         "total_misses": sum(e.miss_count for e in entries),
     }

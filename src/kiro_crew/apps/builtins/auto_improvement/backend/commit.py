@@ -24,7 +24,7 @@ from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import _prefer_authenticated_remote
-from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
+from ..spine.git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 from ..spine.push_policy import (
     authorize_direct_push,
     describe_scan,
@@ -83,7 +83,7 @@ def _git(
     # ``pr_watchers._git``. Scanning REPLACED text is still correct here: the replacement
     # only affects bytes that were never valid UTF-8, so no ASCII secret can hide behind it.
     return subprocess.run(
-        ["git", "-C", str(clone), *_GIT_SAFE_CONFIG, *args],
+        ["git", "-C", str(clone), *_GIT_SAFE_CONFIG, *hook_off_args(clone), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -138,7 +138,7 @@ def materialize_queued_diff(
                 # Redact BEFORE the bound: git echoes the authenticated remote URL —
                 # userinfo and all — on an auth failure, and a slice can cut the
                 # credential mid-match into a fragment the downstream serving route's
-                # redaction pass no longer recognises.
+                # redaction pass does not recognise.
                 "error": (
                     f"could not fetch {branch}: " f"{redact_via_context(fetch.stderr or '')[:160]}"
                 ),
@@ -169,24 +169,19 @@ def materialize_queued_diff(
 
     apply_proc = subprocess.run(
         ["git", "-C", str(clone), "apply", "--index", "-"],
-        input=diff_text,
+        # Binary stdin preserves patch newlines on Windows; surrogateescape
+        # restores any non-UTF-8 bytes exactly as captured.
+        input=diff_text.encode("utf-8", errors="surrogateescape"),
         capture_output=True,
         timeout=_GIT_TIMEOUT_S,
-        # The queued diff is a byte-exact payload; surrogateescape re-encodes
-        # any non-UTF-8 byte back exactly as captured.
-        text=True,
-        encoding="utf-8",
-        errors="surrogateescape",
     )
     if apply_proc.returncode != 0:
         # Leave the tree clean so a retry or the draft-PR path still works.
         _git(clone, "reset", "--hard", base_ref_local)
+        stderr = (apply_proc.stderr or b"").decode("utf-8", errors="replace")
         return {
             "ok": False,
-            "error": (
-                f"the queued diff did not apply: "
-                f"{redact_via_context(apply_proc.stderr or '')[:160]}"
-            ),
+            "error": f"the queued diff did not apply: {redact_via_context(stderr)[:160]}",
         }
     return {"ok": True, "base": base_ref_local}
 
@@ -266,7 +261,7 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
             return {"ok": False, "error": "repository isolation check failed — re-run setup"}
     except IsolationProbeError as exc:
         # A crashed probe is a sandbox failure, not an isolation verdict — re-running
-        # setup cannot fix it, so surface the real reason instead (#8151).
+        # setup cannot fix it, so surface the real reason instead.
         return {"ok": False, "error": str(exc)}
 
     diff_text = diff_path.read_text(encoding="utf-8")
@@ -328,9 +323,8 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     # rather than to an unguarded push.
 
     # Resolved from the SAME source `materialize_queued_diff` fetched through, so the base
-    # this commit sits on and the url it is pushed to cannot disagree. (It used to be one
-    # local variable shared by both steps; the fetch moved into the helper, so recompute it
-    # here from `config` rather than threading it back out.)
+    # this commit sits on and the url it is pushed to cannot disagree. (The fetch lives in
+    # that helper, so this is recomputed here from `config` rather than threaded back out.)
     configured_url = resolve_origin_url(config)
     remote_url = _prefer_authenticated_remote(configured_url) if configured_url else ""
     url = remote_url or _resolve_push_url(clone, _prefer_authenticated_remote)

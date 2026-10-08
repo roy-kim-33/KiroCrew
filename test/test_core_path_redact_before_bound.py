@@ -1,4 +1,4 @@
-"""Redact-before-bound at the core-path slice sites (issue #7390).
+"""Redact-before-bound at the core-path slice sites.
 
 A bounded slice applied to text BEFORE it is passed to a redactor can cut a
 credential at the slice boundary into fragments no redaction regex matches, so
@@ -13,12 +13,13 @@ Two layers of pinning, mirroring ``test_theme_clone_stderr_redact_before_bound``
 - Behavioral straddle tests on the pure display helpers: the secret is laid out
   so the bound falls INSIDE it, so a raw slice AND a slice-then-redact reorder
   both go red.
-- A structural AST scan over every module the issue names: a bounded char slice
-  may never appear INSIDE a redact call's argument expression. Deliberate
-  limits: a slice of a renamed local later fed to a redactor is beyond this
-  scan — the behavioral tests carry that shape. Constant bounds under 10 are
-  ignored to keep whole-item idioms (``splitlines()[-1:]``, ``raw[:7]`` hex)
-  out of scope: it is the wide CHAR slice that severs a secret.
+- A structural AST scan over every module the issue names, and over every module
+  of the packages it scans whole: a bounded char slice may never appear INSIDE a
+  redact call's argument expression. Deliberate limits: a slice of a renamed
+  local later fed to a redactor is beyond this scan — the behavioral tests carry
+  that shape. Constant bounds under 10 are ignored to keep whole-item idioms
+  (``splitlines()[-1:]``, ``raw[:7]`` hex) out of scope: it is the wide CHAR
+  slice that severs a secret.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ class TestArtifactSnippetStraddle:
 class TestToolResultPartStraddle:
     """Tool-output parts must be redacted as ONE combined text, bounded after.
 
-    Two failure shapes are pinned: a credential straddling what used to be a
+    Two failure shapes are pinned: a credential straddling a
     per-part cut (a bound applied before redaction severs it into unmatchable
     fragments), and a multi-line PEM key whose header and footer arrive in
     DIFFERENT parts (per-part redaction can never see it whole — only the
@@ -161,20 +162,42 @@ class TestToolResultPartStraddle:
         assert "[REDACTED" in event.tool_output
 
 
-# Every module the issue names, relative to the repo root. The scan pins the
-# WHOLE module, not just the fixed lines, so a new slice-before-redact call
-# shape in these files goes red immediately.
+def _package_modules(package: str) -> list[str]:
+    """Every module of *package* outside its ``tests`` directories, repo-relative."""
+    root = _REPO_ROOT / package
+    return sorted(
+        path.relative_to(_REPO_ROOT).as_posix()
+        for path in root.rglob("*.py")
+        if "tests" not in path.relative_to(root).parts
+    )
+
+
+# Packages scanned whole, each with a floor: how many of its modules must make a
+# redact call the scan can see. Enumerated from the package directory, so a module
+# added to one is scanned without an edit here, and the floor fails a scan that
+# stops reaching the package's owners instead of passing on nothing.
+_SCANNED_PACKAGES = {
+    # The Research Lab facade and the campaign engine it is composed from.
+    "src/kiro_crew/apps/builtins/auto_research": 8,
+}
+
+# Every module the issue names, then every module of the packages scanned whole,
+# relative to the repo root. The scan pins the WHOLE module, not just the fixed
+# lines, so a new slice-before-redact call shape in these files goes red
+# immediately.
 _SCANNED_MODULES = [
     "src/kiro_crew/channel.py",
     "src/kiro_crew/dashboard/chat_runner.py",
     "src/kiro_crew/acp/_dispatch.py",
     # Its near-twin: AcpClient carries a hand-copied tool-result extractor with
     # the same shape, and its absence from this list is why the bound-then-redact
-    # ordering survived there (issue #7799). NOTE the scan would not have caught
+    # ordering survived there. NOTE the scan would not have caught
     # that instance -- the slice was a separate statement, not an argument to the
     # redactor -- so the behavioural pin for it lives in
     # test_acp_client.py::test_credential_straddling_the_bound_is_still_redacted.
     "src/kiro_crew/acp/client.py",
+    # The client's error formatter and classifiers, with their redactor calls.
+    "src/kiro_crew/acp/transport_errors.py",
     "src/kiro_crew/dashboard/handlers/artifacts.py",
     "src/kiro_crew/dashboard/handlers/discover.py",
     "src/kiro_crew/mcp_tools/control.py",
@@ -184,18 +207,30 @@ _SCANNED_MODULES = [
     "src/kiro_crew/slack/gateway.py",
     "src/kiro_crew/telegram/renderer.py",
     "src/kiro_crew/subagent_manager/continuation.py",
-    "src/kiro_crew/apps/builtins/auto_research/handlers.py",
+    *(rel for package in _SCANNED_PACKAGES for rel in _package_modules(package)),
 ]
 
 
 class TestNoSliceInsideRedactCallInNamedModules:
-    """Structural class pin over every module issue #7390 names."""
+    """Structural class pin over every module this suite names."""
 
     def test_no_bounded_slice_inside_a_redact_call(self) -> None:
         offenders: list[str] = []
         for rel in _SCANNED_MODULES:
             offenders += _find_slice_inside_redact_call(_REPO_ROOT / rel)
         assert offenders == []
+
+    def test_every_package_scanned_whole_reaches_its_redacting_modules(self) -> None:
+        for package, floor in _SCANNED_PACKAGES.items():
+            redacting = [
+                rel
+                for rel in _SCANNED_MODULES
+                if rel.startswith(f"{package}/") and _redact_calls(_REPO_ROOT / rel)
+            ]
+            assert len(redacting) >= floor, (
+                f"{package}: the scan reaches {len(redacting)} module(s) that call a "
+                f"redactor, under its floor of {floor}: {redacting}"
+            )
 
 
 def _call_name(call: ast.Call) -> str:
@@ -220,6 +255,16 @@ def _constant_bound(sl: ast.Slice) -> int | None:
         ):
             bound = max(bound or 0, edge.operand.value)
     return bound
+
+
+def _redact_calls(path: Path) -> list[ast.Call]:
+    """The calls in *path* the scan treats as redactor calls."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "redact" in _call_name(node).lower()
+    ]
 
 
 def _find_slice_inside_redact_call(path: Path) -> list[str]:

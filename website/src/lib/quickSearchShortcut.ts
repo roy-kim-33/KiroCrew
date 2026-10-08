@@ -1,5 +1,6 @@
 import { isMac } from '../utils/platform'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { CODE_TOKENS } from './shortcutRegistry'
 
 /**
  * Configurable activation shortcut for the Search Everywhere command palette.
@@ -54,6 +55,8 @@ export interface QuickSearchChord {
   key: string
   /** Cmd on macOS / Ctrl on Windows/Linux. */
   mod?: boolean
+  /** Control held independently on macOS; the same key as `mod` on Windows/Linux. */
+  ctrl?: boolean
   /** Option on macOS / Alt elsewhere. */
   alt?: boolean
   shift?: boolean
@@ -69,20 +72,33 @@ export interface QuickSearchConfig {
 export const DEFAULT_QUICK_SEARCH_CONFIG: QuickSearchConfig = { mode: 'mod-k' }
 
 /**
- * A custom chord must carry at least one command/option modifier (`mod` or
- * `alt`). A bare key — or Shift alone, which merely types a capital — would fire
+ * A custom chord must carry at least one non-shift modifier (`mod`, `ctrl`,
+ * or `alt`). A bare key — or Shift alone, which merely types a capital — would fire
  * mid-typing, so the recorder and the loader both reject it. This keeps a
  * malformed or hostile localStorage value from installing a footgun binding.
  */
 export function isValidChord(c: Partial<QuickSearchChord> | null | undefined): c is QuickSearchChord {
   if (!c || typeof c.key !== 'string' || c.key.trim() === '') return false
-  return c.mod === true || c.alt === true
+  return c.mod === true || c.ctrl === true || c.alt === true
+}
+
+/**
+ * US-layout shifted glyph → the unshifted key it sits on. Before
+ * {@link eventKeyToken} read punctuation from `code`, a Shift+punctuation chord
+ * was recorded with the SHIFTED glyph (Ctrl+Shift+` stored as `~`); mapping it
+ * back keeps those stored chords matching the positional token.
+ */
+const LEGACY_SHIFTED_GLYPHS: Readonly<Record<string, string>> = {
+  '~': '`', '<': ',', '>': '.', '?': '/', '|': '\\', '{': '[', '}': ']',
+  '_': '-', '+': '=', ':': ';', '"': "'",
 }
 
 /** Lowercase the key token so matching is case-insensitive and Shift-stable. */
 export function normalizeChord(c: QuickSearchChord): QuickSearchChord {
-  const out: QuickSearchChord = { key: c.key.toLowerCase() }
+  const lowered = c.key.toLowerCase()
+  const out: QuickSearchChord = { key: (c.shift && LEGACY_SHIFTED_GLYPHS[lowered]) || lowered }
   if (c.mod) out.mod = true
+  if (c.ctrl) out.ctrl = true
   if (c.alt) out.alt = true
   if (c.shift) out.shift = true
   return out
@@ -133,9 +149,10 @@ export function saveQuickSearchConfig(config: QuickSearchConfig): boolean {
 /**
  * The stable physical key token for a keydown, or `null` when the event carries
  * no usable key (a bare modifier press, or a dead key). Prefers
- * `KeyboardEvent.code` for letters/digits so the token is independent of Shift
- * state and the macOS Option layer; falls back to `KeyboardEvent.key` for named
- * keys (`ArrowUp`, `Enter`, punctuation).
+ * `KeyboardEvent.code` for letters, digits and punctuation so the token is
+ * independent of Shift state and the macOS Option layer — Ctrl+Shift+` reads as
+ * `` ` ``, not the `~` that `key` reports — and falls back to `KeyboardEvent.key`
+ * for named keys (`ArrowUp`, `Enter`).
  */
 export function eventKeyToken(e: Pick<KeyboardEvent, 'code' | 'key'>): string | null {
   const code = e.code
@@ -143,10 +160,28 @@ export function eventKeyToken(e: Pick<KeyboardEvent, 'code' | 'key'>): string | 
     if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase()
     if (/^Digit\d$/.test(code)) return code.slice(5)
     if (/^Numpad\d$/.test(code)) return code.slice(6)
+    const punct = CODE_TOKENS[code]
+    if (punct) return punct
   }
   const key = e.key
   if (!key || key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') return null
   return key.length === 1 ? key.toLowerCase() : key
+}
+
+/**
+ * The token a keydown matches, folded through {@link LEGACY_SHIFTED_GLYPHS}
+ * while Shift is held — the same fold {@link normalizeChord} applies to the
+ * stored side. Only a token read from `key` can carry a shifted glyph (an ISO
+ * `IntlBackslash` reporting `|`, or `~` on a Mac ISO board), so the fold leaves
+ * positional tokens alone. The typed glyph of a key that HAS a positional token
+ * is never matched: on many layouts it is another key's glyph (Italian
+ * Backquote types `\`), and matching it would hand one key's binding to another.
+ */
+function eventToken(e: Pick<KeyboardEvent, 'code' | 'key' | 'shiftKey'>): string | null {
+  const token = eventKeyToken(e)
+  if (token === null) return null
+  const lowered = token.toLowerCase()
+  return (e.shiftKey && LEGACY_SHIFTED_GLYPHS[lowered]) || lowered
 }
 
 /**
@@ -159,10 +194,11 @@ export function isModKEvent(e: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey'
 }
 
 /**
- * True when `e` exactly matches `chord` on the given platform. `mod` maps to
- * `metaKey` on macOS and `ctrlKey` elsewhere; the opposite primary modifier
- * must NOT be held (so a Mac ⌃J never satisfies a `mod` chord meant as ⌘J), and
- * `alt`/`shift` must match exactly. `mac` is injectable (defaulting to the
+ * True when `e` exactly matches `chord` on the given platform. On macOS `mod`
+ * is Meta and `ctrl` is Control, held independently (so a Mac ⌃J never
+ * satisfies a `mod` chord meant as ⌘J, and vice versa); off macOS both mean
+ * Control and Meta (the Windows key) must not be held — mirroring
+ * `chordMatchesEvent` in shortcutRegistry. `alt`/`shift` must match exactly. `mac` is injectable (defaulting to the
  * detected platform) so both behaviours are testable without reloading the
  * module — mirroring `isSettingsChord` in useKeyboardShortcuts.
  */
@@ -171,12 +207,13 @@ export function chordMatchesEvent(
   chord: QuickSearchChord,
   mac: boolean = isMac,
 ): boolean {
-  const token = eventKeyToken(e)
-  if (token === null || token.toLowerCase() !== chord.key.toLowerCase()) return false
-  const modDown = mac ? e.metaKey : e.ctrlKey
-  const crossModDown = mac ? e.ctrlKey : e.metaKey
-  if (crossModDown) return false
-  if (!!chord.mod !== modDown) return false
+  if (eventToken(e) !== chord.key.toLowerCase()) return false
+  if (mac) {
+    if (!!chord.mod !== e.metaKey || !!chord.ctrl !== e.ctrlKey) return false
+  } else {
+    if (e.metaKey) return false
+    if ((!!chord.mod || !!chord.ctrl) !== e.ctrlKey) return false
+  }
   if (!!chord.alt !== e.altKey) return false
   if (!!chord.shift !== e.shiftKey) return false
   return true
@@ -207,6 +244,8 @@ export function formatQuickSearchKeys(config: QuickSearchConfig, mac: boolean = 
 /** Human keycaps for a single chord, platform-aware (modifiers first, then key). */
 export function formatChordKeys(chord: QuickSearchChord, mac: boolean = isMac): string[] {
   const caps: string[] = []
+  // Off macOS `ctrl` and `mod` are the same key, so never render 'Ctrl' twice.
+  if (chord.ctrl && !(chord.mod && !mac)) caps.push(mac ? '⌃' : 'Ctrl')
   if (chord.mod) caps.push(mac ? '⌘' : 'Ctrl')
   if (chord.alt) caps.push(mac ? '⌥' : 'Alt')
   if (chord.shift) caps.push(mac ? '⇧' : 'Shift')

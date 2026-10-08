@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.artifacts import (
     MAX_CONTENT_BYTES,
     MAX_VERSIONS,
     Artifact,
     ArtifactComment,
+    ArtifactConflictError,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactValidationError,
     _infer_kind,
+    _new_content_token,
+    _validate_slug,
     detect_editor_kind,
     has_unthemed_hardcoded_colors,
     slugify,
@@ -31,6 +36,13 @@ from kiro_crew.artifacts import (
 def store(tmp_path: Path) -> ArtifactStore:
     """Fresh store rooted at a tmp dir."""
     return ArtifactStore(root=tmp_path / "artifacts")
+
+
+@pytest.fixture
+def sequential_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hand out distinct content tokens in order, so no comparison rests on chance."""
+    counter = itertools.count(1)
+    monkeypatch.setattr("kiro_crew.artifacts._new_content_token", lambda: f"{next(counter):064x}")
 
 
 # ── slugify ─────────────────────────────────────────────────────────────────
@@ -96,10 +108,21 @@ class TestSlugify:
     def test_collapses_punctuation(self) -> None:
         assert slugify("hello! world?? foo!! bar") == "hello-world-foo-bar"
 
-    def test_empty_falls_back(self) -> None:
-        assert slugify("") == "artifact"
-        assert slugify("!!!") == "artifact"
-        assert slugify("---") == "artifact"
+    def test_empty_falls_back_to_distinct_hash_slugs(self) -> None:
+        # No surviving slug-safe characters: fall back to artifact-<hash> so
+        # distinct inputs derive distinct slugs.
+        for name in ("", "!!!", "---"):
+            out = slugify(name)
+            assert out.startswith("artifact-")
+            assert _validate_slug(out) == out
+        assert slugify("!!!") != slugify("---")
+
+    def test_non_ascii_names_derive_distinct_stable_slugs(self) -> None:
+        chinese = slugify("\u4f1a\u8bae\u7eaa\u8981")
+        japanese = slugify("\u8cb7\u3044\u7269\u30ea\u30b9\u30c8")
+        assert chinese != japanese
+        assert chinese == slugify("\u4f1a\u8bae\u7eaa\u8981")
+        assert _validate_slug(chinese) == chinese
 
     def test_truncates_long_input(self) -> None:
         long = "a" * 300
@@ -196,6 +219,12 @@ class TestCreateValidation:
     def test_invalid_tag_format(self, store: ArtifactStore) -> None:
         with pytest.raises(ArtifactValidationError):
             store.create(name="x", content="a", tags=["bad tag with spaces"])
+
+    @pytest.mark.parametrize("tag", ["cr\n", "a" * 64 + "\n"])
+    def test_trailing_newline_tag_is_rejected(self, store: ArtifactStore, tag: str) -> None:
+        """A raw HTTP/store tag cannot use ``$``'s before-newline match."""
+        with pytest.raises(ArtifactValidationError):
+            store.create(name="x", content="a", tags=[tag])
 
     def test_dedupes_tags(self, store: ArtifactStore) -> None:
         art = store.create(name="x", content="a", tags=["a", "b", "a"])
@@ -298,12 +327,46 @@ class TestList:
     def test_empty(self, store: ArtifactStore) -> None:
         assert store.list() == []
 
-    def test_returns_newest_first(self, store: ArtifactStore) -> None:
+    def test_returns_newest_first(self, store: ArtifactStore, monkeypatch) -> None:
+        from kiro_crew import artifacts
+
+        # All timestamp reads within a write share its explicit instant.
+        now = "2026-01-01T00:00:00.000001+00:00"
+        monkeypatch.setattr(artifacts, "_now_iso", lambda: now)
         store.create(name="alpha", content="a")
+        now = "2026-01-01T00:00:00.000002+00:00"
         store.create(name="bravo", content="b")
+        now = "2026-01-01T00:00:00.000003+00:00"
         store.create(name="charlie", content="c")
         items = store.list()
         assert [a.slug for a in items] == ["charlie", "bravo", "alpha"]
+
+        now = "2026-01-01T00:00:00.000004+00:00"
+        store.update("alpha", content="updated oldest artifact")
+        assert [a.slug for a in store.list()] == ["alpha", "charlie", "bravo"]
+
+    def test_a_timestamp_tie_still_has_one_defined_order(
+        self, store: ArtifactStore, monkeypatch
+    ) -> None:
+        """Equal ``updated_at`` must not leave the order to the filesystem.
+
+        ``_now_iso`` is microsecond ISO, so two artifacts written inside one
+        microsecond carry the identical stamp. Sorting on ``updated_at`` alone is a
+        stable sort over equal keys, which preserves directory scan order and makes
+        "newest first" answer differently per platform and per filesystem -- Windows
+        CI failed ``test_artifacts_handlers.TestList.test_returns_items`` on exactly
+        that. The ``slug`` tie-break is what makes the answer total.
+        """
+        from kiro_crew import artifacts
+
+        monkeypatch.setattr(
+            artifacts, "_now_iso", lambda: "2026-01-01T00:00:00.000001+00:00"
+        )
+        # Created out of slug order, so passing cannot be an accident of insertion.
+        for name in ("bravo", "alpha", "charlie"):
+            store.create(name=name, content=name)
+
+        assert [a.slug for a in store.list()] == ["charlie", "bravo", "alpha"]
 
     def test_filter_by_tag(self, store: ArtifactStore) -> None:
         store.create(name="a", content="a", tags=["x"])
@@ -441,10 +504,10 @@ class TestList:
         assert {a.slug for a in results} == {"ok"}
 
     def test_list_skips_meta_with_bad_int_or_tags(self, store: ArtifactStore) -> None:
-        # Regression: _read_meta_file used to bubble ValueError (int("abc") on
-        # bad version field) and TypeError (list(non_iterable) on bad tags
-        # field) up through list(), crashing the whole library page on a
-        # single corrupted meta.json. Ensure those are now skipped+warned.
+        # _read_meta_file must skip a corrupted meta.json instead of bubbling a
+        # ValueError (int("abc") on a bad version field) or TypeError
+        # (list(non_iterable) on bad tags) up through list() and crashing the
+        # whole library page on a single bad file.
         store.create(name="ok", content="a")
 
         bad_version = store.root / "bad-version"
@@ -524,7 +587,7 @@ class TestSecurity:
         # Pretend the root path is sensitive
         from kiro_crew import artifacts as art_mod
 
-        monkeypatch.setattr(art_mod, "is_sensitive_path", lambda _p: True)
+        monkeypatch.setattr(art_mod, "sensitive_path_refusal", lambda _p: "Blocked: x")
         with pytest.raises(ArtifactError):
             ArtifactStore(root=tmp_path / "artifacts")
 
@@ -537,8 +600,11 @@ class TestSecurity:
     def test_snapshot_version_routes_through_read_gate(
         self, store: ArtifactStore, monkeypatch
     ) -> None:
-        # Regression: _snapshot_version() used to call src.read_text(encoding="utf-8") directly,
-        # bypassing the is_sensitive_path() gate enforced by self._read_text().
+        # _snapshot_version() reads through self._read_text(), not src.read_text()
+        # directly, so the sensitive-path gate always applies. The helper hands
+        # the gate the realpath it already computed through
+        # canonical_path_refusal; that is the name to patch, since the
+        # bounded is_sensitive_path is not on this read path.
         # If the gate ever started flagging artifact-internal paths (e.g. a
         # symlink expansion landing on a sensitive path), the snapshot read
         # must refuse rather than silently leak. Verify the gated helper is
@@ -546,30 +612,30 @@ class TestSecurity:
         from kiro_crew import artifacts as art_mod
 
         store.create(name="x", content="v1")
-        # First update succeeds — is_sensitive_path() returns False normally.
+        # First update succeeds: the gate returns False normally.
         store.update("x", content="v2", snapshot=True)
 
-        # Now make is_sensitive_path() return True for current.html only.
+        # Now make the gate return True for current.html only.
         # _snapshot_version reads from current.html via self._read_text() now;
         # that read must surface ArtifactError.
-        original = art_mod.is_sensitive_path
+        original = art_mod.canonical_path_refusal
 
-        def _selective(p: str) -> bool:
+        def _selective(p: str) -> str | None:
             if "current.html" in p:
-                return True
+                return "Blocked: x"
             return original(p)
 
-        monkeypatch.setattr(art_mod, "is_sensitive_path", _selective)
+        monkeypatch.setattr(art_mod, "canonical_path_refusal", _selective)
         with pytest.raises(ArtifactError):
             store.update("x", content="v3", snapshot=True)
 
 
 class TestSharedLockAcrossInstances:
-    """#2492: two ``ArtifactStore`` instances pointed at the same root must
+    """Two ``ArtifactStore`` instances pointed at the same root must
     serialize against EACH OTHER, not just against themselves.
 
-    ``__init__`` used to hand out a fresh ``threading.Lock()`` per instance —
-    correct for a single long-lived store, but any code constructing its own
+    A fresh ``threading.Lock()`` per instance is correct for a single long-lived
+    store, but any code constructing its own
     ``ArtifactStore()`` against the shared default root (rather than going
     through :func:`get_default_store`) got an unserialized lock: a concurrent
     write from that second instance was never mutually exclusive with the
@@ -605,7 +671,10 @@ class TestSharedLockAcrossInstances:
         real = tmp_path / "real-artifacts"
         real.mkdir()
         link = tmp_path / "linked-artifacts"
-        link.symlink_to(real)
+        # A directory link: the subject is that the two spellings RESOLVE to one
+        # root, which a junction exercises on Windows without the symlink
+        # privilege (see testing-conventions "Links").
+        make_dir_link(link, real)
         a = ArtifactStore(root=real)
         b = ArtifactStore(root=link)
         assert a._lock is b._lock
@@ -834,7 +903,7 @@ class TestSourcePath:
         assert results[0].name == "a"
 
 
-# ── Live-pointer behavior for file-backed artifacts (round 3) ──
+# ── Live-pointer behavior for file-backed artifacts ──
 
 
 class TestLivePointer:
@@ -923,7 +992,7 @@ class TestLivePointer:
 
 
 class TestExplicitSnapshotModel:
-    """round 5: saves don't bump version unless snapshot=True.
+    """Saves don't bump version unless snapshot=True.
 
     Versioning is now deliberate — like git commits. Saves silently update
     the live state. Snapshots create new numbered versions. This makes
@@ -994,7 +1063,7 @@ class TestExplicitSnapshotModel:
 
 
 class TestLiveDirtyAndSnapshotAnytime:
-    """round 6: snapshot button works whenever live differs
+    """The snapshot button works whenever live differs
     from the latest version, not just when there are unsaved edits."""
 
     def test_live_dirty_false_immediately_after_create(self, store: ArtifactStore) -> None:
@@ -1080,7 +1149,7 @@ class TestLiveDirtyAndSnapshotAnytime:
 
 
 class TestSourcePathSecurityHardening:
-    """review-bot round 12 fixes: path traversal + symlink bypass + UTF-8
+    """Source-path hardening: path traversal, symlink bypass, and UTF-8
     truncation arithmetic."""
 
     def test_traversal_path_resolves_before_sensitive_check(
@@ -1151,7 +1220,7 @@ class TestSourcePathSecurityHardening:
         f.write_text("😀" * 30, encoding="utf-8")
         result = store._try_read_source_path(str(f))
         assert result is not None
-        # Round 13: bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
+        # Bounded read caps the disk-IO at MAX_CONTENT_BYTES+1
         # bytes regardless of file size. The decoded string may contain
         # U+FFFD replacement chars at the truncation boundary so its
         # re-encoded byte length CAN exceed MAX_CONTENT_BYTES — that's
@@ -1162,8 +1231,7 @@ class TestSourcePathSecurityHardening:
 
 
 class TestRoundThirteenFixes:
-    """review-bot round 13 fixes: bounded read, event_type pre-validation,
-    live_dirty not persisted."""
+    """Bounded read, event_type pre-validation, and live_dirty not persisted."""
 
     def test_oversized_file_does_not_load_full_content_into_memory(
         self, store: ArtifactStore, tmp_path: Path, monkeypatch
@@ -1196,7 +1264,7 @@ class TestRoundThirteenFixes:
     def test_invalid_event_type_does_not_leave_orphaned_version_file(
         self, store: ArtifactStore
     ) -> None:
-        # Round 13: validation happens BEFORE version bump and snapshot
+        # Validation happens BEFORE version bump and snapshot
         # write. An invalid event_type must not leave a versions/v{N}.html
         # on disk.
         store.create(name="x", content="v1", slug="x")
@@ -1217,7 +1285,7 @@ class TestRoundThirteenFixes:
         assert loaded.version == 1
 
     def test_live_dirty_not_persisted_in_meta_json(self, store: ArtifactStore) -> None:
-        # Round 13: live_dirty is computed at GET time and must not be
+        # live_dirty is computed at GET time and must not be
         # written to meta.json. Persisting would create staleness bugs.
         store.create(name="x", content="v1", slug="x")
         # Trigger a GET that sets live_dirty, then write_meta via update
@@ -1551,7 +1619,7 @@ class TestBlankDocumentKind:
         store.create(name="Untitled", content="", slug="u")
         pinned = store.update("u", content="# prose", kind="text")
         assert (pinned.kind, pinned.kind_auto) == ("text", False)
-        # Now that it's pinned, JSON content no longer re-types it.
+        # Once pinned, JSON content does not re-type it.
         assert store.update("u", content='{"a": 1}').kind == "text"
 
     def test_snapshot_records_the_detected_kind_for_the_version(
@@ -1939,6 +2007,10 @@ class TestSourceRootBarrier:
         monkeypatch.undo()
         assert src.read_text(encoding="utf-8") == "ORIGINAL"
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="os.link needs elevated privileges on Windows to make the second name",
+    )
     def test_rejected_writes_do_not_leak_descriptors(
         self, home_store, project_file
     ) -> None:
@@ -1948,27 +2020,56 @@ class TestSourceRootBarrier:
         through it), so it cannot be closed in a blanket ``finally``. That made
         each rejected update leak one descriptor, which would eventually exhaust
         the gateway's limit.
+
+        The subject therefore has to be a path the write gate refuses AFTER that
+        open: a second hardlink on the file, which ``_pinned_replace``'s
+        ``fstat`` check rejects (``st_nlink > 1``). A path OUTSIDE the approved
+        root -- what this test drove before -- never gets that far:
+        ``allowed_source_roots`` refuses it in ``_try_write_source_path`` itself,
+        so no descriptor is opened and the leak this test names could not have
+        been observed either way.
+
+        Pairing is read off the descriptors the writer itself opened and closed,
+        never a ``/proc/<pid>/fd`` census: this worker's other threads (executor
+        pools, the SEL writer) open and close descriptors of their own, so a
+        census moves for reasons that have nothing to do with this write.
         """
         import os as _os
 
         proj, src = project_file
-        # A path outside the approved root is rejected during validation.
-        outside = proj.parent / "outside.md"
-        outside.write_text("x", encoding="utf-8")
+        target = str(src.resolve())
+        # A second name on the same inode makes st_nlink == 2, which the pinned
+        # writer refuses -- but only once it already holds the descriptor.
+        _os.link(target, str(src.with_name("second-name.md")))
 
-        def open_fds() -> int:
-            try:
-                return len(_os.listdir(f"/proc/{_os.getpid()}/fd"))
-            except OSError:  # pragma: no cover -- non-Linux
-                pytest.skip("no /proc to count descriptors")
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open, real_close = _os.open, _os.close
 
-        before = open_fds()
-        for _ in range(40):
-            assert (
-                home_store._try_write_source_path(str(outside), "nope", str(proj)) is False
-            )
-        # A leak would add ~40 descriptors; allow a little slack for unrelated I/O.
-        assert open_fds() - before < 10
+        def tracking_open(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if str(path) == target:
+                opened.append(fd)
+            return fd
+
+        def tracking_close(fd: int, /) -> None:
+            closed.append(fd)
+            real_close(fd)
+
+        # Wrapped, never stubbed -- the real syscalls still run, so what the
+        # assertions below see is the writer's own cleanup. Scoped to a context
+        # rather than the shared ``monkeypatch``, whose ``undo()`` would also
+        # unpin the fake ``Path.home`` the ``home_store`` fixture installed.
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(_os, "open", tracking_open)
+            patched.setattr(_os, "close", tracking_close)
+            for _ in range(5):
+                assert home_store._try_write_source_path(target, "nope", str(proj)) is False
+
+        assert len(opened) == 5, "the refusal never reached the descriptor-pinned open"
+        leaked = [fd for fd in opened if fd not in closed]
+        assert leaked == [], f"a rejected update leaked its descriptor: {leaked}"
+        assert src.read_text(encoding="utf-8") == "# live from the project"
 
     def test_write_refuses_when_an_acl_attribute_cannot_be_carried(
         self, home_store, project_file, monkeypatch
@@ -2417,7 +2518,7 @@ class TestSourceRootBarrier:
         home_dst = Path.home() / "moved.md"
         home_dst.write_text("# moved", encoding="utf-8")
         art = home_store.relocate("spec", str(home_dst))
-        # The old project root no longer authorizes anything about the new path.
+        # The old project root does not authorize anything about the new path.
         assert art.source_path == str(home_dst)
         assert art.source_root == ""
 
@@ -2564,7 +2665,7 @@ class TestAllowedRootsSingleProducer:
         assert verifiable.resolve() in home_store.allowed_source_roots(str(verifiable))
 
     def test_data_home_path_accepted_by_read_and_write(self, home_store) -> None:
-        # The root the relocate handler used to omit. Read and write must agree.
+        # The data-home root the relocate handler must include. Read and write must agree.
         data_home = home_store._root.resolve().parent
         target = data_home / "note.md"
         target.write_text("in the data home", encoding="utf-8")
@@ -2588,3 +2689,268 @@ class TestAllowedRootsSingleProducer:
         assert "Path.home()" not in handler_src
         assert ".publish.relocate_roots" not in handler_src
         assert "allowed_source_roots()" in handler_src
+
+
+# ── optimistic-concurrency content token ────────────────────────────────────
+
+
+def test_a_new_content_token_is_256_random_bits_as_hex() -> None:
+    assert re.fullmatch(r"[0-9a-f]{64}", _new_content_token())
+
+
+@pytest.mark.usefixtures("sequential_tokens")
+class TestConflictToken:
+    def test_create_assigns_a_token_for_store_backed_content(self, store: ArtifactStore) -> None:
+        art = store.create(name="x", content="v1")
+        assert art.content_token and len(art.content_token) == 64
+        assert store.get("x").content_token == art.content_token
+
+    def test_matching_token_writes_and_returns_the_next_token(self, store: ArtifactStore) -> None:
+        store.create(name="x", content="v1")
+        token = store.get("x").content_token
+        art = store.update("x", content="v2", expected_token=token)
+        assert store.get("x").content == "v2"
+        assert art.content_token == store.get("x").content_token != token
+
+    def test_stale_token_raises_and_writes_nothing(self, store: ArtifactStore) -> None:
+        store.create(name="x", content="v1")
+        stale = store.get("x").content_token
+        store.update("x", content="from another window")
+        with pytest.raises(ArtifactConflictError) as info:
+            store.update("x", content="stale edit", expected_token=stale, snapshot=True)
+        assert info.value.current_token == store.get("x").content_token
+        assert store.get("x").content == "from another window"
+        assert store.get("x").version == 1
+
+    def test_a_silent_save_trips_the_guard_though_the_version_did_not_move(
+        self, store: ArtifactStore
+    ) -> None:
+        store.create(name="x", content="v1")
+        stale = store.get("x").content_token
+        store.update("x", content="silent save")  # snapshot=False: version stays 1
+        assert store.get("x").version == 1
+        with pytest.raises(ArtifactConflictError):
+            store.update("x", content="stale", expected_token=stale)
+
+    def test_rewriting_identical_content_still_moves_the_token(self, store: ArtifactStore) -> None:
+        # Every content write gets a fresh token, even when the bytes match.
+        store.create(name="x", content="same")
+        first = store.get("x").content_token
+        store.update("x", content="same")
+        assert store.get("x").content_token != first
+
+    def test_omitted_token_keeps_last_write_wins(self, store: ArtifactStore) -> None:
+        store.create(name="x", content="v1")
+        store.update("x", content="v2")
+        store.update("x", content="v3")
+        assert store.get("x").content == "v3"
+
+    def test_metadata_only_update_ignores_the_token(self, store: ArtifactStore) -> None:
+        store.create(name="x", content="v1")
+        stale = store.get("x").content_token
+        store.update("x", content="v2")
+        art = store.update("x", name="Renamed", expected_token=stale)
+        assert art.name == "Renamed"
+        # A rename is not a content write, so it does not move the token.
+        token = store.get("x").content_token
+        store.update("x", description="d")
+        assert store.get("x").content_token == token
+
+    def test_snapshot_of_unchanged_content_keeps_the_token(self, store: ArtifactStore) -> None:
+        store.create(name="x", content="v1")
+        token = store.get("x").content_token
+        store.update("x", snapshot=True)
+        assert store.get("x").content_token == token
+        store.update("x", content="v2", expected_token=token)
+
+    @pytest.mark.parametrize("bad", ["abc", "G" * 64, "A" * 64, 123])
+    def test_malformed_token_is_a_validation_error(self, store: ArtifactStore, bad) -> None:
+        store.create(name="x", content="v1")
+        with pytest.raises(ArtifactValidationError):
+            store.update("x", content="v2", expected_token=bad)
+        assert store.get("x").content == "v1"
+
+    def test_live_file_backed_artifact_mints_no_token_and_ignores_one(
+        self, store: ArtifactStore, tmp_path: Path
+    ) -> None:
+        src = tmp_path / "live.md"
+        src.write_text("v1", encoding="utf-8")
+        created = store.create(
+            name="live", content="v1", source_path=str(src), kind="markdown"
+        )
+        assert created.content_token is None
+        assert store.get("live").content_token is None
+        updated = store.update("live", content="v2", expected_token="0" * 64)
+        assert updated.content_token is None
+        assert src.read_text(encoding="utf-8") == "v2"
+
+    def test_versioned_read_carries_no_token(self, store: ArtifactStore) -> None:
+        art = store.create(name="x", content="v1")
+        store.update(art.slug, content="v2", snapshot=True)
+        assert store.get(art.slug, version=1).content_token is None
+
+    def test_token_is_shared_by_every_instance_on_a_root(self, tmp_path: Path) -> None:
+        a = ArtifactStore(root=tmp_path / "artifacts")
+        b = ArtifactStore(root=tmp_path / "artifacts")
+        a.create(name="x", content="v1")
+        b.update("x", content="v2", expected_token=a.get("x").content_token)
+        assert a.get("x").content == "v2"
+
+    def test_token_is_persisted_and_served_with_content_only(self, store: ArtifactStore) -> None:
+        art = store.create(name="x", content="v1")
+        meta = json.loads((store.root / "x" / "meta.json").read_text(encoding="utf-8"))
+        assert meta["content_token"] == art.content_token
+        wire = store.get("x").to_dict(include_content=True)
+        assert wire["content_token"] == meta["content_token"]
+        assert "content_token" not in store.get("x").to_dict()
+
+    @pytest.mark.parametrize("bad", ["not-hex", "é" * 64, "A" * 64, 7])
+    def test_corrupt_persisted_token_is_replaced_not_fatal(
+        self, store: ArtifactStore, bad
+    ) -> None:
+        store.create(name="x", content="v1")
+        path = store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["content_token"] = bad
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        art = store.get("x", assign_token=True)
+        persisted = json.loads(path.read_text(encoding="utf-8"))["content_token"]
+        assert art.content == "v1" and art.content_token == persisted
+        assert len(persisted) == 64
+        assert [a.slug for a in store.list()] == ["x"]
+        store.update("x", content="v2", expected_token=art.content_token)
+
+    def test_an_assigning_read_gives_an_untokened_artifact_a_guarded_token(
+        self, store: ArtifactStore
+    ) -> None:
+        store.create(name="x", content="v1")
+        path = store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        token = store.get("x", assign_token=True).content_token
+        assert token
+        assert json.loads(path.read_text(encoding="utf-8"))["content_token"] == token
+        assert store.get("x").content_token == token
+        store.update("x", content="v2", expected_token=token)
+        with pytest.raises(ArtifactConflictError):
+            store.update("x", content="v3", expected_token=token)
+
+    def test_a_plain_read_of_an_untokened_artifact_writes_nothing(
+        self, store: ArtifactStore
+    ) -> None:
+        store.create(name="x", content="v1")
+        path = store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        before = path.read_bytes()
+        art = store.get("x")
+        assert art.content == "v1"
+        assert art.content_token is None
+        assert path.read_bytes() == before
+
+    @staticmethod
+    def _untokened_with_refused_meta_writes(
+        store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        store.create(name="x", content="v1")  # events already backfilled
+        path = store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+
+        def refuse(art: Artifact) -> None:
+            raise PermissionError("read-only data directory")
+
+        monkeypatch.setattr(store, "_write_meta", refuse)
+        return path
+
+    def test_untokened_read_survives_a_failed_meta_write_without_a_token(
+        self, store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = self._untokened_with_refused_meta_writes(store, monkeypatch)
+        art = store.get("x", assign_token=True)
+        assert art.content == "v1"
+        assert art.content_token is None
+        assert "content_token" not in json.loads(path.read_text(encoding="utf-8"))
+        # A guarded content write on the same unwritable directory still fails.
+        with pytest.raises(OSError):
+            store.update("x", content="v2", expected_token="0" * 64)
+
+    def test_read_after_a_failed_token_write_gets_a_working_token(
+        self, store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with monkeypatch.context() as mp:
+            path = self._untokened_with_refused_meta_writes(store, mp)
+            store.get("x", assign_token=True)
+        token = store.get("x", assign_token=True).content_token
+        assert token
+        assert json.loads(path.read_text(encoding="utf-8"))["content_token"] == token
+        store.update("x", content="v2", expected_token=token)
+        assert store.get("x").content == "v2"
+
+    @staticmethod
+    def _fail_meta_writes_once_content_is(
+        store: ArtifactStore, monkeypatch: pytest.MonkeyPatch, slug: str, content: str
+    ) -> None:
+        """Make every meta.json write fail once current.html holds *content*."""
+        current = store.root / slug / "current.html"
+        write_meta = store._write_meta
+
+        def failing(art: Artifact) -> None:
+            if current.read_text(encoding="utf-8") == content:
+                raise OSError("disk full")
+            write_meta(art)
+
+        monkeypatch.setattr(store, "_write_meta", failing)
+
+    def test_a_save_that_fails_after_its_content_write_still_refuses_a_stale_token(
+        self, store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store.create(name="x", content="v1")
+        stale = store.get("x").content_token
+        with monkeypatch.context() as mp:
+            self._fail_meta_writes_once_content_is(store, mp, "x", "v2")
+            with pytest.raises(OSError):
+                store.update("x", content="v2", expected_token=stale)
+        assert store.get("x").content == "v2"
+        with pytest.raises(ArtifactConflictError):
+            store.update("x", content="v3", expected_token=stale)
+        assert store.get("x").content == "v2"
+
+    def test_a_settled_draft_that_fails_after_its_content_write_still_refuses_a_stale_token(
+        self, store: ArtifactStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store.create(name="Untitled", content="", slug="u")
+        stale = store.get("u").content_token
+        with monkeypatch.context() as mp:
+            self._fail_meta_writes_once_content_is(store, mp, "u", "# notes")
+            with pytest.raises(OSError):
+                store.settle_blank("u", untitled_name="Untitled", draft="# notes")
+        assert store.get("u").content == "# notes"
+        with pytest.raises(ArtifactConflictError):
+            store.update("u", content="replaced", expected_token=stale)
+        assert store.get("u").content == "# notes"
+
+    @pytest.mark.parametrize("snapshot", [True, False])
+    def test_metadata_only_update_of_an_untokened_artifact(
+        self, store: ArtifactStore, snapshot: bool
+    ) -> None:
+        store.create(name="x", content="v1")
+        path = store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        art = store.update("x", name="renamed", tags=["t"], snapshot=snapshot)
+        assert art.name == "renamed"
+        assert "content_token" not in json.loads(path.read_text(encoding="utf-8"))
+        assert store.get("x", assign_token=True).content_token
+
+    def test_token_survives_a_new_store_instance(self, tmp_path: Path) -> None:
+        # No process-held key: a gateway restart must not 409 every open editor.
+        a = ArtifactStore(root=tmp_path / "artifacts")
+        a.create(name="x", content="v1")
+        token = a.get("x").content_token
+        b = ArtifactStore(root=tmp_path / "artifacts")
+        assert b.get("x").content_token == token

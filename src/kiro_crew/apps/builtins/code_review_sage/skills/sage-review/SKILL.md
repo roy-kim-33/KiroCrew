@@ -29,10 +29,25 @@ to a Microsoft Store app-execution alias that runs nothing), so the command
 would produce no record and the review would end with no result. Outside a
 review session, use the interpreter running the app.
 
+## Where every path below is rooted
+
+Paths in this skill are **relative to the app root** — the directory holding
+`sage_lib/` and `data/`. A review worker is already started there, so
+`sage_lib/store.py` and `data/results/<id>.json` resolve without any prefix.
+Deliberately relative, not `~/.kiro/crew/apps/code-review-sage/...`: `~` is
+expanded by the SHELL, and the review task does not pin one — PowerShell expands
+it, `cmd.exe` passes it through literally, and Python then cannot open the file.
+Outside a review session, `cd` into the app root first
+(`~/.kiro/crew/apps/code-review-sage` on macOS/Linux,
+`%USERPROFILE%\.kiro\crew\apps\code-review-sage` on Windows).
+
+Prefer your own file-read tool over `cat` for the reads below — it needs no shell
+at all, so it behaves the same on every host.
+
 ## Self-heal (run first, always — idempotent)
 
 ```bash
-<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/store.py --ensure
+<python> sage_lib/store.py --ensure
 ```
 
 ## Load learning context (before reviewing)
@@ -41,16 +56,16 @@ Load patterns from all **active namespaces** (configured in config.json →
 `review.active_namespaces`). The CLI command unions them for you:
 
 ```bash
-<python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py list-for-review
+<python> sage_lib/learning.py list-for-review
 ```
 
 Or read them manually — the "default" namespace maps to `common/`, others live
 under `namespaces/<name>/`:
 
 ```bash
-cat ~/.kiro/crew/apps/code-review-sage/data/learnings/common/learned-patterns.md
+cat data/learnings/common/learned-patterns.md
 # For each additional active namespace:
-cat ~/.kiro/crew/apps/code-review-sage/data/learnings/namespaces/<namespace>/learned-patterns.md 2>/dev/null
+cat data/learnings/namespaces/<namespace>/learned-patterns.md
 ```
 
 Treat all loaded patterns as additional review heuristics (warm start).
@@ -418,11 +433,13 @@ reason, no hedging or preamble; the author reads this first. Examples:
 
 ## Draft-only safety (hard rule)
 
-Every comment is posted as a **draft** (`publish=false`). A human publishes. Never
-auto-publish. For shipped/merged changes with no open thread, record findings in
-the result record only (no comment).
+**You record; you never post.** A review session writes the result record and
+calls no comment tool. The app builds every comment body in Python (redacted),
+and only when the user asks (or `review.auto_post` is on) does a separate poster
+session publish them as ONE pending (unsubmitted) GitHub review. A human submits
+it. Never auto-publish.
 
-## Comment mechanics
+## Comment mechanics (what the app renders from your finding fields)
 
 - **Line numbers are LLM-emitted** (no deterministic locator in V1). Minor drift
   is accepted — **every inline comment MUST quote the offending code snippet** in
@@ -437,8 +454,8 @@ the result record only (no comment).
 
   **Suggestion:** {concrete fix}
   ```
-- Attribute drafts as `[code-review-sage]` and dedupe against existing drafts so
-  there is no double-posting when composed with a team's own reviewer.
+- The app attributes drafts with the `[code-review-sage]` marker and replaces
+  only its own stale pending draft, so you do not write the marker or dedupe.
 
 ---
 
@@ -455,9 +472,13 @@ from the `learn-from-sage` skill:
 3. If it passes the quality gate (general, non-trivial, fits a dimension),
    **stage** it into the candidate file (`source=fix_introduce`):
    ```bash
-   <python> ~/.kiro/crew/apps/code-review-sage/sage_lib/learning.py stage \
-       --file /tmp/pattern.json --source fix_introduce
+   <python> sage_lib/learning.py stage \
+       --file data/tmp/pattern.json --source fix_introduce
    ```
+   Write the pattern JSON to that path yourself first. `data/tmp/` is created by
+   the `store.py --ensure` self-heal above and is inside the app root, so it is
+   real on every platform — unlike a `/tmp/...` path, which does not exist on a
+   Windows host and would lose the learning silently.
    This appends to `learned-patterns.candidate.md` only — it does NOT touch the
    live ruleset. A human later triggers **consolidation** (an AI one-shot merge
    into `learned-patterns.md`); see the `learn-from-sage` skill.
@@ -470,7 +491,7 @@ candidate is pure staging until consolidated.
 
 ## Result record (write one per change)
 
-Write `~/.kiro/crew/apps/code-review-sage/data/results/<change-id>.json`. This is
+Write `data/results/<change-id>.json`. This is
 the durable source of truth the Focus Report reads. **Findings JSON contract**
 (kept stable so the deterministic scorer is decoupled from prompt wording):
 
@@ -543,7 +564,7 @@ Some repos maintain a team-specific rulebook. At review time, *if*
 skill directory name), resolve and read that `SKILL.md` and apply it as
 **additional rules** layered on top of the generic dimensions — **read-only
 reuse, no fork**. If no mapping exists (the default), the review uses only the
-generic dimensions below. If a pack says "do not use subagents", honor it: read
+generic dimensions above. If a pack says "do not use subagents", honor it: read
 the file and apply its checks inside this single clean session — do not nest
 orchestration.
 
@@ -557,7 +578,7 @@ orchestration.
 - [ ] ONE thorough pass: design dimension (verdict + design_risk + criticality + design_headline) AND the 9 code dimensions together → chain-of-consequences findings
 - [ ] Coverage self-check: every changed hunk reviewed against all dimensions; emit files_covered + coverage_complete (driver runs ONE targeted follow-up if incomplete)
 - [ ] Self-critique (Filter / De-dup against green gates / Merge / Sharpen / Stabilize)
-- [ ] Post surviving findings as DRAFT comments (publish=false), each quoting the snippet
+- [ ] Record surviving findings (each with a quoted `snippet`) — do NOT post; the app posts on request
 - [ ] If the change is a fix, run INLINE miss-analysis (learn-from-sage) → STAGE the learning into the candidate file
 - [ ] Write the result record JSON
 ```

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import host_abs
 from kiro_crew.dashboard.handlers.agents import (
     api_capability_mcp_install,
     api_capability_mcp_uninstall,
@@ -151,9 +152,8 @@ class TestGlobalWritesAreOwnershipGated:
     ``discover_servers_to_sync``, which merges every scope -- so a name the user
     configured only in their own global file arrives exactly like a managed one.
 
-    Parametrized on purpose: the gate was previously reasoned about one write site
-    at a time, so a per-site test lets the next site ship ungated. This asserts
-    the property across all of them at once.
+    Parametrized on purpose: a per-site test would let the next write site ship
+    ungated, so this asserts the property across all of them at once.
     """
 
     @staticmethod
@@ -282,12 +282,12 @@ class TestGlobalWritesAreOwnershipGated:
 class TestExactNameCollisionIsDecidedByTheMarker:
     """The marker separates "ours, moved" from "the user's, colliding".
 
-    Both of these used to arrive at the write as the SAME input -- a global entry
+    Both of these arrive at the write as the SAME input -- a global entry
     at url A, that name in the store, and a discovered url B:
 
     * LEGITIMATE: a managed server whose store url moved A -> B. The global entry
       at A is our own earlier emit and MUST be rewritten, or the re-sync never
-      propagates and kiro-cli keeps running a url the dashboard no longer shows.
+      propagates and kiro-cli keeps running a url the dashboard does not show.
     * HARMFUL: the user hand-authored a global server at A whose name collides
       with a managed one. Rewriting destroys config we did not author.
 
@@ -1631,12 +1631,16 @@ class TestCcSidecarEnvEmission:
     def test_stdio_env_path_is_expanded_on_write(self, tmp_path, monkeypatch):
         from kiro_crew import mcp_discovery as md
 
-        monkeypatch.setenv("PATH", "/usr/bin")
+        # Spelled for the host (conftest.host_abs): the declared entry passes
+        # through the ``os.path.isabs`` filter in env._spec_path_entries, and from
+        # Python 3.13 a bare ``/opt/shims`` is not absolute under ntpath.
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
         srv = md.McpServerInfo(
             name="tooling",
             command="/opt/bin/tooling",
             args=["--stdio"],
-            env={"PATH": "/opt/shims", "TOKEN": "t"},
+            env={"PATH": shims, "TOKEN": "t"},
             source="discovered",
         )
         sidecar = tmp_path / "cc.json"
@@ -1644,8 +1648,8 @@ class TestCcSidecarEnvEmission:
 
         written = json.loads(sidecar.read_text())["mcpServers"]["tooling"]
         entries = written["env"]["PATH"].split(os.pathsep)
-        assert entries[0] == "/opt/shims", "spec-authored entries stay first"
-        assert "/usr/bin" in entries, "inherited PATH must survive the override"
+        assert entries[0] == shims, "spec-authored entries stay first"
+        assert usr_bin in entries, "inherited PATH must survive the override"
         assert written["env"]["TOKEN"] == "t"
 
     def test_source_env_object_is_not_mutated(self, tmp_path, monkeypatch):
@@ -1731,3 +1735,69 @@ class TestSyncDiscoveredServers:
             t1.start(), t2.start()
             t1.join(), t2.join()
         assert not overlap, "the sync mutex must serialize concurrent callers"
+
+
+def _seed_per_tool_grants(agent_cfg: Path) -> None:
+    """Give builder-mcp per-tool grants next to its bare ref, plus a duplicate
+    and a prefix-sharing sibling the removal must leave alone."""
+    cfg = _load(agent_cfg)
+    cfg["mcpServers"]["builder-mcp-extra"] = {"command": "extra"}
+    cfg["tools"] = ["@builder-mcp", "@builder-mcp/search", "@builder-mcp-extra"]
+    cfg["allowedTools"] = [
+        "@builder-mcp",
+        "@builder-mcp/search",
+        "@builder-mcp/search",
+        "@builder-mcp/read",
+        "@builder-mcp-extra",
+        "@builder-mcp-extra/run",
+        "fs_read",
+    ]
+    agent_cfg.write_text(json.dumps(cfg))
+
+
+class TestRemovalDropsPerToolGrants:
+    """Disabling or removing a server drops its ``@server/tool`` grants from
+    ``allowedTools`` as well as the bare ``@server`` ref."""
+
+    @pytest.mark.parametrize("remove", [False, True])
+    def test_single_server_path(self, mcp_env, remove):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False, remove=remove)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" not in cfg["tools"]
+        assert "@builder-mcp-extra" in cfg["tools"]
+
+    def test_batch_path(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent_batch
+
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+
+    def test_withheld_auto_approve_drops_per_tool_grants(self, mcp_env, monkeypatch):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.may_skip_gate_now",
+            lambda ref: not ref.startswith("@builder-mcp") or ref.startswith("@builder-mcp-"),
+        )
+        from kiro_crew.dashboard.handlers.mcp import (
+            _sync_mcp_to_agent,
+            _sync_mcp_to_agent_batch,
+        )
+
+        _sync_mcp_to_agent("builder-mcp", enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" in cfg["tools"]
+
+        _seed_per_tool_grants(agent_cfg)
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]

@@ -199,7 +199,7 @@ class TestFoldCacheCoversTheScanWindow:
 
         Sized at 256 while scanning 500, the second query would re-fold every
         single session. Kept small enough to stay a fast test but larger than the
-        transcript cache it used to borrow its size from.
+        transcript cache whose size it once borrowed.
         """
         monkeypatch.setattr(history, "_TRANSCRIPT_CACHE_MAX", 8)
         monkeypatch.setattr(history, "_SEARCH_SCAN_WINDOW", 40)
@@ -272,16 +272,16 @@ class TestFoldDoesNotPinParsedTranscripts:
         log._read_messages("s0")  # warm the parsed cache
         assert len(log._msg_cache) == 1
 
-        # Poison the parsed cache under the CURRENT mtime — an mtime guard alone
-        # would happily reuse this entry.
-        mtime = log._path("s0").stat().st_mtime
+        # Poison the parsed cache under the CURRENT identity — an identity guard
+        # alone would happily reuse this entry.
+        identity = log._cache_identity(log._path("s0").stat())
         log._msg_cache["s0"] = (
-            mtime,
+            identity,
             log._cache_gen("s0"),
             [{"role": "user", "content": "phantom text"}],
         )
 
-        built = log._build_folded("s0", mtime, log._cache_gen("s0"))
+        built = log._build_folded("s0", identity, log._cache_gen("s0"))
         assert built is not None
         assert built[1] == "on disk only", "the fold must come from the file"
         assert "phantom" not in built[1]
@@ -430,7 +430,7 @@ class TestFoldDoesNotPinParsedTranscripts:
 
     def test_unreadable_file_signals_failure_rather_than_empty(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
-        assert log._build_folded("never-existed", 0.0, 0) is None
+        assert log._build_folded("never-existed", (0, 0, 0), 0) is None
 
     def test_both_halves_of_a_query_share_one_definition_of_searchable_text(
         self, tmp_path, monkeypatch
@@ -445,7 +445,7 @@ class TestFoldDoesNotPinParsedTranscripts:
         the snippet memo the very list it folded, so a single traversal of
         ``_iter_message_texts`` serves both halves and there is no second
         traversal that could apply different rules. One call, not two — the
-        second call is what this used to assert, and its disappearance is the
+        second call is what this test now forbids, and its absence is the
         optimization. The fallback path (memo refused or stale) still routes
         through the shared iterator; see ``TestSnippetSourceIsMemoized``.
         """
@@ -711,7 +711,7 @@ class TestSnippetSourceIsMemoized:
         ``list_sessions``. After one of those the file's mtime still matches what
         the memo recorded, so the mtime guard in :meth:`_snippet_texts` is blind
         and ``_invalidate_cache`` is the only thing standing between the user and
-        a preview quoting text the session no longer contains.
+        a preview quoting text the session does not contain.
 
         Asserted on the memo directly rather than through a snippet, because a
         content-changing rewrite bumps the mtime and would pass on the guard
@@ -754,7 +754,7 @@ class TestSnippetSourceIsMemoized:
     ):
         """Defence in depth behind ``_invalidate_cache``.
 
-        If a write path ever forgets to drop the memo, the stored mtime must
+        If a write path ever forgets to drop the memo, the stored identity must
         still stop the snippet from being served from it.
         """
         log = ConversationLog(base_dir=tmp_path)
@@ -763,14 +763,15 @@ class TestSnippetSourceIsMemoized:
 
         stored = log._snippet_cache.get("s0")
         assert stored is not None, "precondition: the memo holds this session"
-        # Poison the memo, keeping its (now wrong) mtime.
+        # Poison the memo, keeping its (now wrong) identity.
         log._snippet_cache["s0"] = (stored[0], stored[1], ["poisoned deployment content"])
-        # Make the file's mtime disagree with the memo's.
+        # Make the file's identity disagree with the memo's.
         path = log._path("s0")
-        os.utime(path, (stored[0] + 10, stored[0] + 10))
+        moved_mtime = os.stat(path).st_mtime + 10
+        os.utime(path, (moved_mtime, moved_mtime))
 
         snippet = log._content_snippet("s0", "deployment")
-        assert "poisoned" not in snippet, "a stale mtime must not be trusted"
+        assert "poisoned" not in snippet, "a stale identity must not be trusted"
         assert "first deployment wording" in snippet
 
     def test_unreadable_session_drops_both_memos_together(self, tmp_path):

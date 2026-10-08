@@ -21,10 +21,10 @@ an LLM-facing capability to be an MCP tool (it is: ``computer_get_state``).
 its MCP twin (``computer_list_apps``), so neither brushes the rule.
 
 **Why ``call`` does not brush the MCP-first rule either.** It is not a new
-capability and it adds no tool: it is a *harness* over the existing ten, for a
+capability and it adds no tool: it is a *harness* over the existing tools, for a
 human reproducing a failure at a terminal. The rule exists so the model gets a
 structured tool rather than being told to shell out — and the model already has
-all eleven as MCP tools. ``call`` deliberately has no MCP twin, because a tool that
+every one of them as an MCP tool. ``call`` deliberately has no MCP twin, because a tool that
 runs other tools would let a model launder a per-call gate decision through one
 approved invocation.
 
@@ -33,14 +33,14 @@ approved invocation.
 through the same ordered chokepoint as an agent call: the fail-closed keystone
 primary enable, the audit-only ``gate.require_computer_use``, the built-in app
 denylist, index freshness, the secure-target refusals, and the observation
-ceiling. So this command cannot be used to see or do anything the agent could
+ceiling. So this command cannot see or do anything the agent could
 not, which is exactly what makes it a faithful reproduction tool. Two
 consequences worth stating rather than discovering:
 
 * the session key is the attended CLI surface (:data:`_CLI_SESSION_KEY`) — a real
   surface the gate accepts, not a bypass sentinel;
-* ``approval_recorded`` is left at ``False``. The approval ceiling it used to
-  satisfy is gone, so the flag no longer changes any outcome — but it is still
+* ``approval_recorded`` is left at ``False``. There is no approval ceiling for
+  it to satisfy, so the flag changes no outcome — but it is still
   never minted here, because doing so would be the CLI asserting a prompt that
   nobody answered on this leg (asserted by an AST test over the whole package).
 
@@ -101,16 +101,13 @@ def _session_key() -> str:
 
     ``cli_chat`` is the repo's existing key for "a human at a terminal"
     (``sel._infer_source`` maps it to the ``cli`` surface). It is used
-    unconditionally now: the unattended-surface refusal that used to make this
-    decision load-bearing is gone, so there is nothing left for a stricter identity
+    unconditionally: no unattended-surface refusal makes this
+    decision load-bearing, so there is nothing for a stricter identity
     to buy. The key still matters for the SEL audit trail, which is why this is a
     named surface rather than an empty string.
     """
     return _CLI_SESSION_KEY
 
-
-# Shown when an unauthenticated invocation has no keystone opt-in. Names the flag
-# and the file, because "refused" without the remedy is not a usable diagnostic.
 
 # ``--calls`` entry keys. A batch entry is ``{"tool": "...", "args": {...}}``;
 # ``args`` is optional so a no-argument tool is ``{"tool": "computer_end_turn"}``.
@@ -136,11 +133,9 @@ A key=value argument is parsed as JSON when it can be (element_index=3,
 screenshot=false, x=120.5) and kept as a plain string otherwise (app=Finder).
 Wrap a value with spaces in shell quotes: text='hello there'.
 
-Every call runs through the same gate the agent does — the primary enable,
-security policy, the app denylist and the secure-field refusals all apply, so
-this cannot reach anything the agent could not. Under a policy that forces
-interactive approval, a mutating call is refused here: there is no prompt on this
-leg for anyone to answer.
+Every call runs through the same gate the agent does — the primary enable, the
+app denylist and allowed apps, and the secure-field refusals all apply, so this
+cannot reach anything the agent could not.
 
 Computer use is OFF by default and can only be enabled by you, from the
 dashboard: Settings -> Computer Use. An agent cannot enable it.
@@ -288,13 +283,11 @@ def _state_path() -> object:
 def _cmd_apps() -> None:
     """Print the on-screen application list, through the SAME gate as ``call``.
 
-    This used to call ``service.list_apps()`` directly, on the
-    reasoning that a diagnostic in the operator's own terminal is not the agent.
-    That reasoning does not hold, because the agent can run this command with
-    bash — so the direct call was an ungated read of every window TITLE (document
-    names, paths, and whatever a terminal put in its title) that worked even with
-    the feature disabled, in an unattended cron session, or under a policy that
-    bans computer use outright.
+    It does not call ``service.list_apps()`` directly: the agent can run this
+    command with bash, so a direct call would be an ungated read of every window
+    TITLE (document names, paths, and whatever a terminal put in its title) that
+    works even with the feature disabled, in an unattended cron session, or under
+    a policy that bans computer use outright.
 
     Routing it through ``dispatch_tool`` costs the operator nothing they should
     have had: ``computer_list_apps`` renders the same list, filtered by the app

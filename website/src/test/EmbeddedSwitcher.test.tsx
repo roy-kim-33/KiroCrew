@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { screen, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
@@ -20,6 +23,7 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   activeId: 'cd-1',
   self: null,
   macInset: false,
+  winInset: false,
   electron: true,
   pinnedCrews: [],
   stableOrder: false,
@@ -32,6 +36,7 @@ beforeEach(() => {
 })
 afterEach(() => {
   document.documentElement.classList.remove('embedded-mac-inset')
+  document.documentElement.classList.remove('embedded-win-inset')
 })
 
 describe('EmbeddedInstanceTabBar (option B)', () => {
@@ -43,7 +48,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
     // Local + the relayed instance tab both render.
-    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
     expect(screen.getByRole('menuitemradio', { name: /Local/ })).toBeTruthy()
     const cloud = screen.getByRole('menuitemradio', { name: /Cloud One/ })
     expect(cloud).toBeTruthy()
@@ -54,7 +59,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       '*',
     )
 
-    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
     await userEvent.click(screen.getByRole('menuitemradio', { name: /Local/ }))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: null }),
@@ -67,7 +72,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       instances: { warm: {}, activeId: null, mru: [], unread: {}, host: null },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    expect(container.querySelector('[aria-label="Remote instances"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Remote crews"]')).toBeNull()
   })
 
   it('honors the relayed pin set: a pinned crew renders as a chip beside the dropdown', async () => {
@@ -83,7 +88,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // the trailing chevron that reaches every OTHER crew.
     const row = screen.getByTestId('crew-chip-row')
     expect(row.textContent).toMatch(/Cloud One/)
-    expect(screen.getByRole('button', { name: /Switch instance/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Switch crew/i })).toBeTruthy()
   })
 
   it('renders no chip row when the parent relays an empty pin set', () => {
@@ -105,7 +110,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       },
     })
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     const toggle = await screen.findByTestId('crew-stable-order-toggle')
     expect(toggle).toBeTruthy()
     expect(toggle.getAttribute('aria-checked')).toBe('true')
@@ -123,7 +128,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await screen.findByRole('menuitemradio', { name: /Cloud One/ })
     expect(screen.queryByTestId('crew-stable-order-toggle')).toBeNull()
     // Ordering falls back to the pre-relay default: the active crew still leads.
@@ -142,7 +147,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     })
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await userEvent.click(await screen.findByTestId('crew-stable-order-toggle'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-stable-order', on: true }),
@@ -186,7 +191,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // A pane cannot write the parent's preference store from its own iframe
     // realm, so pinning here must travel up as a message rather than persist
     // locally — otherwise the pane would drift from every other bar.
-    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
     await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-crew-pin', id: 'cd-1' }),
@@ -217,6 +222,80 @@ describe('EmbeddedHostBridge (option B relay)', () => {
     expect(store.getState().instances.host?.macInset).toBe(true)
     expect(store.getState().instances.host?.stableOrder).toBe(true)
     expect(document.documentElement.classList.contains('embedded-mac-inset')).toBe(true)
+  })
+
+  it('applies the Windows caption inset when the host relays winInset', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ winInset: true }) },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+    expect(store.getState().instances.host?.winInset).toBe(true)
+    expect(document.documentElement.classList.contains('embedded-win-inset')).toBe(true)
+  })
+
+  it('keeps the embedded Windows reserves in lock-step with the local .win-electron rule (CSS pin)', () => {
+    // jsdom applies no stylesheet, so the reserve is pinned against the
+    // index.css source, the same way App.focusMode.test.tsx pins the local
+    // pair. The caption reserve is now zoom-aware: all four
+    // .win-electron/.embedded-win-inset rules reference the single
+    // --mc-win-caption-reserve custom property, so they cannot drift by
+    // construction. The main process sets that property inline on <html>
+    // (= :root) from its own zoom factor (142/zoom px); the static 142px
+    // default on :root covers the first paint, non-Electron contexts, and the
+    // cross-origin embedded pane (where the host var is not inherited — the
+    // pane's own :root default supplies the prior static reserve, unchanged by
+    // this change). This asserts both halves: the shared variable is used
+    // everywhere, and the 142px default lives on :root (NOT on .win-electron,
+    // which sits on the inner shell div and would shadow the inline <html>
+    // value for the header subtree). */
+    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.css'), 'utf8')
+    const reserveRule = /padding-right:var\(--mc-win-caption-reserve\)/g
+    const rootDefault = css.match(/:root\{--mc-win-caption-reserve:142px\}/)
+    const localHeader = css.match(/\.win-electron header\.topbar-glass\{\s*padding-right:var\(--mc-win-caption-reserve\)/)
+    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    expect(rootDefault, 'the 142px default is on :root, not .win-electron (so the inline <html> value is not shadowed)').not.toBeNull()
+    // The property must be DECLARED exactly once, and on :root — not
+    // re-declared on .win-electron / .embedded-win-inset, which would shadow
+    // the inherited <html> value for the header subtree.
+    const declarations = css.match(/\{--mc-win-caption-reserve:/g) || []
+    expect(declarations.length, 'the reserve property is declared exactly once').toBe(1)
+    expect(css).toMatch(/:root\{--mc-win-caption-reserve:142px\}/)
+    expect(localHeader, 'local .win-electron header uses the shared reserve var').not.toBeNull()
+    expect(embeddedHeader, 'embedded header uses the shared reserve var').not.toBeNull()
+    expect(embeddedReserve, 'embedded focus reserve uses the shared reserve var').not.toBeNull()
+    // Every reserve rule reads the bare shared variable; the single :root
+    // default (asserted above) means a context without the main-process var
+    // lays out exactly as the previous static rule did.
+    expect((css.match(reserveRule) || []).length, 'all reserve rules read the shared var').toBeGreaterThanOrEqual(3)
+  })
+
+  it('reads a model without winInset as false — an older host has no Windows inset to relay', async () => {
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    const { winInset: _omitted, ...withoutWinInset } = model()
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...withoutWinInset },
+        }),
+      )
+    })
+    await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+    expect(store.getState().instances.host?.winInset).toBe(false)
+    expect(document.documentElement.classList.contains('embedded-win-inset')).toBe(false)
   })
 
   it('ignores messages that are not from the direct parent', async () => {
@@ -295,5 +374,86 @@ describe('EmbeddedHostBridge (option B relay)', () => {
       }))
     })
     await waitFor(() => expect(store.getState().instances.host?.stableOrder).toBe(false))
+  })
+
+  it('stops re-announcing on the distinct ack, but NOT on a plain host model', () => {
+    // The root fix: a single announce loses the mount/reload race where the
+    // parent's listener isn't wired yet, stranding the parent's loading overlay.
+    // A received host model is NOT the ack: the parent broadcasts its model to
+    // every warm pane on any input change, independent of the readiness
+    // handshake, so a spontaneous broadcast can race past a dropped announce, and
+    // a late announce re-marking readiness after the parent gave the pane up would
+    // suppress its Retry panel. Only the distinct `mc-embedded-ack` stops the
+    // retries. Fake timers exercise the schedule instantly — no real wait.
+    vi.useFakeTimers()
+    try {
+      const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+      const readyCount = () =>
+        post.mock.calls.filter(c => (c[0] as { type?: string })?.type === 'mc-embedded-ready').length
+      const store = createTestStore()
+      renderWithProviders(<EmbeddedHostBridge />, { store })
+
+      // Announced once synchronously on mount.
+      expect(readyCount()).toBe(1)
+      // First backoff step (250ms) re-announces because no ack has arrived.
+      act(() => { vi.advanceTimersByTime(300) })
+      expect(readyCount()).toBe(2)
+
+      // A host model arrives — ingested, but it does NOT cancel the retries.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      expect(store.getState().instances.host?.tabs).toHaveLength(1)
+      act(() => { vi.advanceTimersByTime(600) })
+      expect(readyCount()).toBe(3) // still climbing — the model was not an ack
+
+      // The distinct ack lands: every outstanding retry is cancelled.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-embedded-ack', v: 1 },
+        }))
+      })
+      // Advance well past the whole schedule — no further announcements fire.
+      act(() => { vi.advanceTimersByTime(60_000) })
+      expect(readyCount()).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('caps re-announcements when the parent never acks (finite, no infinite loop)', () => {
+    // The other half of the directive: bounded, not endless. With no ack ever,
+    // the schedule (initial + HANDSHAKE_RETRY_DELAYS_MS) tops out and goes quiet,
+    // so the pane falls through to the parent's error panel instead of re-posting
+    // forever. 6 = 1 immediate + 5 backoff steps. A host model in the meantime
+    // must not be mistaken for an ack, so it does not shorten the schedule.
+    vi.useFakeTimers()
+    try {
+      const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+      const readyCount = () =>
+        post.mock.calls.filter(c => (c[0] as { type?: string })?.type === 'mc-embedded-ready').length
+      const store = createTestStore()
+      renderWithProviders(<EmbeddedHostBridge />, { store })
+
+      // A broadcast model arrives but never an ack — retries run to the cap.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      // Drain the whole backoff (cumulative ~7.75s) and then some.
+      act(() => { vi.advanceTimersByTime(10_000) })
+      expect(readyCount()).toBe(6)
+      // Far past the schedule: it stays capped rather than climbing.
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(readyCount()).toBe(6)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

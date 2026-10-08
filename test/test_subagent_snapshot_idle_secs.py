@@ -1,4 +1,4 @@
-"""The subagent_snapshot replay frame must carry the stall idle span (#3929).
+"""The subagent_snapshot replay frame must carry the stall idle span.
 
 The live ``subagent_stalled`` event sends ``idle_secs`` on the not-stalled →
 stalled transition, and the stalled row renders "possibly stalled at <tool> —
@@ -42,6 +42,7 @@ def _agent(**over):
         stalled=False,
         started=1000.0,
         last_activity=1000.0,
+        batch_id="",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -114,7 +115,7 @@ def test_the_frame_still_redacts_credentials():
 
 def test_snapshot_includes_requested_model_when_set():
     """``requested_model`` must appear in the frame so the frontend can
-    render the amber downgrade chip on the live card (#5326)."""
+    render the amber downgrade chip on the live card."""
     a = _agent(requested_model="claude-opus-4.8", resolved_model="claude-opus-4.7")
     data = build_subagent_snapshot(a, now=1000.0)
     assert data["requested_model"] == "claude-opus-4.8"
@@ -122,7 +123,7 @@ def test_snapshot_includes_requested_model_when_set():
 
 def test_snapshot_redacts_a_credential_shaped_requested_model():
     """The requested pin is caller-supplied (spawn_run.model), so an
-    AKIA-shaped value must be redacted before it reaches the socket (#5326)."""
+    AKIA-shaped value must be redacted before it reaches the socket."""
     a = _agent(requested_model="AKIAIOSFODNN7EXAMPLE", resolved_model="model-1")
     data = build_subagent_snapshot(a, now=1000.0)
     assert "AKIAIOSFODNN7EXAMPLE" not in data["requested_model"]
@@ -135,6 +136,33 @@ def test_snapshot_requested_model_is_empty_string_when_unset():
     a = _agent(requested_model="")
     data = build_subagent_snapshot(a, now=1000.0)
     assert data["requested_model"] == ""
+
+
+def test_snapshot_carries_batch_id_when_the_run_is_part_of_a_wave():
+    """A wave member's ``batch_id`` must survive into the replay frame so a
+    reconnect during a live wave keeps the panel's batch chip -- the queued
+    members get fresh ids that never appear in the launch text, so this is the
+    only on-wire tie to their siblings (#759 item 4)."""
+    a = _agent(batch_id="wave-abc123")
+    data = build_subagent_snapshot(a, now=1000.0)
+    assert data["batch_id"] == "wave-abc123"
+
+
+def test_snapshot_omits_batch_id_for_a_solo_spawn():
+    """Omitted rather than '' — the reducer reads an absent key as "this frame
+    does not say" and a solo spawn genuinely has no wave, so it must not carry
+    an empty-string batch that a client would render as a chip."""
+    data = build_subagent_snapshot(_agent(batch_id=""), now=1000.0)
+    assert "batch_id" not in data
+
+
+def test_snapshot_tolerates_a_missing_batch_id_attribute():
+    """An older SubagentInfo with no ``batch_id`` attribute at all must not
+    raise -- the frame reads it defensively and treats absence as a solo run."""
+    a = _agent()
+    delattr(a, "batch_id")
+    data = build_subagent_snapshot(a, now=1000.0)
+    assert "batch_id" not in data
 
 
 def test_replay_accepts_a_frame_with_an_owning_slot():

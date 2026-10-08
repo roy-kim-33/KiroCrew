@@ -24,6 +24,7 @@ import {
 import { PanelLeftLight, PanelLeftSolid } from '../../components/icons/panels'
 import { Trans } from 'react-i18next'
 import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
 import {
   ACCENT,
   AUTO_COMMIT_MINS,
@@ -206,8 +207,11 @@ export default function MdNotebookPage() {
   // With no note open the pane has nothing to show but the list, and the empty
   // state's copy points at the + button INSIDE the drawer -- so a closed drawer
   // there instructs an action whose control is off-screen. Forced open until a
-  // note is picked, which is also when `openNote` closes it again.
-  const panelShown = isMobile ? (narrowPanelOpen || !activePath) : panelOpen
+  // note is picked, which is also when `openNote` closes it again. Settings is
+  // the other thing the pane can show without a note, so it lifts the force too:
+  // the drawer's Settings row closes the drawer, and closing Settings with no
+  // note open brings the drawer straight back.
+  const panelShown = isMobile ? (narrowPanelOpen || (!activePath && !settingsOpen)) : panelOpen
   const [panelW, setPanelW] = useState(() => {
     const w = loadPref<number>(LS.panelWidth, PANEL_DEFAULT_WIDTH)
     return w >= PANEL_MIN_WIDTH && w <= PANEL_MAX_WIDTH ? w : PANEL_DEFAULT_WIDTH
@@ -2121,7 +2125,15 @@ export default function MdNotebookPage() {
                   })}
           </div>
 
-          <SettingsBar open={settingsOpen} onOpen={() => setSettingsOpen(true)} />
+          <SettingsBar
+            open={settingsOpen}
+            onOpen={() => {
+              setSettingsOpen(true)
+              // Same gesture as picking a note: the drawer owns the pane while it
+              // is open, so it has to step aside for the page it just asked for.
+              if (isMobile) setNarrowPanelOpen(false)
+            }}
+          />
 
           {/* Drag handle */}
           <div
@@ -2138,7 +2150,17 @@ export default function MdNotebookPage() {
         </div>
       )}
 
-      {/* ---- main column: Settings page, or the open note ---- */}
+      {/* ---- main column: Settings page, or the open note ----
+          While narrow the drawer is `width: 100%`, which leaves this flex
+          sibling 0px wide -- and its header controls are `position: absolute`
+          at `right: COLUMN_PAD_X`, so they were painted leftward OVER the
+          drawer: at 390px the Commit / Save-locally pill landed on the first
+          tree row, and the Settings close button did the same. The column is
+          hidden rather than unmounted (the file-explorer drawer makes the same
+          call) so the editor keeps its scroll, selection and pending-save
+          state across a drawer round trip; `contents` puts both branches
+          back in the row's flex flow when shown. */}
+      <div style={{ display: isMobile && panelShown ? 'none' : 'contents' }}>
       {settingsOpen ? (
         <SettingsPage
           vaults={vaults}
@@ -2428,19 +2450,11 @@ export default function MdNotebookPage() {
             </button>
           </div>
         )}
+        {/* No hand-off: the open note's editor buffer below is unsaved local
+            state — a failed save is exactly when it holds text nowhere else. */}
         {error && (
-          <div
-            role="alert"
-            style={{
-              margin: `8px ${COLUMN_PAD_X}px 0`,
-              padding: '8px 10px',
-              borderRadius: '8px',
-              background: 'var(--danger-subtle)',
-              color: 'var(--danger)',
-              fontSize: '11px',
-            }}
-          >
-            {error}
+          <div style={{ margin: `8px ${COLUMN_PAD_X}px 0` }}>
+            <ErrorNotice message={error} />
           </div>
         )}
 
@@ -2572,6 +2586,7 @@ export default function MdNotebookPage() {
         )}
       </div>
       )}
+      </div>
     </div>
   )
 }

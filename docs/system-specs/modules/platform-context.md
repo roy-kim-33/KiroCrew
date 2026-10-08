@@ -5,9 +5,9 @@ The `kiro_crew.platform` package defines the **Composed Platform Providers
 edition and an enterprise companion without the core ever importing
 enterprise-specific code.
 
-> Authoring note: KiroCrew is the public edition of this seam. The daily
+> Authoring note: Kiro Crew is the public edition of this seam. The daily
 > de-branding content sync from the upstream authoring home strips the
-> enterprise-tinted Defaults (e.g. the internal git host, `.midway` sandbox dirs)
+> enterprise-tinted Defaults (e.g. the internal git host, SSO sandbox dirs)
 > down to the public baseline; the enterprise companion re-adds them via overrides.
 > The contract (interfaces + consumption-site wiring) is generic core
 > infrastructure and survives the sync.
@@ -16,13 +16,24 @@ enterprise-specific code.
 
 The core defines a set of **extension points** — interfaces where behavior
 differs between editions — and ships a `Default*` adapter for each that
-reproduces today's KiroCrew behavior. An enterprise companion package (module
+reproduces today's Kiro Crew behavior. An enterprise companion package (module
 separate from `kiro_crew`) depends on the public wheel and supplies enterprise
 adapters for the same interfaces.
 
 The dependency runs one way: **the companion depends on the core; the core never
 depends on the companion.** Because the core ships a default for every
 interface, the public edition is complete standalone.
+
+The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
+through `current_context()` and `safe_context_call` for owner-visible member rows.
+The lookup key is the agent the member runs: its `kiro_agent` through
+`dispatch_kiro_agent`, so a row that recorded an agent's file name keys on the
+name that file declares, falling back to its roster alias when the binding is
+empty. Redacted requests neither query nor emit this metadata; template
+rows never carry it. The public adapter returns `None`; companion policy is
+advisory metadata, not an enforcement boundary or a public picker behavior.
+Composition failures propagate, while other lookup failures log at debug and
+omit the policy.
 
 ## PlatformContext
 
@@ -33,17 +44,18 @@ interface, the public edition is complete standalone.
 | `contract_version` | carrier (int) | `CONTRACT_VERSION` | must match core |
 | `profile` | carrier (str) | `"standalone"` | `"enterprise"` |
 | `cfg` | carrier (`KiroCrewConfig`) | loaded config | same |
-| `providers` | adapter | `DefaultProviderRegistry` (Kiro-CLI-ACP only) | re-registers a companion-registered backend |
-| `publish` | adapter | `DefaultPublishRegistry` (registers no provider → publish unavailable) | registers enterprise artifact/publish providers |
+| `providers` | adapter | `DefaultProviderRegistry` (the baseline in `agent_sdk/backends.py`; registration is a no-op) | registers an edition backend after the core knows and verifies its routing |
+| `publish` | adapter | `DefaultPublishRegistry` (registers the personal cloud drive under `PERSONAL_DRIVE_PROVIDER`; leaves the unnamed default unregistered) | registers enterprise artifact/publish providers |
 | `agent_runtime` | adapter | `DefaultAgentRuntime` (`run_first_run_setup` wired; `managed_mcp_servers` **RESERVED**) | extra one-time first-run provisioning |
 | `agent_executable` | adapter | `DefaultAgentExecutableResolver` (identity) | resolves an edition-managed launcher to its direct executable before core sandboxing |
+| `gateway_lifecycle` | adapter | `DefaultGatewayLifecycleProvider` (`restart_launcher()` → `None`) | stable absolute launcher for package-manager-owned gateway installs |
 | `sandbox` | settings | `DefaultSandboxPolicy` (`_STRICT_DIRS`/`_CC_DIRS`) | additional edition-specific credential dirs |
 | `credentials` | adapter | `DefaultCredentialPolicy` (AKIA/ASIA redaction; `exempt_exact_hosts()` → `frozenset()`) | internal token regexes + trusted-tenant exempt hosts |
 | `security` | **concrete** | `PolicyAuthority()` (baseline only) | `PolicyAuthority(overlay=…)` ADD-only |
 | `governance` | **concrete carrier** | `load_security_policy()` result or `None` | bundled Level-1 ceiling |
 | `slack_gate` | adapter | `DefaultSlackEnterpriseGate` (default-open) | fail-closed enterprise allowlist |
 | `identity` | adapter | `DefaultIdentityProvider` (`sso_status.py` stub; `whoami`/`issuer` **RESERVED**) | enterprise SSO / directory |
-| `agent_identity` | adapter | `DefaultAgentIdentityProvider` (disabled: `enabled() -> False`; no workload, no Gateway spec, no tokens). Distinct from operator-SSO `identity`. `IdentityProvider.whoami` / `issuer` stay RESERVED and are not consumed to satisfy this seam. A later stack PR may swap this adapter when an optional extra opts in; this PR composes only the Default. | edition workload identity + token vending |
+| `agent_identity` | adapter | `DefaultAgentIdentityProvider` (disabled: `enabled() -> False`; no workload, no Gateway spec, no tokens). Distinct from operator-SSO `identity`. `IdentityProvider.whoami` / `issuer` stay RESERVED and are not consumed to satisfy this seam. The public edition composes only the Default. | edition workload identity + token vending |
 | `embeddings` | adapter | **RESERVED** — `DefaultEmbeddingSource`; the public runtime is the bundled in-process llama-cpp model, so no method is consumed (swap via `embeddings.register_embedding_backend`) | — (slot inert) |
 | `mcp_tooling` | adapter | `DefaultMcpToolingProvider` (all methods empty) | enterprise MCP server + skills + provider MCP scopes |
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
@@ -56,14 +68,45 @@ interface, the public edition is complete standalone.
 | `external_access` | adapter | `DefaultExternalAccessPolicy` (`admits_registry()` / `admits_cloud_deployment()` → `True`) | allowlist installable content to an internal registry; withhold cloud deployment |
 | `registry` | adapter | `DefaultAppRegistryPolicy` (public-forge baseline) | internal git hosts |
 | `apps_loader` | adapter | `DefaultAppsLoader` (OSS builtins) | internal app sources (code-reviewer; team_manager/mimir follow-on) |
-| `package_manager` | adapter | **RESERVED** — `DefaultPackageManager`; installs are inline in `cli_doctor.py` (use `CapabilityManager`) | — (slot inert) |
+| `package_manager` | adapter | **RESERVED** — `DefaultPackageManager`; install hints are inline in `doctor_checks/features.py` (use `CapabilityManager`) | — (slot inert) |
 | `knowledge` | adapter | `DefaultKnowledgeProvider` (no extra connectors) | enterprise doc connector (`extra_connectors`) |
+| `memory_files` | adapter | `DefaultMemoryFilesProvider` (memory's markdown source text on local disk) | a non-local `MemoryFiles` for memory's markdown source. `memory_files_for` does not catch a provider error: `PlatformCompositionError` propagates and nothing falls back to local disk. Memory's derived state (the FTS index, the SQLite stores, the FAISS vectors) stays local and does not travel through this seam |
 | `tunnel` | adapter | `DefaultTunnelProvider` (no-op) | internal tunnel supervisor |
 | `telemetry` | adapter | `DefaultTelemetryProvider` (no-op, RUM off; OTLP destination from `telemetry.otlp_endpoint`) | RUM/Cognito config + its own OTLP collector |
-| `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler) | secretary/taskkeeper routes + enterprise SSO PTY login |
+| `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler, no internal-reachable paths) | secretary/taskkeeper routes + enterprise SSO PTY login |
 | `jail` | adapter | `DefaultJailProvider` (no-op, never jails) | enterprise process isolation |
 | `mobile_connect` | adapter | `DefaultMobileConnectProvider` (personal-install pair: `tailnet_qr` + `login_link` (id == kind by design)) | edition-specific phone-connection methods (descriptor-only `{id, kind}`; minting stays on each method's own endpoint; an empty list hides the dashboard entry; list + mint governed by `capabilities.mobile_connect`) |
+| `remote_provisioners` | adapter | `DefaultRemoteProvisionerProvider` (the built-in `aws_ec2` lane backed by `RealLaunchEngine`, **plus a conditional `aws_fargate` lane** backed by `FargateLaunchEngine` that is offered only when `cloud.json` carries a complete `fargate` block; id == kind by design for both) | edition-specific ways to CREATE a remote instance (a managed dev environment, a container task): descriptor-only `{id, kind, label, posix_only, step_labels, confirm_before_launch}` plus a `LaunchEngine` per id (`confirm_before_launch` carries what the operator must see and confirm before that lane may launch -- `POST /api/cloud/launch` requires `confirm_recipient` to equal it, so the requirement is derived from the row rather than hard-coded to one id, and a lane with nothing to confirm leaves it empty); the core's durable launch job still drives every launch, so cancel, rollback and orphan reaping are inherited rather than reimplemented |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
+
+> `remote_provisioners` note — this seam lets the Set-up tab under Settings →
+> Remote Crew offer lanes beyond an EC2 instance in the user's own AWS account:
+> `handlers_cloud._engine()` resolves the engine for a `provider_id` through the
+> seam (the `state.cloud_launch_engine` hook beside it is a test seam, not a
+> contract), so a deployment whose users have no AWS account of their own, or
+> whose machines come from a managed dev-environment service, can add a lane
+> without shadowing the panel. The seam follows `mobile_connect`
+> exactly: the backend contributes descriptors (`GET /api/cloud/provisioners`),
+> the frontend draws each `kind` through `registerRemoteProvisionerRenderer()`
+> (the `aws_ec2` kind is drawn by the core's own form and cannot be claimed), and
+> `POST /api/cloud/launch` resolves the requested `provider_id` against the same
+> seam before a job file exists. What the seam deliberately does NOT hand out is
+> the launch loop itself: an edition supplies the five-method `LaunchEngine` and
+> `cloud/launch_job.py::run_launch` drives it, so one-launch-at-a-time, cancel,
+> the two rollback paths and `reap_orphans` apply to every lane. The four step
+> KEYS are therefore fixed (rollback branches on them); a descriptor may only
+> relabel them. `size_key`, `profile` and `region` are the generic wires: for the
+> built-in they are the EC2 ladder, an AWS profile and an AWS region; another
+> provisioner reads them as its own shape, credential selector and placement,
+> which is why `LaunchJobStore.create()` validates `size_key` against
+> `sizes.py` for the built-in id only. The stop/start/delete lifecycle routes
+> (`/api/cloud/{tag}/...`) remain EC2-specific: a lane that needs them
+> contributes its own through `dashboard.contribute_routes`. No governance scope
+> is added here; the existing EC2 lane carries none today, and a
+> `capabilities.remote_provisioners` row mirroring `capabilities.mobile_connect`
+> is the natural follow-up once a second lane exists to narrow on.
+>
+> Contributor walkthrough: [adding-a-remote-provisioner.md](../../guides/adding-a-remote-provisioner.md).
 
 > `external_access` note — three surfaces the core offers unconditionally, none of
 > which had a composition point. Two are installable-content registries: skill
@@ -136,25 +179,34 @@ installs the context. `bootstrap_context`:
 2. If profile != standalone: `discover_companion_context` (fail-closed), then validate `contract_version` and the ADD-only security floor.
 3. `assert_governance_paths_protected`, `assert_policy_signature_satisfied`, and `assert_profiles_within_ceiling` validate the final context before `set_context`; these gates prevent an agent-writable trust root, an absent required signature, or a profile looser than its ceiling from becoming active.
 4. `ctx.providers.register_acp_backends()` once (Default no-op).
-5. `ctx.publish.register_publish_providers()` once (Default no-op → the `publish_provider` registry stays empty and publishing is unavailable).
+5. `ctx.publish.register_publish_providers()` once (Default registers the personal
+   cloud drive under its OWN key, `PERSONAL_DRIVE_PROVIDER`, so the destination is
+   listed and selectable but does NOT capture the unnamed default — a publish that
+   names no destination still resolves `DEFAULT_PROVIDER`, which stays unregistered,
+   and gets a 503; a companion edition registers its own destination instead).
 
 ## Profile resolution
 
 `resolve_profile(cfg, *, entry_points)` precedence (first match wins):
 1. `KIROCREW_PROFILE` env (`standalone` | `enterprise`; unknown → standalone).
 2. Non-empty `kirocrew.plugins` entry-point group (companion installed).
-3. Identity signal: a present `~/.midway` directory (a cheap stat, no
-   subprocess) — **only when the opt-in `KIROCREW_MIDWAY_PROFILE_PROBE` env var
-   is truthy**. OFF by default so a stray `~/.midway` left by some other tool
-   cannot force the public edition into the `enterprise` profile (which has no
-   companion to compose and would fail-closed at boot, bricking every command).
-   The companion's managed launcher sets `KIROCREW_MIDWAY_PROFILE_PROBE=1`.
+3. Identity signal: a present SSO-marker directory (a cheap stat, no
+   subprocess) — **only when the opt-in `KIROCREW_SSO_PROFILE_PROBE` env var
+   is truthy**. The legacy name `KIROCREW_MIDWAY_PROFILE_PROBE` is honored too,
+   because already-deployed managed launchers set it: dropping it would let an
+   enterprise host with the marker but a missing companion resolve `standalone`
+   instead of failing closed. `KIROCREW_SSO_MARKER_PATH` overrides the path that
+   is stat'd (default `~/.midway`). The probe is OFF by default so a stray marker
+   directory left by some other tool cannot force the public edition into the
+   `enterprise` profile (which has no companion to compose and would fail-closed
+   at boot, bricking every command). A companion's managed launcher sets the
+   opt-in.
 4. Otherwise `standalone`.
 
 The profile is a **load trigger, not a security decision**: capability comes
 from the installed companion, so a spoofed signal at worst loads a stricter
 posture on a host that has nothing to enforce it. The core does NOT spawn a
-`whoami` subprocess — entry-point presence + the opt-in `~/.midway` stat cover
+`whoami` subprocess — entry-point presence + the opt-in marker stat cover
 the trigger cases; the companion's own identity provider refines the principal
 once loaded.
 
@@ -171,9 +223,9 @@ once loaded.
 
 ## Level-1 governance ceiling and distribution
 
-`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` selects the first available source: an explicit local policy, a centrally distributed policy, a companion-bundled policy, then the data-home policy; no source leaves editable standalone defaults. The local source remains first so an operator can roll back a bad fleet-wide publication without waiting for the central control plane.
+`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` composes a **tier ladder**, highest first: the centrally distributed document, then exactly one of the local sources (an explicit `KIROCREW_SECURITY_POLICY` path, a companion-bundled policy, or the data-home policy). The central document is the authority; every tier below it may only **tighten** it, through the same per-scope AND the profile layer uses. There is no local rollback lever above the fleet: recovery from a bad publication is re-publishing a good document at the source (`governance.md` → "Loading + precedence"). No source leaves editable standalone defaults.
 
-`policy_distribution.resolve_distribution` accepts the central source from fleet environment settings or the `distribution` declaration of an already-selected lower-tier policy, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
+`policy_distribution.resolve_distribution` takes the central source from the `distribution` declaration of the highest tier that made one, or from fleet environment settings when none did, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
 
 `governance._parse_controls` rejects every unknown governed key, including an unrecognised `sandbox` child. Only documented non-governed sandbox flags are accepted in the reserved internal scope. This fails closed instead of recording a misspelled sandbox floor as a valid but unenforced policy control.
 
@@ -202,11 +254,11 @@ remove or weaken the floor — is enforced structurally:
 
 **`BASELINE_DENY` is `()` — the floor definition.** The built-in
 denied-command patterns are **default-ON but user-DISABLEABLE** (Settings →
-Security; see `security.md`), so they can no longer be an unconditional compiled
+Security; see `security.md`), so they cannot be an unconditional compiled
 `BASELINE_DENY = tuple(security.BUILTIN_DENY_PATTERNS)` — that would re-apply
 every built-in inside `PolicyAuthority.is_denied` and make user opt-out inert.
 `BASELINE_DENY` therefore narrows to the empty tuple: the static, un-weakenable
-OSS floor is now empty. The un-opt-out-able floor is supplied dynamically by (a)
+OSS floor is empty. The un-opt-out-able floor is supplied dynamically by (a)
 the companion's ADD-only `SecurityOverlay` (structurally un-removable via the
 `@final` union) and (b) the governance `commands`-scope **pins**
 (`resolve_pinned_commands`, applied tightest-wins in `hooks.py` — see
@@ -285,6 +337,17 @@ Policy shape (`admission_policy.json`):
 }
 ```
 
+**Strict gate-flag reading.** `require_signature` and
+`require_policy_signature` are read strictly by `_coerce_flag`: a real JSON
+boolean is honoured, an absent key leaves the gate off (the documented
+default), and any other present value — explicit `null`, the string
+`"false"`, `0`, `1` — is warned about and read as **on**, the fail-closed
+direction. A plain `bool()` on the raw value would read any non-empty string
+as ON but `null`/`""` as OFF, so a template rendering
+`"require_policy_signature": null` would silently disable the gate. Same
+strict-read shape as the `boot` gate flags in
+[governance](governance.md).
+
 **This policy is also the trust root for the security ceiling.**
 `require_policy_signature` (default `false`) additionally demands a *verified*
 `identity.signature` on `security_policy.json`, keyed by that document's
@@ -326,7 +389,7 @@ added pre-launch landed under this same `1`, with no bump:
   contributor), and `jail` (process-isolation) extension points;
 - the `agent_identity` slot (`AgentIdentityProvider` — agent workload identity
   and token vending, distinct from operator-SSO `identity`);
-- wiring an *existing* but previously-unconsumed Protocol method into a call site
+- wiring an *existing* but unconsumed Protocol method into a call site
   (e.g. `ProviderRegistry.create_factory` going live, `AppsLoader` bundling
   feature apps) — no shape change, so no bump regardless;
 - adding `TunnelProvider.register_callbacks` / `status_snapshot` when the tunnel
@@ -340,14 +403,29 @@ companion can pin against a frozen contract.
 
 The companion declares (in its `pyproject.toml`):
 ```toml
+[project]
+dependencies = ["kirocrew"]
+
 [project.entry-points."kirocrew.plugins"]
 enterprise = "kirocrew_enterprise.compose:build_enterprise_context"
+
 [project.scripts]
 kirocrew-enterprise = "kirocrew_enterprise.cli:main"
-dependencies = ["kirocrew"]
 ```
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
+
+**The companion's top-level module MUST be named `kirocrew_<edition>`** — lowercase
+letters, digits and underscores only, no dots or hyphens. Two matchers identify a
+running gateway from its command line and neither can read the companion's entry
+points: `port_resolution._gateway_module_roots()` derives the Python side's set
+from the installed `kirocrew.plugins` entry points, while the desktop launcher's
+`isKirocrewCommand` (`website/electron/gateway-stop.js`) runs in a process with no
+view of that Python environment and matches the name against `KIROCREW_MODULE_RE`
+instead. Both also require a server subcommand (`gateway`, `dashboard`, `start`)
+as the first positional after the module. A companion named outside the
+convention classifies as ours on the Python side but as a foreign port holder on
+the desktop side, and the app refuses to start on its own gateway's port.
 
 ### Distribution build version
 
@@ -390,7 +468,32 @@ the helpers in `kiro_crew/__init__` are private. The accepted shape parses as a
 PEP 440 release wherever the version is compared (`_is_newer` orders `0.6.0.12`
 above `0.6.0` and below `0.6.1`; `release_channel.channel` still reads
 `stable`), and `base_version` — the stable-channel display fold — preserves the
-stamped string, which is what lets the chip show it.
+stamped string, which is what lets the chip show it. The one reader that does
+NOT take the stamp's word is the bug-report resolver
+(`release_channel.provenance`, behind `kirocrew doctor --bundle` and the
+dashboard's Report-a-problem link): because this rule admits a stamp only over
+a bare base, a stamped build has by construction lost whatever prerelease
+marker the release pipeline wrote, so the stamp claims no lane there — a
+prerelease marker in the installed distribution's metadata version (which the
+stamp never rewrites) or the `channel` record decides, and with neither the
+report says `Not sure` rather than Stable. The public `version` field is the
+release the stamp is a build of (`changelog.release_of_build`); the evidence
+the resolver weighed stays in the private bundle, where `versions.txt` and
+`manifest.json` both record the raw stamp (`kirocrew_version`), the folded
+release (`release`), the distribution's metadata version
+(`distribution_version`), the proven lane (`channel`, `unknown` when none) and
+the `channel` record (`channel_record`) — the manifest spells a silent source
+as JSON `null`, the text file as `unavailable` / `absent`. `collect_bundle`
+resolves the provenance exactly ONCE, before it writes the first member, and
+keeps that snapshot on `BundleResult.provenance`: `versions.txt`, the manifest
+and the issue link are all written from it, and the terminal link `kirocrew
+doctor` prints afterwards reads the same field rather than resolving again.
+The resolver reads host state that can change mid-collection — the dashboard's
+`set_release_channel` rewrites the `channel` record on the event loop while
+the collector runs in a worker thread — so a per-member read could leave one
+bundle with a `versions.txt` and a `manifest.json` that disagree about the
+lane, beside a link that explains neither (pinned by
+`test_one_bundle_is_written_from_one_resolution`).
 
 Update lane. A distribution owns its own update path, normally the command
 provider selected by `check_command` / `apply_command` update pins, which never
@@ -403,11 +506,104 @@ dist-info metadata is not touched by the stamp — `pip` and `importlib.metadata
 still report the base — so a downstream that builds its own wheel and needs
 those to differ must bump its own project version as well.
 
+## Gateway restart launcher
+
+`PlatformContext.gateway_lifecycle` composes a `GatewayLifecycleProvider`.
+`restart_launcher() -> str | None` returns an absolute stable launcher pathname;
+`DefaultGatewayLifecycleProvider` returns `None`. A companion opts in through
+`dataclasses.replace(ctx, gateway_lifecycle=provider)` at its trusted composition
+root, only for installs its launcher owns. This is lifecycle selection, not an
+update authorization setting: no request, config or environment command selects
+it, and update governance is unchanged. `CONTRACT_VERSION` remains 1.
+
+`gateway_restart.resolve_restart_launcher()` is the shared selector for dashboard
+restart (including update apply) and the orchestrator's automatic-update restart.
+Both import it before an update can retire the running package tree and call it
+off-loop before saving or draining sessions. The provider must load its own
+dependencies at composition and return cheaply without deferred imports. A
+provider error or an explicit empty, relative, missing, non-file or non-executable
+target refuses restart; only `None` reaches the interpreter, which normally takes
+the existing `respawn_executable()` → `reexec_python_module()` path, including
+core-managed virtual environments.
+
+The core executes `[launcher, *sys.argv[1:]]` directly, without a shell or Python
+`-m` prefix, and never resolves the launcher's symlinks: dispatch may depend on
+its basename. `reexec_launcher` preserves the inherited environment, including
+instance home and port, while pinning Python's UTF-8 stream settings. The launcher
+owns choosing the current bundle/interpreter and replacing version-specific
+`PYTHONPATH` and other environment entries before loading that bundle. Windows
+launchers must be native `.exe` files; each argument is quoted for the CRT's
+`execv` command-line reconstruction. POSIX receives the original argv unchanged.
+The existing restart coalescing, callback fence and drain ordering remain with
+their callers. CLI service-manager restarts are independent and unchanged.
+
+Validation establishes availability at selection time, not future execution:
+an updater must keep the stable launcher usable through handoff. The core does
+not retry a failed explicit launcher with the old Python bundle. When it is the
+*interpreter* an update retires, the guard below is what keeps the gateway
+serving.
+
+### The pruned-interpreter guard
+
+`resolve_restart_launcher()` returning `None` and the interpreter no longer
+existing is a real state: an `apply_command` that installs into a new versioned
+tree and prunes the old one deletes the interpreter the running gateway was
+launched from.
+
+What made that state costly was the ORDERING, not the missing file. The
+orchestrator saved, fenced, closed every session and only then raised `ENOENT`
+from `os.execv`. Admission itself does come back —
+`_finish_auto_update_apply` calls `resume_turn_admission_after_update()` — but the
+sessions `close_all()` tore down do not, and `_pending_update_respawn` is cleared
+immediately before the exec, so `_retry_pending_update_restart` can never fire.
+What survived was a gateway with no sessions, running a different version from the
+install on disk. The dashboard's own path is worse by one step: its `close_all()`
+sets the closing flag without owning the update pause, so `resume_...` returns
+early and admission stays shut as well.
+
+Both consumers therefore ask before the point of no return. The dashboard's
+`_restart_gateway` refuses with `Cannot restart: invalid Python executable path`
+while every session is still answerable. The orchestrator defers, retaining
+`_pending_update_respawn` so `_retry_pending_update_restart` completes the update
+once the install is repaired. Neither drains on the chance that a restart might
+still work.
+
+Asking early narrows that failure; it cannot remove it. The target can be
+replaced between the check and the call, and a file that is present and carries
+the exec bit can still be an image this kernel refuses — a wrong architecture, a
+truncated binary, a script whose interpreter is gone. The kernel is the authority
+on all of those and reports them as `OSError` from `execv` itself, so the exec
+site is the only place they can be answered. Both consumers answer by exiting:
+`platform_compat.exit_after_failed_restart_exec()` logs CRITICAL naming the
+target and calls `os._exit(1)`. Returning instead is what produced the original
+defect — the orchestrator's caller catches `Exception`, logs and sleeps, and the
+dashboard's path would fall through to `return True` and report a restart that
+did not happen. Exiting makes the failure visible to whatever started the
+gateway, frees the port so the operator's own relaunch can bind, and refuses to
+serve the version skew. Reopening admission is not an alternative: the closed
+sessions do not come back, and the skew would then be served. Because `os._exit`
+runs no `atexit` handler, that function repeats the two bounded best-effort
+flushes the force-exit signal handler performs — the CRITICAL line is the whole
+diagnosis and is queued, not yet on disk. Only the event log's flush is bounded there:
+the `gateway.log` tail goes through `cli.drain_log_queue_before_hard_exit()`, the shared
+async hard-exit drain for that queue, so every hard-exit path keeps one spelling and one
+ceiling for it. The event log's own ceiling is derived the way that function derives
+its own — the inner bound plus one second — rather than chosen independently.
+
+There is deliberately NO second pathname for an operator to declare as a fallback
+exec target. Validating one is not reachable. A pathname's bytes do not decide
+what the kernel execs: a `#!` line delegates to an interpreter the check never
+sees, and a header that parses can still belong to a truncated binary. The only
+way to learn the answer for certain is to exec the candidate, which means either
+running an arbitrary operator-supplied binary or booting a second gateway. So the
+recovery is repair-then-relaunch, which an operator can actually perform and the
+core can describe honestly.
+
 ## Consumption-site wiring
 
-Core consumption sites read the context rather than the module global they
-previously used. Standalone behavior is preserved because each Default adapter
-delegates to that same global. Wired sites:
+Core consumption sites read the context rather than a module global. Standalone
+behavior is unchanged because each Default adapter delegates to that same global.
+Wired sites:
 
 - `cli.py:main` / `slack/gateway.py:run_gateway` — `boot_platform(cfg)` once at
   startup (gateway raises fail-closed; cli is defensive — standalone never raises).
@@ -421,11 +617,13 @@ delegates to that same global. Wired sites:
   `test_gateway_first_run_setup_routes_through_the_seam`). Best-effort: the
   gateway's surrounding `except` keeps a failure non-fatal to startup, and
   `PlatformCompositionError` still propagates fail-closed.
-- `sandbox.py` — `_build_launcher_script` / `_build_seatbelt_profile` source the
-  sensitive-dir lists from `current_context().sandbox` (the `.aws`-exclusion at
-  the cc branch is preserved). `namespace_argv` / `sandbox_exec_argv` resolve
-  argv[0] through `current_context().agent_executable` before applying the core
-  sandbox. The public Default is identity; a companion may return the direct
+- `sandbox.py` — `_live_plan_host`, the plan host `_build_launcher_script` /
+  `_build_seatbelt_profile` both plan with, sources the sensitive-dir lists from
+  `current_context().sandbox` through `sandbox._sandbox_policy` (Seatbelt's
+  `.aws`-exclusion at the cc tier is preserved, as that renderer's declared capability). `sandbox.py`'s
+  `namespace_argv` / `sandbox_exec_argv` resolve argv[0] through
+  `current_context().agent_executable` before applying the core sandbox. The
+  public Default is identity; a companion may return the direct
   executable behind an edition-managed launcher to avoid nested isolation, but
   cannot disable or weaken the outer sandbox. A transient adapter error falls
   back to the original executable (outer sandbox still applies); a
@@ -438,8 +636,9 @@ delegates to that same global. Wired sites:
   fail-closed-aware shim; modules import it as `redact`). Covers: `agent.py`
   SEL-audit callers, `mcp_core.py` chat-history/spawn output, `mcp_cron.py`
   deny-reason + script-vet + timezone messages, and `dashboard/handlers/files.py`
-  file-content egress (slot append, file-watch, file_read, download gate) as well
-  as the filename/path/description gates. Standalone is byte-for-byte the prior
+  file-content egress (slot append, file_read; file-watch and the download gate in
+  `dashboard/file_api/transfer.py`) as well as the filename/path/description gates.
+  Standalone is byte-for-byte the prior
   exfil-then-credential two-pass (the Default `CredentialPolicy.redact` delegates
   to `security.redact`); a loaded companion adds its internal-token regexes
   uniformly across every egress surface.
@@ -485,9 +684,8 @@ delegates to that same global. Wired sites:
   write, either nested in the call or through a local assigned from one in the
   same scope — rather than for a filename or a subject name, because a grep
   scoped to files mentioning stderr is exactly what missed `task_planner.py` and
-  `name_grant.py`. `_BASELINE_LOG_SITE_CENSUS` records the per-module residual
-  measured when the gate went up (76 sites in 26 modules, `acp/client.py` the
-  largest at 7); it is a census, NOT an approved-exception list and NOT a to-do
+  `name_grant.py`. `_BASELINE_LOG_SITE_CENSUS` in `test/test_security_posture.py` records the
+  per-module residual and owns the counts; it is a census, NOT an approved-exception list and NOT a to-do
   list, since for a process that never composes — gatewayd above — the baseline
   is the honest answer. Growth in any module, or a first site in a module absent
   from it, fails until someone either calls `redact_log_via_context` or raises
@@ -532,7 +730,8 @@ delegates to that same global. Wired sites:
   `CredentialPolicy` Protocol; no `CONTRACT_VERSION` bump; `DefaultCredentialPolicy`
   returns `frozenset()` so standalone redaction is byte-identical.
 - `agent.py` — `current_context().mcp_tooling.extra_mcp_servers()` merged
-  additively (`setdefault`) into the agent config build + dynamic refresh.
+  additively into the agent config build; the dynamic refresh also re-pins an
+  existing entry's `command`/`args` and keeps its other keys.
 - `slack/events.py` / `slack/handler.py` / `dashboard/handlers_system.py` —
   Slack enterprise gate + SSO status route through `slack_gate` / `identity`.
 - `mcp_gateway/manager.py` — `GatewayManager._spawn_once` resolves
@@ -562,9 +761,9 @@ delegates to that same global. Wired sites:
   pre-method companion adapter degrades to no-watcher instead of raising.
 - `apps/manager.py` — builtin discovery + orphan detection merge
   `current_context().apps_loader` sources.
-- `apps/registry.py` / `apps/routes.py` — clone-sandbox-mode decision routes
+- `apps/registry_pipeline/sources.py` / `apps/routes.py` — clone-sandbox-mode decision routes
   through `current_context().registry` (`_context_clone_sandbox_mode`).
-- Telemetry `record_event` sites — `dashboard/server.py` records `gateway_start`
+- Telemetry `record_event` sites — `dashboard/server_runtime/diagnostics.py` records `gateway_start`
   at boot; `dashboard/chat_runner.py` and `slack/handler.py` record one
   `interaction` event per successful chat turn (immediately after the
   `record_success` call, non-cancelled / non-retrying branch only; cancelled
@@ -631,7 +830,7 @@ delegates to that same global. Wired sites:
   `start()` reached, so a companion tunnel cannot start without dashboard token
   auth; the connect/disconnect callbacks and `/api/tunnel/status` stay wrapped
   AROUND the provider. **Teardown is wired at
-  `dashboard/server.py::_wire_tunnel_shutdown`** — an `app.on_cleanup` hook that
+  `dashboard/server_runtime/tunnel.py::_wire_tunnel_shutdown`** — an `app.on_cleanup` hook that
   reads `state.tunnel_manager` lazily (the manager is assigned later, by
   `setup_tunnel`). It covers BOTH start paths, because a live tunnel does not
   imply a manager: with a manager it calls `TunnelManager.stop()`; with
@@ -658,8 +857,8 @@ delegates to that same global. Wired sites:
   `setup_tunnel`, so it needs no hook.
   Import direction: `tunnel/` imports
   `kiro_crew.platform.context`; `platform/` keeps zero imports of `kiro_crew.tunnel`.
-- `dashboard/server.py` — tunnel enable-gate
-  ORs in `current_context().tunnel.enabled()`. **Dashboard contributor (wave 3):**
+- `dashboard/server.py` (the gate in `dashboard/server_runtime/tunnel.py`) — tunnel enable-gate
+  ORs in `current_context().tunnel.enabled()`. **Dashboard contributor:**
   in `start_dashboard` only, the `/api/sso-login` route binds
   `dashboard.sso_login_handler()` (or the built-in stub when `None`),
   `dashboard.contribute_routes(app)` mounts edition routes before the SPA
@@ -671,9 +870,42 @@ delegates to that same global. Wired sites:
   contract, centralized so the fail-closed policy cannot diverge). `stop_services`
   takes the same `app` handle as `start_services` (symmetric) so a companion need
   not stash services in process-global state.
+- `dashboard/server_runtime/security_middleware.py` `_mixed_internal_api_paths()` — unions
+  `dashboard.mixed_internal_api_paths()` into the module-level
+  `_MIXED_INTERNAL_API_PATHS` at BOTH `token_auth_middleware` construction sites
+  (the dashboard chain and the headless `--slack-only` one), so the two cannot
+  gate different route sets. It exists because an edition mounts its routes
+  through `contribute_routes`, so the core cannot name them in a frozenset —
+  without it an edition's own MCP tool authenticating with the loopback
+  `X-Internal-Secret` handshake is not recognized as internal at all and answers
+  `Token required` on every call. ADD-ONLY with two core-enforced limits: a
+  contributed path matching a CORE STRICT entry is DROPPED and SEL-audited
+  (strict hard-denies off-loopback where mixed accepts a validated cookie, so
+  admitting one would soften a deliberately loopback-only route), and the result
+  is a union so a contribution can never remove a core entry. BOTH outcomes are
+  recorded — the admitted set is logged and SEL-audited at composition time
+  alongside the drop audit, because a dropped contribution is invisible to the
+  EDITION while an honoured one is invisible to the OPERATOR, and SEL is what has
+  to distinguish a widened deployment from stock; a public build contributes
+  nothing and stays silent. The degraded-contributor path goes through
+  `safe_context_call`, not a hand-written `try/except`: a
+  `PlatformCompositionError` is RE-RAISED (a host that could not compose its
+  companion must abort, never fall back to open-source defaults) while any other
+  contributor failure degrades to no contribution. The contribution is also
+  MATERIALIZED inside that thunk, so a generator raising part-way through
+  iteration degrades instead of escaping middleware construction and stopping the
+  gateway from binding at all. The overlap is checked in BOTH directions by
+  `_would_soften_a_strict_path`: the request is what
+  gets prefix-matched, so a contributed ANCESTOR of a strict entry reclassifies it
+  exactly as a child does — a request for the strict path then matches both sets,
+  and token_auth's off-loopback arm tests `_matches_mixed` first. Every degraded
+  contributor shape — raising, absent method, non-iterable, non-path entries —
+  contributes nothing rather than widening the set on a value the core could not
+  check; a contributor predating the seam is NOT logged as a fault, while one
+  that raises is.
 - `dashboard/handlers_system.py` — `frontend_rum_config()` added to the status
   payload only when non-None.
-- `config/loader.py` `build_provider_factory(cfg)` (wave 3 wiring) — the
+- `config/loader.py` `build_provider_factory(cfg)` — the
   LLM-provider factory build sites (`cli_chat`, `cli_server`,
   `session.reload_provider_factory`, `slack/gateway`, `cli`, `cli_commands`) route
   through `current_context().providers.create_factory(cfg)` instead of
@@ -687,9 +919,9 @@ delegates to that same global. Wired sites:
   `current_context().knowledge.extra_connectors(cfg)` after the built-ins
   (`local_folder`/`obsidian_vault`); Default returns `{}` so standalone is
   unchanged.
-- `cli.py` `main` (wave 3 jail gate, factored into `_jail_reexec_gate`) +
+- `cli.py` `main` (jail gate, factored into `_jail_reexec_gate`) +
   `cli_doctor.py` — for `_JAILED_COMMANDS`
-  (`chat`/`tui`/`run`/`consolidate`/`eval` — the rule is "every command that
+  (`chat`/`run`/`consolidate`/`eval` — the rule is "every command that
   builds a provider factory / runs in-process agent work"; `gateway` is excluded
   so its execv self-update path is never nested in a jail). Order: (0) **re-entry
   guard** — if the `KIROCREW_JAILED` marker is PRESENT (any non-empty value) we
@@ -733,17 +965,23 @@ the public fork dropped without the core importing it. All are v1 additions (a
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
 - `SlackEnterpriseGate.heartbeat_safe_tools() -> frozenset[str]` — unioned into
-  `slack/gateway.py::_is_heartbeat_safe_tool` after the core `HEARTBEAT_SAFE_TOOLS`
-  exact-match. Default `frozenset()`. ADD-only; never sourced from config.
+  `slack/gateway_runtime/tool_policy.py::_is_heartbeat_safe_tool` after the core
+  `HEARTBEAT_SAFE_TOOLS` exact-match. Default `frozenset()`. ADD-only; never sourced from config.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
-  `apps/registry.py::_load_registry_file` after bundled `app-registry.json`
+  `apps/registry_pipeline/sources.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
 - `AppsLoader.default_registries() -> List[Dict]` — external app registries the
   edition pins, merged with the operator's `config.registries` by
-  `apps/registry.py::_effective_registries`, which is the single list every
+  `apps/registry_pipeline/sources.py::_effective_registries`, which is the single list every
   registry consumer reads (index fetch/refresh, the trusted-host allowlist, row
   lookup, install, the blob-proxy allowlist). Rows are the field shape of
-  `ExternalRegistryConfig` (`{name, repo, branch, trust}`). Unlike
+  `ExternalRegistryConfig` (`{name, repo, branch, label, review, trust}`).
+  `label` (a display name shown instead of the `name` id) and `review` (`""` /
+  `"curated"` / `"community"`, which badge the dashboard renders) are display-only
+  and change no security posture; an unrecognised `review` degrades to `""` (no
+  claim) and is logged, never dropping the row, since a display field must not be
+  able to remove a registry from install and the security gates. `label` never replaces
+  the id: cache paths and installed apps' `_registry` tags are keyed by it. Unlike
   `registry_rows`, the **edition row wins** a `name` collision — and when the two
   rows name DIFFERENT repositories, **neither** is served, because the index cache
   is keyed by name and the displaced row's cache would otherwise be read under the
@@ -777,7 +1015,7 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
 - `DashboardContributor.on_user_message(app, message)` — fired once per user
   message by `dashboard/chat_handlers.py::api_chat` before the turn, inside a
   fail-safe `safe_context_call`. OBSERVER only. Default no-op.
-- `McpToolingProvider.extra_skills()` — now WIRED: `SkillsLoader.__init__`
+- `McpToolingProvider.extra_skills()` — WIRED: `SkillsLoader.__init__`
   appends returned paths as lowest-precedence extra skill roots (sensitivity- +
   existence-checked). Default `[]`.
 - `AgentCatalogProvider.builtin_agents() -> List[Dict[str, Any]]` — ADD-only
@@ -834,9 +1072,9 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   separator — a split silently misattributes any package whose own name contains
   that separator, which makes the package permanently "drifted" so every
   `sync_plugins` reinstalls a plugin that already exists.
-- `CapabilityManager` (operations-based external package/capability manager) —
-  **replaces the former `external_capability_bin()` binary-name seam.** Rather
-  than naming a binary whose exact CLI grammar the core then hardcodes, the
+- `CapabilityManager` (operations-based external package/capability manager).
+  The seam names OPERATIONS, not a binary whose exact CLI grammar the core would
+  hardcode: the
   edition implements OPERATIONS and OWNS its own invocation grammar, output
   parsing, and error translation; the core (`/api/capability/*` handlers +
   `mcp.py` uninstall) calls an operation and only serializes the result / applies
@@ -943,12 +1181,26 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   > through read and does NOT auto-reconcile — the sweep + idempotent re-apply are
   > the recovery path.
 
-  `async registry() -> List[Dict]` (the manager parses its own registry output
-  into entries; the core passes them through as `{"servers": [...]}`). The public
+  `async registry(query: str | None = None) -> List[Dict]` (the manager parses its
+  own registry output into entries; the core passes them through as
+  `{"servers": [...]}`). The public
   `DefaultCapabilityManager.available()` is `False` → the handlers return HTTP 503;
   a companion implements registry-backed management. This is the operations-based
   Protocol the prior binary-name seam's contract note anticipated — chosen now,
   pre-launch, so no external CLI grammar fossilizes in the core.
+
+  > `query` is an optional free-text filter HINT, sent only by MCP discovery
+  > search (`mcp_providers/capability.py`); the browse endpoint
+  > `GET /api/capability/mcp/registry` omits it and gets the full listing. The
+  > provider hands on at most `_LIST_LIMIT_GUARD` (500) entries, and when a query
+  > is present that cap applies to the MATCHES: it bounds the fan-out, never the
+  > searchable window. So a manager whose registry is larger than the cap does NOT
+  > have to filter server-side to stay searchable, and ignoring the hint costs
+  > nothing but the work of returning its own catalog — it is a cost hint, not a
+  > correctness one. The hint is feature-detected on the signature
+  > (`mcp_utils.registry_accepts_query`) and forwarded by
+  > `BoundedCapabilityManager`, so an edition still on the zero-arg signature
+  > keeps working.
 
   **Second consumer — App Kit dependency resolution.** `apps/dependencies.py`
   resolves an app manifest's `dependencies.capabilities.{mcp,skills}` through
@@ -959,9 +1211,11 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   `False` the entries are recorded as `failed` (unresolved) and the app still
   installs, so a public install surfaces the unmet dependency instead of silently
   reporting success. `dependencies.capabilities.agents` is **declarable but never
-  gateway-installed**: the Protocol exposes `list_agents` only (package/agent
-  install routes were removed), so those entries always report unresolved —
-  declare them `managedBy: app` or install them out of band. The wire key `aim`
+  gateway-installed**: `CapabilityManager` does expose `install_agent` /
+  `uninstall_agent` (and `/api/capability/agents/{install,uninstall}` routes),
+  but `apps/dependencies.py` does not call `install_agent`, so those entries
+  always report unresolved — declare them `managedBy: app` or install them out
+  of band. The wire key `aim`
   is a deprecated READ alias (`Dependencies.from_dict`) that is never
   re-emitted, so a manifest round-trip migrates it; ledger keys/types likewise
   resolve the pre-rename `aim/*` / `aim.*` spellings so an upgraded install does
@@ -1047,49 +1301,45 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   fork. v1 addition; `Default` returns `[]`.
 
 **`McpToolingProvider` is intentionally scoped to MCP tooling only** —
-`extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. The former
-grab-bag members were split into dedicated Protocols this session
+`extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. Agent
+catalogs, prompt sources and capability management each own a dedicated Protocol
 (`AgentCatalogProvider`, `PromptSourceProvider`, `CapabilityManager`) so the CPP
-layer keeps its "one adapter per concern" shape; every future edition hook lands
-on its own interface rather than accreting onto the nearest existing one.
+layer keeps its "one adapter per concern" shape; every edition hook lands on its
+own interface rather than accreting onto the nearest existing one.
 
-**Agent-discovery module rename (this session).** `aim_agents.py` →
-`agent_discovery.py`; the `AimAgent` dataclass → `AgentInfo`. The agent `source`
-classification was generalized: the old `KiroCrewAICapabilities`-specific
-hardcode was removed, so a package-installed agent is now classified
-`source="package"` (alongside `"kirocrew"` for `kirocrew.json`/`kirocrew-lite.json`
-and `"builtin"` for the rest) rather than the former `"aim"` literal. Importers
-(`subagent`, `mcp_core`, `conductor_skill`, dashboard agents) were updated to the
-new module/class names.
-- **`register_browser_auth_provider(provider)` — removed with the playwright-cli
-  migration.** The module that carried this seam is gone, so there is no
-  browser-auth provider hook to register at all: browsing runs through the
-  external `playwright-cli` binary (`kiro_crew/browser_cli/`), and a logged-in
-  session reaches that binary through the CLI's own surfaces (`state-save` /
+**Agent discovery.** `agent_discovery.py` owns it, and `AgentInfo` is the record
+it yields. The `source` classification is generic — no product-specific hardcode:
+`"kirocrew"` for `kirocrew.json` / `kirocrew-lite.json`, `"package"` for a
+package-installed agent, `"builtin"` for the rest. It has many consumers —
+`agent`, `session`, `context`, `subagent`, `mcp_core`, `cron_script`,
+`slack/handler` and several dashboard modules among them — so treat any list here as
+representative rather than exhaustive.
+- **There is no browser-auth provider hook.** Browsing runs through the external
+  `playwright-cli` binary (`kiro_crew/browser_cli/`), and a logged-in session
+  reaches that binary through the CLI's own surfaces (`state-save` /
   `state-load`, `attach --extension`) rather than through an in-process
   provider.
 - `hooks.register_internal_read_path(read_id, rel_path)` — guarded seam adding a
   fixed-path entry to `_INTERNAL_READ_ALLOWLIST` (rejects `..`/absolute/
   non-sensitive/repoint).
-- `security._SENSITIVE_HOME_DIRS` gains `.midway` (live SSO bearer cookie;
-  inert on a host without `~/.midway`).
-- `config.dashboard.mwinit_flags` (str) + `_EDITABLE_CONFIG` PATCH entry.
+- `security._SENSITIVE_HOME_DIRS` gains the SSO cookie directory (live SSO
+  bearer cookie; inert on a host without it).
 - `config.knowledge.doc_ingest_hosts` (list) — SSRF-safe allowlist for the
   server-side fetch path only; empty = deny-by-default. The agent-driven
-  `auto_add_documents` path (renamed from `auto_ingest_doc_links`) is NOT gated
+  `auto_add_documents` path is NOT gated
   on it: the agent hands over text it already fetched, Kiro Crew fetches nothing.
 - `KiroCrewConfig._extra_sections` (private) — unknown top-level config.json
   sections captured at `load()`, re-emitted by `to_dict()`, so an edition
   section is not dropped on `save()`/PATCH. Excluded from the JSON schema
   (`build_json_schema` skips leading-underscore fields). Data-preservation half
   of the eventual `ConfigSchemaContributor`; Settings-visibility half is TODO.
-- ACP claude seam (inert on kiro-cli, and implemented in the core now that CC is
+- ACP claude seam (inert on kiro-cli, and implemented in the core because CC is
   selectable): `AcpClient._session_mcp_servers()` translates the materialized
   kiro agent spec (`acp/session_mcp.py`) and feeds both `session/new` +
   `session/load` `mcpServers` — gated on membership in
   `ACP_BACKENDS_SESSION_MCP_ARRAY`, not on `_is_claude`, since reading no agent
-  file is a property of the transport rather than of Anthropic; `_spawn` calls
-  `_write_claude_local_settings()` (still identity-gated — it writes a literal
+  file is a property of the transport rather than of Anthropic; the claude adapter's
+  launch (`ClaudeLaunch.resolve_spawn`) calls `_write_claude_local_settings()` (still identity-gated — it writes a literal
   `.claude/` path) on the PRIMARY
   spawn path (permission mode, `availableModels`, resolved model — snapshotted and
   restored by `_reset_state`); `AcpClient`/`AcpProvider` take a `permission_mode`
@@ -1139,12 +1389,9 @@ new module/class names.
   `sel().log_api_access(operation="slack.message.intercept")` audit event — the
   interceptor is a permission decision distinct from the allowlist check, so its
   verdict reaches the SEL trail.
-
-### Deferred / non-mapping sites
-
-- `apps/routes.py` — `_fetch_git_blob`'s per-URL clone-sandbox-mode decision IS
-  wired: it routes through `_context_clone_sandbox_mode` (same as the
-  `apps/registry.py` clone sites), so a companion's extended trusted-host set
+- `apps/routes.py` — `_fetch_git_blob`'s per-URL clone-sandbox-mode decision
+  routes through `_context_clone_sandbox_mode` (same as the registry's clone
+  sites in `apps/registry_pipeline/`), so a companion's extended trusted-host set
   applies to registry-blob fetches too. The other `wrap_argv` sites run local
   lifecycle scripts (no per-URL git host), so they have no clone decision to
   route.
@@ -1196,7 +1443,7 @@ Current reserved surface:
 | Slot / method | Why inert | Use instead |
 |---|---|---|
 | `embeddings` (whole slot) | the public embedding runtime is the bundled in-process llama.cpp model — there is no HTTP embed path to source a model/endpoint/signature from | `embeddings.register_embedding_backend()` |
-| `package_manager` (whole slot) | external-tool installs (ollama, ffmpeg, whisper) are inline step-by-step brew/curl/pip logic in `cli_doctor.py`, not a single plan-resolution point | `CapabilityManager` for registry-backed MCP/skill/agent installs |
+| `package_manager` (whole slot) | external-tool install hints (ffmpeg, faiss, the `voice-aws` extra) are inline brew/winget/pip text in `doctor_checks/features.py`, not a single plan-resolution point | `CapabilityManager` for registry-backed MCP/skill/agent installs |
 | `feature_apps` (whole slot) | bundled apps are discovered via `AppsLoader` and registered by `apps/manager.py`; the tuple is a provenance record only | `AppsLoader.manifest_sources()` / `bundled_app_names()` |
 | `AgentRuntime.managed_mcp_servers` | the agent config is built from the `agent._MANAGED_MCP_SERVERS` global directly | `McpToolingProvider.extra_mcp_servers()` (wired, ADD-only) |
 | `IdentityProvider.whoami` / `.issuer` | nothing in the core displays the principal or branches on the issuer | return them in the wired `status()` payload |

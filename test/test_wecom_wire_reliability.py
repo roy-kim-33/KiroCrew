@@ -1,7 +1,7 @@
 """WeCom long-connection reliability contracts.
 
-Each class here pins one way the channel used to lose a turn, or deliver one it
-should not have, on the WebSocket surface:
+Each class here pins one way the channel can lose a turn, or deliver one it
+should not, on the WebSocket surface:
 
 * a redelivered callback ran the whole turn a second time;
 * a group message ran inside the sender's private DM session;
@@ -1164,7 +1164,9 @@ class TestRendererRollsOffASealedBubble:
         r = _renderer(c)
         # A transform that lengthens the slice, as `cards` or `grid` would.
         monkeypatch.setattr(
-            WeComRenderer, "_render_slice", lambda self, body, *, final: body + "<<PADDING>>"
+            WeComRenderer,
+            "_render_slice",
+            lambda self, body, *, final, seams=None: body + "<<PADDING>>",
         )
         await r.on_turn_start()
         await r.on_text_chunk("ABCDE")

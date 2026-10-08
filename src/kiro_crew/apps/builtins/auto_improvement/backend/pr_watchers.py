@@ -63,7 +63,7 @@ from typing import Any, Callable
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
-from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
+from ..spine.git_safety import GIT_SAFE_CONFIG, GitSafetyError, hook_off_args, require_pinned
 from . import pr_checks, store
 
 logger = logging.getLogger(__name__)
@@ -134,13 +134,24 @@ _PR_URL_RE = re.compile(r"^https://[^\s]+/(?:pull|merge_requests)/\d+", re.IGNOR
 _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 
 
-def _git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
+def _git(
+    *args: str, timeout: float = 60.0, cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
     # Callers pass their own ``-C <clone>``; recover it so the attributes pin (which unbinds
     # repository-controlled filter/diff drivers) is refreshed for the tree being touched.
-    if "-C" in args:
-        i = args.index("-C")
-        if i + 1 < len(args):
-            require_pinned(args[i + 1])
+    # The same path becomes the child's ``cwd``: ``-C`` fixes the tree git reads, but the
+    # working directory would otherwise be inherited from the gateway, which is the one
+    # thing about a host-side spawn that must never be ambient. Both name the SAME absolute
+    # path -- git resolves ``-C`` against the child's cwd, so a relative clone handed to both
+    # would be applied twice. A call with no ``-C`` (``clone``) names its cwd explicitly.
+    argv = list(args)
+    if "-C" in argv:
+        i = argv.index("-C")
+        if i + 1 < len(argv):
+            require_pinned(argv[i + 1])
+            argv[i + 1] = os.path.abspath(argv[i + 1])
+            if cwd is None:
+                cwd = argv[i + 1]
     # ``errors="replace"``, not a strict decode. `git diff` emits the CONTENT of changed
     # files, and a repository legitimately contains non-UTF-8 bytes — a PNG fixture, a
     # latin-1 source file. A strict decode raises UnicodeDecodeError from inside
@@ -151,12 +162,13 @@ def _git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     # need — whether the diff is EMPTY — and never fabricates emptiness, since a replaced
     # byte is still a byte.
     return subprocess.run(
-        ["git", *_GIT_SAFE_CONFIG, *args],
+        ["git", *_GIT_SAFE_CONFIG, *(hook_off_args(cwd) if cwd else []), *argv],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        cwd=cwd,
     )
 
 
@@ -228,7 +240,18 @@ def setup_isolated_clone(
             shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         # --local hardlinks the object store: no network, near-instant, cheap on disk.
-        proc = _git("clone", "--local", shared_clone, dest, timeout=300)
+        # Absolute operands and the destination's parent as cwd: ``clone`` has no ``-C``
+        # to pin the child's working directory, and a relative operand must not be
+        # re-resolved against the pinned cwd.
+        dest_abs = os.path.abspath(dest)
+        proc = _git(
+            "clone",
+            "--local",
+            os.path.abspath(shared_clone),
+            dest_abs,
+            timeout=300,
+            cwd=os.path.dirname(dest_abs),
+        )
         if proc.returncode != 0:
             # Redact BEFORE the bound: a slice can cut a credential in the URL git
             # echoes mid-match, leaving a fragment no downstream pass recognises.
@@ -310,6 +333,21 @@ class WatcherState:
     #: isolated clone's origin is dead by design, so in that state the directory is the
     #: ONLY copy of the work and must survive teardown (and the orphan sweep).
     unexported_work: bool = False
+    #: True only when a disable (``stop_all``) stood this watcher down — never when the
+    #: operator stopped it per PR via ``stop(fp)`` or when the thread exited on its own.
+    #: ``STATUS_STOPPED`` alone cannot tell those apart (all three write the same status
+    #: and note), so the relaunch branch in :meth:`start` keys on this flag instead: only
+    #: a disable-stood-down watcher is re-driven by the next reconcile sweep, and an
+    #: operator's per-PR stop survives it.
+    stopped_by_disable: bool = False
+    #: Exported-patch sequence base, carried across a disable→enable relaunch. A relaunch
+    #: installs a fresh state whose pass counter restarts at 1, but the durable patch is
+    #: named ``<fp>.nudge-<n>.diff`` on disk and the fingerprint is stable, so a plain
+    #: ``attempt`` would make the new pass 1 overwrite an earlier incarnation's pass 1 —
+    #: and that earlier clone is already gone, so its patch is the only copy. Seeding this
+    #: from the prior incarnation's pass count makes the on-disk sequence monotone per
+    #: fingerprint, so no relaunch ever reuses a patch name.
+    export_base: int = 0
     started_at: float = 0.0
     updated_at: float = 0.0
     #: Bounded newest-last ring the UI polls, plus a monotone total so an
@@ -528,7 +566,52 @@ class PRWatcherRegistry:
         with self._lock:
             existing = self._watchers.get(fp)
             if existing is not None:
-                return existing
+                # Relaunch ONLY a watcher a disable stood down: ``stopped_by_disable``
+                # set, STATUS_STOPPED, and no live thread. The flag is the thing that
+                # tells a disable apart from the operator's own per-PR stop and the
+                # thread's natural exits — all three write STATUS_STOPPED with the same
+                # note, so status alone cannot. ``stop_all`` sets the flag; ``stop(fp)``
+                # clears it; a natural exit never sets it. Only the disable→enable gap
+                # should relaunch: the stopped entry stays in ``_watchers``, so returning
+                # it would make ``reconcile_failing_prs`` believe the PR is being driven
+                # while no thread runs, and it would sit undriven until a gateway restart.
+                # Any other terminal state (operator stop, exhausted, ready, error) is
+                # left exactly as it is: those are the operator's or the watcher's own
+                # decision, not the app being switched off, and relaunching them is out
+                # of this fix's scope.
+                #
+                # A stopped watcher that still holds UNEXPORTED work is also returned,
+                # never evicted: replacing it with a fresh ``WatcherState``
+                # (``unexported_work=False``) would let ``sweep_orphan_clones`` — or a
+                # fresh ``_ensure_clone`` — delete the kept clone that holds the only
+                # copy of that pass's commits. The clone's origin is dead, so that
+                # loss is unrecoverable. Keeping the entry preserves the clone. Nothing
+                # resets ``unexported_work`` to False (the only write is ``= True``), so
+                # a disable that lands mid-pass with unexported work keeps that watcher
+                # stopped across re-enable; a gateway restart (which clears the registry)
+                # is the only way it is re-driven. That is deliberate — the work stays
+                # safe on disk — and is the chosen behaviour, not a bug to relaunch into.
+                _thread = self._threads.get(fp)
+                relaunchable = (
+                    existing.status == STATUS_STOPPED
+                    and existing.stopped_by_disable
+                    and not existing.unexported_work
+                    and not (_thread is not None and _thread.is_alive())
+                )
+                if not relaunchable:
+                    return existing
+                # Carry the export sequence forward so the relaunched watcher's patches
+                # never reuse a name an earlier incarnation already wrote: its passes
+                # restart at 1, but ``_export_fix`` offsets by this base. ``export_base``
+                # itself accumulates, so a watcher stopped and relaunched repeatedly keeps
+                # advancing the on-disk sequence.
+                st.export_base = existing.export_base + existing.nudges
+                # Drop the stood-down entry's bookkeeping so the launch below starts a
+                # fresh thread. (``stop``/``_run_watcher`` also take the lock, so a
+                # thread that stops between checks only leaves its own stopped entry,
+                # which this clears.)
+                self._threads.pop(fp, None)
+                self._stop_flags.pop(fp, None)
             self._watchers[fp] = st
         if not is_watchable_pr(pr):
             # ``pr_recipe`` degrades to ``QUEUED:<fp>`` when it could not open a PR.
@@ -731,6 +814,12 @@ class PRWatcherRegistry:
             return False
         if stop_ev is not None:
             stop_ev.set()
+        # An operator stop must survive the next reconcile sweep, so clear the disable
+        # marker unconditionally — even for a watcher a disable already stood down. Once
+        # the operator stops it by hand it is an operator stop, and :meth:`start`'s
+        # relaunch branch must leave it alone.
+        with self._lock:
+            st.stopped_by_disable = False
         if st.status in _ACTIVE_STATUSES:
             self._set(st, status=STATUS_STOPPED, note="stopped by request")
         return True
@@ -743,6 +832,10 @@ class PRWatcherRegistry:
         for ev in flags:
             ev.set()
         for st in active:
+            # Mark these as disable-stood-down so :meth:`start`'s relaunch branch
+            # re-drives them on the next reconcile, while an operator's per-PR stop
+            # (which clears the flag) does not.
+            st.stopped_by_disable = True
             self._set(st, status=STATUS_STOPPED, note="stopped by request")
         return len(active)
 
@@ -1043,6 +1136,8 @@ class PRWatcherRegistry:
         """
         prompt = build_nudge_prompt(st, clone, status)
         isolated = True
+        faulted = False
+        result: Any = None
         try:
             result = runner.run(
                 prompt,
@@ -1059,16 +1154,45 @@ class PRWatcherRegistry:
             # teardown's `_cleanup_clone` then `rmtree`d the only copy. Run the same check on
             # this path: D-100 (failed diff) and D-101 (uncommitted tree) both live INSIDE
             # `_export_is_durable`, so an early return is exactly how work goes missing.
-            # Raised by the Opus review.
+            # Raised by the Opus review. Record the fault, but do NOT return from the except
+            # branch: a return here runs the finally and then wins over it, so an isolation
+            # breach the finally detects could never make this pass terminal. Decide the
+            # return AFTER the finally has run.
             self._retain_if_work_is_undurable(st, clone, attempt)
-            return True
+            faulted = True
         finally:
             # The turn had shell access in this tree. Re-assert the invariant before
             # trusting anything it produced, and flag a breach loudly.
             if clone and self._isolate_clone:
-                isolated = self._verify_isolation(st, clone)
+                try:
+                    isolated = self._verify_isolation(st, clone)
+                except GitSafetyError as exc:
+                    # A post-turn git safety pin could not be established (the agent
+                    # planted a config this helper refuses to run git over — an unsafe
+                    # attributes pin, or a `hook.*` config the disable scan rejects). We
+                    # can neither verify isolation nor probe durability. Retain the clone
+                    # directly — it may hold the only copy of this pass's commits — and
+                    # stop trusting this watcher. Do NOT run git again. Raised by GPT review.
+                    self._set(
+                        st,
+                        status=STATUS_ERROR,
+                        note="post-turn git safety pin failed — retaining the clone and "
+                        "not trusting this watcher further",
+                    )
+                    self._log(
+                        st,
+                        "error",
+                        f"post-turn git safety pin failed: {exc} — retaining the clone",
+                    )
+                    st.unexported_work = True
+                    isolated = False
+        # An isolation breach or an unverifiable tree is terminal and OUTRANKS a runner
+        # fault: a tree we can neither verify nor trust must stop getting turns, even when
+        # the pass that ran in it also faulted.
         if not isolated:
             return False
+        if faulted:
+            return True
         if not getattr(result, "ok", False):
             error = str(getattr(result, "error", "") or "unknown")
             self._set(st, note=f"agent pass failed: {error}")
@@ -1117,16 +1241,32 @@ class PRWatcherRegistry:
         itself stays best-effort (a lost patch must not fail the watcher), but "the patch
         was lost" and "the directory holding the commits may be deleted" are different
         decisions, and conflating them destroyed verified work.
+
+        No clone configured means no working tree to diff — there is nothing to export
+        and nothing to retain. Without this guard the fallback `git diff`/`git status`
+        calls below still ran with `-C ""`, which git treats as no `-C` at all: it walks
+        up from the process's real CWD and operates on whatever repository (or worktree)
+        happens to contain it, spawning a host-side git call — and `require_pinned`'s
+        attributes pin write — against the operator's real checkout instead of this run's
+        clone.
         """
+        if not clone:
+            return True
         try:
             self._export_fix(st, clone, attempt)
         except (OSError, subprocess.SubprocessError) as exc:
             self._log(st, "error", f"could not export the fix patch: {exc}")
             return False
+        except GitSafetyError as exc:
+            # A host-side git safety pin (attributes pin, or the config-hook disable
+            # scan) could not be established, so no git ran. That is "cannot tell",
+            # NOT "no work" — deleting the clone would lose an unexported pass. Keep it.
+            self._log(st, "error", f"could not export the fix patch (git safety): {exc}")
+            return False
         # `_export_fix` swallows its own errors, so presence of the artifact is the strongest
         # signal: if the patch is on disk the work IS saved.
         try:
-            if (store.pr_queue_dir() / f"{st.fp}.nudge-{attempt}.diff").exists():
+            if (store.pr_queue_dir() / f"{st.fp}.nudge-{st.export_base + attempt}.diff").exists():
                 return True
             # Otherwise the only safe conclusion is "this pass produced nothing", and that
             # requires the diff to have SUCCEEDED. `returncode` is checked because a FAILING
@@ -1170,6 +1310,10 @@ class PRWatcherRegistry:
             return (status.stdout or "").strip() == ""
         except (OSError, subprocess.SubprocessError):
             return False
+        except GitSafetyError:
+            # Same reasoning: a safety-pin failure means git never ran, so the pass's
+            # durability cannot be confirmed. Keep the clone rather than lose the work.
+            return False
 
     def _export_fix(self, st: WatcherState, clone: str, attempt: int) -> None:
         """Copy the pass's commits into the durable PR queue as a patch.
@@ -1184,7 +1328,7 @@ class PRWatcherRegistry:
             proc = _git("-C", clone, "diff", f"{self._base_rev(st)}...HEAD", timeout=60)
             if proc.returncode != 0 or not (proc.stdout or "").strip():
                 return
-            path = store.pr_queue_dir() / f"{st.fp}.nudge-{attempt}.diff"
+            path = store.pr_queue_dir() / f"{st.fp}.nudge-{st.export_base + attempt}.diff"
             path.write_text(proc.stdout, encoding="utf-8")
         except (OSError, subprocess.SubprocessError) as exc:
             self._log(st, "error", f"could not export the fix patch: {exc}")
@@ -1377,7 +1521,7 @@ def _delete_clone_if_unowned(reg: PRWatcherRegistry, child: Path) -> bool:
 
 
 def sweep_orphan_clones(*, clones_root: str | None = None) -> int:
-    """Delete per-PR watcher clones whose watcher is no longer live. Returns the count.
+    """Delete per-PR watcher clones whose watcher is not live. Returns the count.
 
     A watcher removes its own clone on a clean exit, but a crash, a SIGKILL, or a gateway
     restart mid-run leaves it behind — and each is a full repo checkout, so they
@@ -1461,12 +1605,11 @@ def _work_items(status: dict[str, Any]) -> list[str]:
 def _redact(text: str) -> str:
     """Credential/exfiltration redaction for a watcher log line. FAIL-CLOSED.
 
-    This used to fail OPEN so "redaction must never be the reason a watcher stops logging".
-    The concern was right but the remedy leaked: `GET /watchers/{fp}/log` serves these lines
-    straight to the browser with NO second redaction pass, so this is the only scan standing
-    between agent/CI output and the operator's screen — the same boundary
-    `routes._redact_for_display` fails closed on. Fixed alongside the identical gap in
-    `runner._redact_activity`, which the GPT review of this branch raised.
+    Failing OPEN would honour "redaction must never be the reason a watcher stops logging",
+    but it leaks: `GET /watchers/{fp}/log` serves these lines straight to the browser with NO
+    second redaction pass, so this is the only scan standing between agent/CI output and the
+    operator's screen — the same boundary `routes._redact_for_display` fails closed on.
+    `runner._redact_activity` guards the identical surface for the activity feed.
 
     Failing closed still does not stop the watcher logging: the LINE is replaced by a fixed
     placeholder, so the log keeps advancing and the operator sees activity, just not

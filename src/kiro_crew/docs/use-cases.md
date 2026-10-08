@@ -6,24 +6,46 @@ into end-to-end automation.
 
 ## Backlog Crusher
 
-The most powerful workflow: Kiro Crew digs through your issue backlog, picks up
-tasks, implements them, runs tests, opens pull requests, and handles review
-comments — all autonomously. It can push 20+ PRs overnight.
+An example workflow: Kiro Crew works through your issue backlog, picks up tasks,
+implements them, runs tests, opens pull requests, and handles review comments
+without you driving each step.
+
+The task runner reads a spec you write. Save the steps below as
+`backlog-crusher.md`:
+
+```markdown
+# Backlog crusher
+
+1. List open issues in the project's tracker.
+2. Pick the highest-priority unassigned issue.
+3. Read the issue description and the code it links to.
+4. Implement the change.
+5. Run the test suite (e.g. `pytest`).
+6. Open a pull request targeting the correct branch.
+7. Move to the next issue.
+```
+
+Then hand that file to the runner. The path is resolved as given, so run this from
+the directory holding the file, or pass its absolute path:
 
 ```
-kirocrew run docs/task-specs/backlog-crusher.md
+kirocrew run backlog-crusher.md
 ```
 
-A typical spec:
-1. List open issues in the project's tracker
-2. Pick the highest-priority unassigned issue
-3. Read the issue description and linked code
-4. Implement the change
-5. Run the test suite (e.g. `pytest`)
-6. Open a pull request targeting the correct branch
-7. Move to the next issue
+`kirocrew run --help` lists the flags that matter for a long run: `--fresh`
+ignores an existing checkpoint, `--no-test` skips verification between steps,
+and `--timeout` caps the whole run.
 
-For unattended operation with the `yolo` approval mode, use an isolated `KIROCREW_HOME`; the gateway refuses `--approval yolo` for the main data home.
+Standalone `kirocrew run` has nobody to ask for approval, so it is
+deny-by-default: a tool runs only when it matches `hooks.auto_approve_tools`.
+Allowlist the tools this spec needs (see
+[Task Runner → Tool Approval](task-runner.md#tool-approval)), or start the run
+from the dashboard Task Runner, where you approve tool calls as they come or
+switch on auto-approve for that run.
+
+The `yolo` approval mode applies to the gateway only (`kirocrew gateway
+--approval yolo`), not to `kirocrew run`. The gateway refuses it unless
+`KIROCREW_HOME` points at an isolated data home rather than the main one.
 
 ## Repetitive Refactors
 
@@ -33,13 +55,14 @@ requests.
 
 ## Slack → Issue Pipeline
 
-Monitor a Slack channel for incoming requests and auto-create issues. Your
-coding Kiro Crew instance picks them up automatically.
+An example of composing a cron job with a task-runner spec: a cron prompt turns
+requests in a Slack channel into issues, and a separate run works on them.
+Nothing picks the new issues up on its own; you start that run.
 
 Setup:
 1. Enable observe mode for the source channel.
 2. Create a cron job: "Every hour, check #my-channel for new requests and create issues for actionable items"
-3. Your backlog crusher picks up the new tasks
+3. Run a backlog-crusher spec (above) over the new issues
 
 ## Daily Briefings
 
@@ -95,6 +118,6 @@ per-agent MCP configuration.
 
 ## Tips from the Community
 
-- **Unattended overnight runs**: Use an isolated `KIROCREW_HOME` when running the gateway with `--approval yolo`. Review the CRs in the morning.
+- **Unattended overnight runs**: For `kirocrew run`, allowlist the tools the spec needs in `hooks.auto_approve_tools`; for a gateway started with `--approval yolo`, use an isolated `KIROCREW_HOME`. Review the pull requests in the morning.
 - **Workspace isolation**: Use `KIROCREW_HOME` and `KIROCREW_PORT` env vars to run multiple Kiro Crew instances with separate data.
 - **Background gateway**: Use a macOS Launch Agent or systemd service to keep the gateway running across reboots (see [Getting Started](getting-started.md)).

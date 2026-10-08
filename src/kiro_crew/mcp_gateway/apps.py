@@ -133,6 +133,14 @@ def write_spool(payload: dict) -> str:
         "server": payload.get("server", ""),
         "tool": payload.get("tool", ""),
         "session_key": payload.get("session_key", ""),
+        # The agent the PRODUCING stub declared, stamped by gatewayd at
+        # interception. The governance identity of every callback this render
+        # makes (``app_call._agent_for_call``): per call rather than per
+        # session, so a backend shared by several agents attributes each one
+        # correctly, and written here rather than read from a session-side store
+        # the governed agent could edit. Empty on a record an older gateway
+        # wrote or when the stub declared none, which the reader REFUSES.
+        "agent": payload.get("agent", ""),
         # Callback capability secret: split from the render id so the
         # model-visible marker (which carries only ``spool_id``) authorizes
         # NOTHING. This high-entropy secret is delivered ONLY over the
@@ -168,10 +176,10 @@ def write_spool(payload: dict) -> str:
     # Lockdown-before-content + atomic publish: ``restrict_to_owner=True``
     # applies the owner-only DACL (and 0o600 on POSIX) to the temp file BEFORE
     # any byte of the record — whose filename and callback_secret are live
-    # capability tokens — reaches it. The previous hand-rolled ``os.open`` at
-    # the final path published the content first and applied the Windows DACL
+    # capability tokens — reaches it. A hand-rolled ``os.open`` at the final
+    # path instead would publish the content first and apply the Windows DACL
     # only afterwards, leaving it readable under the inherited ACL for the
-    # write window (issue #5285). Fail closed is now structural: every failure
+    # write window. Fail closed is structural here: every failure
     # (lockdown, write, rename) happens before the final path is touched, so
     # an unprotected record never exists there and no unlink is needed; the
     # raised OSError propagates so the interception caller's failure-safe path

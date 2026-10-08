@@ -25,14 +25,18 @@ Lark).
    its **App ID** and **App Secret** from *Credentials & Basic Info*.
 2. **Add the bot capability** — *Add features → Bot*.
 3. **Grant permissions** — under *Permissions & Scopes*, add
-   `im:message` (receive) and `im:message:send_as_bot` (reply).
+   `im:message.p2p_msg:readonly` (receive DMs) and
+   `im:message:send_as_bot` (reply). If you enable group chats, also add
+   `im:message.group_at_msg.include_bot:readonly` (receive group messages that
+   @-mention the bot). The broader `im:message` grant does not replace the
+   explicit p2p event scope in the current Feishu console.
 4. **Use long connection** — under *Events & Callbacks*, choose
    **Long connection** (not a request URL), then subscribe to
    `im.message.receive_v1`.
 5. **Publish the app** so your tenant can install it.
 6. **Find your open_id** — the console's API Explorer, or any inbound message
    in the gateway log, shows the sender's `open_id` (it starts with `ou_`).
-7. **Paste it into Settings** — open **Settings → Channels → Feishu**, put the
+7. **Paste it into Settings** — open **Settings → Messaging Channels → Feishu**, put the
    App ID and App Secret in their fields, add your `open_id` to the allow-list,
    turn the channel on, and save. Saving writes the two secrets to
    `~/.kiro/crew/.env` (owner-only, `0600`) and the rest to `config.json`, so
@@ -43,8 +47,9 @@ Lark).
    ```
 
 DM the bot in Feishu and it answers. The panel's badge tells you where you are:
-**Needs setup** until both credentials are stored, **Not connected** once they
-are but the receiver is not running, **Connected** when it is.
+**Needs setup** until both credentials are stored, the channel is turned on, and
+at least one `open_id` is on the allow-list; **Not connected** once all of that
+is in place but the receiver is not running; **Connected** when it is.
 
 <details>
 <summary>Prefer to edit the files directly?</summary>
@@ -72,7 +77,7 @@ session, editing the files on the gateway's own machine is the way in.
 
 </details>
 
-## Who can reach it
+## Access control
 
 Deny-by-default, in both directions:
 
@@ -94,7 +99,7 @@ Deny-by-default, in both directions:
   never evaluated can never run a turn.
 - **Every denial is audited.** Rejected inbound messages write a SEL audit
   record with `source: feishu`, so an unexpected sender shows up in
-  `kirocrew security posture` rather than vanishing.
+  `kirocrew security events` rather than vanishing.
 - Feishu itself only delivers a group message to the bot when it is
   **@-mentioned**, so a bot in a busy group does not see unrelated chatter.
 - **Mentions reach the agent as names.** Feishu puts opaque placeholders
@@ -113,7 +118,7 @@ Deny-by-default, in both directions:
   would reset the conversation on a message you addressed to a colleague, and
   that is not recoverable, so anything ambiguous is treated as a prompt.
 
-## Settings
+## Settings reference
 
 | Key | Default | What it does |
 | --- | --- | --- |
@@ -126,7 +131,7 @@ Deny-by-default, in both directions:
 | `feishu.session_folder` | `""` | Sidebar folder for sessions that start here. Empty = unfiled. |
 
 Everything above except `hard_threshold_pct` is editable in **Settings →
-Channels → Feishu**; that one is file-only, because the panel exposes the soft
+Messaging Channels → Feishu**; that one is file-only, because the panel exposes the soft
 threshold as the single number worth tuning and keeps the hard ceiling as a
 safety net.
 
@@ -144,7 +149,7 @@ masked preview: a saved secret can be **replaced or cleared, never read back**.
 
 Anything else is a prompt.
 
-## What this channel can and cannot do
+## Limits
 
 Feishu v1 is deliberately single-shot: the agent's answer is buffered and sent
 as **one reply** when the turn completes, rather than streamed. There are no
@@ -156,7 +161,10 @@ Known gaps, all follow-up work rather than defects:
 
 - **No streaming.** Feishu supports `PATCH /im/v1/messages/{id}`, so
   edit-in-place streaming is a natural next step.
-- **Text only.** Non-text messages (images, files, audio) are ignored inbound.
+- **Text only.** Non-text messages (images, files, audio) are not read inbound.
+  The bot answers with a short line saying so rather than staying silent, so a
+  photo does not look like a dead bot — but only to a sender who is already on
+  the allow-list, and in a group only one that is allow-listed too.
 - **Replies only.** The bot answers an inbound message and cannot start a
   conversation, so it is not a proactive-notification target.
 - **The panel configures the channel; it does not install it.** `lark-oapi` is an
@@ -172,16 +180,32 @@ Known gaps, all follow-up work rather than defects:
   internally; if it gives up, the gateway logs that the receiver is down and you
   restart.
 
+### Bot doesn’t receive direct messages
+
+- Confirm `im:message.p2p_msg:readonly` is granted. A green
+  `im:message.group_at_msg.include_bot:readonly` grant covers group @-mentions,
+  not private messages.
+- Publish a new app version after changing permissions; a draft permission does
+  not affect the installed bot.
+- Confirm `im.message.receive_v1` appears in the subscribed-event list, not only
+  that long connection is selected.
+
 ## How it fits together
 
 The channel is a thin transport over the shared messaging core — the same
 `TurnDriver` (credential redaction, tool-approval ladder, SEL audit) every other
-channel uses. See [messaging-transport.md](messaging-transport.md).
+channel uses.
 
 | File | Role |
 | --- | --- |
 | `feishu/client.py` | `lark-oapi` WebSocket receive + REST reply |
 | `feishu/transport.py` | Authorisation (deny-by-default) and normalisation |
-| `feishu/renderer.py` | Buffers the turn, sends one reply |
+| `feishu/renderer.py` | Buffers the turn, sends one reply, plus a best-effort notice reply when the answer was redacted |
 | `feishu/transport_dispatch.py` | Drives `TurnDriver`, handles `/new` `/compact` |
 | `feishu/gateway.py` | `maybe_start_feishu()` boot entry point |
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

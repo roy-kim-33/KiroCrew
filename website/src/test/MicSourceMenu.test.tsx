@@ -49,6 +49,41 @@ describe('MicSourceMenu', () => {
     expect(screen.queryByText('FaceTime HD')).toBeNull()
   })
 
+  it('remeasures the open menu when the visual viewport changes', async () => {
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport')
+    const viewport = new EventTarget()
+    Object.defineProperty(window, 'visualViewport', {
+      configurable: true,
+      value: viewport as unknown as VisualViewport,
+    })
+
+    try {
+      render(<MicSourceMenu onSelect={() => {}} />)
+      const trigger = screen.getByRole('button')
+      const wrap = trigger.parentElement
+      expect(wrap).toBeInstanceOf(HTMLElement)
+
+      let anchor = DOMRect.fromRect({ x: 100, y: 600, width: 120, height: 20 })
+      vi.spyOn(wrap as HTMLElement, 'getBoundingClientRect').mockImplementation(() => anchor)
+
+      fireEvent.click(trigger)
+      const menu = await screen.findByRole('menu')
+      expect(menu.style.bottom).toBe(`${window.innerHeight - anchor.top + 4}px`)
+
+      // The mobile keyboard closing moves the anchor and announces itself only
+      // on window.visualViewport -- window resize/scroll never fire.
+      anchor = DOMRect.fromRect({ x: 100, y: 700, width: 120, height: 20 })
+      fireEvent(viewport, new Event('resize'))
+
+      await waitFor(() => {
+        expect(menu.style.bottom).toBe(`${window.innerHeight - anchor.top + 4}px`)
+      })
+    } finally {
+      if (originalViewport) Object.defineProperty(window, 'visualViewport', originalViewport)
+      else delete (window as { visualViewport?: VisualViewport }).visualViewport
+    }
+  })
+
   it('reports the chosen deviceId and closes', async () => {
     const onSelect = vi.fn()
     render(<MicSourceMenu onSelect={onSelect} />)
@@ -96,6 +131,54 @@ describe('MicSourceMenu', () => {
     fireEvent.click(screen.getByRole('button'))
     expect(await screen.findByText(/next recording/)).toBeTruthy()
     expect(screen.queryByText(/drops about 0.2s/)).toBeNull()
+  })
+
+  it('folds Chromium\'s default pseudo-device into System default instead of a second row', async () => {
+    const pseudo = { deviceId: 'default', kind: 'audioinput', label: 'Default - MacBook Pro Microphone', groupId: 'g1' }
+    mockDevices([pseudo, ...DEVICES])
+    render(<MicSourceMenu onSelect={() => {}} />)
+    fireEvent.click(screen.getByRole('button'))
+    const menu = await screen.findByRole('menu')
+    await screen.findByText('AirPods Pro')
+    const labels = Array.from(menu.querySelectorAll('[role="menuitemradio"]')).map(r => r.textContent)
+    expect(labels).toEqual(['MacBook Pro Microphone', 'AirPods Pro', 'System default (MacBook Pro Microphone)'])
+    expect(screen.queryByText(/^Default - /)).toBeNull()
+  })
+
+  it('names the live default track on the trigger without Chromium\'s "Default - " prefix', () => {
+    render(<MicSourceMenu onSelect={() => {}} recording deviceLabel="Default - MacBook Pro Microphone" />)
+    const trigger = screen.getByRole('button')
+    expect(trigger.textContent).toBe('MacBook Pro Microphone')
+    expect(trigger.getAttribute('title')).toBe('MacBook Pro Microphone')
+  })
+
+  it('keeps plain "System default" when the browser lists no default entry', async () => {
+    render(<MicSourceMenu onSelect={() => {}} />)
+    fireEvent.click(screen.getByRole('button'))
+    // The device rows commit after listMicrophones() resolves; wait for them so
+    // the label is read from the loaded list, not the empty first render.
+    await screen.findByText('AirPods Pro')
+    expect(screen.getByRole('menuitemradio', { name: /^system default$/i })).toBeTruthy()
+  })
+
+  it('marks System default while recording on the pseudo-device, and for a saved default id', async () => {
+    const pseudo = { deviceId: 'default', kind: 'audioinput', label: 'Default - MacBook Pro Microphone', groupId: 'g1' }
+    mockDevices([pseudo, ...DEVICES])
+    const { unmount } = render(<MicSourceMenu onSelect={() => {}} recording liveSwitch activeDeviceId="default" />)
+    fireEvent.click(screen.getByRole('button'))
+    await screen.findByText('AirPods Pro')
+    const live = screen.getByRole('menuitemradio', { name: /system default/i })
+    expect(live.getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('menuitemradio', { name: /^macbook pro microphone$/i }).getAttribute('aria-checked')).toBe('false')
+    unmount()
+
+    setPreferredMicId('default')
+    render(<MicSourceMenu onSelect={() => {}} />)
+    fireEvent.click(screen.getByRole('button'))
+    await screen.findByText('AirPods Pro')
+    const idle = screen.getByRole('menuitemradio', { name: /system default/i })
+    expect(idle.getAttribute('aria-checked')).toBe('true')
+    expect(screen.queryByText(/unavailable/)).toBeNull()
   })
 
   it('says the saved device is unavailable instead of faking a checkmark', async () => {

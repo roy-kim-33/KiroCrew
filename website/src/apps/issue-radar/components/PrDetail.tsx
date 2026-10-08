@@ -50,7 +50,30 @@ import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
 import { providerTerms } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtDateTime } from '../../../i18n/format'
+
+/**
+ * Catalog keys for GitHub's `mergeable_state` vocabulary — the merge-READINESS
+ * verdict shown while a PR is open and unmerged. The wire value arrives raw and
+ * lowercased (GitHub's REST `mergeable_state`, or the GraphQL `mergeStateStatus`
+ * lowercased), so it was printed verbatim and CSS-capitalized: untranslated in
+ * every locale and invisible to the i18n added-lines gate. Flat and indexed
+ * inline at the `i18nT()` call so the key gate resolves the whole map, matching
+ * `PullRequestPanel.tsx::LIFECYCLE_LABEL_KEY`. `?? unknown` covers any value the
+ * provider adds later, so an unmapped state still reads as a word, not a blank.
+ */
+const MERGEABLE_STATE_LABEL_KEY: Record<string, string> = {
+  clean: 'apps.issueRadar.components.prDetail.mergeable_state_clean',
+  dirty: 'apps.issueRadar.components.prDetail.mergeable_state_dirty',
+  unstable: 'apps.issueRadar.components.prDetail.mergeable_state_unstable',
+  blocked: 'apps.issueRadar.components.prDetail.mergeable_state_blocked',
+  behind: 'apps.issueRadar.components.prDetail.mergeable_state_behind',
+  has_hooks: 'apps.issueRadar.components.prDetail.mergeable_state_has_hooks',
+  draft: 'apps.issueRadar.components.prDetail.mergeable_state_draft',
+  unknown: 'apps.issueRadar.components.prDetail.mergeable_state_unknown',
+}
+
 /** A relative timestamp that flips to the absolute local date-time on click
  * (and shows it on hover). Renders nothing for a missing/unparseable value. */
 function RelTime({ iso, className = '' }: { iso?: string | null; className?: string }) {
@@ -66,7 +89,7 @@ function RelTime({ iso, className = '' }: { iso?: string | null; className?: str
       title={absolute}
       onClick={(e) => { e.stopPropagation(); setAbs((v) => !v) }}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setAbs((v) => !v) } }}
-      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-accent/40 ${className}`}
+      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/40 ${className}`}
     >
       {abs ? absolute : relativeTimeOrDate(iso)}
     </span>
@@ -554,16 +577,11 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
   const copyLink = async () => {
     const attempt = ++copyAttemptRef.current
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
-    let next: 'copied' | 'failed'
-    try {
-      await copyToClipboard(detail?.url ?? pull.url)
-      next = 'copied'
-    } catch {
-      // Reported, never swallowed: a row that does nothing on press is
-      // indistinguishable from a copy that worked, so the URL is silently
-      // missing from the clipboard at the moment it is about to be pasted.
-      next = 'failed'
-    }
+    const ok = await copyToClipboard(detail?.url ?? pull.url)
+    // Reported, never swallowed: a row that does nothing on press is
+    // indistinguishable from a copy that worked, so the URL is silently
+    // missing from the clipboard at the moment it is about to be pasted.
+    const next = ok ? 'copied' : 'failed'
     if (attempt !== copyAttemptRef.current) return
     setCopyStatus(next)
     copyTimerRef.current = setTimeout(() => setCopyStatus('idle'), 1500)
@@ -952,11 +970,20 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
 
             {activityLoading && <TimelineSkeleton />}
             {activityError && (
-              <div className={`py-2 text-[12px] ${activityStale ? 'text-warn' : 'text-danger'}`}>
-                {activityStale
-                  ? i18nT('apps.issueRadar.components.prDetail.showing_the_last_successful_read', { error: activityError.message })
-                  : i18nT('apps.issueRadar.components.prDetail.couldnt_load_activity', { error: activityError.message })}
-              </div>
+              activityStale ? (
+                // Still showing the last successful read: a warning, not a failure.
+                <div className="py-2 text-[12px] text-warn">
+                  {i18nT('apps.issueRadar.components.prDetail.showing_the_last_successful_read', { error: activityError.message })}
+                </div>
+              ) : (
+                // A read of a persisted PR's timeline; nothing in this column is
+                // a draft (the actions bar's composer guards its own notice).
+                <ErrorNotice
+                  message={i18nT('apps.issueRadar.components.prDetail.couldnt_load_activity', { error: activityError.message })}
+                  askAgent
+                  className="my-2"
+                />
+              )
             )}
             {!activityLoading && !activityError && activityDesc.length === 0 && (
               <div className="py-2 text-[12px] text-muted">{i18nT('apps.issueRadar.components.prDetail.no_activity_yet')}</div>
@@ -1066,7 +1093,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
                 {mergeableState && !merged && state !== 'closed' && (
                   <div className="flex justify-between gap-2">
                     <dt className="text-muted">{i18nT('apps.issueRadar.components.prDetail.mergeable')}</dt>
-                    <dd className="text-text capitalize">{mergeableState.replace(/_/g, ' ')}</dd>
+                    <dd className="text-text">{i18nT(MERGEABLE_STATE_LABEL_KEY[mergeableState.toLowerCase()] ?? 'apps.issueRadar.components.prDetail.mergeable_state_unknown')}</dd>
                   </div>
                 )}
               </dl>

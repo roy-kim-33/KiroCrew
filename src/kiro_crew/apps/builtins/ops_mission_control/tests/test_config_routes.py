@@ -12,17 +12,27 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.ops_mission_control.backend import routes
+from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store, routes
 
 
 def _request(body=None, match_info=None):
-    """A MagicMock request whose ``.json()`` resolves to ``body``."""
+    """A MagicMock request whose ``.json()`` resolves to ``body``.
+
+    It carries the dashboard owner's claims, the same shape as the composition
+    contract's ``_owner_request``: the settings and provider-config routes are
+    owner-gated, and the gate reads ``request.get("user")`` and ``request["app"]``."""
     request = mock.MagicMock(spec=web.Request)
     request.match_info = match_info or {}
+    request.app = {"state": SimpleNamespace(owner_id="")}
+    claims = {"user": "local-app", "app": ""}
+    request.get = lambda key, default=None: claims.get(key, default)
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
 
     async def _json():
         if body is None:
@@ -30,6 +40,17 @@ def _request(body=None, match_info=None):
         return body
 
     request.json = _json
+    return request
+
+
+def _request_as(user, app, body=None, match_info=None):
+    """``_request`` carrying another caller's claims, with ``owner-user`` as the owner."""
+    request = _request(body, match_info)
+    request.app = {"state": SimpleNamespace(owner_id="owner-user")}
+    claims = {"user": user, "app": app}
+    request.get = lambda key, default=None: claims.get(key, default)
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
     return request
 
 
@@ -299,8 +320,8 @@ class TestSettingsRoute(_HomeIsolatedAsync):
     async def test_the_failure_fallback_has_the_same_shape_as_a_real_status(self):
         """One shape, so the UI can read every field instead of guarding each one.
 
-        The fallback used to carry two keys out of six. A panel reading it therefore had to
-        guard each field individually, and forgetting one renders ``undefined`` as the team's
+        A fallback carrying two keys out of six makes a panel guard each field
+        individually, and forgetting one renders ``undefined`` as the team's
         remote — which reads as a repo called "undefined" rather than as "we could not tell".
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger_sync
@@ -373,6 +394,90 @@ class TestSettingsRoute(_HomeIsolatedAsync):
         self.assertTrue(status["conflict"])
         self.assertFalse(status["schedule_conflict"])
         self.assertNotIn("refused", status["detail"])
+
+    async def test_the_incidentio_identity_round_trips_through_the_keystone(self):
+        """This route is the only way the incident.io rotation identity can be set.
+
+        ``INCIDENTIO_USER_KEY`` is operator-only, so ``policy_store.put`` refuses it from
+        anywhere outside this fence and the agent API does not expose ``/settings`` at all.
+        Without this write path the Providers panel field has nothing behind it and
+        ``RotationSource`` abstains forever — the provider silently never votes on shift.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        response = await routes._handle_put_settings(
+            _request({"incidentio_user_id": "01HZY7K3QF8V2N4M6P8R0T2W4X"})
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            _payload(response)["applied"]["incidentio_user_id"],
+            "01HZY7K3QF8V2N4M6P8R0T2W4X",
+        )
+        self.assertEqual(
+            policy_store.get(policy_store.INCIDENTIO_USER_KEY),
+            "01HZY7K3QF8V2N4M6P8R0T2W4X",
+        )
+
+    async def test_a_pasted_incidentio_identity_is_stripped_not_stored_padded(self):
+        """A copied id carries whitespace, and a padded id matches nobody.
+
+        The rotation source compares this value against the ``final`` schedule entries
+        verbatim. Storing `" 01H… "` would make every comparison miss, which presents as
+        the operator being off shift rather than as a bad setting.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        response = await routes._handle_put_settings(
+            _request({"incidentio_user_id": "  01HZY7K3QF8V2N4M6P8R0T2W4X\n"})
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            policy_store.get(policy_store.INCIDENTIO_USER_KEY),
+            "01HZY7K3QF8V2N4M6P8R0T2W4X",
+        )
+
+    async def test_an_overlong_incidentio_identity_is_refused_and_writes_nothing(self):
+        """The length cap is refused before any field is applied, not after.
+
+        ``_handle_put_settings`` applies several keys in sequence, so a validation error
+        raised late would leave a half-written settings state. This pins that the refusal
+        happens up front: the mode in the same body must not survive it.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store, rotation
+
+        response = await routes._handle_put_settings(
+            _request({"mode": "propose", "incidentio_user_id": "x" * 129})
+        )
+        self.assertEqual(response.status, 400)
+        body = _payload(response)
+        self.assertEqual(body["code"], "value_too_long")
+        self.assertIn("incidentio_user_id", body["error"])
+        self.assertIsNone(policy_store.get(policy_store.INCIDENTIO_USER_KEY))
+        self.assertEqual(rotation.app_mode(), "observe")  # the valid sibling field too
+
+    async def test_a_refused_incidentio_identity_write_is_a_coded_503(self):
+        """A keystone write the store refuses must surface as a coded refusal.
+
+        Every sibling keystone write in ``_handle_put_settings`` routes through
+        ``_settings_write_or_refuse``, which maps ``OSError`` to a 503 carrying
+        ``code`` so the dashboard can tell "my identity did not land" from a bare
+        500. The incident.io identity is the same class of value as the PagerDuty
+        one beside it, so it takes the same path.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
+
+        def _refuse(*_a, **_kw):
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(policy_store, "put", _refuse):
+            response = await routes._handle_put_settings(
+                _request({"incidentio_user_id": "01HZY7K3QF8V2N4M6P8R0T2W4X"})
+            )
+        self.assertEqual(response.status, 503)
+        body = _payload(response)
+        self.assertEqual(body["code"], "policy_store_unwritable")
+        self.assertIs(body["ok"], False)
+        self.assertIsNone(policy_store.get(policy_store.INCIDENTIO_USER_KEY))
 
 
 class TestManifestCrons(unittest.TestCase):
@@ -1174,3 +1279,78 @@ class TestSettingsAppliesTheCeilingAtomically(_HomeIsolatedAsync):
         self.assertEqual(response.status, 200)
         self.assertEqual(rotation.app_mode(), "act")
         self.assertEqual([rotation.rule_to_dict(r) for r in rotation.load_rules()], [rule])
+
+
+class TestTheCeilingAndConfigWritersAreOwnerOnly(_HomeIsolatedAsync):
+    """``PUT /settings`` and ``PUT /providers/{id}/config`` answer the owner alone.
+
+    ``mode`` and ``autonomy_rules`` are the provider-write ceiling, and the same body
+    moves ``primary_instance``, the rotation identity and the ledger-sync remote. The
+    ``/secret`` siblings refuse every other caller with 403 ``owner_only``; these two
+    match them, the app's own token included. The agent routes are not gated.
+    """
+
+    _NON_OWNER = ("someone-else", "")
+    _OWN_APP = ("app:ops-mission-control", "ops-mission-control")
+
+    def setUp(self):
+        self._enter_isolation()
+        self.addCleanup(self._exit_isolation)
+        self.set_ceiling = self.enterContext(mock.patch.object(policy_store, "set_ceiling"))
+        self.policy_put = self.enterContext(mock.patch.object(policy_store, "put"))
+        self.merge = self.enterContext(
+            mock.patch.object(routes, "merge_provider_config", return_value={"enabled": True})
+        )
+        pagerduty = SimpleNamespace(
+            id="pagerduty", config_fields=("enabled",), secret_fields=("api_token",)
+        )
+        catalog = SimpleNamespace(catalog=lambda: [pagerduty])
+        self.enterContext(mock.patch.object(routes, "get_registry", return_value=catalog))
+
+    async def _settings(self, user, app):
+        return await routes._handle_put_settings(
+            _request_as(user, app, {"mode": "act", "primary_instance": True})
+        )
+
+    async def _config(self, user, app):
+        return await routes._handle_put_provider_config(
+            _request_as(user, app, {"enabled": True}, {"provider_id": "pagerduty"})
+        )
+
+    async def test_a_non_owner_cannot_put_settings(self):
+        response = await self._settings(*self._NON_OWNER)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(_payload(response)["code"], "owner_only")
+        self.set_ceiling.assert_not_called()
+        self.policy_put.assert_not_called()
+
+    async def test_the_apps_own_token_cannot_put_settings(self):
+        response = await self._settings(*self._OWN_APP)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(_payload(response)["code"], "owner_only")
+        self.set_ceiling.assert_not_called()
+        self.policy_put.assert_not_called()
+
+    async def test_a_non_owner_cannot_put_provider_config(self):
+        response = await self._config(*self._NON_OWNER)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(_payload(response)["code"], "owner_only")
+        self.merge.assert_not_called()
+
+    async def test_the_apps_own_token_cannot_put_provider_config(self):
+        response = await self._config(*self._OWN_APP)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(_payload(response)["code"], "owner_only")
+        self.merge.assert_not_called()
+
+    async def test_the_owner_still_puts_settings_and_config(self):
+        settings = await self._settings("owner-user", "")
+        self.assertEqual(settings.status, 200)
+        self.set_ceiling.assert_called_once_with(mode="act", rules=None)
+        config = await self._config("owner-user", "")
+        self.assertEqual(config.status, 200)
+        self.merge.assert_called_once_with("pagerduty", {"enabled": True})
+
+    async def test_an_agent_route_still_answers_a_non_owner(self):
+        response = await routes._handle_ledger_hygiene(_request_as(*self._OWN_APP))
+        self.assertNotEqual(_payload(response).get("code"), "owner_only")

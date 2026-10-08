@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: Read and drive native desktop applications through the accessibility layer — list on-screen apps, snapshot one window as a numbered element tree, then click / type / set a value / scroll / drag / run a named action, by element index or by screen coordinates. Use for work in a desktop app rather than a web page. Full tool set on macOS and Windows; on Windows a keystroke takes the user's keyboard focus and a coordinate click moves their real cursor. Off unless the user enabled it in Settings.
+description: Read and drive native desktop apps through the accessibility layer — list apps, snapshot a window as a numbered element tree, then click/type/scroll/drag by element index or screen coordinates. Use for a desktop app, not a web page. macOS + Windows; off unless enabled in Settings.
 triggers: desktop, desktop app, native app, app window, on screen, click button, type into, accessibility, a11y, AXUIElement, computer use, drive the app, Finder, Preview, TextEdit, Excel, Word, System Events, !browser, !web page, !playwright
 ---
 
@@ -65,16 +65,10 @@ separate `computer_get_state`. Two things to remember:
 computer_get_state(app="Finder", screenshot=True)
 ```
 
-**Do NOT pass `screenshot=false` here.** Omitting the argument already captures one
-(the operator's Settings default), and that capture is what opens the user's **live
-view**: the dashboard mirrors the JPEG into a floating panel, which only appears once
-a frame exists. Turning it off on the first call leaves the user watching a blank
-space while you drive their machine. Passing `screenshot=True` explicitly is fine and
-harmless if you want to be sure.
-
-The capture is not for your benefit — you get a file PATH, not an image, and you
-should keep reading the outline. One frame opens the panel; it stays open for the rest
-of the task.
+Request a screenshot on the first snapshot of each turn: do not pass
+`screenshot=false` while the user is watching. The capture opens the floating live
+view. You receive a file path, not an image; keep using the outline unless the
+pixels are needed.
 
 Optional: `text_limit` (per-element text cap), `max_tree_nodes`, `max_tree_depth`,
 `screenshot` (bool). You get a numbered outline:
@@ -130,21 +124,22 @@ that it exists.
 | `computer_click(app, element_index)` | press a button, checkbox, menu item, link, row |
 | `computer_type_text(app, element_index, text)` | type text into that element. `element_index` is **required** — see the note below |
 | `computer_set_value(app, element_index, value)` | replace a field's whole contents in one step |
-| `computer_press_key(app, element_index, key)` | a key or chord — `"return"`, `"tab"`, `"escape"`, `"cmd+s"`, `"cmd+shift+a"`. **Paste (`cmd+v`) is refused** — the clipboard cannot be inspected, so use `computer_type_text` with the literal text |
+| `computer_press_key(app, element_index, key)` | a key or chord — `"return"`, `"tab"`, `"escape"`, `"cmd+s"`, `"cmd+shift+a"`. Paste (`cmd+v`) is allowed, but you cannot see the clipboard — when you know the text, prefer `computer_type_text` with the literal text |
 | `computer_scroll(app, element_index, direction, pages?)` | scroll a scrollable area (`up`/`down`/`left`/`right`) |
 | `computer_perform_action(app, element_index, action)` | run one of the element's own advertised actions when nothing above fits |
 | `computer_click(app, x, y)` | click a point when the target has no element — see below |
 | `computer_drag(app, from_x, from_y, to_x, to_y)` | a slider sweep, a range selection, a reorder — and, with `steps`, a canvas stroke |
 | `computer_launch_app(app)` | open an app that is not running yet. Name only, never a path |
 
-**Every one of these needs an `element_index`, and the keyboard tools are the ones
+**Every element tool needs an `element_index`, and the keyboard tools are the ones
 to remember.** There is no "type into whatever is focused" form: an unnamed target
 has no role or subrole, so the secure-field check cannot inspect it, and an indexless
 keystroke would land in a focused password box. That applies to `computer_press_key`
 too — `press_key("tab")` can *move* focus onto a password field, and the next
 keystroke would go there. So name the field you mean; if you want to tab through a
 form, address each field by index instead of tabbing blind. `computer_click` is the
-only exception, and only because it takes coordinates as the alternative.
+one element tool that also takes coordinates; `computer_drag` is coordinate-only and
+`computer_launch_app` takes only a name.
 
 Every action returns a **refreshed** tree, so after a click you already have the
 new indices — do not call `computer_get_state` again just to re-read them. The same
@@ -203,6 +198,9 @@ single/double/triple), and `click_method`:
   one method built on a private Apple API, so it can stop working on a future macOS —
   when it is unavailable the refusal says so and names `app_post`. Do not reach for it
   first; reach for it when a covered window is the reason a click did nothing.
+  It is a **left-button recipe only**: pairing it with `mouse_button: right` or
+  `middle` is refused, and the refusal names `app_post` as the route for those,
+  since that reaches the same application through a public API.
 
 `computer_drag` is coordinate-only — no accessibility action expresses a sweep
 between two points — and it takes the same `mouse_button` / `click_method` options.
@@ -270,20 +268,6 @@ computer_end_turn()
 Drops the cached snapshots. Call it when the desktop part of the task is done. It
 is cheap and it prevents a stale-index refusal later in the conversation.
 
-## A screenshot has TWO purposes — keep them straight
-
-This trips models up, so be explicit about which one you are serving:
-
-1. **The user's live view (usually why you want one).** Capturing a screenshot is
-   what makes the floating panel appear and update, so the user can watch you work.
-   This costs you almost nothing: you get a file PATH, not an image, and you do not
-   read it. **Ask for it on your first snapshot and after each visible change.**
-2. **Your own perception (rarely).** Actually READING the file costs ~8,000 tokens
-   and is a last resort — the outline is your channel.
-
-So "take a screenshot" and "look at a screenshot" are different acts. Do the first
-liberally; do the second only when the tree genuinely cannot answer the question.
-
 ## When something does not work: change the MECHANISM, not the arguments
 
 This is the rule that separates a two-call fix from a twenty-call loop. When an
@@ -344,15 +328,10 @@ Screenshot: /var/folders/.../kirocrew-computer-shots/shot-1769472013411.jpeg
   insufficient.
 ```
 
-Open it with the file-read tool **only** when the outline genuinely cannot answer
-the question — a chart, a rendered document, a layout problem, or a control the
-accessibility layer did not expose. Reading it costs roughly 8,000 tokens. If the
-user asked "show me", just give them the path; the dashboard renders it.
-
-Pass `screenshot=false` only when nobody is watching and you purely need
-structure — a long mechanical loop over many elements, for instance. Prefer leaving
-it on: the cost of capturing (not reading) one is small, and it is what keeps the
-user's live view alive.
+Read the file only when the outline cannot answer the question: a chart, rendered
+document, layout problem, or unexposed control. Reading costs roughly 8,000 tokens;
+capture alone is cheap. If the user asked "show me", give them the path to render.
+Use `screenshot=false` only for unwatched, structure-only work.
 
 ## Reading the refusals correctly
 
@@ -368,10 +347,11 @@ These are **answers**, not failures. Relay them and adapt; do not loop.
 | `element_index 7 changed since the last computer_get_state (was 'AXButton "Save"', now 'AXButton "Delete"')` | the UI moved under you — this refusal is what stopped you clicking the wrong thing | snapshot again and re-locate the element by its label, not its old number |
 | `'…' is a blocked target for computer use (…)` | KiroCrew's own dashboard is permanently refused — driving it would let you change your own security settings | do the task another way; tell the user why |
 | `refusing to type this text into 'X': …` | the text looked like a sensitive command or credential | do not rephrase to get around it; explain and stop |
-| `refusing to … a secure text field` | the target is a password field | ask the user to type it themselves |
+| `refusing to send input to a secure (password) field …` | the target is a password field | ask the user to type it themselves |
 | `computer use is disabled …` | the primary switch is off | tell the user to enable it in Settings → Computer Use; do not retry |
 | `computer use is not supported on this platform (…)` | no driver for this OS (e.g. Linux) | say so once |
 | `click_method 'app_post' is macOS-only …` / `'sky_click' is macOS-only …` | a macOS-only click method on Windows | use an `element_index` (no pointer moves), or name `click_method: "global"` to accept the cursor move |
+| `click_method 'sky_click' supports only the left mouse button (…)` | `sky_click` is a left-button-only recipe | use `left`, or switch to `app_post` for a right/middle click — the refusal names it |
 | `click_method 'auto' with coordinates cannot be served on Windows` | `auto` + x/y, where the only coordinate route moves the real cursor | pass an `element_index`, or name `global` explicitly — `auto` never takes the pointer on its own |
 | `element N … advertises no action this platform can perform` | the element implements no invoke / toggle / select / legacy default action | try its parent or a child from `computer_get_state` |
 | `dragging on Windows moves the operator's real cursor …` | a drag with the default `click_method` (the macOS app-scoped route) | pass `click_method: "global"` explicitly — Windows has no pointer-free drag, so the opt-in is the whole point. There is no element form of a drag |
@@ -406,10 +386,10 @@ this is what stops you clicking the same wrong index four times:
 
 ## Things that will bite you if you do not know them
 
-- **Electron apps are slow on the first snapshot.** Slack, VS Code, Obsidian and
-  KiroCrew's own desktop app need an accessibility opt-in that takes ~2 seconds to
-  take effect. The first `computer_get_state` on one of them looks like a hang and
-  is not. Wait for it; do not fire a second call.
+- **Electron apps are slow on the first snapshot.** Slack, VS Code and Obsidian
+  need an accessibility opt-in that takes ~2 seconds to take effect. The first
+  `computer_get_state` on one of them looks like a hang and is not. Wait for it;
+  do not fire a second call.
 - **A password field can look ordinary.** It renders as `<secure>` and its value
   is never shown to you. A window containing one gets **no screenshot at all** —
   that is deliberate, not a bug.
@@ -454,9 +434,10 @@ computer_end_turn()
 
 Two things to copy from this:
 
-- **The re-snapshot after the keypress is mandatory**, not stylistic: entering rename
+- **Take the new index from the refreshed tree after the keypress**: entering rename
   mode changed the tree, so the old index for the row is no longer the index of the
-  field. Never carry an index across a UI change.
+  field. Never carry an index across a UI change. The `computer_get_state` call is
+  there for the screenshot (a visible change), not to re-read indices.
 - **Three screenshots, not seven.** One to open the live view, one when the row turned
   into a field, one to show the result. The `click`, `set_value` and the first
   `press_key` produced no separate frame — they are steps toward one visible change,

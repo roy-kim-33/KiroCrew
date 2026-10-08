@@ -1,14 +1,38 @@
 ---
 name: meetings
-description: Context for working with the Meetings app's data — where a meeting's notes, diagram, transcript-derived tasks, and calendar cache live, what the lifecycle states mean, and how the app's agents are driven. Load when the user asks about a meeting's notes or action items, or when writing/reading files under the meetings app data dir.
+description: Context for the Meetings app's data — where a meeting's notes, diagram, transcript-derived tasks and calendar cache live, what the lifecycle states mean, how the app's agents are driven. Load when asked about a meeting's notes or action items, or when touching the meetings app data dir.
 triggers: meeting, meeting notes, action items, meeting tasks, transcript, standup, retro, calendar, meetings app
 ---
 
 # Meetings app
 
 The Meetings app transcribes a live meeting and fans each line out to a small
-crew of background agents. Each agent owns exactly ONE output file and rewrites
-it in full after every batch.
+crew of background agents. A **file-backed** agent (`widget_type` `markdown` or
+`html`) owns exactly ONE output file and rewrites it in full after every batch.
+An agent whose `widget_type` is `chat` has no output file — its output IS its
+chat replies, it gets no `OUTPUT_FILE` line, and none of the file rules below
+apply to it.
+
+Only a markdown agent's output is user-editable in the app (the editable
+minutes). A user edit never touches the agent's file: it is saved as a separate
+sidecar under `edits/` that the dashboard shows in place of the agent's output,
+so the agent's next rewrite cannot destroy it. That `edits/` tree is a sensitive
+path — no agent can read or write it through file tools — so the agent's own
+file is NOT what the user sees once they have edited it. An `html` output is not
+user-editable.
+
+Only one meeting may be active at a time; starting a second answers 409. The
+server enforces the lifecycle transition table, not just the UI: `active` and
+`paused` may only reach `ended` through `reviewing` (the action-item review
+gate) on the status route, `reviewing` may go back to `paused`, `ended` may be
+reopened to `active`, and a same-status POST is an idempotent no-op. Stop
+(`POST …/meetings/<id>/stop`) is the separate exit that ends a meeting outright.
+
+A live translation panel translates each transcript line as it lands, using one
+tool-less `kirocrew-lite` call per line in an ephemeral session — deliberately
+NOT the agent batch path, because latency is the point. It is sequential per
+meeting and drops the oldest pending line when it falls behind, so gaps in
+`translations.json` are expected, not a bug.
 
 ## Where the data lives
 
@@ -24,6 +48,9 @@ All paths are under `~/.kiro/crew/apps/meetings/data/`:
 | `meetings/<id>/tasks.json` | that meeting's extracted action items |
 | `meetings/<id>/<agent-id>.md` | a markdown agent's output (e.g. `note-taker.md`) |
 | `meetings/<id>/<agent-id>.html` | an HTML agent's output (e.g. `sketch-artist.html`) |
+| `meetings/<id>/transcript.jsonl` | the raw transcript, one finalized speech segment per line — read this instead of asking the user to re-summarize |
+| `meetings/<id>/translations.json` | per-line translations for the live translation panel |
+| `edits/<id>/<agent-id>.md` | the user's edit of a markdown output — not readable by agents (see above) |
 
 `<id>` is the meeting id with `:` replaced by `_`. Only `[A-Za-z0-9._-]` is
 legal in it — the backend rejects anything else, so do not construct a path from
@@ -45,9 +72,10 @@ a raw calendar UID.
 | `meetings-sketch-artist` | `sketch-artist.html` | one self-contained HTML/Mermaid diagram, revised in place |
 | `meetings-task-extractor` | `tasks.json` | always runs; the app's core output |
 
-Each agent's first message carries an `OUTPUT_FILE:` line. Write to that exact
-path, character for character, and rewrite the FULL file after every batch —
-never accumulate content in memory, because a context limit would lose it.
+A file-backed agent's first message carries an `OUTPUT_FILE:` line. Write to that
+exact path, character for character, and rewrite the FULL file after every batch —
+never accumulate content in memory, because a context limit would lose it. A
+`chat` agent gets no such line and writes no file.
 
 Lines prefixed `[chat]` are typed by the user, not transcribed: treat them as
 corrections or added context and act on them immediately.
@@ -63,9 +91,12 @@ Two things are pluggable, and which implementation is active comes from
   meetings are created by hand) or `ics`, which reads the iCalendar document at
   `calendar.source` (a local `.ics` file path, or a published `https://` URL).
 
-To sync the calendar, call `POST /api/apps/meetings/calendar/sync` — do not try
-to fetch or parse the calendar yourself. With a provider configured the app also
-syncs on its own every `calendar.poll_interval_secs` (default 300) and creates
+To sync the calendar now, ask the user to press **Sync calendar** on the
+Meetings page — do not try to fetch or parse the calendar yourself. The app's
+`/api/apps/meetings/*` routes sit behind the dashboard's token auth and no agent
+tool carries that credential, so a raw HTTP call from an agent is refused. With
+a provider configured the app also syncs on its own every
+`calendar.poll_interval_secs` (default 300) and creates
 the meeting directory for an event `calendar.precreate_lead_minutes` (default 15)
 before it starts, so an imminent meeting usually already exists as `idle`;
 `calendar.auto_sync: false` turns the background poll off, and a lead of `0`
@@ -81,8 +112,9 @@ feed the agents.
 
 ## Correcting recurring mistranscriptions
 
-When the user complains that a project noun keeps coming through wrong, add a
-dictionary term rather than correcting it in the notes:
+When the user complains that a project noun keeps coming through wrong, ask them
+to add a dictionary term in the Meetings settings (the owner-only route below)
+rather than correcting it in the notes:
 
 ```
 POST /api/apps/meetings/dictionary

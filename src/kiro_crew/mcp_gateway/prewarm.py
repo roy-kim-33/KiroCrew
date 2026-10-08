@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 HOT_KEYS_FILENAME = "hot-keys.json"
 
 #: Cap on distinct keys retained in the store / persisted file. Bounds
-#: both memory and file size; far above any real (agent x server x channel)
+#: both memory and file size; far above any real (agent x server x config)
 #: working set, so it only ever clips pathological churn.
 _MAX_TRACKED_KEYS = 512
 
@@ -92,7 +92,7 @@ class HotKeyStore:
     persistence to disk.
 
     Keyed by :meth:`PoolKey.stable_hash` so the same logical backend
-    (same agent x server x channel x config) accumulates across new-chats.
+    (same agent x server x config) accumulates across new-chats.
     :meth:`record` / :meth:`record_outcome` are touched from the event loop
     and do no IO; :meth:`flush` / :meth:`load` do the IO and run via
     ``asyncio.to_thread`` (a thread-pool thread). Because those two sides run
@@ -342,18 +342,17 @@ class HotKeyStore:
             # Keep the explicit mode: atomic_write's own parent mkdir does not
             # set one, and this directory holds identity-bearing keys.
             self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # restrict_to_owner is passed unconditionally where this used to
-            # guard it behind `not IS_POSIX`. On POSIX it is os.chmod(0o600),
-            # which the fchmod_safe(0o600) it replaces already achieved, so the
-            # resulting mode is identical; the helper applies it to the temp
-            # file before any content reaches it, which is the ordering this
-            # site already used on Windows. It stays fail-loud, and the OSError
-            # still lands in the handler below that re-arms _dirty, so a failed
-            # write is retried rather than silently dropped.
+            # restrict_to_owner is passed unconditionally rather than guarded
+            # behind `not IS_POSIX`. On POSIX it is os.chmod(0o600), the same
+            # mode a bare fchmod_safe(0o600) yields, and the helper applies it
+            # to the temp file before any content reaches it — the ordering
+            # Windows requires. It stays fail-loud, and the OSError still lands
+            # in the handler below that re-arms _dirty, so a failed write is
+            # retried rather than silently dropped.
             #
             # json.dumps, not json.dump into the handle: the helper owns the
             # file object. Output is ASCII-only (ensure_ascii defaults to True)
-            # and carries no newline, so neither the switch to utf-8 nor
+            # and carries no newline, so neither utf-8 encoding nor
             # universal-newline translation can change a byte.
             atomic_write(self._path, json.dumps(payload), restrict_to_owner=True)
         except OSError as exc:

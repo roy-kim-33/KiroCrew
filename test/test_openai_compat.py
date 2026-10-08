@@ -106,6 +106,8 @@ def _make_slot():
     slot.key = "test-slot"
     slot.agent = ""
     slot.task = None
+    slot.running = False
+    slot.turn_running = False
     slot.event = asyncio.Event()
     slot._pending = []
 
@@ -117,6 +119,42 @@ def _make_slot():
 
     slot.drain = drain
     return slot
+
+
+@pytest.mark.asyncio
+async def test_named_slot_refuses_while_stage_controller_runs():
+    """The controller keeps a slot busy between its stage-turn tasks."""
+    slot = _make_slot()
+    slot.task = None
+    slot.running = True
+    slot.turn_running = True
+    state = _make_state(slot)
+    request = _make_request(
+        {
+            "id": "test-slot",
+            "model": "vanellope",
+            "messages": [{"role": "user", "content": "do not interleave"}],
+            "stream": False,
+        },
+        state,
+    )
+
+    async def fake_run_chat(_state, _slot, _prompt, **_kwargs):
+        slot._pending.append({"role": "assistant", "content": "interleaved"})
+        slot._pending.append({"cls": "done"})
+        slot.event.set()
+
+    with patch(
+        "kiro_crew.dashboard.openai_compat._run_chat", side_effect=fake_run_chat
+    ) as run_chat:
+        response = await api_completions(request)
+
+    assert response.status == 409
+    response_body = json.loads(response.body)
+    assert response_body["error"]["type"] == "slot_busy"
+    assert response_body["error"]["code"] == "slot_busy"
+    assert response_body["code"] == "slot_busy"
+    run_chat.assert_not_called()
 
 
 def _make_state(slot):
@@ -188,6 +226,8 @@ class TestApiCompletionsBlocking:
         # Simulate the assistant responding then done
         async def fake_run_chat(s, sl, prompt, **_kwargs):
             assert _kwargs["_directive_user_origin"] is True
+            # No app claim, so no actor is named and the turn reads as the person's.
+            assert _kwargs["_turn_actor"] == ""
             slot._pending.append({"role": "assistant", "content": "hey there"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -735,6 +775,12 @@ class TestAppKitOwnership:
 
         async def fake_run_chat(s, sl, prompt, **_kwargs):
             assert _kwargs["_directive_user_origin"] is False
+            # And the actor SAYS so. Without this the turn reaches the runner as
+            # `_crew_log_actor == "user"` -- the resolver's fallback -- and every
+            # consumer that asks "is a human watching this turn" is told yes,
+            # including the model-routing gate, which then spends the owner's
+            # tier map on a turn nobody typed.
+            assert _kwargs["_turn_actor"] == "app"
             slot._pending.append({"role": "assistant", "content": "yo"})
             slot._pending.append({"cls": "done"})
             slot.event.set()
@@ -917,8 +963,8 @@ class TestAgentMismatchFix:
         The turn runs on a peer and streams over the dashboard WebSocket; this
         endpoint's collector reads only local rows, so reaching the local dispatch
         chokepoint would append the prompt, emit a WS-only ``chat_done``, and leave
-        this HTTP caller waiting forever on a turn the peer never received
-        (GPT #7693). The refusal must fire BEFORE the prompt is appended.
+        this HTTP caller waiting forever on a turn the peer never received.
+        The refusal must fire BEFORE the prompt is appended.
         """
         slot = _make_slot()
         slot.agent = "vanellope"
@@ -936,7 +982,7 @@ class TestAgentMismatchFix:
         resp = await api_completions(request)
 
         assert resp.status == 409
-        assert json.loads(resp.body)["code"] == "remote_slot_unsupported"
+        assert json.loads(resp.body)["code"] == "relay_archive_read_only"
         # No unsent turn recorded and no dispatch: refused ahead of the mutation.
         slot.append.assert_not_called()
         assert slot.task is None

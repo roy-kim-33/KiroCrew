@@ -22,7 +22,9 @@ import { useCallback, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { api } from '../../../api/client'
-import { readSendReceipt } from '../../../utils/sendDelivery'
+import { sendTurn } from '../../../chat-core/transport/sendTurn'
+import { ensureChatFolder } from '../../../utils/ensureChatFolder'
+import { settleSeedReceipt } from '../../../utils/seedReceipt'
 import { isMissingSlotError } from '../../../utils/thunkError'
 import { useAppDispatch } from '../../../store'
 import { createSlot, deleteSlot, switchSlot } from '../../../store/chatSlice'
@@ -138,14 +140,17 @@ async function saveRecord(key: string, patch: Partial<SessionRecord>): Promise<S
 }
 
 /** Resolve the "Auto-Improve - <repo>" folder id, creating it on first use.
- *  Matched by name because folders have no upsert endpoint. */
+ *  Matched by name because folders have no upsert endpoint. A rejected list or
+ *  create propagates untouched; a create that answers without an id throws, so the
+ *  `Promise<string>` contract holds without a silent `undefined` folder id. */
 async function resolveFolderId(repo: string): Promise<string> {
-  const name = `${FOLDER_PREFIX}${repo}`
-  const folders = (await api.chatFolders()) as Array<{ id: string; name: string }>
-  const existing = Array.isArray(folders) ? folders.find((f) => f.name === name) : undefined
-  if (existing?.id) return existing.id
-  const created = (await api.createChatFolder(name)) as { id: string }
-  return created.id
+  const id = await ensureChatFolder({
+    list: () => api.chatFolders(),
+    create: (name) => api.createChatFolder(name),
+    name: `${FOLDER_PREFIX}${repo}`,
+  })
+  if (!id) throw new Error('Chat folder create returned no id')
+  return id
 }
 
 // Whether a rejection means the slot is genuinely GONE (and so justifies opening
@@ -228,8 +233,14 @@ export function useAgentSession(): UseAgentSession {
         // already carries it. A follow-up rename instead paints a generated title
         // first and, being best-effort, can fail silently -- leaving the slot with
         // whatever the auto-titler chooses. Same shape the Issue Radar path uses.
+        // App-owned workstreams choose their memory contract explicitly; a
+        // general chat preference must not silently alter their behavior.
         const slot = await dispatch(
-          createSlot({ folder_id: folderId, title: truncate(title) }),
+          createSlot({
+            folder_id: folderId,
+            title: truncate(title),
+            memory_mode: 'persistent',
+          }),
         ).unwrap()
         // The slot is persisted but not yet linked, so a failure before the seed
         // would leave an empty session that the next click cannot find. Rollback
@@ -237,25 +248,22 @@ export function useAgentSession(): UseAgentSession {
         // once the POST may have been accepted the agent is starting, and
         // deleting the slot would cancel real work over a metadata hiccup.
         createdSlotKey = slot.key
-        const seedInFlight = api.sendChat(prompt, slot.key)
+        // The chat-core transport owns the receipt contract (`POST /api/chat?ws=1`
+        // RESOLVES on 4xx/5xx, a 200 can still decline with `{ok:false}`, a hung
+        // POST is bounded by its deadline) and never rejects: every outcome is
+        // a receipt status.
+        const seedInFlight = sendTurn({ message: prompt, slot: slot.key })
         createdSlotKey = null
-        const seeded = await seedInFlight
-        // A REFUSAL, not merely a non-2xx: `/api/chat` also declines inside a 200
-        // by answering `{ok:false}`, and a status-only check passed that as a
-        // success -- recording and navigating to exactly the empty session this
-        // guard exists to prevent. `readSendReceipt` owns that distinction for
-        // every send site. An UNREADABLE 2xx receipt deliberately does NOT land
-        // here: the request was accepted, so the seed may be running, and
-        // deleting the slot would cancel real work over a mangled reply.
-        if (seeded && typeof seeded === 'object' && 'ok' in seeded) {
-          const { body, outcome } = await readSendReceipt(seeded as Response)
-          if (outcome === 'refused') {
-            await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
-            const reason = typeof body.error === 'string' && body.error
-              ? body.error
-              : `HTTP ${(seeded as Response).status}`
-            throw new Error(`could not seed the session (${reason})`)
-          }
+        const receipt = await seedInFlight
+        // `settleSeedReceipt` owns the seed policy (shared with the other app
+        // seeder): only a seed that provably never ran -- refused, or no receipt
+        // and the slot stays empty -- tears the empty slot down; recording and
+        // navigating to it would be exactly the empty session this guard exists
+        // to prevent. Everything else is, or may be, running and is recorded.
+        const verdict = await settleSeedReceipt(receipt, slot.key)
+        if (!verdict.ran) {
+          await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+          throw new Error(verdict.reason)
         }
         const record = await saveRecord(key, {
           slot_key: slot.key,

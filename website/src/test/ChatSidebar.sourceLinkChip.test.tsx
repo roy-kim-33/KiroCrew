@@ -16,7 +16,7 @@
  * Mock setup mirrors ChatSidebar.offline.test.tsx: the chat slice's switchSlot
  * thunk is mocked so we can assert whether a click reached the row handler.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, createEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -142,10 +142,23 @@ const clickChip = (el: HTMLElement, init?: MouseEventInit): boolean => {
 /** The consumer took the link (the normal case). */
 const took = () => vi.fn(() => true)
 
+// Each describe below owns its stored state, so it passes alone and in any order.
+// The fixture rows carry fixed old timestamps, so every block turns the stale-session
+// collapse off itself; otherwise every row but the active one folds behind the dormant
+// expander and its chips never render. Clearing storage before the seed is what
+// isolates a block; the clear after each test is a backstop so nothing lingers.
+
 describe('ChatSidebar – PR chip', () => {
   beforeEach(() => {
     switchSlotMock.mockClear()
+    localStorage.clear()
+    sessionStorage.clear()
     localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
   })
 
   it('is still an anchor carrying the provider url', () => {
@@ -164,7 +177,7 @@ describe('ChatSidebar – PR chip', () => {
     const onOpenSource = took()
     renderSidebar({ onOpenSource })
     expect(clickChip(chip())).toBe(true) // no navigation to github.com
-    expect(switchSlotMock).toHaveBeenCalledWith('s2')
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 's2', announceOnMissing: true })
     expect(onOpenSource).toHaveBeenCalledWith('s2', { url: PR_URL, kind: 'change' })
   })
 
@@ -191,13 +204,33 @@ describe('ChatSidebar – PR chip', () => {
     // the negative assertion below is meaningful and not vacuous.
     const row = chip().closest('.session-row') as HTMLElement
     fireEvent.click(row)
-    expect(switchSlotMock).toHaveBeenCalledWith('s2')
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 's2', announceOnMissing: true })
 
     // A chip click switches to s2 exactly once — via the chip, not by bubbling
     // (which would fire the row handler on top of it).
     switchSlotMock.mockClear()
     clickChip(chip())
     expect(switchSlotMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases focus on a pointer click so the row action strip can hide', () => {
+    // The action strip is revealed on the row's focus-within; a chip left
+    // focused after a click would keep it showing once the pointer has gone.
+    renderSidebar({ onOpenSource: took() })
+    const a = chip()
+    a.focus()
+    expect(a).toHaveFocus()
+    clickChip(a, { detail: 1 })
+    expect(a).not.toHaveFocus()
+  })
+
+  it('keeps focus on the chip when it is activated from the keyboard', () => {
+    // Enter on a focused anchor dispatches a click with detail 0.
+    renderSidebar({ onOpenSource: took() })
+    const a = chip()
+    a.focus()
+    clickChip(a, { detail: 0 })
+    expect(a).toHaveFocus()
   })
 
   it('lets a modifier click through to the provider in a new tab', () => {
@@ -252,7 +285,22 @@ describe('ChatSidebar – PR chip', () => {
  * control live in one table.
  */
 describe('ChatSidebar – terminal PR chips suppress CI', () => {
+<<<<<<< HEAD
   const url = (n: number) => `https://github.com/roy-kim-33/KiroCrew/pull/${n}`
+=======
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
+  const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
+>>>>>>> upstream/main
 
   function stateRows(): ChatSlot[] {
     return [
@@ -362,6 +410,17 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
  * worse outcome is the one worth showing.
  */
 describe('ChatSidebar – conflicted PR chips', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
   const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
 
   /** One chip carrying exactly the merge/CI combination under test. */
@@ -439,6 +498,17 @@ describe('ChatSidebar – conflicted PR chips', () => {
 })
 
 describe('ChatSidebar – chip label and provider mark', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
   /** A payload naming a provider this build does not know.
    *
    *  Cast because `provider` is typed as the three the serializer produces

@@ -136,9 +136,10 @@ describe('AppsPage — hybrid Discover', () => {
     expect(screen.getByRole('button', { name: /Developer Tools 1/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /On-call & Ops 1/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Productivity 1/ })).toBeInTheDocument()
-    // Sources block: external registry row with its app count
-    expect(screen.getByText('kirodotdev-labs')).toBeInTheDocument()
-    expect(screen.getByText('1 app')).toBeInTheDocument()
+    // Source attribution also appears on app cards; assert the rail row itself.
+    const source = screen.getByRole('button', { name: 'kirodotdev-labs 1 app' })
+    expect(within(source).getByText('kirodotdev-labs')).toBeInTheDocument()
+    expect(within(source).getByText('1 app')).toBeInTheDocument()
   })
 
   it('selecting a category filters the list but KEEPS the editorial layer', async () => {
@@ -166,6 +167,41 @@ describe('AppsPage — hybrid Discover', () => {
     expect(within(row).getByText(/kirodotdev-labs/)).toBeInTheDocument()
     fireEvent.click(row)
     expect(await screen.findByTestId('detail-route')).toBeInTheDocument()
+  })
+
+  it('install-state facet narrows the shelf to installed apps and composes with category and source', async () => {
+    renderPage()
+    await screen.findAllByText('FEATURED')
+    const status = screen.getByRole('status')
+    expect(status).toHaveTextContent('3 apps')
+    const installed = screen.getByRole('button', { name: 'Installed 1' })
+    expect(installed).toHaveAttribute('aria-pressed', 'false')
+
+    fireEvent.click(installed)
+    expect(installed).toHaveAttribute('aria-pressed', 'true')
+    expect(status).toHaveTextContent('1 app')
+    // Only the installed app is a shelf row; the editorial layer is untouched.
+    expect(screen.getAllByRole('button', { name: /View details for Secretary/ }).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('FEATURED').length).toBeGreaterThan(0)
+
+    // Composes with a category: no installed app is in On-call & Ops.
+    fireEvent.click(screen.getByRole('button', { name: /On-call & Ops 1/ }))
+    expect(status).toHaveTextContent('0 apps')
+    expect(screen.getByRole('button', { name: 'Installed 0' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(screen.getByRole('button', { name: /All apps 3/ }))
+    expect(status).toHaveTextContent('1 app')
+
+    // Composes with a source: the installed app comes from kirodotdev-labs.
+    fireEvent.click(screen.getByRole('button', { name: 'kirodotdev-labs 1 app' }))
+    expect(status).toHaveTextContent('1 app')
+    expect(screen.getByRole('button', { name: 'Installed 1' })).toBeInTheDocument()
+
+    // "All" clears only the install-state filter.
+    fireEvent.click(screen.getByRole('button', { name: 'All' }))
+    expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true')
+    expect(status).toHaveTextContent('1 app')
+    fireEvent.click(screen.getByRole('button', { name: 'All sources' }))
+    expect(status).toHaveTextContent('3 apps')
   })
 
   it('shows the pending-updates hint row on Library, linking to the Updates sub-page', async () => {

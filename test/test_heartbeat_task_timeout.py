@@ -41,6 +41,9 @@ def _make_orchestrator():
     ctx_builder.build_message = MagicMock(return_value=("full message", None))
     ctx_builder.hooks = MagicMock()
     ctx_builder.memory = MagicMock()
+    # The heartbeat's store resolver reads the builder's conversation log, and an
+    # auto-created mock attribute is not one.
+    ctx_builder.conversation_log = None
     orch.ctx_builder = ctx_builder
 
     orch.consolidator = None
@@ -96,10 +99,10 @@ class TestHeartbeatTaskTimeout:
         # Should NOT raise — timeout is handled gracefully.
         result = await on_task("do a thing", "")
 
-        # In-flight turn torn down via reset on the heartbeat key — once
-        # in the except branch only; the finally branch no longer resets
-        # (cycle-end recycle is handled by SessionManager.recycle_heartbeat,
-        # invoked once after asyncio.gather completes — not per task).
+        # In-flight turn torn down via reset on the heartbeat key — once, in the
+        # except branch only. The finally branch must not reset: cycle-end
+        # recycle belongs to SessionManager.recycle_heartbeat, invoked once after
+        # asyncio.gather completes rather than per task.
         sessions.reset.assert_awaited_once_with(HEARTBEAT_KEY)
         # finally still ran: session released.
         sessions.release.assert_called_once_with(HEARTBEAT_KEY)

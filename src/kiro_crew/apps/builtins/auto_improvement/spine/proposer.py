@@ -30,7 +30,7 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from . import ledger as L
 from .contracts import TRACK_BUG, Candidate, Proposal, TargetProfile
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 # Module logger — Phase B is where the "no diff produced" outcome (a top effectiveness
 # killer: the agent investigated and authored nothing) originates. Logging every
@@ -50,7 +50,9 @@ _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     require_pinned(cwd)
     return subprocess.run(
-        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG] + args, capture_output=True, **UTF8_TEXT
+        ["git", "-C", str(cwd), *_GIT_SAFE_CONFIG, *hook_off_args(cwd)] + args,
+        capture_output=True,
+        **UTF8_TEXT,
     )
 
 
@@ -105,7 +107,7 @@ class Proposer:
         # the RED stage of the test to stage at base). ``git add -A`` then a diff of the
         # index against base captures adds + modifications + deletions.
         subprocess.run(
-            ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "add", "-A"],
+            ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, *hook_off_args(worktree), "add", "-A"],
             capture_output=True,
             **UTF8_TEXT,
         )
@@ -113,7 +115,7 @@ class Proposer:
         # worktree (e.g. ``uv.lock`` from a ``uv`` invocation, ``.venv``, caches). They are
         # NEVER part of a legitimate code fix, and including them breaks the downstream
         # ``git apply`` onto the clone ("uv.lock: already exists in working directory" — the
-        # observed committed=0 / failed-CR cause, 2026-06-17). Pathspec exclusions keep the
+        # observed committed=0 / failed-CR cause). Pathspec exclusions keep the
         # diff to real source changes (the fix + its reproducing test).
         return subprocess.run(
             [
@@ -121,6 +123,7 @@ class Proposer:
                 "-C",
                 str(worktree),
                 *_GIT_SAFE_CONFIG,
+                *hook_off_args(worktree),
                 "diff",
                 "--cached",
                 base_sha,
@@ -132,7 +135,7 @@ class Proposer:
                 ":(exclude)**/__pycache__/**",
                 ":(exclude)*.pyc",
                 # Agent-tooling settings the session writes into its own worktree.
-                # Observed live (2026-07-31): the first filed PR carried a spurious
+                # Without this a filed PR carries a spurious
                 # ``.kiro/settings/cli.json`` hunk, which is noise in a reviewer's
                 # diff and can collide on ``git apply`` onto a clone that has its own.
                 ":(exclude).kiro/**",
@@ -187,13 +190,12 @@ class Proposer:
                 bug_runner = getattr(profile, "bug_runner", None)
                 hint_fn = getattr(bug_runner, "agent_test_hint", None)
                 test_cmd_hint = hint_fn(wt) if callable(hint_fn) else None
-                # Dispatch by TRACK. The perf branch used to be missing entirely, which
-                # dead-ended the whole track: a profile with no mechanical seed returns
-                # False from propose(), and with no agent escalation a perf candidate
-                # produced no diff and was recorded no_defect — so the loop could never
-                # keep or file a perf win. Both tracks now author through the model and
-                # are judged by their own deterministic gate (RED→GREEN for a bug, A/B
-                # against the noise band for perf).
+                # Dispatch by TRACK. BOTH tracks author through the model and are judged
+                # by their own deterministic gate (RED→GREEN for a bug, A/B against the
+                # noise band for perf). A track without agent escalation dead-ends: a
+                # profile with no mechanical seed returns False from propose(), so the
+                # candidate produces no diff and is recorded no_defect, and the loop can
+                # never keep or file a win on that track.
                 author = author_bug_fix if candidate.kind == TRACK_BUG else author_perf_fix
                 produced = author(
                     self.agent_runner,
@@ -274,11 +276,11 @@ class Proposer:
         proposals: list[Proposal] = []
         wide_cands = candidates[: self.wide]
         # DISJOINT from wide, per this method's own contract ("reserve the strongest
-        # top-K candidate(s) for deep"). Both slices previously started at index 0, so
-        # with wide=1/deep=1 the two proposers authored THE SAME candidate: two full
+        # top-K candidate(s) for deep"). Were both slices to start at index 0, then at
+        # wide=1/deep=1 the two proposers would author THE SAME candidate: two full
         # agent passes, two worktrees and two gate ladders spent to answer one question,
-        # and the second was then discarded as a same-cycle duplicate. Observed live —
-        # every `c<N>_wide_*` had a matching `c<N>_deep_*` on the identical locus.
+        # with the second discarded as a same-cycle duplicate, and every `c<N>_wide_*`
+        # carrying a matching `c<N>_deep_*` on the identical locus.
         deep_cands = candidates[self.wide : self.wide + self.deep]
         for c in wide_cands:
             if stop_check is not None and stop_check():

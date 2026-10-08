@@ -1,5 +1,7 @@
 // Minimal service worker for PWA installability.
-// Network-first for the SPA shell; everything else goes straight to network.
+// Network-first for the SPA shell; boot-critical modules (hashed /assets and the
+// /vendor import-map stubs) go to the network with a bounded 5xx retry;
+// everything else goes straight to network.
 //
 // Cache contains ONLY the shell (/ and /index.html). No other responses are
 // cached — hashed assets rely on HTTP immutable caching, and app/API routes
@@ -29,6 +31,56 @@ self.addEventListener('activate', e => {
   self.clients.claim()
 })
 
+// ── Boot-critical module retry ──────────────────────────────────────
+// Nothing is cached here — the immutable HTTP cache owns hashed assets, and the
+// /vendor stubs have stable filenames. What this adds is a bounded retry, because
+// one 502 on a module a document imports is not a degraded page, it is a dead
+// one.
+//
+// A page load asks for the entire module graph at once, and the hop in front of
+// the gateway has a lower real concurrency ceiling than it advertises:
+// `tailscale serve` announces 250 concurrent HTTP/2 streams and starts answering
+// 502 past roughly 140. Measured against a Windows gateway on one connection —
+// 120 streams: 120 OK; 200 streams: 140 OK + 60x502; 247 streams: 143 OK +
+// 104x502. The 502s land on module scripts, so the shell paints its dark skeleton
+// and the app never boots. On a phone that reads as a black screen that no reload
+// clears, because the navigation keeps being served from the shell cache above
+// while the modules keep failing.
+//
+// The failure is capacity-shaped, so the backoff is JITTERED — retrying a whole
+// failed wave on one tick just rebuilds the burst that caused it. Only 5xx and
+// network errors are retried: a 404 means the asset is genuinely gone (a stale
+// shell pointing at a pruned build) and must surface at once instead of costing
+// three round trips. Safe to re-issue `request` without cloning because the fetch
+// handler already returned for every non-GET, and a GET carries no body to
+// consume.
+const ASSET_RETRIES = 2
+const ASSET_RETRY_BASE_MS = 150
+
+async function fetchAssetWithRetry(request) {
+  let lastResponse = null
+  for (let attempt = 0; attempt <= ASSET_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const spread = ASSET_RETRY_BASE_MS * attempt + Math.random() * ASSET_RETRY_BASE_MS
+      await new Promise(resolve => setTimeout(resolve, spread))
+    }
+    try {
+      const resp = await fetch(request)
+      if (resp.status < 500) return resp
+      lastResponse = resp
+    } catch {
+      // Deliberately keeps any 5xx already captured. Clearing it here would let a
+      // later throw downgrade a real status into the synthetic network error the
+      // return below exists to avoid, so a 502-then-dropped-connection sequence
+      // would misreport the gateway's actual answer. A throw itself carries no
+      // status worth recording.
+    }
+  }
+  // Out of attempts. Hand back the last real response when there was one, so the
+  // browser reports the true status rather than a synthetic network failure.
+  return lastResponse || Response.error()
+}
+
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return
   const url = new URL(e.request.url)
@@ -36,6 +88,18 @@ self.addEventListener('fetch', e => {
   // ── Skip rules (let the browser handle these natively) ──────────────
   // Cross-origin (CDN scripts, analytics, RUM)
   if (url.origin !== self.location.origin) return
+  // A URL carrying a `token` query parameter is a sign-in link (the owner's
+  // `kirocrew token` link, `/?token=...`). Only the gateway's auth middleware can
+  // honour it: it exchanges the link token for a session cookie and redirects. If
+  // the worker answers instead, the exchange never happens — the cached shell
+  // boots with no session, /api/status answers 403 and the page reads "Session
+  // expired". That is exactly what a phone did when the network-first fetch below
+  // failed and fell back to the cached shell. So the worker never answers such a
+  // request (navigation or otherwise) and, being skipped here, never caches its
+  // response either. Placed before every other rule so no later prefix can
+  // re-claim it. The name is checked by presence, not value: an empty or stale
+  // token is still the gateway's to judge.
+  if (url.searchParams.has('token')) return
   // Core API
   if (url.pathname.startsWith('/api')) return
   // Single-use sandboxed documents for artifact/widget iframes. Two reasons this
@@ -45,12 +109,39 @@ self.addEventListener('fetch', e => {
   // mode === 'navigate', so the offline fallback would serve the SPA shell
   // (/index.html) INTO the widget frame instead of the document.
   if (url.pathname.startsWith('/sandbox-doc/')) return
+  // Standalone app-window documents. These are full top-level applications,
+  // not SPA routes: serving the cached dashboard shell into a frameless overlay
+  // can create an always-on-top, full-display dashboard with no close controls.
+  // Leave navigation and failures to the browser. Electron app-window hosts
+  // already fail closed on 4xx/5xx and transport errors.
+  if (url.pathname.startsWith('/app-windows/')) return
   // App backends (e.g. /apps/dev-fleet/api/*)
   if (url.pathname.startsWith('/apps/')) return
-  // Vite content-hashed assets — immutable HTTP cache handles them
-  if (url.pathname.startsWith('/assets/')) return
-  // Vendor shims, fonts, sprites — stable filenames, no SW caching needed
-  if (url.pathname.startsWith('/vendor/')) return
+  // Vite content-hashed assets — the immutable HTTP cache still owns them, so
+  // nothing is cached here. They are routed through the SW only so a 5xx can be
+  // retried; see fetchAssetWithRetry for why one 502 here is a black screen.
+  if (url.pathname.startsWith('/assets/')) {
+    e.respondWith(fetchAssetWithRetry(e.request))
+    return
+  }
+  // Vendor module stubs get the SAME retry as hashed assets, and for the same
+  // reason. `index.html` carries an import map pointing bare specifiers at
+  // /vendor/*.mjs (react, react-dom, react-dom/client, react/jsx-runtime, the app
+  // SDK, its ui entry, lucide-react), each a 0.2-1.0 KB stub. Any document that
+  // imports one cannot boot without it, so a single 502 there is the same dead
+  // page this retry exists to prevent. The dashboard SPA itself is not the
+  // exposed surface — it has no /vendor/ modulepreload and bundles React into
+  // /assets/vendor-react-*.js — but the standalone app-window documents are, and
+  // they are same-origin so this worker controls them. Nothing is cached here
+  // either. (A sandboxed widget iframe has an opaque origin and is not
+  // SW-controlled at all, so it is unaffected either way.)
+  if (url.pathname.startsWith('/vendor/')) {
+    e.respondWith(fetchAssetWithRetry(e.request))
+    return
+  }
+  // Fonts and sprites are skipped deliberately, not by omission: a font or icon
+  // sprite that fails degrades the page's looks, it does not stop it booting, so
+  // it does not earn retry attempts.
   if (url.pathname.startsWith('/fonts/')) return
   if (url.pathname.startsWith('/sprites/')) return
   // Backend-served brand assets: the sidebar logo + favicon (/logo.png) and the

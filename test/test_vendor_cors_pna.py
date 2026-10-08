@@ -14,7 +14,7 @@ vendored Tailwind runtime unless BOTH halves of the contract hold:
 
 Without them the runtime never loads: Tailwind-classed widgets render
 unstyled and the widget loading overlay sits on its 15s hang backstop as a
-blank box (issue #6181). These tests pin both halves.
+blank box. These tests pin both halves.
 """
 
 from __future__ import annotations
@@ -169,7 +169,10 @@ def test_middleware_uses_the_request_path() -> None:
     """
     from kiro_crew.dashboard import server as server_mod
 
+    # The middleware is built by the chain installer start_dashboard calls.
     source = inspect.getsource(server_mod.start_dashboard)
+    assert "_install_dashboard_middlewares(" in source
+    source += inspect.getsource(server_mod._install_dashboard_middlewares)
     assert "_apply_security_headers(resp, request.app, request.path, request)" in source, (
         "start_dashboard's header middleware no longer calls "
         "_apply_security_headers(resp, request.app, request.path, request); "

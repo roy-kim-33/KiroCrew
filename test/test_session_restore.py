@@ -102,7 +102,8 @@ class TestRestoreRecentSessions:
         assert slot.title == "Test Chat"
         assert slot.agent == "kirocrew"
         assert slot.workspace == "myws"
-        assert slot.mode == "orchestrator"
+        # Autopilot retired: the persisted mode restores as plain chat.
+        assert slot.mode == ""
         assert len(slot.messages) == 2
         assert slot.messages[0]["content"] == "hello"
         assert slot.messages[1]["content"] == "hi there"
@@ -881,8 +882,8 @@ class TestRehydrateSlotFromHistory:
         canonicalizes the stored model per-provider via
         ``model_registry.canonicalize_for_provider`` (so a raw provider id like
         ``claude-opus-4.7`` maps back to the canonical dropdown key for CC). On
-        a kiro provider it is a no-op; previously this test read the ambient
-        on-disk config and so passed or failed depending on the dev machine.
+        a kiro provider it is a no-op; this test must not read the ambient
+        on-disk config, or it passes or fails depending on the dev machine.
         """
         from kiro_crew.config.loader import KiroCrewConfig
 
@@ -1137,7 +1138,7 @@ class TestPartialRehydrateRollsBack:
 
     ``_rehydrate_slot_from_history`` registers the slot via ``get_or_create_slot`` before
     any of its fallible work (title redaction, model canonicalization, the message
-    replay). A failure after that used to leave a half-populated slot in
+    replay). A failure after that must not leave a half-populated slot in
     ``state._slots`` -- and every rehydrate entry point short-circuits on
     ``slot_name in state._slots``, so the next caller received the partial slot as
     a complete restore with ``_disk_older_count`` still 0, after which a save
@@ -1226,27 +1227,71 @@ class TestPartialRehydrateRollsBack:
             "dashboard:keeper" in state._restricted_keys
         ), "rollback discarded a restricted key it did not add"
 
-    def test_the_rollback_lives_in_the_callee_not_the_caller(self):
-        """Source guard: the rollback belongs at the creation site so EVERY caller
-        gets it. restore_open_slots used to carry its own copy, which protected
-        only itself -- the async twin had none. Asserts on the code, not comments."""
-        import inspect
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", ["open-tabs", "open-tabs-async", "direct", "direct-async"])
+    async def test_every_restore_driver_gets_the_callees_rollback(
+        self, driver, tmp_path, monkeypatch
+    ):
+        """The rollback lives at the creation site, so EVERY caller gets it.
 
+        The failure is raised once the metadata line is fully applied -- after the
+        ephemeral line has recorded its restricted key -- so the rollback has both
+        halves to undo. A failing tab must leave no slot and no restricted key
+        behind whichever driver restored it, while the healthy tab beside it still
+        restores. A rollback living only in one driver would leave the others
+        holding the partial slot.
+        """
         from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.slot_persistence import metadata_codec
 
-        callee = inspect.getsource(chat_persistence._rehydrate_slot_from_history)
-        assert "state._slots.pop(" in callee, "the callee no longer rolls back its own slot"
-        assert "_restricted_keys.discard(" in callee, "the callee no longer rolls back its key"
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        state = _make_state(tmp_path)
+        for name in ("healthy", "doomed"):
+            _write_session(
+                tmp_path,
+                f"dashboard_{name}",
+                [{"role": "user", "content": "hi"}],
+                meta={"title": name.title(), "memory_mode": "ephemeral"},
+            )
+        (tmp_path / "open_slots.json").write_text(
+            json.dumps({"keys": ["doomed", "healthy"], "ts": 0.0}), encoding="utf-8"
+        )
+        real = metadata_codec.apply
+        marked_when_raised: list[bool] = []
 
-        caller = inspect.getsource(chat_persistence.restore_open_slots)
-        body = caller.split('"""')[-1]
-        assert "state._slots.pop(" not in body, (
-            "restore_open_slots re-grew its own rollback: two copies of the same "
-            "undo will drift, and the callee's is the one every caller reaches"
+        def _apply_then_fail(state_, slot, meta, purpose):
+            applied = real(state_, slot, meta, purpose)
+            if slot.key == "doomed":
+                marked_when_raised.append("dashboard:doomed" in state_._restricted_keys)
+                raise RuntimeError("malformed persisted content")
+            return applied
+
+        monkeypatch.setattr(metadata_codec, "apply", _apply_then_fail)
+
+        if driver.startswith("open-tabs"):
+            if driver == "open-tabs":
+                restored = chat_persistence.restore_open_slots(state)
+            else:
+                restored = await chat_persistence.restore_open_slots_async(state)
+            assert restored == 1 and "healthy" in state._slots
+            assert "doomed" in state.unrestored_slot_keys
+        else:
+            with pytest.raises(RuntimeError):
+                if driver == "direct":
+                    chat_persistence._rehydrate_slot_from_history(state, "doomed")
+                else:
+                    await chat_persistence.rehydrate_slot_from_history_async(state, "doomed")
+        # Non-vacuous: the key was recorded before the failure, so its absence now
+        # is the rollback's doing.
+        assert marked_when_raised == [True]
+        assert "doomed" not in state._slots, "a partial slot was left registered"
+        assert "dashboard:doomed" not in state._restricted_keys, (
+            "restricted key left behind: a later persistent slot would inherit it "
+            "and silently lose consolidation + lessons"
         )
 
 
-# ── restore_recent_sessions_async: the reads must leave the loop (#895) ──
+# ── restore_recent_sessions_async: the reads must leave the loop ──
 #
 # This driver is the slower of the two startup restores: it calls list_sessions()
 # (a glob + stat + first-line read of EVERY session file) and then per selected
@@ -1262,7 +1307,7 @@ class TestPartialRehydrateRollsBack:
 class TestAsyncRestoreRecentSessionsOffLoop:
     @pytest.mark.asyncio
     async def test_matches_the_sync_driver(self, tmp_path, monkeypatch):
-        """Parity guard: the two drivers no longer share a generator body."""
+        """Parity guard: the two drivers do not share a generator body."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
 
@@ -1430,7 +1475,7 @@ class TestAsyncRestoreRecentSessionsOffLoop:
         """Post-hop re-check: the pre-hop ``_slots`` answer is seconds stale.
 
         Offloading the reads opened a window that did not exist before — the
-        check and the apply used to run atomically on the loop. If a resume, a
+        check and the apply cease to be atomic once the reads move off the loop. If a resume, a
         nudge or the user opening the tab publishes the slot while its transcript
         loads, ``_apply_recent_session`` -> ``get_or_create_slot`` returns that
         LIVE slot and the replay appends the on-disk messages a second time, then
@@ -1531,8 +1576,21 @@ class TestAsyncRestoreRecentSessionsOffLoop:
         (tmp_path / "dashboard_reopened.jsonl").touch()
 
         state = _make_state(tmp_path)
-        channel_slots.note_slot_closed(state, "reopened")  # then reopened
-        time.sleep(0.01)
+        # Stamp the tombstone under a pinned, explicitly OLDER clock rather than
+        # separating it from the driver's own ``started = time.time()`` with a
+        # real sleep. On Windows/CPython <= 3.12 (what CI pins) ``time.sleep``
+        # wakes off a high-resolution timer while ``time.time()`` still steps in
+        # ~15.6ms ticks, so a 10ms gap can leave both readings EQUAL; the guard
+        # is the inclusive ``when >= started``, so the older close would then
+        # block the reopen and this negative control would accuse ``>= started``
+        # of the very defect it exists to rule out. 60s is far inside
+        # ``_CLOSE_TOMBSTONE_TTL_SECS`` (3600s) and ``slot_closed_since`` does
+        # not apply the TTL, so the tombstone still EXISTS when the guard runs —
+        # the assertion stays about the comparison, not about aging out.
+        closed_at = time.time() - 60.0
+        with monkeypatch.context() as mp:
+            mp.setattr("time.time", lambda: closed_at)
+            channel_slots.note_slot_closed(state, "reopened")  # then reopened
 
         assert await restore_recent_sessions_async(state, window_minutes=60) == 1
         assert "reopened" in state._slots
@@ -1606,9 +1664,8 @@ class TestAsyncRestoreRecentSessionsOffLoop:
         ``list_sessions()`` is a snapshot taken one thread hop earlier, so a
         session deleted in that gap still appears in the list while its metadata
         reads back ``{}``. An empty dict sails past every filter (folder, pin,
-        closed, cutoff all read falsy) and used to reach ``get_or_create_slot`` —
+        closed, cutoff all read falsy) and must not reach ``get_or_create_slot`` —
         registering a phantom slot whose flush RECREATES the deleted transcript.
-        Raised as blocking by GPT 5.6 review, round 3.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async

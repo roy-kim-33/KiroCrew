@@ -38,7 +38,11 @@ intent. Each intent carries:
 - **verified** — about the *result*, independent of status: was the outcome ever
   confirmed? Shipped-but-never-run, diagnosed-but-never-fixed, and merged-but-never-
   seen are all `completed` yet unverified. This is the panel's most useful signal;
-  it is exactly the work a person forgets.
+  it is exactly the work a person forgets. It is three-valued: `true` confirmed,
+  `false` shipped-but-unconfirmed, and `null` when confirmation does not apply —
+  so an absent verification is not the same as a failed one. The panel never
+  shows the two fields separately: it shows one chip, **Done**, **Needs you**
+  (completed but `false`), **Active** or **Dropped**.
 - **progress** — a short runbook of what is true now and known to work, not a
   turn-by-turn history. Shorter is better here.
 - **next steps** — inferred open actions, each with why it matters and what to
@@ -46,12 +50,34 @@ intent. Each intent carries:
 - **project notes** — a handful of session-scoped operational facts (a required
   flag, a step that must follow a change, a name you were corrected on). Durable
   cross-session preferences belong in lessons, not here.
+- **turn ranges** — each intent shows which turns it spans, how many times the
+  session returned to it, and the turn it pivoted from, so a session that
+  ping-ponged between two goals reads as such.
+
+In the panel these read as **You asked for** (the goal), **Where it stands**
+(progress), **Suggested next** (next steps) and **How this project works**
+(project notes, a collapsed footer) — use the panel's words when pointing at a
+section.
+
+Enabling it summarizes new turns only: earlier turns are not backfilled, so an
+old session stays unsummarized until it gets another turn or the person presses
+**Summarize**.
 
 ## Why a summary looks wrong or empty
 
-- **"No summary yet."** The feature is off, or the session has not reached the
-  minimum user turns, or nothing has changed since the last cached pass. A brand-new
-  or one-exchange session has no intent structure worth extracting.
+- **"Session summaries are off."** The feature is disabled; point at the
+  Settings toggle above.
+- **"No summary yet."** No pass has stored a summary for this session: it has
+  not reached the minimum user turns, it is an incognito or temporary session
+  (those never get one), its last turn did not end cleanly, or the pass produced
+  nothing usable. A brand-new or one-exchange session has no intent structure
+  worth extracting. Once the session is long enough the panel offers a
+  **Summarize** button that forces a pass on demand (not offered for incognito or
+  temporary sessions); it is refused while a turn is running
+  (`Cannot summarize while a turn is running`) or while another summary is being
+  written — both are wait-and-retry, not failures.
+- **It describes an older state.** The panel serves the last cached pass and
+  marks it stale rather than blocking, so the newest turns may not be in it yet.
 - **It reads like a changelog.** Very large intents flatten into history. The fix is
   narrower, clearly-bounded goals, not a longer summary.
 - **A withdrawn thing still shows.** A retraction ("revert that", "I was wrong")

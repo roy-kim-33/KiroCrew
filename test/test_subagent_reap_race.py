@@ -35,7 +35,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent import (
+    SubagentInfo,
+    SubagentManager,
+)
 
 
 def _make_manager(max_concurrent: int = 4) -> SubagentManager:
@@ -61,8 +64,88 @@ def _done_events(mgr: SubagentManager) -> list:
     return [c for c in mgr._fire_event.call_args_list if c.args and c.args[0] == "subagent_done"]
 
 
-async def _noop_reset(session_key):
+async def _noop_reset(session_key, **_):
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_reap_settles_credits_before_a_cancelled_state_writer_drains(monkeypatch):
+    from kiro_crew.acp.types import AcpPromptStats
+
+    mgr = _make_manager()
+    mgr._sessions.reset = AsyncMock()
+    mgr._running_count = 1
+    info = _info(credits=1.25)
+    mgr._agents[info.id] = info
+    provider = MagicMock()
+    provider.last_prompt_stats = AcpPromptStats(credits=9.0)
+    entered = asyncio.Event()
+    draining = asyncio.Event()
+    released = asyncio.Event()
+    workers = []
+    persisted = []
+    tombstoned = []
+    delivered = []
+    original_wait = asyncio.wait
+    original_to_thread = asyncio.to_thread
+
+    async def blocked_write(func, *args, **fields):
+        # Only the manager's off-loop state writes carry keyword ``fields``
+        # (``turns=`` for the diagnostics write, other keys for plain
+        # persistence). ``asyncio.to_thread`` is patched on the module object,
+        # so it is process-wide for the test's lifetime: any OTHER coroutine
+        # that reaches ``asyncio.to_thread`` (with a bare callable and no state
+        # fields) must run for real rather than be swallowed here — delegating
+        # keeps the patch scoped to the state-writer seam this test drives.
+        if not fields:
+            return await original_to_thread(func, *args)
+        if "turns" in fields:
+            workers.append(asyncio.current_task())
+            entered.set()
+            await released.wait()
+        else:
+            persisted.append(fields)
+        return True
+
+    async def observe_drain(futures, **kwargs):
+        if info._state_drain_active:
+            draining.set()
+        return await original_wait(futures, **kwargs)
+
+    async def billed_consumer(self, run, session_key, usage):
+        usage.begin(provider)
+        provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+        await mgr._write_state_off_loop(run, "diagnostics", turns=1)
+
+    async def on_done(run):
+        delivered.append(run.credits)
+
+    mgr._on_done = on_done
+    mgr._write_tombstone = MagicMock(side_effect=lambda run, cause: tombstoned.append(run.credits))
+    monkeypatch.setattr(type(mgr._run_events), "_run_inner_impl", billed_consumer)
+    monkeypatch.setattr("kiro_crew.subagent.asyncio.to_thread", blocked_write)
+    monkeypatch.setattr("kiro_crew.subagent.asyncio.wait", observe_drain)
+    task = asyncio.create_task(mgr._run_inner(info, f"subagent:{info.id}"))
+    mgr._tasks[info.id] = task
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        await asyncio.wait_for(draining.wait(), timeout=5)
+        await asyncio.wait_for(mgr._force_reap(info.id, info, 12.5, reason="deadline"), timeout=5)
+        assert info._state_drain_active, "test must report before the worker drains"
+        assert not task.done()
+        assert _done_events(mgr)[0].args[2]["credits"] == 2.0
+        assert persisted == []
+        assert tombstoned == [2.0]
+        assert delivered == [2.0]
+    finally:
+        released.set()
+        task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, *workers, *mgr._report_tasks, return_exceptions=True), timeout=5
+        )
+    assert info.credits == 2.0, "the outer finally must not count the attempt twice"
+    assert info._credit_accounting is None
 
 
 async def _schedule_recovery(mgr: SubagentManager, info: SubagentInfo) -> None:
@@ -127,16 +210,16 @@ async def test_done_set_during_reap_teardown_still_reports_and_frees_one_slot():
     """THE round-5 regression.
 
     ``_run_inner`` sets ``info.done`` while ``_force_reap`` is suspended in the
-    session reset. Previously the reaper then declined the report claim (it was
-    gated on ``not info.done``), still set ``reaped``, and ``_run``'s finally
-    skipped BOTH its claim and its slot decrement — so nothing was reported and
-    ``_running_count`` stayed inflated, starving the spawn queue.
+    session reset. A reaper gated on ``not info.done`` would then decline the
+    report claim, still set ``reaped``, and let ``_run``'s finally skip BOTH its
+    claim and its slot decrement — so nothing is reported and ``_running_count``
+    stays inflated, starving the spawn queue.
     """
     mgr = _make_manager()
     info = _info(_session_sharing=False)
     mgr._running_count = 1
 
-    async def _reset_then_finish(session_key):
+    async def _reset_then_finish(session_key, **_):
         # A concurrently-finishing _run_inner marking the record terminal.
         info.done = True
         await asyncio.sleep(0)
@@ -179,7 +262,7 @@ async def test_run_claiming_during_reap_teardown_yields_one_report():
     mgr._running_count = 1
     reports: list[str] = []
 
-    async def _reset_with_race(session_key):
+    async def _reset_with_race(session_key, **_):
         if mgr._claim_finalize(info):
             reports.append("run")
         await asyncio.sleep(0)
@@ -342,8 +425,8 @@ async def test_reap_during_recovering_still_reports_and_supersedes_respawn():
 
     `_claim_finalize` withholds the claim while `_recovering` so a pending
     respawn is not reported done prematurely. But a reap is DEFINITIVELY
-    terminal: previously it was refused the claim, did its teardown, set
-    `reaped=True` and reported nothing — and `_resume`'s `reaped` abort path
+    terminal: a reap that only refused the claim would do its teardown, set
+    `reaped=True` and report nothing — and `_resume`'s `reaped` abort path
     bare-returns, so no path ever reported. The agent sat unfinished until the
     reaper's wall-clock deadline.
     """
@@ -390,6 +473,73 @@ async def test_run_path_claim_still_withheld_during_recovering():
     assert mgr._claim_finalize(info) is False
     assert info._finalized is False
     assert info._recovering is True, "the non-terminal path must not clear it"
+
+
+# ── terminal report outcomes must reach parent settlement ────────────
+
+
+@pytest.mark.asyncio
+async def test_parent_pending_work_includes_live_followup_watcher():
+    """A parent-owned follow-up watcher holds stage settlement open."""
+    manager = _make_manager()
+    parent = "dashboard:parent"
+    info = _info(id="followup", done=True, parent_session_key=parent)
+    release = asyncio.Event()
+    watcher = asyncio.create_task(release.wait())
+    manager._agents = {info.id: info}
+    manager._followup_watchers = {info.id: watcher}
+    manager._followup_watcher_parents = {info.id: parent}
+    manager._queued_depth = MagicMock(return_value=0)
+    manager._queued_depth_async = AsyncMock(return_value=0)
+
+    try:
+        assert manager.has_pending_work_for(parent) is True
+        assert await manager.has_pending_work_for_async(parent) is True
+        assert manager.has_pending_work_for("dashboard:other") is False
+    finally:
+        release.set()
+        await watcher
+
+
+@pytest.mark.asyncio
+async def test_settle_before_delete_waits_for_inflight_terminal_report():
+    """Deletion cannot remove a run while its claimed report is still active."""
+    manager = _make_manager()
+    info = _info(
+        id="delete-reporting",
+        done=True,
+        parent_session_key="dashboard:delete-reporting",
+    )
+    manager._agents[info.id] = info
+    manager._tasks[info.id] = MagicMock()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _report(*_args, **_kwargs) -> bool:
+        started.set()
+        await release.wait()
+        return True
+
+    manager._report_terminal = AsyncMock(side_effect=_report)
+    report = manager._spawn_terminal_report(
+        info,
+        source="test",
+        injection_timeout_reason="test",
+        mark_delivered_on_success=False,
+    )
+    await started.wait()
+    deletion = asyncio.create_task(manager.settle_before_delete(info.id))
+    await asyncio.sleep(0)
+    waited = not deletion.done()
+    stayed_registered = manager._agents.get(info.id) is info
+
+    release.set()
+    assert await report is True
+    assert await deletion == "delivered"
+    assert waited is True
+    assert stayed_registered is True
+    assert info.id not in manager._agents
+    assert info.id not in manager._tasks
 
 
 # ── the shutdown drain must not abandon stragglers ───────────────────
@@ -468,15 +618,25 @@ async def test_cancel_all_readmits_an_undelivered_report_to_orphan_recovery(monk
 
 @pytest.mark.asyncio
 async def test_cancel_all_keeps_the_tombstone_when_delivery_already_happened(monkeypatch):
-    """The converse: a report cancelled AFTER `_on_done` returned is delivered.
+    """The converse: a report whose `_on_done` has returned is never re-admitted.
 
     Re-admitting it would make the next start inject the same completion a
     second time — the duplicate delivery this PR exists to remove. Only
     `_reported_to_parent == False` may be re-admitted.
+
+    The teardown gate handed to the report never opens. The report waits for it
+    BEFORE it publishes (the payload names the teardown's kill verdict), for
+    `_RESET_TIMEOUT + _TEARDOWN_REPORT_GRACE`, then publishes with the kill
+    named undecided and delivers. Both constants are pinned small here for the
+    same reason the sibling tests pin `_REPORT_DRAIN_TIMEOUT`: at their shipped
+    values (30 s + 30 s) this test spent 60 s in that wait every run, to reach
+    an assertion that does not depend on the length of the wait.
     """
     import kiro_crew.subagent as mod
 
     monkeypatch.setattr(mod, "_REPORT_DRAIN_TIMEOUT", 0.05)
+    monkeypatch.setattr(mod, "_RESET_TIMEOUT", 0.05)
+    monkeypatch.setattr(mod, "_TEARDOWN_REPORT_GRACE", 0.05)
     mgr = _make_manager()
     info = _info()
     cleared: list[str] = []
@@ -488,8 +648,9 @@ async def test_cancel_all_keeps_the_tombstone_when_delivery_already_happened(mon
         delivered.set()
 
     mgr._on_done = AsyncMock(side_effect=_on_done)
-    # A teardown gate that never opens, so the report is cancelled in the wait
-    # that follows a SUCCESSFUL delivery.
+    # A teardown gate that never opens: the report's pre-publish wait for it runs
+    # out (see the docstring) and the delivery goes ahead with the kill named
+    # undecided. `cancel_all` then meets a report whose delivery already happened.
     never = asyncio.Event()
     assert mgr._claim_finalize(info) is True
     mgr._spawn_terminal_report(
@@ -515,7 +676,7 @@ async def test_cancel_all_keeps_the_tombstone_when_delivery_already_happened(mon
 async def test_recovery_failure_reports_through_the_claim():
     """A failed cancel-recovery respawn must report via `_claim_finalize`.
 
-    This site used to fire `subagent_done` and `_on_done` DIRECTLY, gated only
+    This site must not fire `subagent_done` and `_on_done` DIRECTLY, gated only
     on `done`/`reaped` — a fourth reporter outside the claim, so it could
     deliver on top of a concurrent reaper. Here the claim is already spent (as
     a reaper would leave it) and the respawn is forced to fail, so a compliant
@@ -566,7 +727,7 @@ async def test_recovery_failure_still_reports_when_it_owns_the_claim():
 async def test_reap_suppression_marker_is_set_before_the_teardown_await():
     """The RESPAWN-suppression marker must be visible during teardown.
 
-    The marker and the recovery-task cancel used to sit AFTER the session reset
+    The marker and the recovery-task cancel must not sit AFTER the session reset
     await. A recovery task whose bounded handshake expired inside that window
     respawned the run being killed — tools running after a user Stop. Asserting
     from inside the reset proves the ordering.
@@ -580,7 +741,7 @@ async def test_reap_suppression_marker_is_set_before_the_teardown_await():
     mgr._running_count = 1
     seen: dict[str, bool] = {}
 
-    async def _observing_reset(session_key):
+    async def _observing_reset(session_key, **_):
         seen["suppression_during_teardown"] = info._reap_started
         # `.cancelled()` only flips once the task runs, so assert the
         # observable that ordering guarantees: it is already de-registered
@@ -642,6 +803,47 @@ async def test_recovery_respawn_releases_its_fresh_slot():
     )
 
 
+@pytest.mark.asyncio
+async def test_recovery_respawn_is_priced_as_a_fresh_process():
+    """A respawn is a NEW process; the dead one's RSS readings must not settle it.
+
+    The spawn guard treats a dedicated worker as settled once two sweeps have
+    measured it and then reserves only its own peak-vs-RSS gap. A respawned
+    run reuses the same record, so without a reset the fresh process would be
+    priced at ~zero for the sweep before the reaper sees it -- exactly the
+    unmeasured window the reserve exists to cover. The peak stays (a high-water
+    mark, and the conservative direction); the sample count and last reading
+    start over.
+    """
+    from kiro_crew.subagent import _startup_memory_reserve_gb
+
+    mgr = _make_manager()
+    info = _info(_session_sharing=False)
+    info._rss_samples = 2
+    info.last_rss_gb = 5.8
+    info.peak_rss_gb = 6.0
+    assert mgr._release_slot(info) is True
+    mgr._running_count = 0
+    seen: dict[str, object] = {}
+
+    async def _fake_run(_info):
+        seen["samples"] = _info._rss_samples
+        seen["last"] = _info.last_rss_gb
+        seen["peak"] = _info.peak_rss_gb
+        # The guard's view at the moment the fresh process is launched: the
+        # next start (6) plus this warming worker holding nothing yet (6).
+        seen["reserve"] = _startup_memory_reserve_gb(
+            [_info], running_count=mgr._running_count, cost_gb=6.0
+        )
+        if mgr._release_slot(_info):
+            mgr._running_count = max(0, mgr._running_count - 1)
+
+    mgr._run = _fake_run  # type: ignore[assignment]
+    await _schedule_recovery(mgr, info)
+
+    assert seen == {"samples": 0, "last": 0.0, "peak": 6.0, "reserve": pytest.approx(12.0)}
+
+
 # ── the reap marker is split: early for respawn, late for records ────
 
 
@@ -655,7 +857,7 @@ async def test_run_woken_by_reaper_reset_still_synthesizes_its_error():
     its error synthesis when `reaped` is set — so a run woken by the reaper's
     reset (the reset kills the provider, `_run_inner` raises) fell through with
     NO error, claimed the report first while the reaper was still tearing down,
-    and delivered a FALSE SUCCESS the reaper could no longer correct.
+    and delivered a FALSE SUCCESS the reaper could not correct.
 
     The flag is therefore split: `_reap_started` early (respawn suppression),
     `reaped` late (record/teardown ownership).
@@ -665,7 +867,7 @@ async def test_run_woken_by_reaper_reset_still_synthesizes_its_error():
     mgr._running_count = 1
     observed: dict[str, bool] = {}
 
-    async def _reset_wakes_the_run(session_key):
+    async def _reset_wakes_the_run(session_key, **_):
         # Exactly the window under test: the reap is in flight and suspended in
         # teardown. A run waking here must still see `reaped == False`.
         observed["reaped"] = info.reaped
@@ -756,15 +958,20 @@ async def test_run_does_not_block_on_its_report_during_shutdown():
 
     mgr._on_done = _wedged_on_done
 
-    # Must return promptly even though the injection is wedged.
-    await asyncio.wait_for(mgr._run(info), timeout=5)
-
-    assert wedged.is_set(), "report never started"
-    pending = [t for t in mgr._report_tasks if not t.done()]
-    assert pending, "report should still be pending, owned by cancel_all's drain"
-    for t in pending:
-        t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        # Must return promptly even though the injection is wedged.
+        await asyncio.wait_for(mgr._run(info), timeout=5)
+        # The independent report may still be persisting terminal usage when
+        # the run returns; synchronize with its callback rather than scheduling.
+        await asyncio.wait_for(wedged.wait(), timeout=5)
+        assert wedged.is_set(), "report never started"
+        pending = [t for t in mgr._report_tasks if not t.done()]
+        assert pending, "report should still be pending, owned by cancel_all's drain"
+    finally:
+        pending = list(mgr._report_tasks)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -775,7 +982,7 @@ async def test_user_stop_during_pending_recovery_is_not_recorded_as_failure():
     must stay false until the reaper owns the record). `_resume_guarded`'s
     CancelledError arm consulted only `reaped`, so it won that race and wrote
     `error="cancelled"` plus a failure stat over a neutral stop — an outcome the
-    reaper could no longer correct. It must consult `_reap_started`.
+    reaper could not correct. It must consult `_reap_started`.
     """
     mgr = _make_manager()
     info = _info(_session_sharing=False, user_stopped=True, started=time.time() - 5.0)

@@ -58,7 +58,7 @@ beforeEach(() => {
 
 /** Open the crew dropdown and return the menu row for `name`. */
 async function openSwitcher(u: ReturnType<typeof userEvent.setup>, name: RegExp) {
-  await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+  await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
   return await screen.findByRole('menuitemradio', { name })
 }
 
@@ -71,7 +71,7 @@ describe('InstanceTabBar', () => {
     })
     const { container } = renderWithProviders(<InstanceTabBar />, { store })
     // No switcher, and the instances poll is disabled while embedded.
-    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
     expect(api.listInstances).not.toHaveBeenCalled()
   })
 
@@ -79,7 +79,7 @@ describe('InstanceTabBar', () => {
     vi.mocked(api.listInstances).mockResolvedValue(listResp([]))
     const { container } = renderWithProviders(<InstanceTabBar />)
     await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
-    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
   })
 
   it('renders Local + a tab per connected instance and switches to Local', async () => {
@@ -195,7 +195,7 @@ describe('InstanceTabBar', () => {
     vi.mocked(api.listInstances).mockResolvedValue(listResp([never]))
     const { container } = renderWithProviders(<InstanceTabBar />)
     await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
-    expect(container.querySelector('[aria-label^="Switch instance"]')).toBeNull()
+    expect(container.querySelector('[aria-label^="Switch crew"]')).toBeNull()
   })
 
   it('keeps the tab and activates it when a reconnect attempt fails', async () => {
@@ -241,7 +241,7 @@ describe('InstanceTabBar', () => {
     // even by screen readers that skip a button's child content.
     expect(await screen.findByRole('button', { name: /3 unread elsewhere/i })).toBeInTheDocument()
 
-    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
     expect(await screen.findByLabelText('3 unread')).toBeInTheDocument()
   })
 
@@ -265,12 +265,12 @@ describe('InstanceTabBar', () => {
 
     // No chip row at all until something is pinned, so a single-crew user pays
     // no header width for the feature.
-    expect(await screen.findByRole('button', { name: /Switch instance/i })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /Switch crew/i })).toBeInTheDocument()
     expect(screen.queryByTestId('crew-chip-row')).toBeNull()
 
     // Pin it from the crew's own row: one lit/unlit pin per destination, no
     // second list of the same crews.
-    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
     const pinItem = await screen.findByTestId('crew-pin-cd-1')
     expect(pinItem).toHaveAttribute('aria-checked', 'false')
     await u.click(pinItem)
@@ -281,6 +281,28 @@ describe('InstanceTabBar', () => {
     // ...and the chip is now on screen, outside the menu.
     const row = await screen.findByTestId('crew-chip-row')
     expect(row.textContent).toMatch(/Cloud One/)
+  })
+
+  it('marks every wrapper between the inline bar and the pinned row as growable', async () => {
+    // The desktop top bar's identity ladder measures the group's content width,
+    // with the pinned row contributing none of its own; the row then grows into the
+    // group's spare room through these wrappers (index.css, `.topbar.tb-measured`). One wrapper
+    // without the hook caps the row at zero width, so every pin reads as cut.
+    vi.mocked(api.listInstances).mockResolvedValue(listResp([conn()]))
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 't' } }, activeId: null, mru: ['cd-1'], unread: {} },
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await u.click(await screen.findByTestId('crew-pin-cd-1'))
+    const row = await screen.findByTestId('crew-chip-row')
+    const between: string[] = []
+    for (let e = row.parentElement; e && !e.classList.contains('instance-tab-bar-inline'); e = e.parentElement) {
+      between.push(e.className)
+    }
+    expect(between.length, 'expected the row inside the inline bar').toBeGreaterThan(0)
+    for (const cls of between) expect(cls).toMatch(/\btb-crew-grow\b/)
   })
 
   it('toggles the pin without switching crews, and keeps the menu open', async () => {
@@ -294,7 +316,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />, { store })
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     await u.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(store.getState().instances.activeId).toBeNull()
 
@@ -316,7 +338,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     const pin = await screen.findByTestId('crew-pin-cd-1')
     pin.focus()
     await u.keyboard('{Enter}')
@@ -332,7 +354,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     // One pin per destination (Local + the crew), each naming its own crew.
     expect(await screen.findByTestId('crew-pin-__local__')).toHaveAccessibleName(/Pin Local/i)
     expect(await screen.findByTestId('crew-pin-cd-1')).toHaveAccessibleName(/Pin Cloud One/i)
@@ -349,7 +371,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     const glyph = (await screen.findByTestId('crew-pin-cd-1')).querySelector('svg')
     expect(glyph?.getAttribute('class')).toMatch(/text-muted/)
     expect(glyph?.getAttribute('class')).not.toMatch(/opacity-/)
@@ -366,7 +388,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />)
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     const glyph = (await screen.findByTestId('crew-pin-cd-1')).querySelector('svg')
     expect(glyph?.getAttribute('class')).toMatch(/fill-current/)
     expect(glyph?.getAttribute('class')).not.toMatch(/opacity-/)
@@ -451,7 +473,7 @@ describe('InstanceTabBar', () => {
     const u = userEvent.setup()
     renderWithProviders(<InstanceTabBar />, { store })
 
-    await u.click(await screen.findByRole('button', { name: /Switch instance/i }))
+    await u.click(await screen.findByRole('button', { name: /Switch crew/i }))
     const toggle = await screen.findByTestId('crew-stable-order-toggle')
     expect(toggle).toHaveAttribute('aria-checked', 'false')
     await u.click(toggle)
@@ -459,6 +481,47 @@ describe('InstanceTabBar', () => {
     // second adjustment needs no reopen.
     await waitFor(() => expect(localStorage.getItem('mc-crew-switcher-stable-order')).toBe('1'))
     expect(await screen.findByTestId('crew-stable-order-toggle')).toHaveAttribute('aria-checked', 'true')
+  })
+
+  it('breaks and clamps an unbreakable list error so it cannot paint over the notice\'s own Ask-the-agent control', async () => {
+    const unbreakable = '<!DOCTYPE html><html><head><meta charset="utf-8">'
+    vi.mocked(api.listInstances).mockRejectedValue(new Error(unbreakable))
+    renderWithProviders(<InstanceTabBar />)
+
+    const notice = await screen.findByTestId('instance-tab-bar-list-error')
+    expect(within(notice).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    // `truncate` on the flex root cannot ellipsise, and its nowrap inherits down
+    // and removes the message's last break opportunity.
+    expect(notice.className).not.toMatch(/truncate|whitespace-nowrap/)
+    const msg = within(notice).getByText(unbreakable)
+    expect(msg.className).toMatch(/line-clamp-1/)
+    // No `break-all`: the span's own `overflow-wrap: anywhere` breaks the unbreakable
+    // token AND prefers word boundaries, so prose does not get cut mid-word.
+    expect(msg.className).not.toMatch(/break-all/)
+  })
+
+  it('marks the list-failure notice so the desktop top bar gives it only spare room', async () => {
+    // The desktop top bar's identity ladder measures the group's content width.
+    // The notice (up to 320px) would raise that width and collapse the rest of
+    // the group to make room for it; index.css hooks this class to give it the
+    // group's spare room only. The message carries its own hook so that it alone gives way:
+    // the warning icon and the hand-off stay whole instead of being clipped.
+    vi.mocked(api.listInstances).mockRejectedValue(new Error('registry unavailable'))
+    renderWithProviders(<InstanceTabBar variant="inline" />)
+    const notice = await screen.findByTestId('instance-tab-bar-list-error')
+    expect(notice.className).toMatch(/\btb-crew-notice\b/)
+    expect(within(notice).getByText('registry unavailable').className).toMatch(/\btb-crew-notice-msg\b/)
+  })
+
+  it('carries the full list-failure text as the message tooltip, since the flow bar can squeeze it to a few letters', async () => {
+    // The clamp and the spare-room sizing together can leave only an ellipsis
+    // (or nothing) of the message visible; the title keeps the whole sentence,
+    // including the part naming what to do about it, reachable on hover.
+    const failure = 'registry unavailable: the crews service did not answer in time'
+    vi.mocked(api.listInstances).mockRejectedValue(new Error(failure))
+    renderWithProviders(<InstanceTabBar variant="inline" />)
+    const notice = await screen.findByTestId('instance-tab-bar-list-error')
+    expect(within(notice).getByText(failure)).toHaveAttribute('title', failure)
   })
 
 })

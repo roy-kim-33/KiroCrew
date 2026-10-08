@@ -23,7 +23,9 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.apps import teardown
+from kiro_crew.apps.manager import app_lifecycle_lock, is_app_enabled
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import redact
 
 from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
@@ -95,17 +97,9 @@ _CONFIG_WRITABLE = frozenset(
         # watchers only at repositories whose PR comments they would be willing to execute.
         # Same opt-in shape as `watcherAutoStart`. Raised by the GPT review.
         "watcherAcceptEgressRisk",
-        # Opt-in: acknowledge that the LOOP's authoring agent runs without this app's own
-        # strict credential masking. Default OFF, fail-closed. The subprocess path spawns
-        # through `sandboxed_spawn_argv(mode="strict")` + `strip_credential_env`, which hides
-        # `~/.aws`/`~/.gnupg`/`gh` stores; the PROVIDER path drives a Kiro Crew session
-        # instead, so isolation is whatever the gateway's `sandbox` setting gives — and only
-        # 'cc'/'strict' profiles hide credential directories from the agent. On a gateway
-        # with default 'auto'/'standard' (which exposes .aws/.ssh for workflow use), a
-        # repository instruction reaching the agent's auto-approved Bash could read those
-        # stores and exfiltrate. `runner._build_runner` therefore runs OFFLINE unless the
-        # sandbox is 'cc'/'strict' or this flag is set. Same one-time-consent shape as
-        # `watcherAcceptEgressRisk`. Raised by the GPT review.
+        # Explicit consent for unattended repository execution when the gateway's
+        # effective sandbox is below strict and credential stores remain visible.
+        # Default OFF. The runner checks this before creating member assignments.
         "acceptUnsandboxedAgentRisk",
         # Run budget. Safe to expose: these only ever SHRINK or grow how much work
         # one run does; none of them can retarget the repository or relax a gate.
@@ -292,6 +286,10 @@ async def _handle_get_config(_request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_put_config(request: web.Request) -> web.StreamResponse:
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.put_config")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.put_config")
     patch = await _json_body(request)
     rejected = sorted(set(patch) - _CONFIG_WRITABLE)
 
@@ -345,6 +343,10 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     the agent is turned loose on. The clone itself is a blocking git subprocess,
     so it runs off the event loop.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.setup_clone")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.setup_clone")
     body = await _json_body(request)
     url = str(body.get("url") or "").strip()
     if not url:
@@ -359,12 +361,12 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     def _clone() -> tuple[dict, str]:
         return clone_setup.setup_safe_clone(url, store.scratch_path())
 
-    # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
-    # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
-    # the lock: that inner function binds its own local `result`, so the outer cell stayed
-    # empty and every successful setup raised `NameError` (a 500, with the clone on disk and
-    # config.json never written — the app could not be set up at all). Passing it explicitly
-    # makes the dependency visible instead of scope-dependent. Raised by the Opus 5 review.
+    # `result` is a PARAMETER, not a closure read. clone+persist live inside
+    # `_clone_and_persist` so they hold the lock, and that inner function binds its own local
+    # `result` — read as a free variable of this handler, the outer cell stays empty and every
+    # successful setup raises `NameError` (a 500, with the clone on disk and config.json never
+    # written, so the app cannot be set up at all). Passing it explicitly makes the dependency
+    # visible instead of scope-dependent.
     def _persist(result: dict) -> dict[str, Any]:
         current = store.read_json(store.config_path(), {}) or {}
         retargeted = str(current.get("target_url") or "") != url
@@ -463,7 +465,15 @@ async def _handle_branches(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_pr_status(request: web.Request) -> web.StreamResponse:
-    """Live status + CI checks + watcher verdict for one PR url."""
+    """Live status + CI checks + watcher verdict for one PR url.
+
+    The fetch runs with the owner's forge credential, so only the dashboard owner
+    may call it; an app token is refused like any other non-owner caller.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.pr_status")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.pr_status")
     url = (request.query.get("url") or "").strip()
     if not url:
         return web.json_response(
@@ -474,7 +484,10 @@ async def _handle_pr_status(request: web.Request) -> web.StreamResponse:
     if status.get("ok"):
         return web.json_response(status, status=200)
     return web.json_response(
-        {"code": "pr_status_unavailable", "error": _redact_for_display(str(status.get("error") or ""))},
+        {
+            "code": "pr_status_unavailable",
+            "error": _redact_for_display(str(status.get("error") or "")),
+        },
         status=502,
     )
 
@@ -506,6 +519,10 @@ async def _handle_save_session(request: web.Request) -> web.StreamResponse:
     The frontend calls this after creating a slot so a repeat click RESUMES the
     same conversation instead of starting a duplicate one.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.session_save")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.session_save")
     key = request.match_info.get("key", "")
     patch = await _json_body(request)
     allowed = {"slot_key", "folder_id", "status", "subject", "title", "url"}
@@ -518,6 +535,10 @@ async def _handle_save_session(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_delete_session(request: web.Request) -> web.StreamResponse:
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.session_delete")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.session_delete")
     key = request.match_info.get("key", "")
     try:
         removed = await asyncio.to_thread(store.delete_session, key)
@@ -634,7 +655,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
             "status": latest.get("status") or "",
             "note": latest.get("note") or "",
             "ts": latest.get("ts"),
-            # The ledger's field is historically named ``cr``; expose it as ``pr``
+            # The ledger's field is named ``cr``; expose it as ``pr``
             # so the UI speaks one vocabulary, and keep the raw key readable.
             "pr": latest.get("pr") or latest.get("cr") or "",
             "history": history,
@@ -768,6 +789,10 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     passes ``--draft`` and never publishes, marks ready, merges, or enables
     auto-merge.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.draft_pr")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.draft_pr")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -801,7 +826,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         try:
             isolated = clone_setup._repository_is_isolated(Path(clone))
         except clone_setup.IsolationProbeError as exc:
-            # Sandbox failure, not an isolation verdict — name it (#8151).
+            # Sandbox failure, not an isolation verdict — name it as such.
             return {"ok": False, "error": str(exc)}
         if not isolated:
             return {"ok": False, "error": "repository isolation check failed — re-run setup"}
@@ -995,7 +1020,7 @@ def ledger_admin_record(fp: str, pr_ref: str) -> None:
 # ── per-PR watcher sessions ──────────────────────────────────────────────────
 
 
-async def _handle_watchers(_request: web.Request) -> web.StreamResponse:
+async def _handle_watchers(request: web.Request) -> web.StreamResponse:
     """Every watcher session and its current state, plus a reconcile sweep.
 
     Reconciling from this polled read is how upstream drove it too: a watcher exits when
@@ -1010,6 +1035,10 @@ async def _handle_watchers(_request: web.Request) -> web.StreamResponse:
     side effect of a READ gave the operator no consent moment. Orphan-clone reclamation still
     runs either way — that only deletes scratch directories.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.watchers_list")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.watchers_list")
 
     registry = pr_watchers.get_registry()
     sessions = await asyncio.to_thread(registry.list_sessions)
@@ -1078,6 +1107,10 @@ async def _handle_watcher_start(request: web.Request) -> web.StreamResponse:
     nothing to watch, and the registry records that refusal as terminal state
     rather than raising.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.watcher_start")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.watcher_start")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -1125,6 +1158,10 @@ async def _handle_watcher_start(request: web.Request) -> web.StreamResponse:
 
 async def _handle_watcher_stop(request: web.Request) -> web.StreamResponse:
     """Ask a watcher to stop after its current attempt."""
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.watcher_stop")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.watcher_stop")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -1191,6 +1228,10 @@ async def _handle_forget(request: web.Request) -> web.StreamResponse:
     forever — even after the reason it failed has been fixed. This is the escape
     hatch for exactly that, and it keeps the artifacts.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.forget")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.forget")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -1209,6 +1250,10 @@ async def _handle_forget(request: web.Request) -> web.StreamResponse:
 
 async def _handle_purge(request: web.Request) -> web.StreamResponse:
     """Forget a finding AND remove its artifacts."""
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.purge")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.purge")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -1231,19 +1276,27 @@ async def _handle_purge_dead(request: web.Request) -> web.StreamResponse:
     Artifact removal is opt-in (``?artifacts=1``): a sweep is a bulk operation and
     the evidence is usually the reason someone is looking at a dead record.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.purge_dead")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.purge_dead")
     remove = request.query.get("artifacts") in {"1", "true", "yes"}
 
     result = await asyncio.to_thread(ledger_admin.purge_dead, remove_artifacts=remove)
     return web.json_response(result)
 
 
-async def _handle_calibrate(_request: web.Request) -> web.StreamResponse:
+async def _handle_calibrate(request: web.Request) -> web.StreamResponse:
     """Run Phase 1 — prove the ruler — before any improvement cycle.
 
     A run refuses to start on an uncalibrated ruler, so this is the gate for the
     perf track. Building the profile touches git and the test suite, so the whole
     call runs off the event loop and the work itself continues on a worker thread.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.calibrate")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.calibrate")
     config = await asyncio.to_thread(store.read_json, store.config_path(), {})
     config = config or {}
     if not str(config.get("clone") or "").strip():
@@ -1265,6 +1318,10 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     """Commit a queued change straight to the configured branch (the one-click
     autocommit button). Denylist-gated to a non-protected branch, same as the
     loop's direct-commit mode."""
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.commit")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.commit")
     fp, _bad = _validated_fp(request)
     if _bad is not None:
         return _bad
@@ -1343,8 +1400,76 @@ async def _handle_deps(_request: web.Request) -> web.StreamResponse:
     return web.json_response(await asyncio.to_thread(deps.check_deps))
 
 
-async def _handle_deps_install(_request: web.Request) -> web.StreamResponse:
-    """Install the optional dependencies that can be installed safely."""
+def _audit_deps_install_allowed_sync(caller: str) -> None:
+    """Best-effort SEL record of an allowed install; never raises.
+
+    Blocking body of :func:`_audit_deps_install_allowed`: the first ``sel()`` of
+    a process constructs the log, so handlers reach this through the async
+    wrapper, which runs it off the event loop.
+    """
+    try:
+        from kiro_crew.sel import sel  # circular import: sel->config->apps cycle
+
+        sel().log_api_access(
+            caller=caller,
+            operation="auto_improvement.deps_install",
+            outcome="allowed",
+            source="dashboard",
+            resources="install_deps",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for deps install failed", exc_info=True)
+
+
+async def _audit_deps_install_allowed(request: web.Request) -> None:
+    """Record the allowed install in SEL; the owner gate audits only its refusals."""
+    caller = str(request.get("app") or request.get("user") or "unknown")
+    try:
+        await asyncio.to_thread(_audit_deps_install_allowed_sync, caller)
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit dispatch for deps install failed", exc_info=True)
+
+
+def _audit_owner_route_allowed_sync(caller: str, operation: str) -> None:
+    """Best-effort SEL record of an allowed owner-gated action; never raises.
+
+    Blocking body of :func:`_audit_owner_route_allowed`: the first ``sel()`` of a
+    process constructs the log, so handlers reach this through the async
+    wrapper, which runs it off the event loop.
+    """
+    try:
+        from kiro_crew.sel import sel  # circular import: sel->config->apps cycle
+
+        sel().log_api_access(
+            caller=caller,
+            operation=operation,
+            outcome="allowed",
+            source="dashboard",
+            resources="owner_route",
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for %s failed", operation, exc_info=True)
+
+
+async def _audit_owner_route_allowed(request: web.Request, operation: str) -> None:
+    """Record an allowed owner-gated action in SEL; the owner gate audits only its refusals."""
+    caller = str(request.get("app") or request.get("user") or "unknown")
+    try:
+        await asyncio.to_thread(_audit_owner_route_allowed_sync, caller, operation)
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit dispatch for %s failed", operation, exc_info=True)
+
+
+async def _handle_deps_install(request: web.Request) -> web.StreamResponse:
+    """Install the optional dependencies that can be installed safely.
+
+    The install runs pip in the gateway interpreter, so only the dashboard owner
+    may run it; an app token is refused like any other non-owner caller.
+    """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.deps_install")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_deps_install_allowed(request)
     result = await asyncio.to_thread(deps.install_deps)
     if result.get("ok"):
         return web.json_response(result, status=200)
@@ -1366,7 +1491,7 @@ async def _handle_health(_request: web.Request) -> web.StreamResponse:
 # ── the run engine (start / status / stop) ───────────────────────────────────
 
 
-async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
+async def _handle_run_start(request: web.Request) -> web.StreamResponse:
     """Start a run from the config ON DISK.
 
     The body is ignored on purpose: the run's target repository, base branch and
@@ -1374,6 +1499,26 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
     repo or a wider budget than what the config endpoints allow. Building the driver
     is blocking (git, provider probe), so the whole call runs off the event loop.
     """
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.run_start")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.run_start")
+
+    # Admit under the app's lifecycle lock, which disable holds across its stop hook and
+    # the `enabled` write. Either this sees the app disabled, or the stop count it records
+    # predates that hook, so the hook's stop makes `start` refuse. Held only for this
+    # short read, never across the driver build.
+    def _admit() -> int | None:
+        if not is_app_enabled(store.APP_NAME):
+            return None
+        return runner.get_supervisor().stop_seq()
+
+    async with app_lifecycle_lock(store.APP_NAME):
+        admitted_at = await asyncio.to_thread(_admit)
+    if admitted_at is None:
+        return web.json_response(
+            {"code": "app_disabled", "error": f"{store.APP_NAME} is disabled"}, status=403
+        )
 
     # Read the config INSIDE the lock, together with the start it feeds. Read outside, a
     # retarget landing between the read and the start means the run operates on the repo
@@ -1382,7 +1527,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
     def _start() -> dict:
         with commit_mod.clone_lock():
             config = store.read_json(store.config_path(), {})
-            return runner.get_supervisor().start(config or {})
+            return runner.get_supervisor().start(config or {}, admitted_at=admitted_at)
 
     try:
         result = await asyncio.to_thread(_start)
@@ -1390,7 +1535,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
         # Before the generic clause: this subclasses RuntimeError, but it is a
         # sandbox-launcher failure, not a config/state conflict — a distinct
         # `code` so a UI branching on it does not render the misleading
-        # push-isolation guidance (#8151). The message is the actionable part.
+        # push-isolation guidance. The message is the actionable part.
         return web.json_response(
             {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
         )
@@ -1409,9 +1554,13 @@ async def _handle_run_status(_request: web.Request) -> web.StreamResponse:
     return web.json_response(runner.get_supervisor().status())
 
 
-async def _handle_run_stop(_request: web.Request) -> web.StreamResponse:
+async def _handle_run_stop(request: web.Request) -> web.StreamResponse:
     """Request a clean stop. Blocking (it joins the worker thread, bounded), so it runs
     off the event loop."""
+    owner_denied = await require_owner_dashboard_request(request, "auto_improvement.run_stop")
+    if owner_denied is not None:
+        return owner_denied
+    await _audit_owner_route_allowed(request, "auto_improvement.run_stop")
 
     def _stop() -> dict:
 
@@ -1476,6 +1625,9 @@ def register_routes(app: web.Application) -> None:
         try:
 
             pr_watchers.attach_loop(asyncio.get_running_loop())
+            from .crew import attach_gateway
+
+            attach_gateway(_app.get("state"))
         except Exception:  # pragma: no cover - never break gateway startup
             logger.warning("%s: could not bind the watcher loop", store.APP_NAME, exc_info=True)
 
@@ -1506,6 +1658,49 @@ def register_routes(app: web.Application) -> None:
         except Exception:  # pragma: no cover - defensive
             logger.warning("%s: run shutdown failed", store.APP_NAME, exc_info=True)
 
+    async def _stop_on_disable(_app: str) -> None:
+        """Wind the same run down when the OPERATOR switches the app off.
+
+        ``on_cleanup`` fires at gateway shutdown and nowhere else. Disabling the app
+        takes a different path entirely: :func:`_require_enabled` starts refusing the
+        routes, while the supervisor thread keeps the clone lock and keeps spending
+        budget — the operator sees the app off and the work carries on.
+
+        :func:`~kiro_crew.apps.teardown.notify_app_disabled` fires INSIDE the disable
+        request and before the ``enabled`` flag is written, which is what makes this
+        an off-switch rather than a sweep: a run signalled on the next poll instead
+        would get a whole further candidate out of a permission that was already
+        withdrawn.
+
+        Both workers stand down, because both keep acting on the operator's
+        repositories: a watcher runs an agent turn inside a per-PR clone on a
+        timer, and the run holds the clone lock and spends budget. Each is
+        signalled the way its own shutdown hook signals it — ``stop_all``
+        only sets flags and joins nothing, ``stop`` is bounded and blocks, so it
+        goes off the loop — and each is contained separately. ``on_cleanup``
+        gets that independence free by holding two hooks; here one failing
+        signal must not swallow the other.
+        """
+        try:
+            # Off the loop: ``stop_all`` only sets flags, but it takes the registry
+            # lock, and the orphan-clone sweep (``_delete_clone_if_unowned``) holds that
+            # same lock across a ``shutil.rmtree``. A disable landing mid-sweep would
+            # otherwise block the event loop — chat and heartbeat tasks included — until
+            # the delete finished. The ``get_registry()`` resolution rides inside the hop
+            # too, so first-call construction cannot run on the loop either.
+            await asyncio.to_thread(lambda: pr_watchers.get_registry().stop_all())
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("%s: watcher stop on disable failed", store.APP_NAME, exc_info=True)
+        try:
+            # Resolve the supervisor INSIDE the hop as well: ``get_supervisor()``
+            # lazily constructs ``RunSupervisor`` on first call, and construction runs
+            # ``_hydrate_terminal_record`` → a synchronous ``store.read_json``. Resolving
+            # it on the loop would block chat/heartbeat on that storage read; the lambda
+            # keeps both the construction and the stop off-loop.
+            await asyncio.to_thread(lambda: runner.get_supervisor().stop())
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("%s: run stop on disable failed", store.APP_NAME, exc_info=True)
+
     # Guarded: register_routes runs before the runner freezes its signal lists,
     # so appending is safe — but a failure here must never break gateway startup.
     try:
@@ -1514,5 +1709,23 @@ def register_routes(app: web.Application) -> None:
         app.on_cleanup.append(_stop_run)
     except Exception:  # pragma: no cover - defensive
         logger.warning("%s: could not register lifecycle hooks", store.APP_NAME)
+
+    # Same wind-down, different trigger. Feature-detected with ``getattr`` rather
+    # than called directly, so a core build whose teardown module predates this
+    # registry still loads — there the shutdown hook above is the only stop
+    # there is, which is the pre-registry behaviour rather than a regression.
+    #
+    # Registered once here, at boot. It is NOT re-asserted on a later path, and
+    # that is accepted: the only thing that drops it is ``forget_app_hooks`` on
+    # uninstall (``apps/hook_reconcile.py``), and this app cannot be uninstalled —
+    # it is a builtin registered ``lifecycle="locked"``, which ``uninstall_app``
+    # refuses (``apps/manager.py``). So an uninstall+reinstall-without-restart that
+    # would strand the hook cannot happen for ``auto_improvement``.
+    try:
+        register_disable = getattr(teardown, "register_app_disable_hook", None)
+        if register_disable is not None:
+            register_disable(store.APP_NAME, _stop_on_disable)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("%s: could not register the app-disable hook", store.APP_NAME)
 
     logger.info("%s backend routes registered", store.APP_NAME)

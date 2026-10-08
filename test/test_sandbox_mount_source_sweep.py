@@ -9,12 +9,13 @@ when the sandboxed process exits — filling the runtime tmpfs until
 fails.
 
 Two halves lock the fix in:
-  (a) the generated launcher tags every staging site with a pid-bearing
-      ``_src_prefix`` (``kirocrew_sb_<pid>_``) assigned in the post-fork CHILD
-      branch — asserted by AST so an unprefixed ``mkdtemp(dir=_tmpfs_src)`` /
-      ``mkstemp(dir=_tmpfs_src)`` cannot reappear and the assignment cannot
-      drift above the fork, at every sandbox level, with the script staying
-      parseable;
+  (a) the launcher (``kiro_crew.sandbox_launcher_program``) tags every staging
+      site with a pid-bearing prefix (``kirocrew_sb_<pid>_``) taken from the
+      process that execs the agent — a whole child run over a tree that reaches
+      every staging site, with a libc whose binds hide their target, shows every
+      name it creates on the stand-in root carries it, and the launcher's child
+      stages run in a separate process show the pid is that process's own, at
+      every sandbox level;
   (b) ``_cleanup_stale_sandbox_mount_sources`` reclaims layered by cost: plain
       files and empty dirs on dead pid or over-age; dirs (whose contents are
       visible inside a live mount namespace, and whose removal S_DEADs it)
@@ -41,14 +42,17 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import pytest
+from test_sandbox_launcher_program import CoveringLibc, launch, payload
 
+from kiro_crew import sandbox_launcher, sandbox_launcher_program, sandbox_plan
+from kiro_crew.config.paths import config_dir
 from kiro_crew.sandbox import (
     _MOUNT_SOURCE_MAX_AGE_SECONDS,
-    _build_launcher_script,
     _cleanup_legacy_mount_source_residue,
     _cleanup_stale_sandbox_mount_sources,
     _mount_pinned_source_names,
@@ -56,11 +60,13 @@ from kiro_crew.sandbox import (
     cleanup_stale_sandbox_profiles,
 )
 
-# ``_build_launcher_script`` calls POSIX-only ``os.getuid``/``os.getgid`` (the
-# namespace launcher never runs on Windows).
-requires_posix = pytest.mark.skipif(
-    not hasattr(os, "getuid"),
-    reason="_build_launcher_script uses POSIX-only os.getuid (#2041)",
+program = sandbox_launcher_program
+
+# The launcher's stages pin their targets through ``O_PATH`` and address them as
+# ``/proc/self/fd/<n>``, which only Linux has; the namespace launcher runs nowhere else.
+requires_linux = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="the namespace launcher is Linux-only",
 )
 # The legacy-residue pass fences on the exact POSIX mode ``mkdtemp``/``mkstemp``
 # create (0o700 / 0o600) and on ``st_uid``; neither is meaningful on Windows,
@@ -383,7 +389,7 @@ class TestMountSourceSweep:
         legacy = tmp_path / "legacy"
         legacy.mkdir()
 
-        removed = cleanup_stale_sandbox_profiles(legacy_dir=str(legacy))
+        removed = cleanup_stale_sandbox_profiles(legacy_dir=str(legacy), data_home=config_dir())
 
         assert removed >= 1
         assert not (root / f"kirocrew_sb_{_DEAD_PID}_wired").exists()
@@ -538,7 +544,7 @@ class TestMountPinnedSourceNames:
         unprovable", which holds back EVERY directory candidate. One unreaped
         child (routine on any host) therefore disabled directory reclamation
         permanently and host-wide, until the runtime tmpfs was out of inodes
-        and ``systemd-run --scope`` could no longer start a spawn.
+        and ``systemd-run --scope`` could not start a spawn.
         """
         proc = tmp_path / "proc"
         self._write_mountinfo(
@@ -883,7 +889,7 @@ class TestMountPinnedSourceNames:
         It must NOT stop reading: this uid's own processes stay visible under
         hidepid, and every sandbox descendant is one. An early return would
         hand the directory gate an empty pinned set with nothing to reason
-        from. Caught by GPT 5.6 review of PR #8559.
+        from.
         """
         proc = tmp_path / "proc"
         d = proc / "106"
@@ -918,7 +924,7 @@ class TestMountPinnedSourceNames:
     def test_a_sibling_thread_in_another_namespace_pins(self, tmp_path: Path):
         """A thread can ``unshare(CLONE_FS)`` + ``setns`` into a sandbox's
         namespace while its leader stays outside; leaders-only reading would
-        miss its binds. Raised by GPT review of PR #8559."""
+        miss its binds."""
         proc = tmp_path / "proc"
         self._proc_task(proc, 1, mountinfo="")
         line = "100 99 0:40 /kirocrew_sb_777_home /root/home rw - tmpfs tmpfs rw\n"
@@ -1008,8 +1014,7 @@ class TestMountPinnedSourceNames:
     def test_filtered_procfs_clears_coverage(self, tmp_path: Path):
         """``hidepid`` hides root's tasks along with pid 1, and root can hold
         any namespace (``nsenter``), so coverage falls with the host-wide flag
-        rather than licensing removal on this uid's tasks alone. Raised by
-        GPT review of PR #8559."""
+        rather than licensing removal on this uid's tasks alone."""
         proc = tmp_path / "proc"
         self._proc_task(proc, 106, mountinfo="")
         self._proc_task(proc, 107, mountinfo="")
@@ -1075,8 +1080,7 @@ class TestMountPinnedSourceNames:
     ):
         """A holder inside a nested user namespace stats as the overflow uid.
         When that uid cannot be learned (sysctl unreadable), a departing task of
-        ANY other uid may have been such a holder, so coverage fails closed.
-        Raised by GPT review of PR #8559."""
+        ANY other uid may have been such a holder, so coverage fails closed."""
         monkeypatch.setattr("kiro_crew.sandbox._PIN_SCAN_MAX_PASSES", 1)
         monkeypatch.setattr("kiro_crew.sandbox._overflow_uid", lambda: None)
         proc = tmp_path / "proc"
@@ -1100,6 +1104,62 @@ class TestMountPinnedSourceNames:
 
         assert _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)]) == 0
         assert held.exists()
+
+    def test_identical_mount_tables_are_parsed_once_per_scan(self, tmp_path: Path):
+        """Every thread of a group reports its leader's mount table verbatim,
+        so a scan over a many-threaded host is thousands of reads of a few
+        dozen distinct tables; each distinct table is split and matched once,
+        and the repeats cost the read alone. ``matcher`` sees every line of a
+        parsed table, so its call count is the number of lines parsed."""
+        proc = tmp_path / "proc"
+        self._proc_task(proc, 1, mountinfo="")
+        table = (
+            "100 99 0:40 /kirocrew_sb_777_home /root/home rw - tmpfs tmpfs rw\n"
+            "101 99 0:40 /kirocrew_sb_777_ssh /root/.ssh rw - tmpfs tmpfs rw\n"
+        )
+        self._proc_task(proc, 500, mountinfo=table, threads={tid: table for tid in range(501, 521)})
+        self._proc_task(proc, 600, mountinfo=table)
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        coverage = _PinScanCoverage()
+        pinned, complete = _mount_pinned_source_names(
+            proc_root=str(proc), matcher=_matcher, coverage=coverage
+        )
+
+        assert pinned == {"kirocrew_sb_777_home", "kirocrew_sb_777_ssh"}
+        assert complete is True and coverage.covered is True
+        assert matched == ["kirocrew_sb_777_home", "kirocrew_sb_777_ssh"]
+
+    @pytest.mark.parametrize(
+        "cache_limit",
+        ["_MOUNT_TABLE_CACHE_MAX_ENTRIES", "_MOUNT_TABLE_CACHE_MAX_BYTES"],
+    )
+    def test_tables_past_cache_limit_remain_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_limit: str
+    ):
+        """A zero cache bound drops deduplication, not mount-source discovery."""
+        monkeypatch.setattr(f"kiro_crew.sandbox.{cache_limit}", 0)
+        proc = tmp_path / "proc"
+        first = "100 99 0:40 /kirocrew_sb_1_first /root/a rw - tmpfs tmpfs rw\n"
+        uncached = "101 99 0:40 /kirocrew_sb_2_later /root/b rw - tmpfs tmpfs rw\n"
+        self._proc_task(proc, 1, mountinfo=first)
+        self._proc_task(proc, 500, mountinfo=uncached, threads={501: uncached})
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        pinned, complete = _mount_pinned_source_names(proc_root=str(proc), matcher=_matcher)
+
+        assert pinned == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert complete is True
+        assert set(matched) == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert len(matched) == 3
 
     @pytest.mark.skipif(
         not os.path.isdir("/proc/1"),
@@ -1129,9 +1189,9 @@ class TestMountPinnedSourceNames:
 
 @requires_posix_modes
 class TestLegacyResidueSweep:
-    """The pre-#6268 ``tmp*`` residue is reclaimed once, behind every fence.
+    """The legacy ``tmp*`` residue is reclaimed once, behind every fence.
 
-    An install that upgraded past #6268 inherited a pile the keyed sweep cannot
+    An install carrying that legacy layout inherited a pile the keyed sweep cannot
     reason about (no pid in the name), so shipping only the reclaim fix leaves
     such a host at its inode ceiling and every spawn still failing. These names
     cannot be PROVEN to be ours, so each test below pins one fence that keeps a
@@ -1185,24 +1245,24 @@ class TestLegacyResidueSweep:
         empty = self._legacy_dir(tmp_path)
         plain = self._legacy_file(tmp_path)
 
-        removed = _cleanup_legacy_mount_source_residue()
+        removed = _cleanup_legacy_mount_source_residue(data_home=config_dir())
 
         assert removed == 1
         assert not empty.exists()
         # The old build's mkstemp FILE sources are left alone: an unlinked file
         # another program still holds open loses what it writes next, and no
-        # fence can tell such a file from ours. Raised by GPT review of #8559.
+        # fence can tell such a file from ours.
         assert plain.exists()
         # Second call is a no-op: no current build creates the shape, so a
         # completed pass is final and must not re-walk the tmpfs forever.
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
 
     def test_a_planted_symlink_at_the_marker_is_not_followed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """The stamp is create-only and O_NOFOLLOW: a dangling link at the
         marker path fails the stamp (the pass repeats) instead of making the
-        gateway write at the link's target. Raised by GPT review of #8559."""
+        gateway write at the link's target."""
         from kiro_crew.sandbox import _LEGACY_RESIDUE_MARKER, config_dir
 
         self._fence(monkeypatch, tmp_path)
@@ -1212,7 +1272,7 @@ class TestLegacyResidueSweep:
         marker.symlink_to(target)
         self._legacy_dir(tmp_path)
 
-        assert _cleanup_legacy_mount_source_residue() == 1
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
         assert not target.exists()
         assert marker.is_symlink()  # untouched, so the pass is not retired
 
@@ -1221,33 +1281,31 @@ class TestLegacyResidueSweep:
     ):
         """The same two claims as the keyed dir gate: ``/run/user/$UID`` is
         reachable by this uid and root alone, so every-possible-holder-read is
-        enough when another user's task keeps the host-wide flag down. Raised
-        by First Principles review of #8559."""
+        enough when another user's task keeps the host-wide flag down."""
         self._fence(monkeypatch, tmp_path, complete=False, covered=True)
         empty = self._legacy_dir(tmp_path)
 
-        assert _cleanup_legacy_mount_source_residue() == 1
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
         assert not empty.exists()
 
     def test_a_cohort_under_the_age_fence_withholds_the_marker(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         """A host upgrading within a day of its last old-build spawn must not
-        retire the pass on the cohort that is merely too young yet. Raised by
-        Design review of #8559."""
+        retire the pass on the cohort that is merely too young yet."""
         self._fence(monkeypatch, tmp_path)
         old = self._legacy_dir(tmp_path)
         young = self._legacy_dir(tmp_path, "tmpyoung001", old=False)
 
-        assert _cleanup_legacy_mount_source_residue() == 1
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
         assert not old.exists() and young.exists()
         stale = time.time() - _MOUNT_SOURCE_MAX_AGE_SECONDS - 100
         os.utime(young, (stale, stale))
         # Not retired: the aged cohort is reclaimed by the next pass, which
         # then finds nothing young and stamps.
-        assert _cleanup_legacy_mount_source_residue() == 1
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
         assert not young.exists()
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
 
     def test_unproven_bind_coverage_removes_nothing_and_does_not_retire_the_pass(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1259,14 +1317,51 @@ class TestLegacyResidueSweep:
         held = self._legacy_dir(tmp_path)
 
         with caplog.at_level(logging.INFO, logger="kiro_crew.sandbox"):
-            assert _cleanup_legacy_mount_source_residue() == 0
+            assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
         assert held.exists()
         retained = [r for r in caplog.records if "legacy pass retained" in r.getMessage()]
         assert len(retained) == 1
         assert retained[0].levelno == logging.WARNING
 
         self._fence(monkeypatch, tmp_path, complete=True)
-        assert _cleanup_legacy_mount_source_residue() == 1
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
+
+    def test_an_absent_root_skips_the_pin_scan_without_a_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """No root present means nowhere for an entry of this class to be, so
+        the pass must not pay for a ``/proc`` scan it cannot use.
+
+        Off Linux ``/run/user/$UID`` never exists and ``/proc`` cannot be read,
+        so the coverage claim was unprovable on every tick and the pass reported
+        a held-back walk at WARNING every few minutes for a root it was never
+        going to touch. It must still not retire itself: the branch found
+        nowhere to look, which is not the same as finding nothing left.
+        """
+        scanned = []
+
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._launcher_tmpfs_roots", lambda: [str(tmp_path / "absent")]
+        )
+
+        def _fake(proc_root="/proc", *, coverage=None, **_kw):
+            scanned.append(proc_root)
+            if coverage is not None:
+                coverage.covered = False
+            return (set(), False)
+
+        monkeypatch.setattr("kiro_crew.sandbox._bound_source_basenames", _fake)
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.sandbox"):
+            assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
+        assert scanned == []  # the pin scan never ran
+        assert not [r for r in caplog.records if "legacy pass retained" in r.getMessage()]
+
+        # Not retired: a root that does appear is still swept.
+        self._fence(monkeypatch, tmp_path)
+        held = self._legacy_dir(tmp_path)
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
+        assert not held.exists()
 
     def test_bound_entry_is_preserved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Removing a live mount's source dir S_DEADs it — the bind scan decides."""
@@ -1274,7 +1369,7 @@ class TestLegacyResidueSweep:
         self._fence(monkeypatch, tmp_path, bound={name})
         held = self._legacy_dir(tmp_path, name)
 
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
         assert held.exists()
 
     def test_non_empty_dir_survives(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1287,7 +1382,7 @@ class TestLegacyResidueSweep:
         populated = self._legacy_dir(tmp_path, "tmpshadow12")
         (populated / "known_hosts").write_text("example.com ssh-ed25519 AAAA\n")
 
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
         assert (populated / "known_hosts").exists()
 
     def test_bound_scan_keys_on_the_tmpfs_relative_root_field(
@@ -1342,7 +1437,7 @@ class TestLegacyResidueSweep:
         named.mkdir(mode=0o700)
         keyed = _make_dir(tmp_path, f"kirocrew_sb_{_DEAD_PID}_keyed01")
 
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
         for path in (fresh, loose, sized, named, keyed):
             assert path.exists(), path
 
@@ -1355,18 +1450,18 @@ class TestLegacyResidueSweep:
         program's ``tempfile`` scratch looks like, and one it may still write
         into — so below the threshold nothing is touched. There is also no
         pile to heal, so the one-shot pass retires rather than re-walking the
-        tmpfs on every sweep. Caught by GPT 5.6 review of PR #8559.
+        tmpfs on every sweep.
         """
         self._fence(monkeypatch, tmp_path)
         monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 4)
         strays = [self._legacy_dir(tmp_path, f"tmpstray00{i}") for i in range(3)]
 
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
         for stray in strays:
             assert stray.exists(), stray
         # Retired: a later pass is a no-op even once more candidates appear.
         self._legacy_dir(tmp_path, "tmpstray003")
-        assert _cleanup_legacy_mount_source_residue() == 0
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 0
 
     def test_at_the_pile_threshold_the_buffered_candidates_are_reclaimed_too(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1376,7 +1471,7 @@ class TestLegacyResidueSweep:
         monkeypatch.setattr("kiro_crew.sandbox._LEGACY_PILE_THRESHOLD", 4)
         pile = [self._legacy_dir(tmp_path, f"tmppile000{i}") for i in range(6)]
 
-        assert _cleanup_legacy_mount_source_residue() == 6
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 6
         for entry in pile:
             assert not entry.exists(), entry
 
@@ -1399,7 +1494,9 @@ class TestLegacyResidueSweep:
         )
         legacy = self._legacy_dir(tmp_path)
 
-        removed = cleanup_stale_sandbox_profiles(legacy_dir=str(tmp_path / "absent"))
+        removed = cleanup_stale_sandbox_profiles(
+            legacy_dir=str(tmp_path / "absent"), data_home=config_dir()
+        )
 
         assert removed >= 1
         assert not legacy.exists()
@@ -1506,13 +1603,13 @@ class TestSweepTimeBudget:
 
         budget = self._spent_budget()
         try:
-            assert _cleanup_legacy_mount_source_residue() == 1
+            assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 1
         finally:
             budget.undo()
         assert len(list(tmp_path.iterdir())) == 2
 
         # The marker was NOT stamped, so the next pass finishes the residue.
-        assert _cleanup_legacy_mount_source_residue() == 2
+        assert _cleanup_legacy_mount_source_residue(data_home=config_dir()) == 2
         assert not list(tmp_path.iterdir())
 
 
@@ -1580,67 +1677,198 @@ class TestMountSourceCandidateRoots:
         ]
 
 
-@requires_posix
+#: Run in a fresh interpreter, a process other than the test that rendered the launcher:
+#: drives the rendered launcher's child stages to the exec with a libc that mounts
+#: nothing, and prints the pid of the process that reached the exec and the stand-in
+#: prefix it used.
+_PREFIX_DRIVER = """
+import importlib.util, os, sys
+
+spec = importlib.util.spec_from_file_location("launcher_under_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+class _Libc:
+    def mount(self, source, target, fstype, flags, data):
+        return 0
+
+    def umount2(self, target, flags):
+        return 0
+
+    def unshare(self, flags):
+        return 0
+
+    def prctl(self, option, a2, a3, a4, a5):
+        return 0
+
+
+at_exec = []
+run = module.Launch(
+    dict(module._PLAN, stand_in_roots=[]),
+    _Libc(),
+    environ={"HOME": sys.argv[2]},
+    execvp=lambda file, argv: at_exec.append(run.src_prefix),
+)
+module.run_child(run, ["/bin/agent"])
+print(os.getpid(), at_exec[0])
+"""
+
+
+@requires_linux
 class TestLauncherStagingSitesArePrefixed:
-    """Every generated staging call against the tmpfs source carries the pid prefix."""
+    """Every name the launcher stages on the stand-in root carries the pid prefix."""
 
     @staticmethod
-    def _staging_calls(tree: ast.AST) -> list[ast.Call]:
-        """tempfile.mkdtemp/mkstemp calls whose ``dir=`` is ``_tmpfs_src``."""
-        calls = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "tempfile"
-                and func.attr in ("mkdtemp", "mkstemp")
-            ):
-                continue
-            dir_kw = next((k for k in node.keywords if k.arg == "dir"), None)
-            if dir_kw is not None and (
-                isinstance(dir_kw.value, ast.Name) and dir_kw.value.id == "_tmpfs_src"
-            ):
-                calls.append(node)
-        return calls
+    def _run_over_every_staging_site(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[program.Launch, list[str], dict[str, list[str]]]:
+        """A whole child run over a tree that reaches every staging site.
 
-    @staticmethod
-    def _src_prefix_assignments(tree: ast.AST) -> list[ast.Assign]:
-        return [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "_src_prefix" for t in node.targets)
-        ]
-
-    @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
-    def test_launcher_parses_and_all_staging_sites_prefixed(self, level: str):
-        script = _build_launcher_script(level)
-        tree = ast.parse(script)  # string-template edits must keep it parseable
-
-        staging = self._staging_calls(tree)
-        # The template always emits all three staging sites (per-dir empties,
-        # per-file empties, SSH shadow); the level varies the DATA, not the code.
-        assert len(staging) == 3
-        for call in staging:
-            prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
-            assert prefix_kw is not None, ast.dump(call)
-            assert isinstance(prefix_kw.value, ast.Name)
-            assert prefix_kw.value.id == "_src_prefix"
-
-    @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
-    def test_every_tempfile_call_in_the_launcher_carries_a_known_prefix(self, level: str):
-        """Closed over ALL tempfile.mkdtemp/mkstemp calls, however spelled.
-
-        The staging-site assertion above keys on ``dir=_tmpfs_src``, which a
-        future positional ``mkdtemp(_tmpfs_src)`` or ``dir=_tmpfs_src or
-        None`` would evade — silently re-opening the unprefixed-orphan class.
-        Every temp creation in the launcher must carry either the pid-bearing
-        ``_src_prefix`` or the probe's own literal prefix.
+        A credential directory, a masked tree holding a private window that itself holds
+        a masked leaf, a secret file, an unreadable-mask leaf (the launcher non-dumpable,
+        as entering the namespaces leaves it, so its private stage is tried) and
+        ``~/.ssh``. ``HOME`` sits on another filesystem than the stand-in root, so the
+        root qualifies and is probed. Returns the run, its libc, every name
+        ``tempfile`` created during it, and the stand-in-root names the mounts used,
+        by the role each played.
         """
-        tree = ast.parse(_build_launcher_script(level))
+        home = tmp_path / "home"
+        keys = home / ".aws"
+        keys.mkdir(parents=True)
+        (keys / "credentials").write_text("[default]\n", encoding="utf-8")
+        crew = home / ".kiro" / "crew"
+        apps = crew / "apps"
+        window = apps / "alpha" / "data"
+        window.mkdir(parents=True)
+        nested = window / "edits"
+        nested.mkdir()
+        (nested / "draft").write_text("draft", encoding="utf-8")
+        netrc = home / ".netrc"
+        netrc.write_text("machine x\n", encoding="utf-8")
+        signing_key = crew / "token_signing.key"
+        signing_key.write_bytes(b"k" * 32)
+        ssh = home / ".ssh"
+        ssh.mkdir()
+        (ssh / "known_hosts").write_text("host ssh-ed25519 AAAA\n", encoding="utf-8")
+        root = tmp_path / "stand-ins"
+        plan = payload(
+            sensitive_dirs=[str(keys), str(apps), str(nested)],
+            private_dirs=[str(window)],
+            sensitive_files=[str(netrc), str(signing_key)],
+            unreadable_masks=["token_signing.key"],
+            ssh_dir=str(ssh),
+            ssh_known_hosts=str(ssh / "known_hosts"),
+            hide_ssh=1,
+            stand_in_roots=[str(root)],
+        )
+        created: list[str] = []
+        real_mkdtemp, real_mkstemp = tempfile.mkdtemp, tempfile.mkstemp
+
+        def _mkdtemp(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            path = real_mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+        def _mkstemp(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            fd, path = real_mkstemp(*args, **kwargs)
+            created.append(path)
+            return fd, path
+
+        libc = CoveringLibc()
+        run = launch(tmp_path, plan, libc=libc, environ={"HOME": "/proc"})
+        run.tmpfs_src = None  # chosen by the run itself, from the plan's stand-in roots
+        run.nondumpable = True
+        with monkeypatch.context() as patched:
+            patched.setattr(program.tempfile, "mkdtemp", _mkdtemp)
+            patched.setattr(program.tempfile, "mkstemp", _mkstemp)
+            program.run_child(run, ["/bin/agent"])
+
+        def _in_root(path: object) -> str | None:
+            spelled = os.fsdecode(path) if isinstance(path, bytes) else path
+            if isinstance(spelled, str) and os.path.dirname(spelled) == str(root):
+                return spelled
+            return None
+
+        roles: dict[str, list[str]] = {
+            "directory mask": [],
+            "nested re-mask": [],
+            "file mask": [],
+            "ssh mask": [],
+            "window stage": [],
+            "unreadable stage": [],
+        }
+        for call in libc.calls:
+            source, target = _in_root(call.source), _in_root(call.target_path)
+            if call.fstype == b"tmpfs" and target:
+                roles["unreadable stage"].append(target)
+            elif call.flags & 4096 and target:
+                roles["window stage"].append(target)
+            elif call.flags & 4096 and source in roles["window stage"]:
+                continue  # the stage bound back at its window's own path
+            elif call.flags & 4096 and source:
+                role = {
+                    str(keys): "directory mask",
+                    str(apps): "directory mask",
+                    str(nested): "nested re-mask",
+                    str(netrc): "file mask",
+                    str(signing_key): "file mask",
+                    str(ssh): "ssh mask",
+                }[call.target_path]
+                roles[role].append(source)
+        return run, created, roles
+
+    def test_every_staging_site_names_its_source_with_the_pid_prefix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        run, _, roles = self._run_over_every_staging_site(tmp_path, monkeypatch)
+
+        # The run reached all six staging sites: per-dir empties, the nested re-mask that
+        # re-hides a masked leaf sitting INSIDE a window after the window is bound,
+        # per-file empties, the SSH shadow, the private-window stage that holds a
+        # window's real contents while its parent is masked, and the private tmpfs stage
+        # for an unreadable mask.
+        assert {role: bool(names) for role, names in roles.items()} == dict.fromkeys(roles, True)
+        prefix = "kirocrew_sb_%d_" % os.getpid()
+        assert run.src_prefix == prefix
+        for role, names in roles.items():
+            for name in names:
+                assert os.path.basename(name).startswith(prefix), (role, name)
+
+    def test_every_tempfile_call_has_a_known_staging_role(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Closed over EVERY name ``tempfile`` creates during a run, however called.
+
+        The staging-site assertion above follows the names the mounts used; a name made
+        and never mounted, or made with a positional ``mkdtemp(root)`` or a
+        ``dir=root or None``, would evade it -- silently re-opening the
+        unprefixed-orphan class. Each must land on the stand-in root and carry the
+        pid-bearing prefix, or be the root's probe, which carries its own sibling prefix
+        and is gone again.
+        """
+        run, created, roles = self._run_over_every_staging_site(tmp_path, monkeypatch)
+
+        root = str(tmp_path / "stand-ins")
+        assert created, "the run created nothing on the stand-in root"
+        probes = [p for p in created if os.path.basename(p).startswith("kirocrew_sbprobe_")]
+        assert len(probes) == 1 and not os.path.lexists(probes[0])
+        for path in created:
+            assert os.path.dirname(path) == root, path
+            name = os.path.basename(path)
+            assert name.startswith(run.src_prefix) or path in probes, path
+        assert {name for names in roles.values() for name in names} <= set(created)
+
+    def test_every_tempfile_call_in_the_program_carries_a_known_prefix(self):
+        """Closed over EVERY ``tempfile`` call the program makes, reached by a run or not.
+
+        The run above sees only the branches one host takes; a staging site on a branch
+        it never reaches (a degraded mount, a refusal path) would escape it. So the
+        program's source is read too: each ``mkdtemp``/``mkstemp`` names
+        ``prefix=launch.src_prefix`` -- the pid-bearing staging prefix the sweep keys on
+        -- or is the stand-in root's probe with its own literal prefix.
+        """
+        tree = ast.parse(sandbox_launcher.launcher_program_source())
         calls = [
             node
             for node in ast.walk(tree)
@@ -1648,59 +1876,43 @@ class TestLauncherStagingSitesArePrefixed:
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "tempfile"
-            and node.func.attr in ("mkdtemp", "mkstemp")
+            and node.func.attr not in ("gettempdir", "gettempdirb", "gettempprefix")
         ]
-        assert len(calls) == 4  # three staging sites + the tmpfs probe
+        assert calls, "the program makes no tempfile call"
         for call in calls:
-            prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
-            assert prefix_kw is not None, ast.dump(call)
-            ok_name = isinstance(prefix_kw.value, ast.Name) and prefix_kw.value.id == "_src_prefix"
-            ok_probe = (
-                isinstance(prefix_kw.value, ast.Constant)
-                and prefix_kw.value.value == "kirocrew_sbprobe_"
-            )
-            assert ok_name or ok_probe, ast.dump(call)
+            assert call.func.attr in ("mkdtemp", "mkstemp"), ast.dump(call)
+            prefix = next((k.value for k in call.keywords if k.arg == "prefix"), None)
+            assert prefix is not None, ast.dump(call)
+            staged = ast.unparse(prefix) == "launch.src_prefix"
+            probe = isinstance(prefix, ast.Constant) and prefix.value == "kirocrew_sbprobe_"
+            assert staged or probe, ast.dump(call)
 
     @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
-    def test_prefix_is_assigned_in_the_post_fork_child_branch(self, level: str):
-        """The embedded pid must be the CHILD's — the process that execs the
-        agent — so the assignment has to sit in the fork's else branch, after
-        ``os.fork()`` returned 0. An assignment hoisted above the fork would
-        bake in the short-lived parent launcher's pid and every entry would
-        read dead the moment the parent exits."""
-        tree = ast.parse(_build_launcher_script(level))
+    def test_prefix_embeds_launcher_runtime_pid(self, level: str, tmp_path: Path):
+        """The prefix is the pid of the process that execs the agent, read at run time.
 
-        assignments = self._src_prefix_assignments(tree)
-        assert len(assignments) == 1
-        assignment = assignments[0]
+        Not baked in by the gateway when it renders the launcher: the launcher is
+        rendered here and its child stages run in another process, which must stage
+        under ITS OWN pid. The pid has to be the one that execs the agent -- the child
+        the launcher forks, not the short-lived parent that writes the uid maps --
+        or every entry would read dead the moment the parent exits.
+        """
+        plan = sandbox_plan.plan_confinement(
+            sandbox_plan.SandboxRequest(tier=level), sandbox_plan.PlanHost(home=str(tmp_path))
+        )
+        script = tmp_path / "kirocrew_sandbox_prefix.py"
+        script.write_text(sandbox_launcher.render_namespace_launcher(plan), encoding="utf-8")
 
-        def _in_child_branch(node: ast.AST) -> bool:
-            for candidate in ast.walk(node):
-                if (
-                    isinstance(candidate, ast.If)
-                    and isinstance(candidate.test, ast.Compare)
-                    and isinstance(candidate.test.left, ast.Name)
-                    and candidate.test.left.id == "pid"
-                ):
-                    return any(assignment is n for b in candidate.orelse for n in ast.walk(b))
-            return False
+        done = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _PREFIX_DRIVER, str(script), "/proc"],
+            capture_output=True,
+            encoding="utf-8",
+            timeout=60,
+            check=False,
+            cwd=str(tmp_path),
+        )
 
-        assert _in_child_branch(tree), "_src_prefix must be assigned in the fork child branch"
-
-    @pytest.mark.parametrize("level", ["strict", "cc", "standard"])
-    def test_prefix_embeds_launcher_runtime_pid(self, level: str):
-        """The prefix value is computed from ``os.getpid()`` at launcher
-        runtime (not baked in by the gateway at template-format time)."""
-        tree = ast.parse(_build_launcher_script(level))
-        (assignment,) = self._src_prefix_assignments(tree)
-
-        getpid_calls = [
-            node
-            for node in ast.walk(assignment.value)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "getpid"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "os"
-        ]
-        assert getpid_calls, "_src_prefix must derive from os.getpid() at runtime"
+        assert done.returncode == 0, done.stderr
+        pid, prefix = done.stdout.split()
+        assert int(pid) != os.getpid()
+        assert prefix == "kirocrew_sb_%s_" % pid

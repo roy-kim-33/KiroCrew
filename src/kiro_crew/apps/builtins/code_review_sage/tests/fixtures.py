@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 
 def _symlinks_creatable() -> bool:
@@ -25,6 +26,23 @@ def _symlinks_creatable() -> bool:
 #: importing modules decorate classes and functions at definition time, so this
 #: must be a plain constant rather than a fixture.
 SYMLINKS_OK = _symlinks_creatable()
+
+
+#: The dashboard owner the route suites' fake requests act as.
+OWNER = "sage-owner"
+
+
+class OwnerRequest(dict):
+    """The identity the dashboard auth middleware stamps on the owner's request.
+
+    The routes' owner gate reads ``request.app["state"].owner_id`` and the
+    ``user`` / ``app`` keys, so a fake that carries the owner's real identity lets
+    the gate run unpatched and admit it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(user=OWNER, app="")
+        self.app = {"state": SimpleNamespace(owner_id=OWNER)}
 
 
 # A sensitive file (gateway/lifecycle) with a guard removal + an import add,
@@ -70,7 +88,7 @@ SENSITIVE_TINY_FILES = [{
 
 # A GitHub PR payload as the worker assembles it from `gh api`: the pulls/{n}
 # object merged with a `files` array (each carrying its per-file `patch`) and
-# a `comments` list. Mirrors the private kiro-team/kiro-cli PR #3361 shape.
+# a `comments` list. Mirrors the shape of a private kiro-team/kiro-cli pull request.
 GITHUB_PAYLOAD = {
     "number": 3361,
     "title": "Fix set_mode deadlock in SwapAgent handler",

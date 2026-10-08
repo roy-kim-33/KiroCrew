@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Mapping, Optional
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.owner_only_files import mkdirs_owner_only, write_text_owner_only
 
 if TYPE_CHECKING:
     import importlib.metadata
@@ -142,8 +143,17 @@ def hmac_signature(secret: str, payload: bytes) -> str:
     against a publisher/issuer public key pinned in the policy; the shape (the
     trust root holds the key, the signed document holds only the signature) is
     unchanged, which is why both call sites route through one helper.
+
+    ``surrogatepass``: the key is text parsed from a JSON trust root, and
+    ``json.loads`` accepts a lone surrogate that a strict encode raises on.  A
+    UnicodeEncodeError here is a ValueError, not a refusal, so it would escape the
+    signature check of every caller.  ``surrogatepass`` only prevents that crash:
+    the key still produces an ordinary HMAC, which verifies exactly when the signer
+    used the same key bytes and reads as UNVERIFIED otherwise.
     """
-    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return hmac.new(
+        secret.encode("utf-8", errors="surrogatepass"), payload, hashlib.sha256
+    ).hexdigest()
 
 
 def _normalize_name(name: str) -> str:
@@ -221,6 +231,48 @@ def _coerce_trust_keys(raw: object) -> Dict[str, str]:
     return out
 
 
+# Sentinel distinguishing "key absent" from "key present with value null":
+# ``d.get(key)`` alone cannot tell ``"require_signature": null`` apart from the
+# key not being written at all, and the two must read differently (absent means
+# the gate is off by its documented default; present-but-not-boolean reads
+# fail-closed).
+_MISSING = object()
+
+
+def _coerce_flag(d: Mapping[str, object], key: str) -> bool:
+    """Read one admission gate flag strictly.
+
+    A real JSON boolean is honoured; an absent key leaves the gate OFF (the
+    documented default). Any other PRESENT value — ``null``, the string
+    ``"false"``, ``0``, ``1``, a list — is NOT interpreted: ``bool()`` on a raw
+    JSON value turns any non-empty string (``"false"`` included) into ``True``
+    while ``null`` and ``""`` read as ``False``, so a hand-edited or
+    template-rendered policy carrying ``"require_policy_signature": null``
+    silently disables the very gate the operator wrote down. Such a value is
+    warned about and read as ``True`` — ON, the fail-closed direction for an
+    admission gate. ``bool`` is a subclass of ``int``, so the boolean check
+    must run before any int handling. Same strict-read shape as
+    ``governance._coerce_boot_flag`` for the ``boot`` gate flags.
+    """
+    value = d.get(key, _MISSING)
+    if value is _MISSING:
+        return False
+    if isinstance(value, bool):
+        return value
+    # Log the TYPE, never the value: a mis-typed flag can carry a secret (a
+    # credential pasted into the policy — this file also holds ``trust_keys``),
+    # and this warning lands in the persistent gateway log ring, which
+    # ``GET /api/logs`` serves. Mirrors ``governance._coerce_boot_flag``.
+    logger.warning(
+        "admission policy %s is %s, not a boolean; reading it fail-closed "
+        "as True. Write true or false (unquoted), or omit the key to leave the "
+        "gate off. Earlier releases read a null or empty value here as off.",
+        key,
+        type(value).__name__,
+    )
+    return True
+
+
 @dataclass(frozen=True)
 class AdmissionPolicy:
     """The fleet-controlled trust root. Never sourced from a plugin."""
@@ -267,8 +319,8 @@ class AdmissionPolicy:
         approved = d.get("approved", None)
         return AdmissionPolicy(
             mode=str(d.get("mode", MODE_OPEN)),
-            require_signature=bool(d.get("require_signature", False)),
-            require_policy_signature=bool(d.get("require_policy_signature", False)),
+            require_signature=_coerce_flag(d, "require_signature"),
+            require_policy_signature=_coerce_flag(d, "require_policy_signature"),
             trust_keys=_coerce_trust_keys(d.get("trust_keys")),
             approved=(_coerce_str_list(approved) if approved is not None else None),
             banned=_coerce_str_list(d.get("banned", [])),
@@ -308,7 +360,8 @@ _DEFAULT_POLICY_BODY: Dict[str, object] = {
         "Default permissive admission policy seeded by KiroCrew at first run. "
         "Deleting this file DISABLES plugin admission (fail-closed): "
         "load_admission_policy() then returns MODE_ENFORCE with an empty allowlist "
-        "and the dashboard governance indicator shows Disabled. To restrict "
+        "and the dashboard governance indicator shows Degraded (Disabled is the "
+        "state of this seeded permissive file). To restrict "
         "admission, set mode='enforce' and populate 'approved' / 'require_signature'. "
         "'require_policy_signature' additionally demands a VERIFIED signature on "
         "security_policy.json, keyed by its identity.issuer in 'trust_keys'."
@@ -335,7 +388,8 @@ def seed_default_policy() -> bool:
     misconfig = fail closed".  Guarded by a one-shot marker so that DELETING the
     policy afterward is never silently re-seeded — a later
     ``load_admission_policy`` then returns :func:`_fail_closed_policy` and the
-    governance health indicator flips to Disabled.
+    governance health indicator flips to Degraded (policy unverified).
+    Disabled is the state of the seeded permissive file itself.
 
     Never clobbers an existing policy file (a managed fleet may ship its own) and
     is skipped entirely when the ``KIROCREW_ADMISSION_POLICY`` env override is
@@ -353,20 +407,17 @@ def seed_default_policy() -> bool:
         wrote = False
         if not env_set and not default_path.exists():
             body_text = json.dumps(_DEFAULT_POLICY_BODY, indent=2) + "\n"
-            default_path.parent.mkdir(parents=True, exist_ok=True)
-            default_path.write_text(body_text, encoding="utf-8")
+            mkdirs_owner_only(default_path.parent)
+            write_text_owner_only(default_path, body_text)
             # Record the integrity baseline for the file we just wrote so a later
             # modification is detectable at load (advisory — see load below).
-            checksum_path.parent.mkdir(parents=True, exist_ok=True)
-            checksum_path.write_text(
-                hashlib.sha256(body_text.encode("utf-8")).hexdigest() + "\n",
-                encoding="utf-8",
+            mkdirs_owner_only(checksum_path.parent)
+            write_text_owner_only(
+                checksum_path, hashlib.sha256(body_text.encode("utf-8")).hexdigest() + "\n"
             )
             wrote = True
-        seed_marker.parent.mkdir(parents=True, exist_ok=True)
-        seed_marker.write_text(
-            datetime.now(tz=timezone.utc).isoformat() + "\n", encoding="utf-8"
-        )
+        mkdirs_owner_only(seed_marker.parent)
+        write_text_owner_only(seed_marker, datetime.now(tz=timezone.utc).isoformat() + "\n")
         return wrote
     except Exception:
         logger.warning("first-run: admission policy seed failed", exc_info=True)
@@ -447,7 +498,13 @@ def _verify_seed_integrity(policy_bytes: bytes) -> None:
             return
         expected = checksum_path.read_text(encoding="utf-8").strip()
         actual = hashlib.sha256(policy_bytes).hexdigest()
-        if not hmac.compare_digest(expected, actual):
+        # Bytes for the same reason as ``_signature_valid``: ``expected`` is
+        # text from a user-owned file, and a non-ASCII character in it would
+        # make ``hmac.compare_digest`` raise instead of reporting a mismatch.
+        if not hmac.compare_digest(
+            expected.encode("utf-8", "surrogatepass"),
+            actual.encode("utf-8", "surrogatepass"),
+        ):
             logger.error(
                 "admission policy at %s does not match its seed checksum "
                 "(modified since first-run); recording integrity event",
@@ -621,7 +678,17 @@ def _signature_valid(manifest: PluginManifest, policy: AdmissionPolicy) -> bool:
     if not secret:
         return False
     expected = hmac_signature(secret, manifest.signing_payload())
-    return hmac.compare_digest(expected, manifest.signature)
+    # Compare as BYTES: ``hmac.compare_digest`` accepts two ASCII-only strs but
+    # raises TypeError the moment either str operand carries a non-ASCII
+    # character, and ``manifest.signature`` is attacker-supplied text from the
+    # plugin's own manifest — the TypeError would escape ``evaluate_admission``
+    # on exactly the input this gate exists to refuse. Encoding both sides
+    # (``surrogatepass`` so a lone surrogate accepted by ``json.loads`` cannot
+    # crash the encode either) makes any malformed signature an ordinary False.
+    return hmac.compare_digest(
+        expected.encode("utf-8", "surrogatepass"),
+        str(manifest.signature).encode("utf-8", "surrogatepass"),
+    )
 
 
 def _capabilities_within_ceiling(

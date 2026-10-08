@@ -219,8 +219,8 @@ def test_no_egress_destination_by_default():
 
 
 def test_default_provider_yields_one_destination_for_the_config_endpoint():
-    """A non-empty telemetry.otlp_endpoint yields exactly the destination the
-    hardcoded exporter used to reach — the byte-identical-behaviour claim."""
+    """A non-empty telemetry.otlp_endpoint yields exactly the destination for
+    that endpoint."""
     from kiro_crew.config.loader import TelemetryConfig
     from kiro_crew.metrics.provider import _otlp_destinations
     from kiro_crew.platform.defaults import DefaultTelemetryProvider
@@ -257,6 +257,60 @@ def test_otlp_reader_degrades_without_logging_endpoint(monkeypatch, caplog):
     assert endpoint not in caplog.text
     assert "super-secret" not in caplog.text
     assert "token=hidden" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "signal"),
+    [
+        ("https://cloud.langfuse.com/api/public/otel/v1/traces", "traces"),
+        ("http://localhost:4318/v1/traces/", "traces"),
+        ("http://localhost:4318/V1/TRACES", "traces"),
+        ("https://user:super-secret@example.test/v1/logs?token=hidden", "logs"),
+    ],
+)
+def test_otlp_reader_warns_on_another_signals_route(monkeypatch, caplog, endpoint, signal):
+    """Kiro Crew emits metrics only. An endpoint aimed at a tracing backend's
+    /v1/traces (e.g. Langfuse) gets every batch rejected and no trace ever
+    arrives, so the reader says so once at WARNING, by destination name only."""
+    import logging
+
+    from kiro_crew.config.loader import TelemetryConfig
+    from kiro_crew.metrics import provider as provider_mod
+
+    monkeypatch.setattr(provider_mod, "_load_otel", lambda: False)
+    cfg = TelemetryConfig(enabled=True, otlp_endpoint=endpoint)
+    with caplog.at_level(logging.WARNING):
+        provider_mod._build_otlp_reader(_dest(endpoint, name="dest-x"), cfg)
+    hits = [r.getMessage() for r in caplog.records if "metrics only" in r.getMessage()]
+    assert len(hits) == 1, caplog.text
+    assert f"OTLP {signal} route" in hits[0]
+    assert "'dest-x'" in hits[0]
+    assert endpoint not in caplog.text
+    assert "super-secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:4318/v1/metrics",
+        "https://traces.example.test/v1/metrics",
+        "https://example.test/v1/metrics?route=/v1/traces",
+        "http://localhost:4318",
+        "not a url at all",
+    ],
+)
+def test_otlp_reader_does_not_warn_on_a_metrics_route(monkeypatch, caplog, endpoint):
+    """Host names and query strings mentioning traces are not a traces route."""
+    import logging
+
+    from kiro_crew.config.loader import TelemetryConfig
+    from kiro_crew.metrics import provider as provider_mod
+
+    monkeypatch.setattr(provider_mod, "_load_otel", lambda: False)
+    cfg = TelemetryConfig(enabled=True, otlp_endpoint=endpoint)
+    with caplog.at_level(logging.WARNING):
+        provider_mod._build_otlp_reader(_dest(endpoint), cfg)
+    assert "metrics only" not in caplog.text
 
 
 def test_otlp_constructor_failure_never_logs_endpoint(monkeypatch, caplog):
@@ -1038,13 +1092,12 @@ class TestConsentRecheck:
 
 
 class TestResetForTestingWaitsOutInFlightWorker:
-    """Pins the fix for the force-clear this module's ``_worker_event`` helper
-    used to do: ``reset_for_testing`` must wait for a REAL in-flight
-    consent-check worker to finish, rather than a test helper force-clearing
-    ``_check_in_flight`` out from under a worker that is still actually
-    running. These tests drive the flag only through the product's own
-    scheduling path (``get_recorder()`` -> ``_schedule_consent_check_locked``
-    -> ``_consent_worker``) and never assign it directly.
+    """``reset_for_testing`` must wait for a REAL in-flight consent-check worker
+    to finish, rather than a test helper force-clearing ``_check_in_flight`` out
+    from under a worker that is still actually running. These tests drive the flag
+    only through the product's own scheduling path (``get_recorder()`` ->
+    ``_schedule_consent_check_locked`` -> ``_consent_worker``) and never assign it
+    directly.
     """
 
     def test_waits_for_a_real_worker_to_finish_before_returning(self, tmp_path, monkeypatch):

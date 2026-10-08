@@ -28,11 +28,16 @@ every builtin app uses):
   POST /api/apps/pptx-maker/templates/rename    -> rename a user template
   DELETE /api/apps/pptx-maker/templates         -> delete a user template
 
-Three invariants hold across every handler:
+Four invariants hold across the handlers:
 
 * **Deny by default.** Every route is wrapped in :func:`_require_enabled`, which
   refuses with 403 while the app is disabled. Routes are registered once at
   gateway startup, so a default-disabled app would otherwise stay callable.
+* **Mutations are owner only.** Every PUT, POST and DELETE handler calls
+  :func:`_refuse_non_owner` before it reads the body or starts any work. A
+  dashboard caller that is not the owner, or a request with no app claim, gets
+  the shared 403 ``owner_only``. An app token (this app's own, or one granted
+  ``/api/apps/pptx-maker/*``) is already scoped by the auth middleware and passes.
 * **Nothing blocking on the loop.** Every filesystem walk, engine subprocess and
   file read runs through :func:`off_loop`, which hands the work to
   ``subprocess_executor()``. This is not optional: one blocking call here
@@ -181,7 +186,7 @@ _INLINE_BITMAP_RE = re.compile(
 # and stays O(1) per blob: a genuine raster always carries its signature, and a
 # smuggled secret essentially never decodes into one. The shared sniffer also
 # checks WebP's form tag at offset 8, so a bare `RIFF` container (e.g. a WAVE
-# audio file) no longer counts as a bitmap here.
+# audio file) does not count as a bitmap here.
 
 # AVIF/HEIF put a 4-byte box length BEFORE the `ftyp` brand, so the signature is
 # at an offset rather than at byte 0.
@@ -193,7 +198,7 @@ _BITMAP_FTYP_MAGIC = b"ftyp"
 # An AWS key id is a fixed 4-char prefix plus exactly 16 upper/digit chars — all of it
 # base64 alphabet — so it can be smuggled as body text and reproduced by the re-encode.
 # Chance collision is negligible (~1.6e-7 per 20 KB raster) because the 16-char body is
-# required; matching a BARE 4-char prefix instead is what used to blank real pictures at
+# required; matching a BARE 4-char prefix instead blanks real pictures at
 # 0.88% per 20 KB and 4.7% per 100 KB.
 #
 # Every other provider marker (`xox…`, `sk-ant…`, `gh[pousr]_…`, `pypi-`, `glpat-`, a
@@ -427,6 +432,21 @@ def _require_enabled(
     return _wrapped
 
 
+async def _refuse_non_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Return the shared 403 ``owner_only`` unless an app token or the owner calls.
+
+    A mutating route changes the owner's deck root, style and template library,
+    or starts a download and build. A dashboard subject must be the owner. A
+    request with no app claim is held to the same rule (fail closed). An app
+    token keeps its manifest-scoped access.
+    """
+    if request.get("app"):
+        return None
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    return await require_owner_dashboard_request(request, f"pptx_maker.{operation}")
+
+
 def _audit(operation: str, resources: str, outcome: str, *, error: str = "") -> None:
     """Emit a Security Event Log entry for a mutating action.
 
@@ -489,7 +509,7 @@ async def _json_body(request: web.Request) -> tuple[dict | None, web.Response | 
     ``styles/import`` endpoint instead, not this JSON path.
 
     The catch spans the client-input failure set: ``LookupError`` (an unknown
-    ``charset=`` codec) previously escaped as a 500 and is now a 400, and
+    ``charset=`` codec) answers 400 rather than escaping as a 500, and
     ``RecursionError`` (a deeply nested body) is caught for the same reason.
     ``UnicodeDecodeError`` is a ``ValueError`` subclass, so ``ValueError`` alone
     already covers undecodable bytes; it is dropped from the tuple as redundant.
@@ -631,6 +651,8 @@ async def _handle_engine_provision(request: web.Request) -> web.Response:
     it is a decision the operator makes rather than a side effect of opening a
     page. Idempotent — re-running moves an existing checkout to the pinned tag.
     """
+    if (owner_denied := await _refuse_non_owner(request, "engine_provision")) is not None:
+        return owner_denied
     with _engine_lock:
         if _engine_state.state == "running":
             return web.json_response({"state": "running"}, status=202)
@@ -670,8 +692,8 @@ def _deps_status() -> dict:
         # The one missing tool the user must install themselves, with the command
         # for THIS platform. Data for the UI to show — never run from here.
         "hints": (
-            {preview_tools.SOFFICE: preview_tools.soffice_hint()}
-            if preview_tools.SOFFICE in missing
+            {preview_tools.SOFFICE: hint}
+            if preview_tools.SOFFICE in missing and (hint := preview_tools.soffice_hint())
             else {}
         ),
     }
@@ -685,7 +707,7 @@ async def _handle_deps(request: web.Request) -> web.Response:
     which is a privileged host mutation driven by an unauthenticated-to-the-OS
     caller — the dashboard shows the command and the user runs it.
 
-    ``pdftoppm`` is no longer in that category: it is provided by an app-private
+    ``pdftoppm`` is not in that category: it is provided by an app-private
     launcher over the engine venv's own ``pypdfium2`` (see :mod:`.preview_tools`),
     installed as part of ``POST /engine/provision``. Nothing is elevated and
     nothing is written outside this app's data dir, so there is still no
@@ -856,6 +878,8 @@ async def _handle_assets_provision(request: web.Request) -> web.Response:
     Fire-and-forget: presentations work without icon packs, so the UI polls
     ``/assets`` for progress rather than holding a request open for the download.
     """
+    if (owner_denied := await _refuse_non_owner(request, "assets_provision")) is not None:
+        return owner_denied
     with _assets_lock:
         if _assets_state.state == "running":
             return web.json_response({"state": "running"}, status=202)
@@ -975,9 +999,11 @@ async def _handle_put_config(request: web.Request) -> web.Response:
     """PUT /config {"deckRoot": "<path>"} — set the deck output directory.
 
     ``deckRoot`` is the ONLY writable key: the body is checked for exact key
-    equality rather than merged, so this endpoint cannot be used to set an
+    equality rather than merged, so this endpoint cannot set an
     arbitrary engine option.
     """
+    if (owner_denied := await _refuse_non_owner(request, "set_deck_root")) is not None:
+        return owner_denied
     body, error = await _json_body(request)
     if error is not None:
         return error
@@ -1292,6 +1318,8 @@ async def _handle_style(request: web.Request) -> web.Response:
 
 async def _handle_style_import(request: web.Request) -> web.Response:
     """POST /styles/import?name=<n> — create a user style from the raw body."""
+    if (owner_denied := await _refuse_non_owner(request, "style_import")) is not None:
+        return owner_denied
     name = _query_name(request)
     body = await _read_body(request)
     if body is None:
@@ -1305,6 +1333,8 @@ async def _handle_style_import(request: web.Request) -> web.Response:
 
 async def _handle_style_rename(request: web.Request) -> web.Response:
     """POST /styles/rename {"name","to"} — rename a user style."""
+    if (owner_denied := await _refuse_non_owner(request, "style_rename")) is not None:
+        return owner_denied
     body, error = await _json_body(request)
     if error is not None:
         return error
@@ -1318,6 +1348,8 @@ async def _handle_style_rename(request: web.Request) -> web.Response:
 
 async def _handle_style_pin(request: web.Request) -> web.Response:
     """POST /styles/pin {"name","pinned"} — pin or unpin a style."""
+    if (owner_denied := await _refuse_non_owner(request, "style_pin")) is not None:
+        return owner_denied
     body, error = await _json_body(request)
     if error is not None:
         return error
@@ -1334,6 +1366,8 @@ async def _handle_style_pin(request: web.Request) -> web.Response:
 
 async def _handle_style_delete(request: web.Request) -> web.Response:
     """DELETE /styles?name=<n> — delete a user style."""
+    if (owner_denied := await _refuse_non_owner(request, "style_delete")) is not None:
+        return owner_denied
     name = _query_name(request)
     status, payload = await off_loop(library.delete_style, name)
     _audit("style_delete", name, "ok" if status == 200 else "failed")
@@ -1350,6 +1384,8 @@ async def _handle_templates(request: web.Request) -> web.Response:
 
 async def _handle_template_import(request: web.Request) -> web.Response:
     """POST /templates/import?name=<n>[&description=] — create a user template."""
+    if (owner_denied := await _refuse_non_owner(request, "template_import")) is not None:
+        return owner_denied
     name = _query_name(request)
     description = (request.query.get("description") or "").strip()
     body = await _read_body(request)
@@ -1364,6 +1400,8 @@ async def _handle_template_import(request: web.Request) -> web.Response:
 
 async def _handle_template_rename(request: web.Request) -> web.Response:
     """POST /templates/rename {"name","to"} — rename a user template."""
+    if (owner_denied := await _refuse_non_owner(request, "template_rename")) is not None:
+        return owner_denied
     body, error = await _json_body(request)
     if error is not None:
         return error
@@ -1377,6 +1415,8 @@ async def _handle_template_rename(request: web.Request) -> web.Response:
 
 async def _handle_template_delete(request: web.Request) -> web.Response:
     """DELETE /templates?name=<n> — delete a user template."""
+    if (owner_denied := await _refuse_non_owner(request, "template_delete")) is not None:
+        return owner_denied
     name = _query_name(request)
     status, payload = await off_loop(library.delete_template, name)
     _audit("template_delete", name, "ok" if status == 200 else "failed")

@@ -95,7 +95,6 @@ _ENCODER_PARAMETER_VALUE_TYPE_LONG = 4
 #: nearest-neighbour scale makes small text unreadable, which defeats the point of
 #: attaching the image at all.
 _INTERPOLATION_HIGH_QUALITY_BICUBIC = 7
-_SMOOTHING_NONE = 3
 _PIXEL_OFFSET_HALF = 4
 
 #: A frame whose pixels are all identical is a failed capture, not a screenshot.
@@ -206,28 +205,11 @@ _GDI_FN_SPECS: tuple[tuple[str, str, Any, list[Any]], ...] = (
     ("gdi32", "SelectObject", ctypes.c_void_p, [_HDC, ctypes.c_void_p]),
     ("gdi32", "DeleteObject", ctypes.c_int, [ctypes.c_void_p]),
     (
-        "gdi32",
-        "BitBlt",
-        ctypes.c_int,
-        [
-            _HDC,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            _HDC,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint,
-        ],
-    ),
-    (
         "gdiplus",
         "GdiplusStartup",
         ctypes.c_int,
         [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_void_p],
     ),
-    ("gdiplus", "GdiplusShutdown", None, [ctypes.c_void_p]),
     (
         "gdiplus",
         "GdipCreateBitmapFromHBITMAP",
@@ -535,7 +517,7 @@ def _has_content(pixels: bytes, *, width: int = 0, bits_per_pixel: int = _BITSPI
         return False
     # ~4096 evenly-spaced probes, enough to catch a body that differs from a uniform
     # caption without scanning megabytes each capture. Counted in PIXELS, so the step
-    # can no longer alias onto a byte lane.
+    # cannot alias onto a byte lane.
     step = max(1, total_pixels // 4096)
     seen = set()
     for n in range(0, total_pixels, step):
@@ -570,7 +552,7 @@ def _capture_window_bitmap(hwnd: int) -> "tuple[Any, int, int] | None":
     space, so a legacy Win32 window renders at its logical size no matter what the
     caller's awareness is: measured 620x392 drawn into both a 620x400 buffer and a
     775x500 one, leaving the aware-sized buffer with a black L-shaped margin and an
-    image that no longer maps linearly onto the window rect the element frames use.
+    image that does not map linearly onto the window rect the element frames use.
     A DPI-aware window fills whichever buffer it is given (1296 unaware, 1620
     aware). ``windows_ffi.window_render_scale`` supplies the ratio, so the buffer is
     exactly the region the window draws into and carries no margin.
@@ -680,7 +662,7 @@ def _encode_jpeg(
     stream = None
     try:
         longest = max(width, height)
-        if max_px > 0 and longest > max_px:
+        if longest > max_px:
             ratio = max_px / float(longest)
             target_w, target_h = max(1, int(width * ratio)), max(1, int(height * ratio))
             scaled = ctypes.c_void_p()
@@ -724,7 +706,7 @@ def _encode_jpeg(
         if ole32.CreateStreamOnHGlobal(None, True, ctypes.byref(stream)) != windows_ffi.S_OK:
             return b"", 0, 0
 
-        value = ctypes.c_long(max(0, min(100, quality)))
+        value = ctypes.c_long(quality)
         params = EncoderParameters()
         params.Count = 1
         params.Parameter[0].Guid = windows_ffi._guid(_ENCODER_QUALITY_GUID)

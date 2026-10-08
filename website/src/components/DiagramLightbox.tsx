@@ -7,6 +7,8 @@ import { useTranslation } from 'react-i18next'
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
 import { Btn, IconButton } from './ui'
+import { isEditableTarget } from '../utils/editableTarget'
+import { overlayCaptionClearancePx } from '../lib/electron'
 
 /** Diagram zoom bounds. `1` is fit-to-viewport. The ceiling is higher than the
  *  image viewer's because the content is vector: a mermaid label at 8px in a
@@ -18,12 +20,6 @@ const DIAGRAM_ZOOM_STEP = 0.5
 /** Travel a one-finger drag must cover before it counts as a pan rather than a
  *  tap — below it the double-tap and click-out paths are left alone. */
 const DRAG_SLOP = 6
-
-function isEditableTarget(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null
-  if (!el || typeof el.tagName !== 'string') return false
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
-}
 
 /**
  * Full-viewport viewer for an inline-rendered SVG diagram (mermaid).
@@ -62,6 +58,7 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
   const dialogRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
   const reduceMotion = useReducedMotion()
+  const captionTop = overlayCaptionClearancePx()
   useDialogFocusTrap(dialogRef, onClose)
 
   // A finished pinch or double-tap is not a click-out. Without this the click
@@ -212,7 +209,7 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault()
-      } else if (!fitted || isEditableTarget(e.target) || e.metaKey || e.ctrlKey || e.altKey) {
+      } else if (!fitted || isEditableTarget(e) || e.metaKey || e.ctrlKey || e.altKey) {
         return
       } else if (e.key === '+' || e.key === '=') {
         e.preventDefault()
@@ -235,7 +232,7 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
       role="dialog"
       aria-modal="true"
       aria-label={t('components.diagramLightbox.diagram_viewer')}
-      className="fixed inset-0 z-[9999] bg-bg/95 backdrop-blur-sm flex flex-col"
+      className="fixed inset-0 z-[9999] bg-bg/95 backdrop-blur-xs flex flex-col"
       initial={reduceMotion ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.15 }}
@@ -249,7 +246,13 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
         if (!el.closest('svg') && !el.closest('button')) onClose()
       }}
     >
-      <div className="flex items-center justify-end gap-2 px-4 h-12 shrink-0">
+      {/* Drops below a frameless window's caption band so the close button is
+          not under the OS caption buttons or in the drag strip (#11732). */}
+      <div
+        className="flex items-center justify-end gap-2 px-4 h-12 shrink-0"
+        style={captionTop > 0 ? { marginTop: `${captionTop}px` } : undefined}
+        data-testid="diagram-lightbox-header"
+      >
         {fitted && zoom > DIAGRAM_ZOOM_MIN && (
           <Btn
             aria-label={t('components.markdownRenderer.reset_zoom')}

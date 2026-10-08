@@ -18,9 +18,15 @@ _TO_DICT_KEYS = (
     "key",
     "title",
     "agent",
+    "agent_kind",
     "effective_agent",
     "model",
+    # The owner's per-turn model-routing choice (the picker's "Auto (Jev)" entry).
+    # Present on EVERY slot, so an absent key and "pinned by hand" are not the
+    # same reading for a stale client.
+    "jev_route",
     "model_withheld",
+    "served_model",
     "reasoning_effort",
     "mode",
     "surface",
@@ -30,10 +36,15 @@ _TO_DICT_KEYS = (
     # "runs locally" from "the field is missing on an older gateway".
     "executor",
     "instance_id",
+    # The row's identity, resolved server-side. `<instance_id>:<peer_key>` for a
+    # remote-bound session, the slot key otherwise. The peer's own slot key is NOT
+    # projected; this is what the sidebar needs from it.
+    "row_identity",
     "artifact",
     "messages",
     "running",
-    "orchestrating",
+    "compacting",
+    "stop_declined",
     "queue_depth",
     "stopping",
     "pending_approval",
@@ -53,9 +64,11 @@ _TO_DICT_KEYS = (
     "todo",
     "mcp_report",
     "has_options",
+    "options_ts",
     "options",
     "prompt_preview",
     "trust",
+    "trust_scope",
     "trust_reads",
     "trusted_patterns_count",
     "slack_linked",
@@ -64,6 +77,7 @@ _TO_DICT_KEYS = (
     "folder_id",
     "pinned",
     "tags",
+    "tags_revision",
     "color_index",
     "color_hex",
     "color_theme",
@@ -72,9 +86,11 @@ _TO_DICT_KEYS = (
     "memory_mode",
     "forked_from",
     "linked_session_key",
+    "history_key",
     "app",
     "origin",
     "created_by",
+    "lineage_minted",
 )
 
 

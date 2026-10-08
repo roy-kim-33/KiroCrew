@@ -1,14 +1,16 @@
-import { FileText, AlertTriangle, FileQuestion, RefreshCw, Download, Copy, ExternalLink, FolderOpen, MoreHorizontal, ShieldAlert } from 'lucide-react'
+import { FileText, FileQuestion, RefreshCw, Download, Copy, ExternalLink, FolderOpen, MoreHorizontal, ShieldAlert } from 'lucide-react'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import MarkdownRenderer, { BasePathCtx } from '../../components/MarkdownRenderer'
 import { EmptyState, Skeleton } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '../../components/ui/dropdown-menu'
 import { IMAGE_EXTS, LANG_BY_EXT } from './constants'
 import { extOf, basename, formatBytes, formatTime, isSensitivePath } from './utils'
 import { copyToClipboard } from '../../utils/clipboard'
-import { revealOrOpen, useRevealLabel, useCanOpenFile } from '../../components/FilePathMenu'
+import { highlightLanguageForExtension } from '../../utils/highlightLanguages'
+import { revealOrOpen, useRevealFailure, useRevealLabel, useCanOpenFile } from '../../components/FilePathMenu'
 import { useBranding } from '../../hooks/useBranding'
 import type { FileMeta } from './types'
 
@@ -34,7 +36,9 @@ function renderViewerBody({ ext, fileMeta, content, openFile }: { ext: string; f
   if (ext === '.md' || ext === '.markdown') {
     return <BasePathCtx.Provider value={openFile}><MarkdownRenderer content={content || ''} /></BasePathCtx.Provider>
   }
-  const lang = LANG_BY_EXT[ext] || 'plaintext'
+  // Edition extensions go through as their token so the core tables win first
+  // (see ContentRenderer.langFor).
+  const lang = LANG_BY_EXT[ext] || (highlightLanguageForExtension(ext) ? ext.slice(1) : 'plaintext')
   const maxRun = (content || '').match(/`{3,}/g)?.reduce((max, s) => Math.max(max, s.length), 0) ?? 0
   const fence = '`'.repeat(Math.max(3, maxRun + 1))
   const wrapped = fence + lang + '\n' + (content || '') + '\n' + fence
@@ -52,12 +56,20 @@ export default function FileViewer({ filePath, fileMeta, content, loading, error
   // files, so no kind is passed. Reveal keeps the laxer directLocal-only gate.
   const canOpen = useCanOpenFile()
   const revealLabel = useRevealLabel()
+  // A failed open/reveal from the ⋯ menu renders under the viewer bar;
+  // askAgent on — the viewer is read-only.
+  const reveal = useRevealFailure(filePath ?? undefined)
   if (!filePath) {
     return <EmptyState icon={<FileText size={28} />} title={i18nT('apps.fileExplorer.fileViewer.select_a_file_to_view')} subtitle={isMobile ? undefined : i18nT('apps.fileExplorer.fileViewer.tip_ctrl_cmd_f_to_search')} />
   }
   if (loading) return <Skeleton className="h-full w-full" />
   if (error) {
-    return <EmptyState icon={<AlertTriangle size={22} style={{ color: 'var(--danger)' }} />} title={error} />
+    // A read failure, not an empty state: the viewer holds nothing to lose.
+    return (
+      <div className="p-4">
+        <ErrorNotice message={error} askAgent />
+      </div>
+    )
   }
   if (!fileMeta) return null
 
@@ -95,13 +107,13 @@ export default function FileViewer({ filePath, fileMeta, content, loading, error
                   host it is not looking at. Failures funnel through the shared
                   i18n path. */}
               {canOpen && (
-                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'open') }}>
+                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'open', reveal) }}>
                   <ExternalLink size={13} className="shrink-0 text-muted" />
                   <span>{i18nT('components.markdownPanel.open_with_default_app')}</span>
                 </DropdownMenuItem>
               )}
               {directLocal && (
-                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'reveal') }}>
+                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'reveal', reveal) }}>
                   <FolderOpen size={13} className="shrink-0 text-muted" />
                   <span>{revealLabel}</span>
                 </DropdownMenuItem>
@@ -114,6 +126,11 @@ export default function FileViewer({ filePath, fileMeta, content, loading, error
           </DropdownMenu>
         </div>
       </div>
+      {reveal.error && (
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)' }}>
+          <ErrorNotice variant="inline" className="whitespace-normal" message={reveal.error} askAgent onDismiss={reveal.clear} testId="file-viewer-reveal-error" />
+        </div>
+      )}
       {isSensitivePath(filePath) && (
         <div style={{ padding: '6px 12px', background: 'color-mix(in srgb, var(--warn) 12%, transparent)', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--warn)' }}>
           <ShieldAlert size={13} /> {i18nT('apps.fileExplorer.fileViewer.sensitive_file_avoid_sharing_your_screen_while_v')}

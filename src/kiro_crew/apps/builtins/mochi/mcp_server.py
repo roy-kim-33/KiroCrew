@@ -597,9 +597,11 @@ def _tool_pin_file(args: dict[str, Any]) -> str:
     # reading it — so the path has to clear the same gate every other file surface
     # uses (hooks.on_tool_call, validate_file_path, artifacts, knowledge indexing)
     # rather than a check of its own.
-    from kiro_crew.security import is_sensitive_path
+    from kiro_crew.security import is_unverifiable_path_refusal, sensitive_path_refusal
 
-    if is_sensitive_path(path):
+    if reason := sensitive_path_refusal(path):
+        if is_unverifiable_path_refusal(reason):
+            return f"Error: pin_file failed: {reason}"
         return "Error: pin_file failed: that path is not allowed"
     pins_path = _data_dir() / _PINNED_FILE
     # Under the shared lock: the gateway's PinnedFilesService persists its WHOLE
@@ -609,7 +611,7 @@ def _tool_pin_file(args: dict[str, Any]) -> str:
     with pins_mutation(str(pins_path)):
         # read_pins_for_update, not the lenient _read_json with an empty default:
         # the write below replaces the WHOLE file, so a corrupt store read as
-        # `{"pins": []}` would be ZEROED here (#8088). That is strictly worse than
+        # `{"pins": []}` would be ZEROED here. That is strictly worse than
         # the gateway service's version of the same bug, which at least wrote its
         # live in-memory list back. Both writers share the one reader so refusing
         # in the service cannot be undone by the next pin_file from this process.

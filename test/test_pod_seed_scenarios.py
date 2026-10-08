@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import yaml  # type: ignore[import-untyped]
 
 from conftest import requires_symlinks
 from kiro_crew import seed as seed_mod
+from kiro_crew.platform_compat import IS_POSIX
 from kiro_crew.pod import cli as pod_cli
 from kiro_crew.pod import runtime as rt
 from kiro_crew.pod.config import PodConfig
@@ -138,7 +140,7 @@ class TestScenarioClassification:
         assert "--seed ./richh" in msg
 
 
-@pytest.mark.skipif(not rt.IS_POSIX, reason="pods require POSIX descriptor traversal")
+@pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
 class TestSeedHomeFromScenario:
     def test_populates_an_absent_home(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
@@ -246,7 +248,218 @@ class TestSeedHomeFromScenario:
             rt.seed_home_from_scenario(cfg, "wt", "no-such-fixture")
 
 
-@pytest.mark.skipif(not rt.IS_POSIX, reason="pods require POSIX descriptor traversal")
+@pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
+class TestSeedCreateThenOpenRemovalWindow:
+    """Creating a directory and opening it are two syscalls, and a removal fits
+    between them. Each removal here is injected through ``os.mkdir``,
+    which creates the directory and removes it again, so the window is a fixture
+    rather than something to reproduce under load -- and, unlike patching
+    ``os.open``, it leaves the descriptor-relative branch the one under test."""
+
+    @staticmethod
+    def _vanishing_mkdir(leaf: str, *, once: bool, counter: list[int]):
+        real_mkdir = os.mkdir
+
+        def vanishing(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+            if name != leaf or (once and counter):
+                return
+            counter.append(1)
+            os.rmdir(name, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        return vanishing
+
+    def test_a_workspace_removed_between_its_mkdir_and_its_open_is_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A removal between the two calls is an interleaving no ordering closes.
+
+        Tolerating only the `FileExistsError` half handles a concurrent writer and
+        not a concurrent remover, whose `ENOENT` escaped naming the bare relative
+        leaf `'workspace'`. The pair is re-run against the held home descriptor,
+        so the seed gets the directory it needs.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir("workspace", once=True, counter=removals)
+        )
+        try:
+            rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert removals == [1], "the race did not happen, so the retry is not what passed"
+        assert (home / "workspace").is_dir()
+
+    def test_a_workspace_removed_on_every_attempt_reports_rather_than_spins(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Exhaustion reports, at exactly the bound: a directory something keeps
+        removing is not a race being lost, and more attempts only delay the answer.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir("workspace", once=False, counter=removals)
+        )
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "removed between its creation and its open" in str(excinfo.value)
+        assert len(removals) == rt._CREATE_ATTEMPTS == 3
+
+    def test_a_met_workspace_that_vanishes_is_reported_not_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The retry covers a directory this call made. A met one is reported.
+
+        On the restart path `workspace` holds the pod's own state; re-creating it
+        empty after a removal would boot the pod over the loss without a word, so
+        the loss is reported instead and the name is left absent.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        workspace = home / "workspace"
+        workspace.mkdir()
+        (workspace / "state.txt").write_text("the pod's file\n", encoding="utf-8")
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_met_directory(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == "workspace":
+                attempts.append(1)
+                try:
+                    real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+                finally:
+                    if workspace.exists():
+                        (workspace / "state.txt").unlink()
+                        workspace.rmdir()
+                return
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_met_directory)
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "already existed when this seed met it" in str(excinfo.value)
+        assert attempts == [1], "a met workspace's removal was re-attempted"
+        assert not workspace.exists(), "the met workspace was re-created empty"
+
+    def test_a_home_removed_under_its_held_fd_is_reported_at_once(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Nothing can be created inside an unlinked directory, so no retry helps."""
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_home(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == "workspace":
+                attempts.append(1)
+                (home / "config.json").unlink()
+                os.rmdir(home)
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_home)
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "pod home was removed" in str(excinfo.value)
+        assert attempts == [1]
+
+    def test_a_fresh_home_removed_between_its_mkdir_and_its_open_is_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The same window at the home's own creation, driven through the seed."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir(home.name, once=True, counter=removals)
+        )
+
+        assert rt.seed_home_from_scenario(cfg, "wt", "minimal") is True
+
+        assert removals == [1], "the race did not happen, so the retry is not what passed"
+        assert (home / "crons.json").is_file()
+
+    def test_a_met_home_that_vanishes_is_reported_with_the_real_cause(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A removal mid-sequence is reported as one, not as a planted file.
+
+        The `ENOENT` here is caught and does name the home -- the defect is the
+        claim: "is not a plain directory" asserts a type the code did not observe,
+        and sends the operator after a file nothing planted. A met home holds a
+        prior seed's state, so it is also never re-created empty.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        assert rt.seed_home_from_scenario(cfg, "wt", "minimal") is True
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_met_home(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == home.name and not attempts:
+                attempts.append(1)
+                try:
+                    real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+                finally:
+                    shutil.rmtree(home)
+                return
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_met_home)
+        with pytest.raises(rt.PodError) as excinfo:
+            rt.seed_home_from_scenario(cfg, "wt", "minimal")
+        assert "already existed when this seed met it" in str(excinfo.value)
+        assert "is not a plain directory" not in str(excinfo.value)
+        assert attempts == [1], "a met home's removal was re-attempted"
+        assert not home.exists(), "the met home was re-created empty"
+
+    def test_a_pod_root_removed_under_its_pin_names_the_root_not_a_type(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The other end of the same sequence: the root goes, so the mkdir has nowhere."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        real_mkdir = os.mkdir
+
+        def removing_the_root(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == home.name:
+                os.rmdir(cfg.pod_root)
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_root)
+        with pytest.raises(rt.PodError, match="pod root .* was removed"):
+            rt.seed_home_from_scenario(cfg, "wt", "minimal")
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
 class TestSeededScenarioInHome:
     """The sentinel ``pod up`` judges a seed against. Every fixture ships a
     ``fixture.yaml`` at its root and ``copytree`` lands it in the pod's home, so
@@ -346,7 +559,7 @@ class TestSeededScenarioInHome:
             os.close(home_fd)
 
 
-@pytest.mark.skipif(not rt.IS_POSIX, reason="pods require POSIX descriptor traversal")
+@pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
 class TestBootAppliesTheScenario:
     """``boot`` is where the seed has to land: after the HOME exists, before the
     gateway is exec'd. These drive the real function with the exec stubbed, so the
@@ -354,8 +567,58 @@ class TestBootAppliesTheScenario:
 
     @pytest.fixture
     def booted(self, tmp_path: Path, monkeypatch):
-        """Run ``boot`` for a pod with SEED=<value>; return (rc, home, argv)."""
+        """Run ``boot`` for a pod with SEED=<value>; return (rc, home, argv).
+
+        ``boot`` reaches two host-derived resolvers on every call, not just on
+        a real pod host: ``_seed_pod_os_home`` stages the OPERATOR's real
+        ``~/.local/share/kiro-cli`` / ``~/.local/share/amazon-q`` sign-in store
+        via ``_runtime_auth_store_mappings`` -> ``identity_stores.store_mappings
+        (sys.platform, Path.home(), os.environ)``, and
+        ``_probe_pod_child_bootstrap`` resolves and SPAWNS whatever real
+        kiro-cli ``kiro_cli.resolve_kiro_cli`` finds under ``Path.home()``
+        (``acp.client._resolve_kiro_bin`` defaults ``home=None`` to
+        ``Path.home()``). Both read the classmethod, not an
+        ``os.path.expanduser`` call, so pinning it here is what keeps every
+        test in this class from touching the operator's real credentials or
+        spawning their real CLI. ``HOME`` is pinned too because
+        ``build_pod_env`` copies ``os.environ.get("HOME", str(Path.home()))``
+        into the pod's own environment, and ``XDG_DATA_HOME`` is cleared
+        because ``identity_stores._source_root`` honours it as an override on
+        the *source* side of the mapping, which would otherwise still point at
+        a real store even under a fake home. ``KIROCREW_KIRO_BIN`` is cleared
+        because ``build_pod_env`` also inherits the operator's whole
+        ``os.environ`` and an override there is deliberately honoured by
+        ``find_kiro_cli_candidates`` ahead of every directory search. ``PATH``
+        is pinned to an empty directory for the same inheritance reason:
+        ``known_kiro_cli_dirs``'s inherited-PATH branch keeps every entry of
+        the REAL ``PATH`` verbatim (``env.augmented_path`` only APPENDS
+        home-templated extras), so a real kiro-cli install directory sitting
+        on the operator's actual ``PATH`` -- independent of ``home`` -- would
+        still resolve and get spawned even with ``Path.home()`` pinned.
+        """
         monkeypatch.setattr(rt, "IS_MACOS", False)
+        fake_host_home = tmp_path / "fake-host-home"
+        fake_host_home.mkdir()
+        empty_path_dir = tmp_path / "empty-path"
+        empty_path_dir.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_host_home))
+        monkeypatch.setenv("HOME", str(fake_host_home))
+        monkeypatch.setenv("PATH", str(empty_path_dir))
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
+        # `known_kiro_cli_dirs` keys on the REAL `sys.platform`, not on the
+        # patched `rt.IS_MACOS`, and on darwin it appends the fixed install
+        # prefixes (`/opt/homebrew/bin`, `/usr/local/bin`) that derive from
+        # neither the pinned home nor the emptied PATH -- so a brew-installed
+        # kiro-cli on a macOS developer host would still resolve and be spawned.
+        # Confine the search to the fake home so the resolver has nothing to find.
+        from kiro_crew import kiro_cli
+
+        monkeypatch.setattr(
+            kiro_cli,
+            "known_kiro_cli_dirs",
+            lambda platform_name, home, environ, **_kw: [str(home / ".local" / "bin")],
+        )
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "envs"))
         checkout = tmp_path / "co"
@@ -378,7 +641,25 @@ class TestBootAppliesTheScenario:
             cfg = PodConfig.load()
             rt.write_env_file(cfg, "wt", {"CHECKOUT": str(checkout), "SEED": seed_value})
             rc = rt.boot(cfg, "wt")
-            return rc, cfg.home_dir("wt"), captured
+            home = cfg.home_dir("wt")
+            # The fake host home never had a kiro-cli sign-in store, so the
+            # child-viability probe must report PROBE_UNAVAILABLE (no real
+            # kiro-cli resolved) rather than finding and spawning the
+            # operator's real binary -- and the staged os-home's identity-
+            # store tree (``.local/share/...``, where the real store would
+            # have been copied to) must be empty, holding no files copied in
+            # from the fake host's non-existent store. The ``.aws/sso/cache``
+            # sibling is excluded: it is unconditionally created EMPTY by
+            # ``_seed_pod_os_home`` for the pod's OWN future grants and is not
+            # host-derived.
+            os_home = home / "os-home"
+            staged_store_root = os_home / ".local" / "share"
+            if staged_store_root.is_dir():
+                assert not any(p.is_file() for p in staged_store_root.rglob("*")), (
+                    f"pod os-home staged host-derived files under {staged_store_root}; "
+                    "the fake host home should have had nothing to copy"
+                )
+            return rc, home, captured
 
         return _run
 
@@ -395,6 +676,27 @@ class TestBootAppliesTheScenario:
         assert captured["argv"][0].endswith(rt.prov.venv_bin(Path(".")).name)
         assert captured["env"]["KIROCREW_HOME"] == str(home)
         assert "seeded home from scenario 'minimal'" in capsys.readouterr().out
+
+    def test_the_child_probe_finds_no_real_host_kiro_cli(self, booted) -> None:
+        """The fixture's fake host home must starve the child-viability probe.
+
+        An unpinned ``Path.home()`` here lets
+        ``_probe_pod_child_bootstrap`` resolve and spawn whatever kiro-cli is
+        really installed on the operator's machine. With the fake home in
+        place ``resolve_kiro_cli`` must find nothing under it, so the boot
+        reaches ``rc == 0`` via ``PROBE_UNAVAILABLE`` rather than by actually
+        launching a real binary.
+        """
+        from kiro_crew import kiro_cli as kiro_cli_mod
+
+        # Confirms the premise directly: nothing under the fake host home (or
+        # any directory a real KIROCREW_KIRO_BIN would point at) resolves to
+        # an executable, so a passing boot below is not silently spawning the
+        # operator's real CLI.
+        assert kiro_cli_mod.resolve_kiro_cli() is None
+        rc, _, captured = booted("minimal")
+        assert rc == 0
+        assert "argv" in captured
 
     def test_the_seeded_config_is_sanitized(self, booted) -> None:
         _, home, _ = booted("minimal")
@@ -475,6 +777,11 @@ class TestBootAppliesTheScenario:
 
 
 class TestUpRefusesAnUnknownScenario:
+    @pytest.fixture(autouse=True)
+    def _available_backend(self, monkeypatch):
+        # These cases test seed validation, not the host's service backend.
+        monkeypatch.setattr(rt, "require_backend", lambda: None)
+
     @pytest.mark.parametrize("scenario", ["no-such-scenario", "Rich"])
     def test_refuses_before_touching_the_host(self, scenario: str, monkeypatch, capsys) -> None:
         """The refusal must land before provisioning, port allocation or a start:

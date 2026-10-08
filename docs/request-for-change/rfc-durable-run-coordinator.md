@@ -1,22 +1,28 @@
 ---
 title: Durable Run Coordinator — typed lifecycle, idempotent commands, and recoverable delivery
-status: draft
+status: superseded
 revision: v1
 author: Kyle Seaman, with Codex
 created: 2026-08-22
-last-audited: 2026-08-22
-audited-at: c4f253891
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr:
 implementation-prs: []
 tracking-issues: []
 supersedes: []
-superseded-by: []
+superseded-by: [rfc-overload-resilience.md]
 ---
 # RFC: Durable Run Coordinator — typed lifecycle, idempotent commands, and recoverable delivery
 
-- Status: draft — no implementation in this RFC has shipped. The migration is
-  deliberately additive and keeps the current subagent API and file artifacts
-  compatible until coordinator-first recovery has proven stable.
+- Status: superseded by
+  [`rfc-overload-resilience.md`](rfc-overload-resilience.md) (its §13 decision
+  Q1). The `runs` / `commands` / `outbox` store proposed below ships as tables of
+  `$KIROCREW_HOME/tasks/tasks.db` (`src/kiro_crew/taskq/`), with the outbox as
+  `task_events(kind="deliver")`; the in-memory manager and run folders described
+  here are imported into it by `taskq.migrate.import_legacy` on first boot. No
+  `RunCoordinator` port was built — this document is kept as the intent behind
+  that store. The owning spec is
+  [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md).
 - Author: Kyle Seaman, with Codex
 - Created: 2026-08-22
 - Audited against: `c4f253891`
@@ -24,7 +30,7 @@ superseded-by: []
   `docs/system-specs/modules/session.md`, and
   `docs/request-for-change/rfc-orchestrator-chat-sessions.md`
 - Detailed implementation plan:
-  `docs/superpowers/plans/2026-08-22-durable-run-coordinator.md`
+  `docs/request-for-change/plans/2026-08-22-durable-run-coordinator.md`
 
 ## 1. Summary
 
@@ -101,7 +107,7 @@ gateway accepted the request, so the caller and gateway maintain extra
 submission accounting and lost-submission reconciliation. The manager exposes
 `record_lost_submission()` and a stuck-wave reaper `_sweep_stuck_waves()`
 (`subagent.py`), while the dashboard handler reconciles the roster
-against accepted IDs (`src/kiro_crew/dashboard/handlers/messaging.py:90-202`).
+against accepted IDs (`api_spawn_lost` in `src/kiro_crew/dashboard/messaging_api/run_control.py`).
 
 The existing preassigned run ID is an important foundation: `spawn()` assigns
 identity before every exit path and preserves it through queueing

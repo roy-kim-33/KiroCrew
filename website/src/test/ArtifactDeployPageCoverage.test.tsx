@@ -35,6 +35,8 @@ interface FetchCfg {
   /** answer for the SECOND (confirm: true) call */
   commit?: { status: number; body: Json }
   confirmPending?: { status: number; body: Json }
+  /** answer for POST /api/deploy/deploy (the direct-deploy preview/confirm) */
+  deploy?: { status: number; body: Json }
   dismissPending?: { status: number; body: Json }
 }
 
@@ -52,8 +54,17 @@ const SITE: Json = {
 
 function installFetch(cfg: FetchCfg = {}): Call[] {
   const calls: Call[] = []
+  // `text()` and `headers` are what the shared `toApiError` factory reads on a
+  // non-2xx reply. An empty-object body stands in for "no body" here, so the
+  // factory's `HTTP <status>` fallback is what the notice shows for it.
   const reply = (status: number, data: Json) =>
-    ({ ok: status < 400, status, json: async () => data }) as unknown as Response
+    ({
+      ok: status < 400,
+      status,
+      json: async () => data,
+      text: async () => (Object.keys(data).length ? JSON.stringify(data) : ''),
+      headers: { get: () => null },
+    }) as unknown as Response
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
@@ -69,6 +80,10 @@ function installFetch(cfg: FetchCfg = {}): Call[] {
       return reply(200, cfg.verify ?? {
         reachable: true, profile: 'ship-prod', account: '123456789012', note: 'sts + s3 + cloudfront reachable',
       })
+    }
+    // POST /api/deploy/deploy — the direct-deploy flow's preview/confirm pair.
+    if (u.endsWith('/deploy/deploy')) {
+      return reply(cfg.deploy?.status ?? 200, cfg.deploy?.body ?? { requires_confirm: true })
     }
     if (u.endsWith('/recall') || u.endsWith('/destroy')) {
       return body?.confirm
@@ -180,9 +195,35 @@ describe('ArtifactDeployPage — navigation, disclosure, and copy affordances', 
     const writeText = installClipboard()
     renderPage()
     const copyButtons = await screen.findAllByRole('button', { name: 'Copy' })
-    expect(copyButtons).toHaveLength(2)
+    // Three now: the two authentication commands plus step 4's optional
+    // auto-cleanup install command.
+    expect(copyButtons).toHaveLength(3)
     fireEvent.click(copyButtons[0])
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining('aws configure sso'))
+  })
+
+  it('shows a check confirmation once a setup-command copy actually lands', async () => {
+    installFetch()
+    installClipboard()
+    renderPage()
+    const copyButtons = await screen.findAllByRole('button', { name: 'Copy' })
+    fireEvent.click(copyButtons[0])
+    await waitFor(() => expect(copyButtons[0].querySelector('.lucide-check')).not.toBeNull())
+  })
+
+  it('renders no check confirmation when a setup-command copy fails outright', async () => {
+    installFetch()
+    // Both clipboard layers fail: writeText rejects, and execCommand (jsdom has
+    // no real implementation) returns false via the shared helper's fallback.
+    Object.defineProperty(window.navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+      configurable: true,
+    })
+    renderPage()
+    const copyButtons = await screen.findAllByRole('button', { name: 'Copy' })
+    fireEvent.click(copyButtons[0])
+    await waitFor(() => expect(copyButtons[0]).toBeInTheDocument())
+    expect(copyButtons[0].querySelector('.lucide-check')).toBeNull()
   })
 
   it('states the empty case for both the registry and the deployment list', async () => {
@@ -220,14 +261,17 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
   it('surfaces the backend reason a registration was refused', async () => {    installFetch({ available: ['other-sso'], write: { status: 400, body: { error: 'profile not found in ~/.aws/config' } } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: profile not found in ~/.aws/config')).toBeInTheDocument()
+    // The backend reason is the ErrorNotice message verbatim (no "Error:" lead),
+    // so the journal message-match keeps working.
+    const notice = await screen.findByRole('alert')
+    expect(notice.textContent).toContain('profile not found in ')
   })
 
   it('falls back to a generic reason when the refusal carries no error field', async () => {
     installFetch({ available: ['other-sso'], write: { status: 500, body: {} } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: add failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('creates and registers a profile from the form, then closes and clears it', async () => {
@@ -287,7 +331,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Make ship-sandbox the default profile'))
-    expect(await screen.findByText('Error: update failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 409')
   })
 
   // The removal guard is the in-app dialog, never window.confirm — the native
@@ -325,7 +369,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     fireEvent.click(screen.getByLabelText('Remove ship-sandbox from registry'))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Remove profile' }))
-    expect(await screen.findByText('Error: remove failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('shows the account behind a verified profile', async () => {
@@ -334,7 +378,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     await profilesLoaded()
     fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0])
     // Built from the mock rather than inlined: the literal "account <12
-    // digits>" string is the shape scripts/scrub-lint.sh rejects.
+    // digits>" string is the shape the internal-content scan rejects.
     const account = (PROFILES[0] as { account: string }).account
     expect(
       await screen.findByText(new RegExp(`access reachable \\(account ${account}\\)`)),
@@ -373,8 +417,25 @@ describe('ArtifactDeployPage — IAM policy loader', () => {
     expect(await screen.findByText('STATIC-POLICY-JSON')).toBeInTheDocument()
     expect(calls.some((c) => c.url.includes('/iam-policy?tier=static'))).toBe(true)
     expect(screen.queryByRole('button', { name: /Copy boundary policy/ })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: /Copy policy/ }))
+    const copyPolicyBtn = screen.getByRole('button', { name: /Copy policy/ })
+    fireEvent.click(copyPolicyBtn)
     expect(writeText).toHaveBeenCalledWith('STATIC-POLICY-JSON')
+    await waitFor(() => expect(copyPolicyBtn.querySelector('.lucide-check')).not.toBeNull())
+  })
+
+  it('renders no confirmation when copying the IAM policy fails', async () => {
+    installFetch()
+    Object.defineProperty(window.navigator, 'clipboard', {
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+      configurable: true,
+    })
+    renderPage()
+    await profilesLoaded()
+    fireEvent.click(screen.getByRole('button', { name: 'Get IAM policy' }))
+    const copyPolicyBtn = await screen.findByRole('button', { name: /Copy policy/ })
+    fireEvent.click(copyPolicyBtn)
+    await waitFor(() => expect(copyPolicyBtn).toBeInTheDocument())
+    expect(copyPolicyBtn.querySelector('.lucide-check')).toBeNull()
   })
 
   it('loads the fullstack tier with its permissions-boundary policy and note', async () => {
@@ -471,7 +532,7 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Recall/ }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Recall site' }))
-    expect(await screen.findByText('Error: bucket changed since preview')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('bucket changed since preview')
   })
 
   it('names the bucket and the distribution in the destroy dialog and binds both', async () => {
@@ -510,7 +571,7 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Destroy/ }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Destroy site' }))
-    expect(await screen.findByText('Error: site was recreated since preview')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('site was recreated since preview')
   })
 
   it('fails the destroy closed when the preview cannot resolve the resources', async () => {
@@ -548,13 +609,40 @@ describe('ArtifactDeployPage — deployment rows', () => {
     expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2)
   })
 
-  it('omits the profile clause from the deploy handoff when nothing is registered', async () => {
-    installFetch({ profiles: [], defaultProfile: '', webapps: [webapp('kanban-draft')] })
+  it('falls back to a labelled agent handoff when the app has no built root', async () => {
+    // The chat handoff is no longer what Deploy does — it is what happens when
+    // the backend says this app has nothing publishable yet
+    // (`webapp_root_unavailable`). The button then SAYS so, which is the whole
+    // point: a button labelled "Deploy" that opens a chat is the loop #12816 was
+    // reported for.
+    installFetch({
+      profiles: [], defaultProfile: '', webapps: [webapp('kanban-draft')],
+      deploy: {
+        status: 400,
+        body: {
+          error: 'This app has not been built yet, so there is no finished page to publish.',
+          code: 'webapp_root_unavailable',
+          details: 'no public/ directory under /w/kanban — the deploy contract\'s static root is app_dir/public',
+        },
+      },
+    })
     renderPage()
     await screen.findByText(/Ready to deploy \(1\)/)
     // With no registered profile there is nothing to pick from, so no selector.
     expect(screen.queryByRole('combobox', { name: /Deploy profile/ })).toBeNull()
     fireEvent.click(screen.getByLabelText('Deploy kanban-draft'))
+
+    // The refusal swaps the button and explains itself in plain words, with the
+    // directory names behind Details rather than in the banner.
+    const viaAgent = await screen.findByRole('button', { name: 'Deploy via agent' })
+    expect(screen.getByText(/has not been built yet/)).toBeInTheDocument()
+    expect(screen.queryByText(/app_dir\/public/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Details' }))
+    expect(await screen.findByText(/app_dir\/public/)).toBeInTheDocument()
+
+    // Only now does the chat handoff happen, and it still omits the profile
+    // clause when nothing is registered.
+    fireEvent.click(viaAgent)
     const launch = (window as unknown as { __mc_chat_launch?: { message: string } }).__mc_chat_launch
     expect(launch?.message).toContain('kanban-draft')
     expect(launch?.message).not.toContain('Use the AWS profile')

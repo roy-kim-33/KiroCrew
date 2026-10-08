@@ -96,6 +96,87 @@ class Ruling:
             raise ValueError("channel is only meaningful for a no-channel Ruling")
 
 
+@dataclass(frozen=True)
+class SessionProjection:
+    """What one ``session/new`` needs from the agent spec, wire and non-wire apart.
+
+    ``params`` is the wire face -- exactly :meth:`AgentConfigMirror.session_params`.
+    ``denied_tools`` is a CLIENT OBLIGATION the same parse produced and the wire
+    must not carry: the ``(server, tool)`` pairs, server spelled as the backend
+    registers it, whose calls the client refuses when the backend asks permission
+    for them. Kept beside the params rather than inside them because the params
+    dict is sent to the adapter verbatim, and a Crew-private key on it is one
+    strict-schema release away from failing the whole request. Empty for a backend
+    that honours the spec's per-tool restrictions itself or through config Crew
+    writes; the codex mirror is the one that fills it.
+    """
+
+    params: dict[str, Any]
+    denied_tools: frozenset[tuple[str, str]] = frozenset()
+    disabled_servers: frozenset[str] = frozenset()
+    """Servers this session switches off WHOLE (``disabled: true``).
+
+    Carried for the same caller ``restricted_servers`` is carried for, and it is the
+    STRONGER of the two: a per-tool narrowing may be honoured by a harness that
+    refuses the call, while a whole-server disable has no per-call form at all, so no
+    backend can refuse a call to a server it was handed. The spec-described half of
+    the array honours it through the ``tools`` allowlist; an element a caller appends
+    itself is outside that rule and reads this instead.
+    """
+    restricted_servers: frozenset[str] = frozenset()
+    """Server names this parse did not mount because their spec narrows them PER TOOL.
+
+    The RESTRICTION half of :func:`~kiro_crew.providers.mirrors.identity.withheld_servers`
+    and not the identity half, because the two are un-withheld by different things: an
+    identity-bound name is withheld from the SPEC-described element and is meant to be
+    re-added as an element Crew authors, while a restricted name must not come back at
+    all on a transport where withholding is the only way the restriction is honoured.
+
+    A third client obligation, and the one a caller that appends an element of its OWN
+    has to read: the member-dispatch entry carries a server name, and re-adding a name
+    from this set on a backend whose ``registry.PerToolDeny`` is ``WHOLE_SERVER`` makes a
+    tool the user switched off callable again, with no second channel to refuse it (see
+    ``AcpClient._append_member_dispatch_server``). Empty is the honest answer for a mirror
+    that keeps a narrowed server MOUNTED because its transport honours the restriction
+    another way -- claude re-expresses it as ``permissions.deny`` rules.
+    """
+    unhonoured_servers: frozenset[str] = frozenset()
+    """Narrowed servers withheld because THIS session cannot honour their restriction.
+
+    On a backend that does carry a per-tool deny, a narrowed server normally stays
+    mounted. This names the ones that still were not: the per-tool rule for one of
+    their switched-off tools could not be put in force on this session. Nothing may
+    re-add one of these names, whatever the backend's ``PerToolDeny`` says, because
+    the second channel that would make re-adding safe is exactly what failed here.
+    Empty on a mirror that has no such case.
+    """
+    harness_deny_rules: tuple[str, ...] = ()
+    """Tool ids the HARNESS must be told to deny, in its own spelling.
+
+    A client obligation for a backend whose per-tool deny is a rule in harness
+    config Crew writes at spawn rather than a file of its own (opencode's
+    ``OPENCODE_CONFIG_CONTENT``). Carried beside the params, not inside them, for
+    the reason ``denied_tools`` is. Empty everywhere else.
+    """
+    derived_spec_snapshot: Any = None
+    """The ``agent.DerivedSpecSnapshot`` the ``mcpServers`` array was built from.
+
+    A second client obligation the wire must not carry: for a derived agent the
+    array in ``params`` IS the spec the host consumes, so the client re-verifies this
+    snapshot once the host has taken it (the ``session/new`` / ``session/load``
+    response) and ends the session on a change. ``None`` for an agent that mirrors
+    nothing, and for a mirror that built no array.
+    """
+    zero_tools: bool = False
+    """Whether the spec declares ``"tools": []`` -- a third client obligation the
+    wire must not carry, alongside ``denied_tools``. The MCP array and the
+    allowlist already answer "which servers mount"; this answers a broader
+    question the array has no opinion on: whether the agent's own native tools
+    (the harness's built-in Bash/Read/Write, not an MCP server) should be
+    callable at all. See ``AcpClient._spec_zero_tools`` for the refusal.
+    """
+
+
 class AgentConfigMirror(ABC):
     """Projects the agent spec onto ONE backend's native configuration.
 
@@ -149,6 +230,32 @@ class AgentConfigMirror(ABC):
         ``_session_mcp_servers`` are that pair.
         """
         return {}
+
+    def session_projection(self, agent: str | None, **kwargs: Any) -> SessionProjection:
+        """Structured face: the wire params PLUS what the client must enforce itself.
+
+        The client calls THIS, not :meth:`session_params`, so it stays
+        backend-agnostic at the seam: every mirror answers with one shape, and a
+        mirror with nothing off-wire to say answers with the wire params alone,
+        which is what this default does. A mirror that derives a client obligation
+        from the same spec parse (codex's per-tool deny set) overrides it and keeps
+        :meth:`session_params` as ``self.session_projection(...).params`` so the two
+        faces cannot drift.
+
+        ``stub_elements`` may arrive in ``kwargs``: the shared MCP gateway's broker
+        stubs for this session, which the client holds because it owns the overlay.
+        A MIRRORED backend receives its stubs only through here -- the client's
+        shared append (``AcpClient._pooled_mcp_servers``) is inert for every
+        mirrored backend, precisely so an unnarrowed append cannot re-add what a
+        projection withheld -- so a mirror places them itself, under its own
+        withhold rules. This default ignores them, and that is the fail-CLOSED
+        direction: a new mirror that does not decide stub placement ships a
+        backend the gateway cannot pool onto, which is visible and harmless,
+        rather than one that mounts stubs no allowlist filtered.
+        Same blocking allowance and the same wiring obligation as
+        :meth:`session_params`.
+        """
+        return SessionProjection(params=self.session_params(agent, **kwargs))
 
     def write_files(self, agent: str | None, **kwargs: Any) -> None:
         """File face: write the native config files this backend loads itself.

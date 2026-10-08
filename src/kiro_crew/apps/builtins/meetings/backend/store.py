@@ -46,6 +46,7 @@ from typing import Any
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
 from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.sel import sel
 
@@ -90,7 +91,7 @@ def _audit(operation: str, resource: str, *, outcome: str) -> None:
 def data_dir(root: Path | None = None) -> Path:
     """Return the app's data dir, creating it if missing."""
     data = root if root is not None else app_data_dir(k.APP_NAME)
-    data.mkdir(parents=True, exist_ok=True)
+    ensure_directory(data)
     return data
 
 
@@ -124,7 +125,7 @@ def ensure_data_dirs(root: Path | None = None) -> Path:
     """
     data = data_dir(root)
     for name in k.DATA_SUBDIRS:
-        (data / name).mkdir(parents=True, exist_ok=True)
+        ensure_directory(data / name)  # meeting notes: 0700 in the data home
     dictionary = data / k.DICTIONARY_FILE
     if not dictionary.exists():
         atomic_write(dictionary, SEED_DICTIONARY)
@@ -226,7 +227,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     atomic_write(path, json.dumps(payload, indent=2))
 
 
@@ -452,12 +453,11 @@ def delete_meeting(meeting_id: str, root: Path | None = None) -> bool:
     safe_id = safe_meeting_id(meeting_id)
     entry = meetings_root(root) / safe_id
     resolved = contain(entry, operation="meetings.delete", root=root)
-    # Built from the RESOLVED data dir so ``_refuse_linked`` covers the whole
-    # chain — a linked edits ROOT would redirect this rmtree just as surely as a
-    # linked per-meeting entry.
-    edit_entry = data_dir(root).resolve() / k.AGENT_EDITS_DIR / safe_id
-    contain(edit_entry, operation="meetings.delete_edits", root=root)
-    edit_resolved = _refuse_linked(edit_entry, operation="meetings.delete_edits")
+    # One spelling of the edits-path derivation: ``agent_edits_dir`` applies the
+    # same ``contain`` + ``_refuse_linked`` barrier at both the edits ROOT and
+    # the per-meeting entry, so a linked entry anywhere on the chain is refused
+    # before this rmtree could follow it.
+    edit_resolved = agent_edits_dir(safe_id, root)
 
     # ``contain`` deliberately follows links to detect an escape. For deletion,
     # following an in-root link would still select the wrong meeting directory.
@@ -534,8 +534,9 @@ def append_transcript(
         payload = separator + encoded
         if current_size + len(payload) > k.MAX_TRANSCRIPT_BYTES:
             return None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("ab") as transcript:
+        ensure_directory(path.parent)
+        # 0600 from creation inside the data home; a root outside it is unchanged.
+        with open(path, "ab", opener=owner_only_opener_for(path)) as transcript:
             transcript.write(payload)
             transcript.flush()
             os.fsync(transcript.fileno())
@@ -689,7 +690,7 @@ def append_translation(
     both be writing, and ``atomic_write`` makes the WRITE atomic, not the
     read-modify-write around it.
 
-    Returns ``None`` without writing when the meeting no longer exists: the
+    Returns ``None`` without writing when the meeting does not exist: the
     worker's persistence runs on a thread and can lose a race with
     ``delete_meeting`` — without this guard, ``_write_json``'s ``mkdir`` would
     silently recreate the deleted meeting's directory. Both sides take
@@ -755,7 +756,7 @@ def ensure_agent_files(
         fpath = agent_output_path(meeting_id, fname, root)
         if fpath.exists():
             continue
-        fpath.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(fpath.parent)
         seed = f"# {title}\n\n" if agent_def.get("widget_type") != "html" else ""
         atomic_write(fpath, seed)
         created.append(fname)
@@ -790,7 +791,7 @@ def write_agent_output(
     if not fname:
         return
     path = agent_output_path(meeting_id, fname, root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     atomic_write(path, content)
 
 
@@ -954,7 +955,7 @@ def write_agent_edit(
         raise MeetingsPathError(
             "this agent has no output file to edit", status=409, code="agent_has_no_output"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     # ``newline=""`` — the byte-for-byte promise again: the default translation
     # rewrites ``\n`` to ``\r\n`` on Windows, and a document that is read back,
     # edited and saved would accumulate carriage returns on every round trip.

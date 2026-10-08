@@ -11,7 +11,7 @@ like Slack, Discord, and Telegram.
 | Requirement | Needed for | Floor |
 |-------------|------------|-------|
 | **Python** + pip | Backend | `>= 3.12` |
-| **Node.js** + npm | Building the dashboard from source | `>= 22` (24 LTS recommended) |
+| **Node.js** + npm | Building the dashboard from source | `>= 22.12` (24 LTS recommended) |
 | **`kiro-cli`** | Driving the LLM | Required, on your `PATH` |
 
 Node is only needed to *build* the dashboard. The prebuilt wheel, the macOS DMG,
@@ -93,15 +93,19 @@ To browse, install the Playwright agent CLI (needs Node.js 20 or newer):
 
 ```bash
 npm install -g @playwright/cli@latest
-playwright-cli install-browser              # --with-deps on Debian/Ubuntu only
+playwright-cli install-browser chromium
 playwright-cli install --skills agents --global
 ```
 
-`--with-deps` installs OS libraries through `apt` and needs root. Playwright
-implements it for apt alone, so on Fedora, RHEL, CentOS or Amazon Linux it
-misfires against Ubuntu package names; install the libraries with your own
-package manager instead. The Settings → Browser install button handles this
-per-distribution and prints the command to run when it needs root.
+`install-browser` downloads a separate Chromium build into your user cache and
+needs no root. It does not install Google Chrome, and it does not install OS
+libraries. If the download reports missing libraries, install them with your own
+package manager; on Debian or Ubuntu `sudo npx playwright install-deps chromium`
+does it. The Settings → Browser page runs the same download on the machine the
+gateway runs on. On a Debian or Ubuntu (apt) host it first tries the download
+with Playwright's `--with-deps`, which also installs the libraries, and retries
+without it if that step is refused. It prints the library command for that
+machine when one is still needed.
 
 Having `playwright-cli` on your `PATH` is what makes browsing available, so
 uninstalling it is how you take the capability away. Note that it covers
@@ -111,13 +115,18 @@ live session and lets you take over with real mouse and keyboard, which is how
 you complete a CAPTCHA or a 2FA prompt.
 
 Use `kirocrew setup --agent-only` to reinstall just the agent config and skip
-the other wizard steps.
+the other wizard steps. `--electron-only` installs only the desktop app (macOS),
+and `--clean` treats the run as a fresh install rather than merging MCP servers
+and tools from an existing config.
 
 ### Messaging channels (optional)
 
 The default wizard configures no messaging channels — the dashboard and CLI need
-none. To connect Slack from the terminal, run `kirocrew setup --slack`, which
-prompts for:
+none. Two channels have a guided terminal setup: `kirocrew setup --slack`, and
+`kirocrew setup --whatsapp`, which reports the optional `whatsapp` extra and the
+pairing state before enabling the channel. Both are ignored with `--agent-only`.
+
+`--slack` prompts for:
 
 - `SLACK_APP_TOKEN` starts with `xapp-`
 - `SLACK_BOT_TOKEN` starts with `xoxb-`
@@ -129,8 +138,9 @@ over Slack.
 
 These are stored in `~/.kiro/crew/.env`.
 
-Other channels (Discord, Telegram, Teams, Webex, WeCom, WeChat) are connected
-from the dashboard — see each channel's doc.
+Every other messaging channel is connected from the dashboard — the roster is in
+[the documentation index](index.md#chat-channels), and each channel has its own
+doc there.
 
 ## Starting Kiro Crew
 
@@ -160,10 +170,12 @@ conversation.
 kirocrew doctor
 ```
 
-Reports the resolved platform edition, the `kiro-cli` binary and login state,
-the project directory, the agent config and its MCP entries, Slack credentials,
-gateway status, and the embedding runtime and model. It repairs missing MCP
-entries where it can, and prints a specific fix hint for anything it cannot.
+Reports, among other checks, the resolved platform edition, the `kiro-cli` binary
+and login state, the project directory, the agent config and its MCP entries,
+confinement and the sandbox, services, channels and access, workload, Slack
+credentials, gateway status, and the embedding runtime and model. It repairs
+missing MCP entries where it can, and prints a specific fix hint for anything it
+cannot. `kirocrew doctor --help` lists its options.
 
 ## Updating
 

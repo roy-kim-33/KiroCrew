@@ -202,7 +202,7 @@ class TestEmitMcpOAuthRequest:
         operator keystone extension — is agent-fenced with no dashboard
         writer and is documented only in an internal spec. If the banner does
         not name it, the failure is indistinguishable from unfixable: two
-        users independently root-caused this from source (#3310) rather than
+        users independently root-caused this from source rather than
         finding the one-line config fix.
         """
         slot = _ChatSlot("s1")
@@ -224,7 +224,7 @@ class TestEmitMcpOAuthRequest:
 
     def test_rejection_banner_names_the_rejected_endpoint(self):
         """A rejected URL must name the SANITIZED host+path that tripped the
-        scanner (#7578): without it the user cannot know which endpoint to
+        scanner: without it the user cannot know which endpoint to
         write into ``oauth_endpoints.json``, so the failure reads as
         unfixable. Query values carry state/PKCE material (and here, the
         smuggled credential) and must NEVER be echoed — not in the content,
@@ -272,6 +272,126 @@ class TestEmitMcpOAuthRequest:
         assert "idp.example[REDACTED: credential]" in m["meta"]["error"]
         assert token not in json.dumps(m, ensure_ascii=False)
 
+    # A PKCE-shaped authorize URL the MCP client synthesizes for a local server
+    # after a failed connect: http, explicit port, ~250-char query.
+    _LOOPBACK_AUTHORIZE_QUERY = (
+        "?response_type=code&client_id=kiro-cli-mcp-client-0123456789abcdef"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A49954%2Foauth%2Fcallback"
+        "&state=Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+    )
+
+    @pytest.mark.parametrize(
+        "host",
+        ["localhost:3100", "127.0.0.1:3100", "[::1]:3100"],
+    )
+    def test_loopback_rejection_points_at_a_retry_not_the_allowlist(self, host):
+        """A loopback authorize URL is still REJECTED, but the banner
+        must not send the user to ``oauth_endpoints.json`` -- that file refuses
+        loopback hosts and the gate never relaxes http/port, so the advice is
+        unactionable. It names the endpoint and suggests reconnecting."""
+        url = f"http://{host}/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        # Premise: the guard verdict itself is unchanged by this fix.
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "tidal-knowledge", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        assert "remedy" not in m["meta"]
+        assert "oauth_endpoints.json" not in m["content"]
+        # The failed banner renders meta["error"], not content: the retry
+        # advice and the endpoint must both ride there.
+        error = m["meta"]["error"]
+        assert "/authorize" in error
+        assert "start a new chat" in error
+        assert "credential or exfiltration pattern" not in error
+        assert "oauth_endpoints.json" not in error
+        serialized = json.dumps(m, ensure_ascii=False)
+        assert "Zk3mQ9pL2vX8rT5wN1bC7hJ4yA6sD0eF" not in serialized
+        assert "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" not in serialized
+
+    def test_non_loopback_rejection_keeps_the_allowlist_remedy(self):
+        """The loopback branch must not swallow a real remote IdP rejection."""
+        url = f"https://idp.example/authorize{self._LOOPBACK_AUTHORIZE_QUERY}"
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "self-hosted", url)
+        m = slot.messages[0]
+        assert m["meta"]["remedy"] == "oauth_endpoints.json"
+        assert "oauth_endpoints.json" in m["content"]
+
+    # A Cloudflare Access per-tenant consent URL with a real-world shape:
+    # PKCE + state + redirect push the query past the 200-char length gate, and
+    # the host can never be a builtin (host, path) pair.
+    _CF_ACCESS_URL = (
+        "https://asu.cloudflareaccess.com/cdn-cgi/access/oauth/authorization"
+        "?response_type=code&client_id=Qm9hcmRJZGVudGl0eUNsaWVudA"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A49152%2Fcallback"
+        "&scope=openid%20profile%20email%20offline_access"
+        "&state=Zk3pQ9rT2vWx8yLmN4bC7dHs1aJ6eUoI"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+    )
+
+    def test_remedy_reaches_the_rendered_error_with_a_working_entry(self):
+        """The failed banner renders ONLY meta["error"], so the
+        oauth_endpoints.json remedy must ride there, as a copy-ready entry --
+        and writing exactly that entry must clear the rejection."""
+        from kiro_crew.config.loader import oauth_endpoints_path
+
+        url = self._CF_ACCESS_URL
+        assert oauth_url_contains_credential(url), "fixture must trip the gate"
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "jenkins-iden", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert m["meta"]["rejected_url"] is True
+        assert "oauth_url" not in m["meta"]
+        error = m["meta"]["error"]
+        entry = {
+            "host": "asu.cloudflareaccess.com",
+            "path": "/cdn-cgi/access/oauth/authorization",
+        }
+        assert json.dumps(entry) in error
+        assert "additional_authorization_endpoints" in error
+        assert str(oauth_endpoints_path()) in error
+        # PKCE/state material never reaches any surfaced field.
+        serialized = json.dumps(m, ensure_ascii=False)
+        assert "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" not in serialized
+        assert "Zk3pQ9rT2vWx8yLmN4bC7dHs1aJ6eUoI" not in serialized
+        # The advertised remedy works: write exactly that entry (into the
+        # test-isolated crew home) and the same URL then passes the gate.
+        path = oauth_endpoints_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"additional_authorization_endpoints": [entry]}))
+        assert not oauth_url_contains_credential(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Fixed credential: refused again even at an approved endpoint.
+            "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
+            # http and an explicit port: the carve-out never relaxes either.
+            _CF_ACCESS_URL.replace("https://", "http://", 1),
+            _CF_ACCESS_URL.replace(".com/", ".com:8443/", 1),
+            # A loopback host the extension loader refuses.
+            _CF_ACCESS_URL.replace("asu.cloudflareaccess.com", "localhost", 1),
+        ],
+    )
+    def test_no_remedy_in_error_when_the_entry_could_not_work(self, url):
+        """Only a rejection the allowlist can clear gets the remedy in the
+        rendered error; anything else keeps the bare reason."""
+        assert oauth_url_contains_credential(url)
+        slot = _ChatSlot("s1")
+        _emit_mcp_oauth_request(MagicMock(), slot, "self-hosted", url)
+        m = slot.messages[0]
+        assert m["meta"]["failed"] is True
+        assert "additional_authorization_endpoints" not in m["meta"]["error"]
+        assert "If you trust" not in m["meta"]["error"]
+
     def test_rejection_banner_survives_unparseable_url(self):
         """A URL that cannot be parsed to a hostname still rejects with the
         original unnamed banner — no endpoint fields, no crash."""
@@ -295,8 +415,8 @@ class TestEmitMcpOAuthRequest:
         """Regression: a legitimate GitHub OAuth + PKCE consent URL must be
         rendered, not rejected.  These URLs carry high-entropy params
         (``state``, ``code_challenge``) and routinely exceed 200 chars, which
-        previously tripped the generic long-query *exfiltration* heuristic and
-        broke every real sign-in flow ("github authentication failed: URL
+        would trip the generic long-query *exfiltration* heuristic and
+        break every real sign-in flow ("github authentication failed: URL
         contained credential or exfiltration pattern")."""
         slot = _ChatSlot("s1")
         state = MagicMock()
@@ -408,7 +528,7 @@ class TestMarkMcpOAuthCompleted:
         slot = _ChatSlot("s1")
         state = self._emit(slot)
         _mark_mcp_oauth_completed(state, slot, "linear", success=False, error="boom")
-        # Banner is now in the failed terminal state, so it's no longer "open".
+        # Banner is now in the failed terminal state, so it's not "open".
         # A subsequent retry would emit a new banner; mark_completed on the
         # closed banner is a no-op (regression guard for #6 in review).
         prior_call_count = state.broadcast_ws.call_count
@@ -490,7 +610,7 @@ class TestMarkMcpOAuthCompleted:
         assert not any(m["meta"].get("completed") for m in slot.messages)
 
 
-# ── _supersede_open_mcp_oauth_banners (issue #7580) ──
+# ── _supersede_open_mcp_oauth_banners ──
 
 
 class TestSupersededOAuthBanners:
@@ -498,10 +618,10 @@ class TestSupersededOAuthBanners:
 
     kiro-cli mints the callback port and the PKCE verifier inside the flow it
     announces, so a second announcement for the same server leaves the first
-    banner pointing at a port that can no longer redeem anything. Left rendered
+    banner pointing at a port that cannot redeem anything. Left rendered
     as a live "Authorize" button, it walks the user through a full provider
     login and dead-ends on `http://127.0.0.1:<dead-port>/?code=…` — a page that
-    looks like success and consumes nothing (issue #7580).
+    looks like success and consumes nothing.
     """
 
     def test_second_request_retires_the_first_banner(self):
@@ -565,7 +685,7 @@ class TestSupersededOAuthBanners:
     def test_a_repeat_request_from_one_credential_named_server_also_retires_nothing(self):
         """The known limitation, pinned so it cannot regress into a guess.
 
-        Same server twice is the case #7580 is about, but when its NAME redacts we
+        Same server twice is the case this guards, but when its NAME redacts we
         cannot prove from the stored row that it IS the same server, so the stale
         banner stays. Documented in the PR body and on the issue: narrow, confined
         to credential-shaped names, and no worse than main.
@@ -776,7 +896,7 @@ class TestSupersededOAuthBanners:
         assert not stale["meta"].get("oauth_url")
 
 
-# ── read-time minting-child liveness gate (issues #7654, #8149) ──
+# ── read-time minting-child liveness gate ──
 
 
 class TestExpiredByDeadChild:
@@ -998,7 +1118,7 @@ class TestLiveChildInstance:
         assert _live_child_instance(state, _ChatSlot("s1")) == ""
 
     def test_end_to_end_a_swept_sessions_banner_is_withdrawn_on_read(self):
-        """The whole #8149 defect in one path: mint under child A, sweep the
+        """The whole defect in one path: mint under child A, sweep the
         session (pool answers None), and the next read withdraws the link."""
         slot = _ChatSlot("s1")
         _emit_mcp_oauth_request(
@@ -1328,7 +1448,7 @@ class TestOAuthParamCredentialScan:
         ) in _OAUTH_AUTHORIZATION_ENDPOINTS
 
 
-# ── Banner gate consolidation: one security predicate, no local copy (#2403) ──
+# ── Banner gate consolidation: one security predicate, no local copy ──
 
 
 class TestBannerGateIsCanonicalSecurityPredicate:
@@ -1343,7 +1463,7 @@ class TestBannerGateIsCanonicalSecurityPredicate:
 
     def test_no_local_copy_of_the_gate_exists(self):
         # Fails on any reintroduction of a dashboard-local `_oauth_url_...`
-        # helper — the drift vector issue #2403 closed.
+        # helper — the drift vector this test closes.
         assert not hasattr(chat_runner, "_oauth_url_contains_credential")
 
     def test_chat_runner_binding_is_the_canonical_function(self):
@@ -1397,9 +1517,12 @@ class _FakeProviderClient:
 
 # A real registry slug with a rendered card, and a real slug whose launch gate is
 # closed. Read from the registry rather than hardcoded so a gate flip fails here
-# instead of silently changing which requests get annotated.
+# instead of silently changing which requests get annotated. The gated slug must
+# also NOT be pre-registered (registry ``auth.mode``): a pre-registered provider
+# is visible regardless of the gate, which rules GitHub and Asana out.
 CARDED_SLUG = "notion"
-GATED_SLUG = "github"
+GATED_SLUG = "superhuman"
+GATED_MCP_URL = "https://mcp.mail.superhuman.com/mcp"
 
 
 def _own(tmp_path, monkeypatch, servers) -> None:
@@ -1480,7 +1603,7 @@ class TestEveryPendingRequestIsEmitted:
     async def test_launch_gated_provider_is_not_annotated(self, tmp_path, monkeypatch):
         """No card is rendered behind a closed launch gate, so chat stays the prompt."""
         assert GATED_SLUG not in {p["slug"] for p in get_visible_providers()}
-        _own(tmp_path, monkeypatch, {GATED_SLUG: {"url": "https://api.githubcopilot.com/mcp/"}})
+        _own(tmp_path, monkeypatch, {GATED_SLUG: {"url": GATED_MCP_URL}})
         slot = _ChatSlot("s1")
         await _drain_session_init_oauth_requests(MagicMock(), slot, _pending(GATED_SLUG))
         assert _owned_flags(slot) == [False]

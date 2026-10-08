@@ -33,11 +33,13 @@ import os
 import shlex
 import stat
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.pptx_maker.backend import paths
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.browser_cli import os_deps
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
@@ -60,16 +62,44 @@ _SOFFICE_HINTS = {
     "win32": "winget install TheDocumentFoundation.LibreOffice",
 }
 
+#: Linux hints keyed by the distribution's os-release ``ID``/``ID_LIKE`` tokens.
+_LINUX_APT_HINT = "sudo apt install libreoffice"
+_LINUX_DNF_HINT = "sudo dnf install libreoffice"
+_APT_IDS = frozenset({"debian", "ubuntu"})
+_DNF_IDS = frozenset({"fedora", "rhel", "centos"})
+#: Distributions with no LibreOffice package in any enabled repo. Amazon Linux
+#: 2023 reports ``ID_LIKE=fedora``, yet ``dnf install libreoffice`` finds nothing
+#: there, so it is checked before the dnf family can claim it.
+_UNPACKAGED_IDS = frozenset({"amzn"})
 
-def soffice_hint() -> str:
-    """The install command for LibreOffice on this host.
+
+@lru_cache(maxsize=1)
+def _linux_soffice_hint() -> str | None:
+    """Cached: the distribution does not change under a running process, and one
+    caller asks from the event loop."""
+    ids = os_deps.os_release_ids()
+    if ids & _UNPACKAGED_IDS:
+        return None
+    if ids & _APT_IDS:
+        return _LINUX_APT_HINT
+    if ids & _DNF_IDS:
+        return _LINUX_DNF_HINT
+    return _SOFFICE_HINTS["linux"]
+
+
+def soffice_hint() -> str | None:
+    """The install command for LibreOffice on this host, or ``None``.
 
     Returned as data for the UI to display, never executed here: running a package
     manager on the operator's behalf from a browser request is the host mutation
     this app refuses.
+
+    ``None`` means this distribution packages no LibreOffice, so there is no
+    command to give. Every surface frames the hint as "install it with:", so a
+    guessed command that fails on its own package name is worse than none.
     """
     if sys.platform.startswith("linux"):
-        return _SOFFICE_HINTS["linux"]
+        return _linux_soffice_hint()
     return _SOFFICE_HINTS.get(sys.platform, "install LibreOffice for your platform")
 
 
@@ -80,16 +110,13 @@ def _engine_python() -> Path | None:
     run under this interpreter. ``None`` means the engine is not provisioned yet,
     which the caller reports as "provision the engine first" rather than writing a
     launcher that could not work.
+
+    The platform's venv layout is resolved by ``paths.venv_python``, which is the
+    single authority: it knows both the POSIX ``bin/python`` and the Windows
+    ``Scripts\\python.exe`` layout, so no caller carries a private candidate list.
     """
-    candidates = [paths.engine_python()]
-    # The engine's venv layout is POSIX-shaped in `paths`; Windows venvs put the
-    # interpreter under Scripts/ instead.
-    if platform_compat.IS_WINDOWS:
-        candidates.insert(0, paths.engine_root() / "mcp-local" / ".venv" / "Scripts" / "python.exe")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
+    candidate = paths.engine_python()
+    return candidate if candidate.is_file() else None
 
 
 def _launcher_paths() -> list[Path]:

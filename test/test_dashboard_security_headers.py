@@ -62,6 +62,116 @@ class TestApplySecurityHeaders:
         assert "Content-Security-Policy" in resp.headers
         assert "Permissions-Policy" in resp.headers
 
+    def test_worker_assets_use_short_lived_not_immutable_or_no_store(self) -> None:
+        """A same-origin worker takes its CSP from its OWN cached response
+        header, and Vite content-hashes a chunk by content only — so a build
+        that changes just a header (a CSP directive) keeps the worker's hashed
+        filename identical. Under ``immutable`` a browser replays the stale
+        header for up to a year and the worker runs on a header that differs
+        from the one the running build serves (WASM refused, every diff/highlight
+        surface dead until a hard refresh). Worker chunks therefore use a
+        SHORT-LIVED cacheable policy: a small ``max-age`` picks up a header-only
+        build within a minute AND keeps the bytes cache-servable across a brief
+        gateway-down window, which a bare ``no-store`` would break by evicting
+        them. It must NOT carry ``no-cache``/``must-revalidate`` (those forbid
+        the cache reuse the gateway-down survival depends on) — the header
+        contradiction Opus flagged."""
+        for name in (
+            "diffWorker-DcdnVVDz.js",
+            "hljsWorker-D29BrEM0.js",
+            "subset-worker.chunk-D4w07nYk.js",
+            "worker-portable-ogdEFvyx.js",
+            # Case-insensitive: a future capitalised spelling is still caught.
+            "MyWorker-abc123.js",
+        ):
+            resp = _make_response()
+            _apply_security_headers(resp, _make_app(), path=f"/assets/{name}")
+            cc = resp.headers["Cache-Control"]
+            assert "immutable" not in cc, name
+            assert "no-store" not in cc, name
+            # Cacheable with a bounded lifetime — NOT a stale-prohibiting policy.
+            assert "max-age=60" in cc, name
+            assert "no-cache" not in cc, name
+            assert "must-revalidate" not in cc, name
+
+    def test_non_worker_assets_stay_immutable(self) -> None:
+        """The worker exemption is surgical: a plain JS/CSS chunk runs under the
+        DOCUMENT's CSP (served no-store, so always fresh) and keeps the year-long
+        immutable policy that spares the ~6MB entry bundle a re-download on every
+        load."""
+        for name in (
+            "index-D9K94z8J.js",
+            "vendor-a1b2c3d4.css",
+            "chunk-CQNSW5MT-B8S09OIh.js",
+        ):
+            resp = _make_response()
+            _apply_security_headers(resp, _make_app(), path=f"/assets/{name}")
+            cc = resp.headers["Cache-Control"]
+            assert "immutable" in cc, name
+            assert "no-store" not in cc, name
+
+    def test_every_built_worker_chunk_carries_the_marker(self) -> None:
+        """Guard the ``worker`` naming convention the serving layer keys on: the
+        worker entry files this project loads with ``new Worker(new URL(...))``
+        or Vite's ``?worker`` import must resolve, in the built dist, to a chunk
+        carrying the ``worker`` substring — otherwise it silently regains the
+        year-long ``immutable`` cache and re-strands its CSP.
+
+        Detection is independent of the marker so this is not tautological: the
+        worker SOURCE modules are found by scanning the frontend source for the
+        two worker-construction shapes, and each source basename is required to
+        appear (as a substring, pre-hash) in some emitted chunk that carries the
+        marker. Skipped when either tree is absent (python-only checkout)."""
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1] / "website"
+        assets = root / "dist" / "assets"
+        src = root / "src"
+        if not assets.is_dir() or not src.is_dir():
+            return  # python-only checkout (sdist/wheel): nothing built to scan.
+
+        # Worker source modules, found by the two construction shapes Vite turns
+        # into a worker chunk: `new Worker(new URL('./x.ts', import.meta.url))`
+        # and a `?worker` / `?worker&url` import. This does NOT look at the
+        # marker, so a worker named without it is still discovered here.
+        new_worker_url = re.compile(
+            r"new\s+Worker\(\s*new\s+URL\(\s*['\"]([^'\"]+?)['\"]", re.MULTILINE
+        )
+        worker_import = re.compile(r"['\"]([^'\"]+?)\?worker(?:&url)?['\"]")
+        worker_stems: set[str] = set()
+        for ts in src.rglob("*.ts*"):
+            if ts.name.endswith((".test.ts", ".test.tsx")):
+                continue
+            text = ts.read_text(encoding="utf-8", errors="ignore")
+            for m in (*new_worker_url.finditer(text), *worker_import.finditer(text)):
+                # Basename without extension, e.g. './diffWorker.ts' -> 'diffWorker'.
+                worker_stems.add(Path(m.group(1)).stem)
+        if not worker_stems:
+            return  # no worker constructions in this checkout — nothing to guard.
+
+        emitted = [p.name for p in assets.glob("*.js")]
+        if not emitted:
+            return  # dist present but not built in this run — nothing to scan.
+        marked = [n for n in emitted if "worker" in n.lower()]
+        # Every worker source resolves to an emitted chunk that carries the
+        # marker. A worker Vite renamed to drop the marker would leave its stem
+        # only in an UNmarked chunk (or in none), failing this — which is the
+        # regression the exemption depends on catching.
+        unmarked = {
+            stem
+            for stem in worker_stems
+            if not any(stem in n for n in marked)
+            # An entry Vite may inline rather than emit as a standalone chunk is
+            # tolerated only if it appears nowhere as a separate /assets/ script.
+            and any(stem in n for n in emitted)
+        }
+        assert not unmarked, (
+            f"worker source(s) {sorted(unmarked)} emitted a chunk WITHOUT the "
+            "'worker' marker the cache-control exemption keys on — it would "
+            "regain the immutable policy and re-strand its CSP"
+        )
+
     def test_non_200_under_assets_stays_no_store(self) -> None:
         """During cold-start, /assets/* may return 404 or 503. Caching that
         with immutable would be a permanent black screen. Only success
@@ -207,58 +317,48 @@ class TestApplySecurityHeaders:
             assert "http://*.cloudfront.net" not in frame_src
             assert "https://*" + " " not in frame_src  # no bare https wildcard
 
-    def test_csp_admits_the_webfonts_index_html_actually_loads(self) -> None:
-        """The dashboard's two brand faces come from Google Fonts, so the
-        stylesheet origin must be in style-src and the font origin in font-src.
+    def test_csp_names_no_font_host_origin(self) -> None:
+        """The brand faces are served from the dashboard's own origin, so
+        style-src and font-src admit no dedicated font host."""
+        import re
 
-        Without them the stylesheet is refused and BOTH families fall through
-        the stack. macOS lands on ``-apple-system`` and still looks deliberate;
-        Windows has no such entry and drops to the generic sans-serif, so the
-        whole UI renders in a face the design never targeted."""
+        font_host = re.compile(r"^https?://([A-Za-z0-9-]+\.)*fonts[A-Za-z0-9-]*\.", re.IGNORECASE)
         for with_instances in (False, True):
             resp = _make_response()
             _apply_security_headers(resp, _make_app(with_instances=with_instances))
             csp = resp.headers["Content-Security-Policy"]
-            style_sources = set(
-                next(d for d in csp.split(";") if d.strip().startswith("style-src")).split()
-            )
-            font_sources = set(
-                next(d for d in csp.split(";") if d.strip().startswith("font-src")).split()
-            )
-            # Subset comparison over the directive's token SET (not `<url> in
-            # <string>`) — exact, and with no substring `in` on a URL literal it
-            # cannot trip CodeQL's incomplete-url-substring-sanitization
-            # heuristic (see test_dashboard_origin.py's same workaround).
-            assert {"https://fonts.googleapis.com"} <= style_sources, style_sources
-            assert {"https://fonts.gstatic.com"} <= font_sources, font_sources
+            for name in ("style-src", "font-src"):
+                sources = next(d for d in csp.split(";") if d.strip().startswith(name)).split()
+                hosts = [s for s in sources if font_host.match(s)]
+                assert not hosts, (name, hosts)
 
-    def test_csp_covers_every_remote_font_origin_in_index_html(self) -> None:
-        """Parity gate: any remote origin ``website/index.html`` fetches a font
-        or font stylesheet from must be admitted, so adding a face to the HTML
-        without widening the CSP cannot silently ship a blocked font."""
+    def test_dashboard_shell_loads_fonts_from_its_own_origin(self) -> None:
+        """``website/index.html`` and the global stylesheet reference no
+        absolute font URL, every face ``index.css`` declares is a relative
+        file under ``website/src`` (so Vite hashes it into ``/assets/`` and
+        ``'self'`` serves it), and each family ships its licence."""
         import re
         from pathlib import Path
 
-        index_html = Path(__file__).resolve().parents[1] / "website" / "index.html"
-        if not index_html.is_file():
+        website = Path(__file__).resolve().parents[1] / "website"
+        index_html = website / "index.html"
+        index_css = website / "src" / "index.css"
+        if not (index_html.is_file() and index_css.is_file()):
             # python-only checkout (sdist/wheel test run): nothing to compare.
             return
-        html = index_html.read_text(encoding="utf-8")
-        origins = {
-            f"{m.group(1)}//{m.group(2)}"
-            for m in re.finditer(r"(https:)//([A-Za-z0-9.-]*fonts[A-Za-z0-9.-]*)", html)
-        }
-        assert origins, "expected index.html to reference at least one font origin"
-        resp = _make_response()
-        _apply_security_headers(resp, _make_app(with_instances=False))
-        csp = resp.headers["Content-Security-Policy"]
-        # Subset comparison over whole CSP source tokens (not `origin in csp`) —
-        # every font origin index.html references must be its own admitted
-        # source. Set arithmetic keeps URL literals off the left of `in`, which
-        # CodeQL's incomplete-url-substring-sanitization heuristic would flag.
-        csp_tokens = set(csp.replace(";", " ").split())
-        missing = origins - csp_tokens
-        assert not missing, (missing, csp)
+        remote_font = re.compile(r"https?://[^\s\"')]*fonts[^\s\"')]*", re.IGNORECASE)
+        for path in (index_html, index_css):
+            hits = remote_font.findall(path.read_text(encoding="utf-8"))
+            assert not hits, (path.name, hits)
+
+        css = index_css.read_text(encoding="utf-8")
+        declared = re.findall(r"url\('(\./assets/fonts/[^']+\.woff2)'\)", css)
+        assert any("space-grotesk" in u for u in declared), declared
+        assert any("jetbrains-mono" in u for u in declared), declared
+        missing = [u for u in declared if not (index_css.parent / u).is_file()]
+        assert not missing, missing
+        for family_dir in ("space-grotesk", "jetbrains-mono"):
+            assert (website / "public" / "fonts" / family_dir / "OFL.txt").is_file(), family_dir
 
     def test_defense_in_depth_headers_present(self) -> None:
         """(CWE-1021/693/200/319): by default the pipeline sets
@@ -299,13 +399,13 @@ class TestApplySecurityHeaders:
         assert "X-Frame-Options" not in resp.headers
 
     def test_frame_ancestors_reads_embed_parent_from_session_cookie(self, monkeypatch) -> None:
-        """PR #118 follow-up: the framed document authenticates via the
+        """The framed document authenticates via the
         ``mc_token_<port>`` session cookie, NOT a ``?token=`` query param
         (token_auth_middleware exchanges the connect link token for that cookie).
         The reader MUST consult the cookie — otherwise every steady-state framed
         load falls back to bare frame-ancestors 'self' and the embedded pane
         never renders (the exact blank-pane bug). Reproduced live: a cookie
-        carrying the claim previously yielded 'self'."""
+        carrying the claim must not yield 'self'."""
         from kiro_crew.dashboard.state import _DEFAULT_PORT
 
         # Stub the (separately unit-tested) signed-claim reader; the point of
@@ -333,7 +433,7 @@ class TestApplySecurityHeaders:
         assert "X-Frame-Options" not in resp.headers
 
     def test_frame_ancestors_prefers_request_stashed_claim(self, monkeypatch) -> None:
-        """PR #129 follow-up: on the FIRST ``?token=`` framed document the
+        """On the FIRST ``?token=`` framed document the
         link→session exchange revokes the link nonce, so re-validating the query
         token here returns None and the header would fall back to bare 'self'
         (the browser enforces THIS response's frame-ancestors → blank pane).

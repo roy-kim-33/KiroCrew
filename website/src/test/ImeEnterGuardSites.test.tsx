@@ -39,6 +39,7 @@ vi.mock('../api/client', async (importOriginal) => {
       createChatTag: vi.fn().mockResolvedValue({ ok: true }),
       chatFolders: vi.fn().mockResolvedValue([]),
       recentProjects: vi.fn().mockResolvedValue({ dirs: [] }),
+      favoriteProjects: vi.fn().mockResolvedValue({ dirs: [] }),
       browseDirs: vi.fn().mockResolvedValue({ path: '/home/u', parent: '/home', dirs: [] }),
     },
   }
@@ -59,6 +60,7 @@ import SearchBar from '../components/SearchBar'
 import BroadcastBar from '../apps/meetings/components/BroadcastBar'
 import { BlockEditor } from '../apps/md-notebook/BlockEditor'
 import PathBar from '../apps/file-explorer/PathBar'
+import { fileExplorerApi } from '../apps/file-explorer/api'
 
 /** Arm the hook's post-composition latch: the WebKit commit-Enter window. */
 function armLatch(el: Element) {
@@ -160,6 +162,7 @@ describe('ProjectPicker path input — rule 2: gate the Enter path only', () => 
   beforeEach(() => {
     vi.useFakeTimers()
     vi.mocked(api.recentProjects).mockResolvedValue({ dirs: [] })
+    vi.mocked(api.favoriteProjects).mockResolvedValue({ dirs: [] })
     vi.mocked(api.browseDirs).mockResolvedValue({
       path: '/home/u',
       parent: '/home',
@@ -437,8 +440,23 @@ describe('file-explorer PathBar — Tab accepts a suggestion INTO the draft', ()
     fireEvent.click(screen.getByTitle('Click to edit path'))
     const input = screen.getByPlaceholderText('/path/to/folder') as HTMLInputElement
     fireEvent.change(input, { target: { value: '/home/user/s' } })
-    // The suggestion query is debounced, so the row is what proves it arrived.
-    await waitFor(() => expect(screen.getByText('/home/user/src')).toBeInTheDocument())
+    // Establish the state Tab is asserted against, not merely "a row is showing".
+    // The `complete` mock answers every key with the same entry, so the row
+    // first renders for the PRE-debounce key (`/home/user`, fetched on focus).
+    // 150ms later the debounced draft flips the query key, `data` resets to
+    // undefined and the list is EMPTY for a tick until the new fetch resolves --
+    // and a Tab that lands in that tick finds no suggestions, so neither the
+    // accept nor the latch branch runs (both PathBar cases red in one of four
+    // loaded runs, with the draft untouched and default not prevented). Wait for
+    // the debounced key's fetch to have been issued, THEN for its row: a row seen
+    // after that call can only be the settled list.
+    const complete = vi.mocked(fileExplorerApi.complete)
+    await waitFor(() => expect(complete).toHaveBeenCalledWith('/home/user/s', 'dir', 30), { timeout: 5000 })
+    // The fetch itself is a debounced (150ms) query, so the row can still arrive
+    // after the default waitFor timeout (1000ms) under a loaded, concurrent run --
+    // a named ceiling for that chain (same class as DiffBlock.streaming.test.tsx /
+    // PierreWorkspaceTree.lazy.test.tsx).
+    await waitFor(() => expect(screen.getByText('/home/user/src')).toBeInTheDocument(), { timeout: 5000 })
     return input
   }
 

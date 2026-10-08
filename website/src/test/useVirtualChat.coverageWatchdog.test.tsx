@@ -13,9 +13,12 @@ const getKey = (it: Item) => it.id
 const mkItems = (n: number, p = 'm'): Item[] =>
   Array.from({ length: n }, (_, i) => ({ id: `${p}-${i}`, text: `row ${i}` }))
 
-function Harness({ items, scrollerRef }: {
+function Harness({ items, scrollerRef, tailChrome = 0 }: {
   items: Item[]
   scrollerRef: RefObject<HTMLDivElement | null>
+  /** Height of page chrome sharing the scroller BELOW the rows (footer, tail
+   *  spacer) -- the shape the chat page mounts. */
+  tailChrome?: number
 }) {
   const v = useVirtualChat<Item>({
     items, sessionId: 'watchdog', getKey, overscan: 2, externalScrollerRef: scrollerRef,
@@ -29,12 +32,33 @@ function Harness({ items, scrollerRef }: {
       ))}
       <div data-spacer="after" style={{ height: v.offsetAfter }} />
       <div ref={v.bottomSentinelRef} data-sentinel="bottom" />
+      {tailChrome > 0 && <div data-chrome="tail" style={{ height: tailChrome }} />}
     </div>
   )
 }
 
 const ROW = 100
 const CLIENT = 400
+
+/** Every row reports ROW from its first render, as a laid-out row does in a
+ *  browser. The test DOM's own `offsetHeight` (happy-dom) is 0, and a row that
+ *  reads 0 at mount is not recorded, so the tree keeps pricing it at the
+ *  default estimate; hence this is installed before the render. The returned
+ *  function puts the prototype's own descriptor back. */
+function installRowHeights(): () => void {
+  const proto = HTMLElement.prototype
+  const original = Object.getOwnPropertyDescriptor(proto, 'offsetHeight')
+  Object.defineProperty(proto, 'offsetHeight', {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.getAttribute('data-index') !== null ? ROW : 0
+    },
+  })
+  return () => {
+    if (original) Object.defineProperty(proto, 'offsetHeight', original)
+    else Reflect.deleteProperty(proto, 'offsetHeight')
+  }
+}
 
 function installFakeLayout(scroller: HTMLElement) {
   const proto = HTMLElement.prototype
@@ -58,12 +82,6 @@ function installFakeLayout(scroller: HTMLElement) {
     }
     return origRect.call(this)
   }
-  Object.defineProperty(proto, 'offsetHeight', {
-    configurable: true,
-    get(this: HTMLElement) {
-      return this.getAttribute('data-index') !== null ? ROW : 0
-    },
-  })
   Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => CLIENT })
   Object.defineProperty(scroller, 'scrollHeight', {
     configurable: true,
@@ -76,12 +94,16 @@ function installFakeLayout(scroller: HTMLElement) {
 
 describe('viewport-coverage watchdog', () => {
   let restore: (() => void) | null = null
+  let restoreRowHeights: (() => void) | null = null
   beforeEach(() => {
     vi.useFakeTimers()
+    restoreRowHeights = installRowHeights()
   })
   afterEach(() => {
     restore?.()
     restore = null
+    restoreRowHeights?.()
+    restoreRowHeights = null
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
@@ -161,12 +183,14 @@ describe('viewport-coverage watchdog', () => {
     const view = render(<Harness items={items} scrollerRef={scrollerRef as RefObject<HTMLDivElement | null>} />)
     const el = scrollerRef.current as HTMLDivElement
     restore = installFakeLayout(el)
-    // Settle at the bottom, then a REAL upward scroll (wheel = hard input)
-    // releases follow — the reader owns their position from here.
+    // Settle at the bottom long enough for the adaptive estimate to converge
+    // (the debounced flush reprices the tree, as in the FOLLOWING case), then a
+    // REAL upward scroll (wheel = hard input) releases follow — the reader owns
+    // their position from here.
     await act(async () => {
       el.scrollTop = 200 * ROW - CLIENT
       el.dispatchEvent(new Event('scroll'))
-      await vi.advanceTimersByTimeAsync(50)
+      await vi.advanceTimersByTimeAsync(600)
       el.dispatchEvent(new Event('wheel'))
       el.scrollTop = 100 * ROW
       el.dispatchEvent(new Event('scroll'))
@@ -229,5 +253,35 @@ describe('viewport-coverage watchdog', () => {
       })
     }
     expect(mountedSpan(el).join(',')).toBe(before)
+  })
+
+  it('a reader at the bottom with page chrome below the rows is covered: no write per tick', async () => {
+    // The chat page mounts a footer / tail spacer under the last row inside the
+    // same scroller, so a reader parked at the bottom always has more viewport
+    // below the last row than the slack allows. That is not uncovered list --
+    // there is no row left to mount -- yet it read as such and force-pinned
+    // every tick: a same-value write that re-armed follow the idle rule had
+    // released and, on WebKit, cut every momentum tail short.
+    const scrollerRef = { current: null as HTMLDivElement | null }
+    const items = mkItems(200)
+    render(<Harness items={items} scrollerRef={scrollerRef as RefObject<HTMLDivElement | null>} tailChrome={40} />)
+    const el = scrollerRef.current as HTMLDivElement
+    restore = installFakeLayout(el)
+    // Record every positioning write from here on. jsdom has no Element.scrollTo,
+    // so the hook writes scrollTop directly; route both through one recorder.
+    let top = 0
+    const writes: number[] = []
+    Object.defineProperty(el, 'scrollTop', { configurable: true, get: () => top, set: (v: number) => { top = v; writes.push(v) } })
+    await act(async () => {
+      el.scrollTop = el.scrollHeight - CLIENT
+      el.dispatchEvent(new Event('scroll'))
+      await vi.advanceTimersByTimeAsync(600)
+    })
+    expect(el.scrollHeight - el.scrollTop - CLIENT).toBe(0)
+    writes.length = 0
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200 + 3 * 500) // outwait the yield, then three ticks
+    })
+    expect(writes).toEqual([])
   })
 })

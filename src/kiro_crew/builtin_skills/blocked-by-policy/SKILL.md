@@ -1,6 +1,6 @@
 ---
 name: blocked-by-policy
-description: What to do when a Kiro Crew safety policy blocks a tool call — how to tell a policy block from a user refusal, and the sanctioned path for each class of block (AWS credentials, enterprise SSO, key files, the governance trust root, exfiltration-shaped requests, and the self-protection floor). Load when a tool result says a command was denied, when a credential or AWS access attempt is refused, or before concluding that this host lacks a capability.
+description: What to do when a Kiro Crew safety policy blocks a tool call — tell a policy block from a user refusal, then take the sanctioned path for that class (AWS creds, SSO, key files, trust root, exfiltration, self-protection). Load on any 'command denied' result or refused credential/AWS access.
 triggers: blocked by security policy, user denied tool execution, access to sensitive path, sensitive credential path, data-exfiltration pattern, governance trust-root, permission denied by policy, cannot access aws, no aws credentials, aws access denied, sso login, credential path, credential tool not available
 ---
 
@@ -12,6 +12,8 @@ A rejected tool call is reported to you as a generic failure — on kiro-cli
 literally `User denied tool execution`. That string is wrong about *who*
 refused. Kiro Crew's own gate produces most refusals, and the real reason
 arrives separately as a `[Kiro Crew host notice]` message in the same turn.
+A host notice that says you made the same tool call several times is not a
+refusal: nothing was blocked. It is advice to change strategy.
 
 So:
 
@@ -191,15 +193,30 @@ The reason has two possible forms:
   a pattern your text does not literally match still fired.
 - `Blocked: <sentence>` — the always-on floor (sensitive paths, the trust root,
   exfiltration shapes). These name the class directly.
+- `Blocked: the path could not be verified against the sensitive-path list…` —
+  NOT a match. The resolver ran out of time before judging the path, so it was
+  refused unjudged. This is the one refusal where the rule above inverts: do not
+  switch reader or spelling (they meet the same budget); wait about thirty
+  seconds and retry the identical call, and if it keeps happening tell the user
+  the path resolver is timing out and name the path.
+
+Where the `kirocrew-debug` tools are granted, `debug_refusals` reads the gateway's
+own record and gives each refusal its class, including refusals your session never
+saw — `unverifiable_path` there is the stall described above.
 
 ## Useful checks
 
 - `kirocrew doctor` — reports the credential posture: which AWS profiles are
   configured, whether a `credential_process` is in play, and whether this host
   mounts an MCP server that vends credentials.
-- `kirocrew policy show` / `explain <scope> <item>` — the governance ceiling, on
-  a host that has one. CLI only, deliberately: there is no tool for enumerating
-  your own ceiling.
+- `kirocrew policy show [--ids]` / `policy explain <scope> <item>` /
+  `policy profile <name>` / `policy source` / `policy validate` — the governance
+  ceiling, where it comes from, and whether it loads. `policy show --ids` lists
+  each denied-command category's rule ids instead of just counts, which is what
+  you want when a refusal names a pattern you cannot place. `policy explain`
+  takes optional `--session-key`, `--agent` and `--app` so you can ask about a
+  surface other than your own. CLI only, deliberately: there is no tool for
+  enumerating your own ceiling.
 
 ## What not to do
 

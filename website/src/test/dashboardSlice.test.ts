@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import reducer, {
   sseStatus,
+  setYoloDuration,
   sseConnected,
   sseDisconnected,
   sseSlots,
@@ -16,6 +17,7 @@ import reducer, {
   sseSubagentStatus,
   sseSubagentText,
   patchSlotLink,
+  dropSlotLinks,
 } from '../store/dashboardSlice'
 import type { StatusData, ChatSlot } from '../types'
 
@@ -57,6 +59,55 @@ describe('dashboardSlice', () => {
       const status = { uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0, yolo: false } as StatusData
       const state = reducer(yoloState, sseStatus(status))
       expect(state.approvalMode).toBe('normal')
+    })
+
+    it('carries the config-derived grant keys across a WebSocket frame that omits them', () => {
+      const http = {
+        uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0,
+        yolo_duration: '1h', yolo_until_shutdown_permitted: false,
+      } as StatusData
+      const wsFrame = { uptime: '2h', sessions: 3, messages: 5, cron_jobs: 1, subagents: 0, lessons: 2 } as StatusData
+      const state = reducer(reducer(initial, sseStatus(http)), sseStatus(wsFrame))
+      expect(state.status).toEqual({ ...wsFrame, yolo_duration: '1h', yolo_until_shutdown_permitted: false })
+    })
+
+    it('still replaces every other key a frame omits (an omitted key is an answer)', () => {
+      const http = {
+        uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0,
+        version_display: '0.4.0', yolo_expires_at: '2026-01-01T00:00:00Z', yolo_until_shutdown: true,
+      } as StatusData
+      const wsFrame = { uptime: '2h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 } as StatusData
+      const state = reducer(reducer(initial, sseStatus(http)), sseStatus(wsFrame))
+      expect(state.status).toEqual(wsFrame)
+    })
+
+    it('lets a frame that carries a grant key overwrite the retained value', () => {
+      const first = { uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0, yolo_duration: '1h' } as StatusData
+      const second = { ...first, yolo_duration: '24h' } as StatusData
+      const state = reducer(reducer(initial, sseStatus(first)), sseStatus(second))
+      expect(state.status?.yolo_duration).toBe('24h')
+    })
+
+    it('setYoloDuration writes the saved value and it outranks later frames and replies', () => {
+      const http = { uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0, yolo_duration: '30m' } as StatusData
+      const wsFrame = { uptime: '2h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 } as StatusData
+      let state = reducer(initial, sseStatus(http))
+      state = reducer(state, setYoloDuration('24h'))
+      expect(state.status?.yolo_duration).toBe('24h')
+      // A frame without the key carries the save; a stale reply WITH the old
+      // key (a request that began before the save) does not roll it back.
+      state = reducer(state, sseStatus(wsFrame))
+      expect(state.status?.yolo_duration).toBe('24h')
+      state = reducer(state, sseStatus(http))
+      expect(state.status?.yolo_duration).toBe('24h')
+    })
+
+    it('a save recorded before any status arrives is applied to the first status', () => {
+      const wsFrame = { uptime: '2h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 } as StatusData
+      let state = reducer(initial, setYoloDuration('1h'))
+      expect(state.status).toBeNull()
+      state = reducer(state, sseStatus(wsFrame))
+      expect(state.status?.yolo_duration).toBe('1h')
     })
   })
 
@@ -199,10 +250,105 @@ describe('dashboardSlice', () => {
       const state = reducer(initial, markSlotRead('nonexistent'))
       expect(state.unreadSlots).toEqual([])
     })
+
+    // The shared unread record is written by an ordinary arrival, and that write
+    // is on the websocket `onmessage` -> Redux dispatch -> re-render path. A
+    // QuotaExceededError raised there is swallowed by the surrounding try/catch,
+    // so the record is silently lost while megabytes of re-derivable cache sit
+    // next to it. `safeSetItem` reclaims a disposable tier and retries; the raw
+    // write does not. This pins the reclaim so the record survives a full quota.
+    it('markSlotUnread reclaims disposable cache and still persists when the quota is full', () => {
+      const quota = () => {
+        const e = new DOMException('quota', 'QuotaExceededError')
+        Object.defineProperty(e, 'code', { value: 22, configurable: true })
+        return e
+      }
+      // Disposable cache the reclaim tiers are allowed to drop.
+      localStorage.setItem('vc_heights_session-A', '{"a":1}')
+      localStorage.setItem('keep-me', 'important')
+
+      const real = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+        this: Storage,
+        key: string,
+        value: string,
+      ) {
+        // Fail only while the reclaimable cache is still present, so a retry
+        // after reclaim succeeds and a non-reclaiming writer never does.
+        if (this.getItem('vc_heights_session-A') !== null && !key.startsWith('vc_heights_')) {
+          throw quota()
+        }
+        real.call(this, key, value)
+      })
+
+      try {
+        reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      } finally {
+        spy.mockRestore()
+      }
+
+      // The shared record survived because the write reclaimed space first.
+      expect(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}')).toEqual({
+        'chat-1': '2026-01-01T00:00:00Z',
+      })
+      // Disposable cache was the thing sacrificed, not the record.
+      expect(localStorage.getItem('vc_heights_session-A')).toBeNull()
+      expect(localStorage.getItem('keep-me')).toBe('important')
+    })
+
+    // `mc-unread-slots` is a PROJECTION of the shared record's keys, so the two
+    // must not disagree. The projection is strictly smaller than the record
+    // (keys only, no timestamps), so writing it can free space and succeed on a
+    // quota where the record's own write just failed. The old code could not
+    // reach that state: the raw setItem THREW, the surrounding catch swallowed
+    // it, and the projection line never ran. A helper that reports failure by
+    // return value instead of throwing silently removed that protection, which
+    // is the whole risk of converting a throwing call in a try/catch body.
+    it('leaves the projection alone when the shared record write fails', () => {
+      const quota = () => {
+        const e = new DOMException('quota', 'QuotaExceededError')
+        Object.defineProperty(e, 'code', { value: 22, configurable: true })
+        return e
+      }
+      // This file has no storage-clearing beforeEach, so start from a known
+      // state rather than whatever the previous case left behind.
+      localStorage.clear()
+      // A stale, larger projection than the one this dispatch would write, so a
+      // projection write would shrink it and find room.
+      localStorage.setItem('mc-unread-slots', JSON.stringify(['chat-1', 'chat-2', 'chat-3']))
+
+      const real = Storage.prototype.setItem
+      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+        this: Storage,
+        key: string,
+        value: string,
+      ) {
+        // The authoritative record cannot be written; the projection still can.
+        if (key === 'mc-unread-shared') throw quota()
+        real.call(this, key, value)
+      })
+
+      try {
+        reducer(initial, markSlotUnread({ slot: 'chat-1', ts: '2026-01-01T00:00:00Z' }))
+      } finally {
+        spy.mockRestore()
+      }
+
+      // The record did not land, so the projection must not have been advanced
+      // past it. Two persisted records that disagree is worse than neither
+      // being written: `restoreUnreadSince` trusts the record while older tabs
+      // and the hub relay read the projection.
+      expect(localStorage.getItem('mc-unread-shared')).toBeNull()
+      expect(JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]')).toEqual([
+        'chat-1',
+        'chat-2',
+        'chat-3',
+      ])
+    })
   })
 
   describe('selectUnreadByMode', () => {
-    // The bigger surface-level coverage (orchestrator-leaks-into-Chat
+    // The bigger surface-level coverage (cross-surface-leaks-into-Chat
     // regression, orphan-key fallback, appOnly visibility) lives in
     // src/test/surfaces.test.tsx where the registry under test is.
     // Here we pin the underlying factory's contract: surface-key resolution
@@ -213,23 +359,30 @@ describe('dashboardSlice', () => {
     it('honors slot.surface over slot.mode when both are present', () => {
       // Forward-compat: backend now emits an explicit `surface` field that
       // mirrors `mode` today but is allowed to diverge later. A slot whose
-      // `mode === ''` but `surface === 'orchestrator'` counts toward the
-      // unified chat badge (both '' and 'orchestrator' are chat-like).
-      const slot: ChatSlot = { key: 'orch-1', title: 'O', messages: 0, running: false, mode: '', surface: 'orchestrator' }
-      const state = buildState([slot], ['orch-1'])
-      // Unified: chat badge includes orchestrator slots
-      expect(selectUnreadByMode('')(state)).toBe(1)
-      expect(selectUnreadByMode('orchestrator')(state)).toBe(1)
+      // `mode === ''` but `surface === 'dashboard'` belongs to the dashboard
+      // surface, not the chat badge.
+      const slot: ChatSlot = { key: 'dash-1', title: 'D', messages: 0, running: false, mode: '', surface: 'dashboard' }
+      const state = buildState([slot], ['dash-1'])
+      expect(selectUnreadByMode('')(state)).toBe(0)
+      expect(selectUnreadByMode('dashboard')(state)).toBe(1)
     })
 
     it('falls back to slot.mode when slot.surface is absent (back-compat)', () => {
       // Older backend payloads without a `surface` field must still route
       // via `mode` so a `surface`-aware client doesn't require a coupled deploy.
-      const slot: ChatSlot = { key: 'orch-1', title: 'O', messages: 0, running: false, mode: 'orchestrator' }
-      const state = buildState([slot], ['orch-1'])
-      // Unified: chat badge includes orchestrator slots
-      expect(selectUnreadByMode('')(state)).toBe(1)
-      expect(selectUnreadByMode('orchestrator')(state)).toBe(1)
+      const slot: ChatSlot = { key: 'dash-1', title: 'D', messages: 0, running: false, mode: 'dashboard' }
+      const state = buildState([slot], ['dash-1'])
+      expect(selectUnreadByMode('')(state)).toBe(0)
+      expect(selectUnreadByMode('dashboard')(state)).toBe(1)
+    })
+
+    it('counts a legacy Autopilot slot toward the chat badge', () => {
+      // A slot still persisted under the retired 'orchestrator' mode renders
+      // as an ordinary chat, so its unread belongs to the chat surface ('').
+      const bySurface: ChatSlot = { key: 'legacy-1', title: 'L', messages: 0, running: false, mode: '', surface: 'orchestrator' }
+      const byMode: ChatSlot = { key: 'legacy-2', title: 'L', messages: 0, running: false, mode: 'orchestrator' }
+      const state = buildState([bySurface, byMode], ['legacy-1', 'legacy-2'])
+      expect(selectUnreadByMode('')(state)).toBe(2)
     })
 
     it('returns the same selector instance on repeated calls (memoization)', () => {
@@ -237,7 +390,7 @@ describe('dashboardSlice', () => {
       // selectAllSurfacesAttention) call this on every render — recreating
       // the selector would defeat both useAppSelector's referential-equality
       // fast path and reselect's input-equality memoization.
-      expect(selectUnreadByMode('orchestrator')).toBe(selectUnreadByMode('orchestrator'))
+      expect(selectUnreadByMode('dashboard')).toBe(selectUnreadByMode('dashboard'))
     })
   })
 
@@ -370,6 +523,76 @@ describe('dashboardSlice', () => {
       expect(rows(state)[0].paused).toBe(true)
     })
   })
+
+  describe('dropSlotLinks removes the rows of ONE binding in place', () => {
+    const twoDiscordRows = (): ChatSlot => ({
+      key: 'chat-1',
+      title: 'Chat 1',
+      messages: 1,
+      running: false,
+      pending_approval: false,
+      waiting_for_input: false,
+      last_activity_ts: undefined,
+      slack_linked: true,
+      slack_channel: 'C-1',
+      slack_thread_ts: '1.2',
+      links: [
+        { channel: 'discord', label: 'Discord', target: 'dm-1', binding: 'b-o', direction: 'origin', live: true, paused: false },
+        { channel: 'discord', label: 'Discord', target: 'chan-2', binding: 'b-a', direction: 'both', live: true, paused: true },
+        { channel: 'telegram', label: 'Telegram', target: 'tg-1', binding: 'b-t', direction: 'out', live: true, paused: false },
+        { channel: 'slack', label: 'Slack', target: 'C-1', binding: 'b-s', direction: 'out', live: true, paused: false },
+      ],
+    })
+    const rows = (s: ReturnType<typeof reducer>) => s.slots[0].links!
+
+    // The Unlink action's write: the named binding is gone server-side, the
+    // origin row (the conversation the session was born in) is not a binding
+    // anyone severed, and every other row is untouched.
+    it('drops the rows carrying the named binding and keeps the origin row', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'discord', binding: 'b-a' }))
+      expect(rows(state).map(l => `${l.channel}:${l.direction}`)).toEqual([
+        'discord:origin', 'telegram:out', 'slack:out',
+      ])
+    })
+
+    it('leaves a same-channel row with a DIFFERENT binding alone', () => {
+      // The race the token exists for: Unlink A, another tab links B on the same
+      // channel before A's response lands, B's slots push arrives first. The
+      // server deleted exactly A, so a completion keyed on the channel would
+      // erase B — a binding the server still holds — and the tab would read as
+      // disconnected. Keyed on the binding, B stays and nothing is stamped.
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      const before = state
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'discord', binding: 'b-gone' }))
+      expect(rows(state)).toHaveLength(4)
+      expect(state.slots).toEqual(before.slots)
+    })
+
+    it('clears the Slack fields only with the Slack thread row it matched', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      // A stale token for the thread: no row matches, the fields stay.
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'slack', binding: 'b-stale' }))
+      expect(state.slots[0].slack_linked).toBe(true)
+      expect(state.slots[0].slack_channel).toBe('C-1')
+      expect(rows(state)).toHaveLength(4)
+      // The current token: the row goes and the fields go with it, one write.
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'slack', binding: 'b-s' }))
+      expect(rows(state).map(l => l.channel)).toEqual(['discord', 'discord', 'telegram'])
+      expect(state.slots[0].slack_linked).toBe(false)
+      expect(state.slots[0].slack_channel).toBeUndefined()
+      expect(state.slots[0].slack_thread_ts).toBeUndefined()
+    })
+
+    it('is a no-op for a channel with no rows and for an unknown slot', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      const before = state
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'imessage', binding: 'b-a' }))
+      expect(rows(state)).toHaveLength(4)
+      state = reducer(state, dropSlotLinks({ key: 'chat-404', channel: 'discord', binding: 'b-a' }))
+      expect(state.slots).toEqual(before.slots)
+    })
+  })
 })
 
 describe('dashboardSlice per-slot sub-agent teardown', () => {
@@ -385,11 +608,15 @@ describe('dashboardSlice per-slot sub-agent teardown', () => {
   }
 
   it('drains unread state for a slot that vanished from the authoritative list', () => {
+    // Persisted state lives in the ONE shared record; 'mc-unread-slots' is a
+    // write-only projection of its keys. Seed the record the way arrivals do.
+    localStorage.setItem('mc-unread-shared', JSON.stringify({ 'chat-1': '', 'chat-2': '' }))
     const before = { ...seeded(), unreadSlots: ['chat-1', 'chat-2'] }
 
     const next = reducer(before, sseSlots([{ key: 'chat-1', messages: 0, running: false }] as ChatSlot[]))
 
     expect(next.unreadSlots).toEqual(['chat-1'])
+    expect(Object.keys(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}'))).toEqual(['chat-1'])
     expect(JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]')).toEqual(['chat-1'])
   })
 

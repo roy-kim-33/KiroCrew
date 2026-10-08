@@ -1,9 +1,10 @@
 import { Check, ChevronDown, Mic, TriangleAlert } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 import { i18nT } from '../i18n/t'
-import { getPreferredMicId, listMicrophones } from '../hooks/mic'
+import { DEFAULT_PSEUDO_DEVICE_ID, defaultMicName, getPreferredMicId, listMicrophones, selectableMicrophones, stripDefaultPrefix } from '../hooks/mic'
+import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 
 interface Props {
@@ -123,22 +124,15 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
   // Reposition-or-close when the anchor moves under an open menu. `rect` is
   // captured once and consumed as fixed viewport coordinates, and the composer
   // GROWS as dictated text accumulates — the feature's primary scenario — so
-  // without this the menu visibly detaches from its trigger.
-  useEffect(() => {
-    if (!open) return
-    const sync = () => {
-      const r = wrapRef.current?.getBoundingClientRect()
-      if (r) setRect({ left: r.left, top: r.bottom, bottom: r.top })
-      else setOpen(false)
-    }
-    window.addEventListener('resize', sync)
-    // Capture phase: a scroll inside the chat transcript does not bubble to window.
-    window.addEventListener('scroll', sync, true)
-    return () => {
-      window.removeEventListener('resize', sync)
-      window.removeEventListener('scroll', sync, true)
-    }
-  }, [open])
+  // without this the menu visibly detaches from its trigger. The shared hook
+  // also covers the mobile-keyboard case, which only `window.visualViewport`
+  // announces.
+  const measureAnchor = useCallback(() => {
+    const r = wrapRef.current?.getBoundingClientRect()
+    if (r) setRect({ left: r.left, top: r.bottom, bottom: r.top })
+    else setOpen(false)
+  }, [])
+  useAnchorRemeasure(open, measureAnchor)
 
   // The saved device is gone (unplugged, or its permission-scoped id rotated).
   // Session-start acquisition falls back to the default in that case, so say so
@@ -161,8 +155,22 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
     return d.deviceId === preferred
   }
   // "System default" is an intent, not a device: mid-capture the concrete
-  // device row carries the truth, so the default row is never marked then.
-  const defaultChecked = recording ? false : !preferred
+  // device row carries the truth, so the default row is marked then only when
+  // the live track is Chromium's `default` pseudo-device, which has no row of
+  // its own (see `selectableMicrophones`). A preference saved as that id
+  // before the fold is still "follow the OS", so idle it marks this row too.
+  const liveOnDefault = activeDeviceId
+    ? activeDeviceId === DEFAULT_PSEUDO_DEVICE_ID
+    : !!deviceLabel && devices.some(d => d.deviceId === DEFAULT_PSEUDO_DEVICE_ID && d.label === deviceLabel)
+  const defaultChecked = recording ? liveOnDefault : !preferred || preferred === DEFAULT_PSEUDO_DEVICE_ID
+  const rows = selectableMicrophones(devices)
+  // Same naming as the Settings picker, so the device "System default" means
+  // can be confirmed where the user dictates.
+  const defaultName = defaultMicName(devices)
+  // The live track's label, without Chromium's "Default - " prefix, the same way
+  // the picker and the mic test name it. `deviceLabel` itself stays the raw
+  // label, because `isChecked` matches it against device labels.
+  const shownLabel = deviceLabel ? stripDefaultPrefix(deviceLabel) : ''
 
   return (
     <span ref={wrapRef} className="relative flex-1 min-w-0 flex items-center">
@@ -173,11 +181,11 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={i18nT('components.micSourceMenu.change_input_source')}
-        title={deviceLabel || undefined}
-        className={`flex items-center gap-1 min-w-0 max-w-full bg-transparent border-none font-inherit px-1 -ml-1 py-px rounded cursor-pointer hover:bg-bg-hover ${triggerClass}`}
+        title={shownLabel || undefined}
+        className={`flex items-center gap-1 min-w-0 max-w-full bg-transparent border-none px-1 -ml-1 py-px rounded cursor-pointer hover:bg-bg-hover ${triggerClass}`}
       >
         <Mic size={12} className="shrink-0 opacity-70" aria-hidden="true" />
-        <span className="truncate">{deviceLabel || i18nT('components.voiceStatusBar.default_microphone')}</span>
+        <span className="truncate">{shownLabel || i18nT('components.voiceStatusBar.default_microphone')}</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" aria-hidden="true" />
       </button>
 
@@ -213,7 +221,7 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
           <div className="px-2 pt-1 pb-1.5 text-[10.5px] font-mono font-semibold tracking-wide text-muted">
             {i18nT('components.micSourceMenu.input_source')}
           </div>
-          {devices.map(d => (
+          {rows.map(d => (
             <button
               key={d.deviceId}
               type="button"
@@ -242,7 +250,9 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
             className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[12.5px] text-left bg-transparent border-none cursor-pointer hover:bg-bg-hover ${defaultChecked ? 'text-accent' : 'text-text'}`}
           >
             <span className="w-3 shrink-0">{defaultChecked && <Check size={12} aria-hidden="true" />}</span>
-            <span className="truncate">{i18nT('components.micSourceMenu.system_default')}</span>
+            <span className="truncate">{defaultName
+              ? i18nT('components.micSourceMenu.system_default_named', { device: defaultName })
+              : i18nT('components.micSourceMenu.system_default')}</span>
           </button>
           {savedMissing && (
             <div className="flex gap-1.5 items-start px-2 py-1.5 text-[11px] leading-snug text-warn">

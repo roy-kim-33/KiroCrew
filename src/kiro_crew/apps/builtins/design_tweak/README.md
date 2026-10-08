@@ -78,9 +78,10 @@ second from the right".
    previous is still running. Reply on a pin to file a linked follow-up.
 
 Static HTML/CSS/JS folders work out of the box. A project whose entry point isn't
-a top-level `index.html` is handled too — `public/`, `dist/`, `build/`, `out/`,
-`app/`, `src/`, `site/`, `www/` and `docs/` are tried automatically, and if there
-is no entry at all the preview explains what it found instead of failing blank.
+a top-level `index.html` is handled too — common locations such as `public/`,
+`dist/`, `build/` and `docs/` are tried automatically
+(`backend/preview_files.py`, `ENTRY_CANDIDATES`, is the authoritative list), and if
+there is no entry at all the preview explains what it found instead of failing blank.
 
 **Framework projects (Vite, React Router, Next, …) are detected, not fumbled.**
 Their entry script is TypeScript/JSX, so serving the files from disk renders an
@@ -104,7 +105,7 @@ rewriting except the one injected script tag.
 |---|---|
 | Preview (static) | An ephemeral loopback server on its own OS-assigned port serves each registered folder, injecting a `<base href>` pointing at the served file's own directory, plus the overlay. It is a **different origin** from the dashboard (ports separate origins under the same-origin policy), which is what makes the sandboxed frame safe |
 | Preview (dev server) | An injecting reverse proxy on its own ephemeral port, mapping paths 1:1; HTML gains the overlay, WebSocket upgrades are relayed as raw bytes so HMR survives. Its port is resolved live, never persisted — it dies with the backend |
-| Dev-server discovery | `lsof` maps a listening port → pid → working directory, so an already-running server is matched back to its project folder |
+| Dev-server discovery | Two channels. For a server the **user** started, `lsof` maps a listening port → pid → working directory, so it is matched back to its project folder. For a server **we** started the pid is already known, so the port is read from the dev server's own startup output and then proved against the real listener table (`platform_compat.find_port_listeners`) — which is why starting a project's dev server works on hosts with no `lsof` |
 | Selection overlay | `inject/select-to-edit.js`, auto-injected into served HTML — no manual wiring |
 | Pin anchoring | A chain, best first: `[data-kiro-cid]` → the captured CSS locator → the element's former parent → the click point → page bottom-left. It never fails, so a pin is never deleted for failing to resolve |
 | Panel ↔ overlay bridge | `window.postMessage` both ways (comments up; mode + theme colors down). A pin's id **is** its comment's `cid` |
@@ -112,17 +113,22 @@ rewriting except the one injected script tag.
 | Per-app scoping | Each request carries `projectId` + `projectRoot`; the panel shows only the previewed app's requests, and numbering is derived per project (not a global counter) |
 | Agent delivery target | One chat slot per app folder, keyed by a hash of its path — created idempotently, so a request can never open a second session |
 | Source mapping | `projectRoot` per request + `sourceFile` per comment, stamped from the serving path; where an element carries `data-kiro-source="file:line:col"` the agent gets a high-confidence target, otherwise it falls back to React Fiber `_debugSource` (medium) or HTML-snippet matching (low) and verifies before editing |
-| Delivery into agent | The batch is queued as JSON in the app's data dir and handed to that app's chat session; the bundled `visual-edit` skill teaches the agent to work a batch and report per comment via `POST /thread?id=…&cid=…` |
-| Node toolchain | The gateway spawns the backend with a minimal PATH, so `npm` is resolved by absolute path from a list of known install dirs (homebrew, MacPorts, volta, bun, asdf, fnm, nvm, `/usr/local/bin`, `/usr/bin`) and that dir is put on the child's PATH |
+| Delivery into agent | The batch is queued as JSON in the app's data dir and handed to that app's chat session; the bundled `visual-edit` skill teaches the agent to work a batch and report per comment via the `design_tweak_update_thread` MCP tool (the credentialed path to `POST /thread`; an agent session cannot post to it directly) |
+| Node toolchain | The gateway spawns the backend with a minimal PATH, so `npm` is resolved by absolute path from known install dirs — common ones such as homebrew, MacPorts, volta, bun, asdf, fnm and nvm (`backend/dev_preview.py`, `NODE_BIN_DIRS` and `NVM_GLOB`, is the authoritative list) — and that dir is put on the child's PATH |
 
 ## Structure
 
 ```
 design_tweak/
 ├── app.json                       ← manifest (UI page + backend + skill + perms)
-├── backend/server.py              ← project registry, multi-root static serving,
-│                                    dev-server detect/start/proxy, request queue,
-│                                    folder picker, per-comment threads
+├── backend/
+│   ├── server.py                  ← composition root: process creation and
+│   │                                security-policy calls
+│   ├── dev_preview.py             ← dev-server discovery, lifecycle, injecting proxy
+│   ├── http_api.py                ← HTTP API adapter
+│   ├── preview_files.py           ← file-backed (static) preview serving
+│   └── request_state.py           ← durable request and project state
+├── tests/test_windows_support.py  ← manifest platform claim + Windows code paths
 ├── inject/select-to-edit.js       ← selection overlay (auto-injected into previews)
 ├── skills/visual-edit/SKILL.md    ← teaches the agent to work a batch + report per comment
 └── README.md
@@ -138,11 +144,35 @@ the request schema and the reporting protocol.
 
 ## Platform notes
 
-macOS and Linux. The only macOS-specific piece is the **native folder chooser**
-(`POST /pick-folder`, AppleScript): on any other platform it answers `501` and
-the panel falls back to typing the folder path, which registers a project
-identically. Dev-server discovery needs `lsof` on PATH; without it, detection is
-skipped and you can point a project at a dev-server URL yourself.
+macOS, Linux, and Windows. `platform.os` in a builtin's manifest is a published
+capability claim, not an enablement gate — see "Windows" below for what that
+means here.
+
+Two pieces degrade off macOS/POSIX, both of them into a path the app already
+ships rather than into an error:
+
+- **Native folder chooser** (`POST /pick-folder`, AppleScript) is macOS-only. On
+  Linux and Windows it answers `501` and the panel falls back to typing the
+  folder path, which registers a project identically.
+- **Adopting a dev server you started yourself** needs port → pid → working
+  directory, and that needs `lsof`. Starting the project's **own** dev server
+  is unaffected: the pid is already known, so the port comes from the dev
+  server's own output and is then verified against the listener table. You can
+  also always point a project at a dev-server URL yourself.
+
+Everything else — static folder preview, the injecting reverse proxy, the overlay,
+and the whole request/queue lifecycle — is platform-neutral. Note that the dev
+script itself is spawned directly, **not** through Kiro Crew's sandbox, on every
+platform.
+
+### Windows
+
+`app.json` declares `platform.os` including `windows`. The app's own Python is
+cross-platform (`platform_compat` branches, no POSIX-only calls), but the spawned
+dev server's OS-level process tree management (`kill_process_tree`, port listener
+enumeration via `find_port_listeners`) is not verified on native Windows. Adopting
+a user-started dev server needs `lsof` and has no Windows path, as the
+"Dev-server discovery" row above states.
 
 ## Coming from the external `poke-and-prose` app
 

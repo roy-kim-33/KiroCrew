@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -39,6 +40,13 @@ logger = logging.getLogger(__name__)
 
 # Telegram message text limit.
 TELEGRAM_MAX_TEXT = 4096
+
+#: Bot API 7.0+ link_preview_options payload disabling server-side link
+#: previews. ONE shared source injected into EVERY text-bearing call
+#: (sendMessage, sendMessageDraft, editMessageText, sendRichMessage): a URL
+#: appearing mid-stream must not gain a preview on the edit path that the
+#: send path already denies — the fetch happens with no recipient click.
+_LINK_PREVIEW_DISABLED: dict[str, Any] = {"is_disabled": True}
 
 #: Caption cap on every media-bearing send (sendPhoto, sendDocument, …),
 #: measured after entities parsing — a quarter of the text budget, which is why
@@ -191,8 +199,96 @@ TELEGRAM_CHUNK_LIMIT = 4000
 #: table-bearing segments are budgeted against this cap, not the render cap.
 TELEGRAM_RICH_MAX_CHARS = 32768
 
-# Bot API base URL.
-_API_BASE = "https://api.telegram.org/bot{token}/{method}"
+# Default Bot API method template: the public host when no proxy is set.
+_DEFAULT_API_BASE = "https://api.telegram.org/bot{token}/{method}"
+
+#: Hosts for which a plaintext ``http://`` scheme is accepted. Everywhere else
+#: the bot token would travel in clear text to a remote host, so only ``https``
+#: is allowed; loopback never leaves the machine.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "[::1]", "localhost"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when *host* (netloc without port) is a loopback address."""
+    bare = host.rsplit(":", 1)[0] if host.rsplit(":", 1)[-1].isdigit() else host
+    return bare.lower() in _LOOPBACK_HOSTS
+
+
+def _url_is_loopback(url: str) -> bool:
+    """True when *url*'s host is a loopback address.
+
+    Lets the client bypass a configured forward proxy for a loopback
+    destination: a loopback request must stay on the machine, so routing it
+    through a remote ``HTTPS_PROXY``/``HTTP_PROXY`` would send the token-bearing
+    URL off-box in plaintext — exactly what the loopback-``http`` allowance is
+    meant to avoid.
+    """
+    try:
+        return _is_loopback_host(urllib.parse.urlparse(url).netloc)
+    except ValueError:
+        return False
+
+
+def _api_base() -> str:
+    """The Bot API method template, read at call time (not import).
+
+    Override with ``TELEGRAM_API_BASE_URL`` for proxy/reverse-proxy setups
+    (e.g. a network that blocks api.telegram.org). Must be a full method
+    template containing ``{token}`` and ``{method}``.
+
+    Reading on every call (rather than freezing at import) is deliberate: the
+    gateway loads ``~/.kiro/crew/.env`` into ``os.environ`` *after* this module
+    is imported, so an override placed there only takes effect if read later.
+
+    The value is validated because it carries the bot token: the scheme must be
+    ``https``, except for a loopback host (``127.0.0.1``/``::1``/``localhost``),
+    where plaintext never leaves the machine. A missing ``{token}``/``{method}``
+    placeholder, an unparseable value, or a non-loopback ``http`` URL is refused
+    with a warning and the public default is used instead, so a misconfigured
+    var fails safe to the public host rather than leaking the token.
+    """
+    raw = os.environ.get("TELEGRAM_API_BASE_URL")
+    if not raw:
+        return _DEFAULT_API_BASE
+    try:
+        parsed = urllib.parse.urlparse(raw)
+    except ValueError:
+        parsed = None
+    reason = ""
+    if parsed is None or parsed.scheme not in ("http", "https") or not parsed.netloc:
+        reason = "not an http(s) URL"
+    elif parsed.scheme == "http" and not _is_loopback_host(parsed.netloc):
+        reason = "plaintext http is only allowed for loopback hosts"
+    elif "{token}" not in raw or "{method}" not in raw:
+        reason = "missing {token}/{method} placeholder"
+    if reason:
+        logger.warning(
+            "Ignoring TELEGRAM_API_BASE_URL (%s); using the public Bot API host.",
+            reason,
+        )
+        return _DEFAULT_API_BASE
+    return raw
+
+
+def _file_base() -> str:
+    """Origin + path prefix for Telegram file downloads.
+
+    Derived from :func:`_api_base` so a configured proxy also serves
+    ``/file/bot<token>/<path>`` downloads. Everything up to the trailing
+    ``bot{token}/{method}`` is kept, so a path-prefixed template such as
+    ``https://proxy.example.com/tg/bot{token}/{method}`` yields the download
+    base ``https://proxy.example.com/tg`` and the file URL stays inside the
+    proxied route. Falls back to the public host when the template is unset or
+    unparseable.
+    """
+    base = _api_base()
+    # Strip the method-template tail so any path prefix before it survives.
+    prefix = re.sub(r"bot\{token\}/\{method\}$", "", base).rstrip("/")
+    if re.match(r"^https?://[^/]+", prefix):
+        return prefix
+    m = re.match(r"^(https?://[^/]+)", base)
+    return m.group(1) if m else "https://api.telegram.org"
+
 
 #: Consecutive polling failures before the status callback reports unhealthy.
 _STATUS_FAILURE_THRESHOLD = 3
@@ -616,6 +712,12 @@ class TelegramClient:
         # transitions to persistently-failing or recovers. Set by the gateway
         # to keep the settings status badge truthful after startup.
         self.on_status: Callable[[bool, str], None] | None = None
+        #: Optional teardown callback: called once from :meth:`close`, best-effort.
+        #: The gateway sets it to unregister the dispatcher's spawn-approval
+        #: delivery hook so the host gate stops routing to a channel that is going
+        #: away (the registration is process-global; see
+        #: ``messaging/spawn_approval_delivery.py``).
+        self.on_close: Callable[[], None] | None = None
         #: Last health state reported through on_status (None = never
         #: reported). The gateway seeds this with the startup getMe outcome so
         #: transitions are relative to the boot state.
@@ -717,6 +819,14 @@ class TelegramClient:
     async def close(self) -> None:
         """Gracefully shut down."""
         self._closed = True
+        # Retire any process-global registration this channel holds (the
+        # spawn-approval delivery hook) BEFORE tearing the transport down, so the
+        # host spawn gate stops routing to a dispatcher that is going away.
+        if self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:
+                logger.debug("Telegram on_close callback failed", exc_info=True)
         # Best-effort flush of buffered albums BEFORE cancelling the polling
         # task. This is NOT a delivery guarantee -- see _flush_all_albums: the
         # handler it spawns races SessionManager._closing and may be refused,
@@ -779,6 +889,7 @@ class TelegramClient:
         params: dict[str, Any] = {
             "chat_id": chat_id,
             "text": _cap_text(text, parse_mode),
+            "link_preview_options": _LINK_PREVIEW_DISABLED,
         }
         if message_thread_id is not None:
             params["message_thread_id"] = message_thread_id
@@ -843,6 +954,7 @@ class TelegramClient:
         params: dict[str, Any] = {
             "chat_id": chat_id,
             "rich_message": {"markdown": markdown},
+            "link_preview_options": _LINK_PREVIEW_DISABLED,
         }
         if message_thread_id is not None:
             params["message_thread_id"] = message_thread_id
@@ -898,6 +1010,7 @@ class TelegramClient:
             "chat_id": chat_id,
             "draft_id": draft_id,
             "text": _cap_text(text, parse_mode),
+            "link_preview_options": _LINK_PREVIEW_DISABLED,
         }
         if message_thread_id is not None:
             params["message_thread_id"] = message_thread_id
@@ -925,6 +1038,7 @@ class TelegramClient:
             "chat_id": chat_id,
             "message_id": message_id,
             "text": _cap_text(text, parse_mode),
+            "link_preview_options": _LINK_PREVIEW_DISABLED,
         }
         if parse_mode:
             params["parse_mode"] = parse_mode
@@ -943,7 +1057,7 @@ class TelegramClient:
     ) -> bool:
         """Edit ONLY a message's inline keyboard, leaving its text intact.
 
-        Used to retire an ``[OPTIONS:]`` keyboard after a choice is tapped
+        Retires an ``[OPTIONS:]`` keyboard after a choice is tapped
         without clobbering the answer text that carried it. Pass
         ``{"inline_keyboard": []}`` to remove the buttons.
         """
@@ -1176,10 +1290,24 @@ class TelegramClient:
             if isinstance(entry, dict) and isinstance(entry.get("message_id"), int)
         ]
 
+    def _proxy_for(self, url: str) -> str | None:
+        """The forward proxy to use for *url*, or ``None`` to bypass it.
+
+        A loopback destination must never traverse a remote forward proxy: the
+        request URL carries the bot token, so routing a ``http://127.0.0.1``
+        call through ``HTTPS_PROXY`` would leak the token off-box in plaintext.
+        For every non-loopback host the configured proxy is used unchanged.
+        """
+        if _url_is_loopback(url):
+            return None
+        return self._proxy
+
     # ── File download (attachment ingestion) ──
 
-    #: The only host Telegram file downloads may resolve to. A redirect or
-    #: different host means the URL is not from Telegram and must be refused.
+    #: The default host Telegram file downloads resolve to. When
+    #: ``TELEGRAM_API_BASE_URL`` configures a proxy, downloads instead go to
+    #: that proxy's origin (and path prefix), derived by :func:`_file_base`.
+    #: A redirect to any other host is still refused.
     _FILE_HOST = "api.telegram.org"
 
     async def download_file(self, file_id: str, dest: str) -> None:
@@ -1187,13 +1315,14 @@ class TelegramClient:
 
         Two-step process per Bot API docs:
         1. ``getFile(file_id)`` → returns a ``File`` object with ``file_path``
-        2. Construct ``https://api.telegram.org/file/bot<token>/<file_path>``
-           and download the bytes.
+        2. Construct ``<file_base>/file/bot<token>/<file_path>`` and download
+           the bytes, where ``<file_base>`` is the public host by default or a
+           configured proxy origin (with any path prefix) via :func:`_file_base`.
 
-        Host-allowlisted: only ``api.telegram.org`` is accepted. Redirects are
-        refused so a compromised file_path cannot exfiltrate data via an open
-        redirect. Errors raise token-free messages (the download URL contains
-        the bot token, so aiohttp's default exception str() must never propagate).
+        Redirects are refused so a compromised file_path cannot exfiltrate data
+        via an open redirect. Errors raise token-free messages (the download URL
+        contains the bot token, so aiohttp's default exception str() must never
+        propagate).
         """
         result = await self._api("getFile", {"file_id": file_id})
         if not result or not isinstance(result, dict):
@@ -1202,13 +1331,13 @@ class TelegramClient:
         if not file_path:
             raise ValueError(f"getFile returned empty file_path for file_id={file_id!r}")
 
-        url = f"https://api.telegram.org/file/bot{self._token}/{file_path}"
+        url = f"{_file_base()}/file/bot{self._token}/{file_path}"
 
         session = await self._ensure_session()
         try:
             async with session.get(
                 url,
-                proxy=self._proxy,
+                proxy=self._proxy_for(url),
                 timeout=aiohttp.ClientTimeout(total=60),
                 allow_redirects=False,
             ) as resp:
@@ -1238,7 +1367,7 @@ class TelegramClient:
 
         Telegram REPLACES the whole default-scope menu on each call, so the full
         list must be sent every time — that is also what retires a command the
-        bot no longer serves. An empty list is refused rather than sent, because
+        bot does not serve. An empty list is refused rather than sent, because
         Telegram would read it as "this bot has no commands" and wipe the menu.
         """
         if not commands:
@@ -1255,12 +1384,17 @@ class TelegramClient:
         "Telegram said no" from "network down".
         """
         session = await self._ensure_session()
-        url = _API_BASE.format(token=self._token, method=method)
+        url = _api_base().format(token=self._token, method=method)
         async with session.post(
             url,
             json=params,
-            proxy=self._proxy,
+            proxy=self._proxy_for(url),
             timeout=aiohttp.ClientTimeout(total=timeout),
+            # The URL carries the bot token. A TLS-terminating proxy can answer
+            # with a redirect to a plaintext http:// Location; following it would
+            # send the token off-box in clear text. Refuse redirects outright,
+            # as download_file already does.
+            allow_redirects=False,
         ) as resp:
             return await resp.json(content_type=None)
 
@@ -1520,7 +1654,7 @@ class TelegramClient:
         # _spawn_handler only creates a task, so acking at this point would advance
         # the cursor past an album whose turn has not run. The handler resolves them
         # as a unit in its finally, because replaying half an album would deliver the
-        # same photos again under a caption that no longer matches.
+        # same photos again under a caption that does not match.
         self._spawn_handler(merged, tuple(pending))
 
     def _flush_all_albums(self) -> None:
@@ -1930,7 +2064,7 @@ class TelegramClient:
         """
         session = await self._ensure_session()
 
-        url = _API_BASE.format(token=self._token, method=method)
+        url = _api_base().format(token=self._token, method=method)
         # ONE timer for the whole call, not per attempt: the caller is blocked
         # for the entire span including a 429 ``retry_after`` sleep, and that
         # multi-second stall is exactly the user-visible latency the metric
@@ -1945,8 +2079,11 @@ class TelegramClient:
             try:
                 async with session.post(
                     url,
-                    proxy=self._proxy,
+                    proxy=self._proxy_for(url),
                     timeout=aiohttp.ClientTimeout(total=timeout),
+                    # The URL carries the bot token; refuse a proxy redirect to a
+                    # plaintext http:// Location rather than follow it off-box.
+                    allow_redirects=False,
                     **body(),
                 ) as resp:
                     data = await resp.json(content_type=None)

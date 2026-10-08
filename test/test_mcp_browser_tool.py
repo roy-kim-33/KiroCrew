@@ -148,6 +148,79 @@ def test_navigate_classifier_rejects_alternate_ip_encodings() -> None:
     assert mod._navigate_target_is_public("http://2130706433/") is False  # 127.0.0.1
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://%31%32%37.0.0.1:8080/",  # 127.0.0.1
+        "http://%31%36%39.254.169.254/",  # IMDS
+        "http://loc%61lhost/",
+        "http://%4C%4F%43%41%4C%48%4F%53%54/",  # LOCALHOST
+        "http://foo.loc%61lhost/",
+        "http://loc%61lhost%2e/",  # trailing dot
+        "http://127.0.0.1%2e/",  # trailing dot
+        "http://0x7f%30%30%30001/",  # hex 127.0.0.1
+        "http://%32130706433/",  # decimal 127.0.0.1
+        "http://%31%32%37.1/",  # short 127.1
+        "http://%2531%32%37.0.0.1/",  # double-encoded: a '%' survives one decode
+        "http://%ff127.0.0.1/",  # not UTF-8
+        "http://%e2%91%a027.0.0.1/",  # circled digit one
+        "http://%ef%bc%91%ef%bc%92%ef%bc%97.0.0.1/",  # fullwidth digits
+        "http://127%e3%80%820%e3%80%820%e3%80%821/",  # ideographic full stop
+        "http://127.0.0.1%40example.com/",  # '@' after decode
+        "http://169.254.169.254%2f.example.com/",  # '/' after decode
+        "http://127.0.0.1%3a80/",  # ':' after decode
+        "http://a@loc%61lhost/",  # userinfo
+    ],
+)
+def test_navigate_classifier_rejects_percent_encoded_hosts(url: str) -> None:
+    # urlsplit leaves the host percent-encoded; the browser decodes it.
+    assert mod._navigate_target_is_public(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://１２７.０.０.１/",  # fullwidth digits
+        "http://ｌｏｃａｌｈｏｓｔ/",  # fullwidth letters
+        "http://①27.0.0.1/",  # circled digit one
+        "http://ⓛocalhost/",  # circled letter
+        "http://127。0。0。1/",  # ideographic full stop
+    ],
+)
+def test_navigate_classifier_rejects_raw_non_ascii_private_hosts(url: str) -> None:
+    assert mod._navigate_target_is_public(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example%2ecom/",
+        "https://ex%41mple.com/",
+        "https://example.com/path?q=%2F",
+        "https://xn--bcher-kva.example/",
+        "http://[2606:4700::1111%25eth0]/",
+    ],
+)
+def test_navigate_classifier_keeps_percent_encoded_public_hosts(url: str) -> None:
+    assert mod._navigate_target_is_public(url) is True
+
+
+def test_navigate_percent_encoded_loopback_is_refused_without_posting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod.mcp_core, "_resolve_session_key", lambda: "dashboard:chat-7-1")
+
+    def _must_not_post(*_a: Any, **_k: Any) -> tuple[int, dict]:
+        raise AssertionError("must not POST a percent-encoded loopback target")
+
+    monkeypatch.setattr(mod, "_post_command", _must_not_post)
+
+    out = mod.browser(
+        "browser", {"op": "navigate", "args": {"url": "http://%31%32%37.0.0.1:8080/"}}
+    )
+    assert out.startswith("Error: the browser tool only opens public http(s) URLs")
+
+
 def test_governance_deny_refuses_without_fallback_or_posting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,3 +396,62 @@ def test_post_command_parses_success_and_transport_errors(monkeypatch: pytest.Mo
     monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _raise_url)
     status, payload = mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
     assert status is None and payload == {}
+
+
+def test_post_command_sends_the_session_token_beside_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADLINE: the token travels WITH the declared key, asserted on the real request.
+
+    On a pid hosting several sessions the peer check cannot tell which of them holds
+    the socket from kernel credentials, so it requires a token naming exactly the
+    declared key and refuses the declaration otherwise. Without this header every
+    native browser-panel op on a shared runtime is refused -- including the founder's,
+    which worked before that demand existed. The header dict is read off the request
+    object rather than from a stub, so a refactor that rebuilds it cannot drop the
+    token silently, which is how it came to be missing.
+    """
+    seen: list[dict] = []
+
+    monkeypatch.setattr(mod.mcp_core, "_api_base", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(mod.mcp_core, "_internal_secret", lambda: "sekret")
+    monkeypatch.setattr(
+        mod.mcp_core, "_session_token_header", lambda: {"X-Session-Token": "a-signed-token"}
+    )
+
+    def _record(req, timeout):
+        seen.append(dict(req.headers))
+        return _FakeResp(200, b'{"ok": true}')
+
+    monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _record)
+    mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
+
+    assert len(seen) == 1
+    # urllib title-cases header names on the Request object.
+    headers = {k.lower(): v for k, v in seen[0].items()}
+    assert headers["x-session-key"] == "dashboard:chat-1"
+    assert headers["x-session-token"] == "a-signed-token"
+
+
+def test_post_command_adds_no_token_header_when_there_is_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The converse, and what keeps a 1:1 install byte-identical: with no token the
+    helper contributes no header at all, rather than an empty one that the gateway
+    would have to tell apart from a real attestation."""
+    seen: list[dict] = []
+
+    monkeypatch.setattr(mod.mcp_core, "_api_base", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(mod.mcp_core, "_internal_secret", lambda: "sekret")
+    monkeypatch.setattr(mod.mcp_core, "_session_token_header", dict)
+
+    def _record(req, timeout):
+        seen.append(dict(req.headers))
+        return _FakeResp(200, b'{"ok": true}')
+
+    monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _record)
+    mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
+
+    headers = {k.lower() for k in seen[0]}
+    assert "x-session-key" in headers
+    assert "x-session-token" not in headers

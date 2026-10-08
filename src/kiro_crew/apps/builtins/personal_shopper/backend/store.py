@@ -19,11 +19,13 @@ import sqlite3
 import struct
 import threading
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew.apps.manager import app_data_dir
+from kiro_crew.owner_only_files import mkdirs_owner_only, prepare_owner_only_sqlite
 
 APP_NAME = "personal-shopper"
 
@@ -122,7 +124,8 @@ class PreferenceStore:
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or _default_db_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        mkdirs_owner_only(self.db_path.parent)
+        prepare_owner_only_sqlite(self.db_path)
         # One connection shared across the worker threads that `asyncio.to_thread`
         # hands route handlers, so every write goes through `_lock`: sqlite allows
         # a single writer, and the multi-statement FTS sync below must not
@@ -347,31 +350,38 @@ class PreferenceStore:
         match = _fts_query(query)
         if not match:
             return []
-        with self._lock:
-            rows = self._conn.execute(
+        results: list[SearchResult] = []
+        with self._lock, closing(
+            self._conn.execute(
                 "SELECT f.entry_id, p.text, p.tags, f.rank "
                 "FROM preferences_fts f JOIN preferences p ON p.id = f.entry_id "
-                "WHERE preferences_fts MATCH ? ORDER BY f.rank LIMIT ?",
-                (match, top_k * 3),  # over-fetch, tag filtering happens below
-            ).fetchall()
-
-        results: list[SearchResult] = []
-        for entry_id, text, tags_json, rank in rows:
-            tags = json.loads(tags_json)
-            if not self._matches_tags(tags, tag_filter):
-                continue
-            # bm25 rank is negative and unbounded; map it to a monotonic 0-1
-            # ordering signal. It is NOT a similarity, hence semantic=False.
-            results.append(
-                SearchResult(
-                    id=entry_id,
-                    text=text,
-                    tags=tags,
-                    score=1.0 / (1.0 + abs(float(rank))),
-                    semantic=False,
-                )
+                "WHERE preferences_fts MATCH ? ORDER BY f.rank",
+                (match,),
             )
-        return results[:top_k]
+        ) as rows:
+            # Count eligible results, not candidates from unrelated groups.
+            # Stream under the connection lock so a sparse filter does not
+            # materialize every matching preference in Python.
+            while len(results) < top_k:
+                row = rows.fetchone()
+                if row is None:
+                    break
+                entry_id, text, tags_json, rank = row
+                tags = json.loads(tags_json)
+                if not self._matches_tags(tags, tag_filter):
+                    continue
+                # bm25 rank is negative and unbounded; map it to a monotonic 0-1
+                # ordering signal. It is NOT a similarity, hence semantic=False.
+                results.append(
+                    SearchResult(
+                        id=entry_id,
+                        text=text,
+                        tags=tags,
+                        score=1.0 / (1.0 + abs(float(rank))),
+                        semantic=False,
+                    )
+                )
+        return results
 
     def _find_similar(self, text: str) -> SearchResult | None:
         """The existing entry *text* restates, or None.
@@ -399,7 +409,7 @@ class PreferenceStore:
         with that id to the second group.
 
         Same-name adds still return the original group instead of creating a
-        duplicate, which is the idempotency the slug used to provide for free.
+        duplicate, which is the idempotency a slug provides for free.
         Matching is case-insensitive on the trimmed name.
         """
         clean = name.strip()
@@ -443,7 +453,7 @@ class PreferenceStore:
                 if group_id in tags:
                     # Strip EVERY occurrence. list.remove drops only the first,
                     # so a preference tagged twice kept a tag pointing at a group
-                    # that no longer exists -- it then belongs to no visible group
+                    # that does not exist -- it then belongs to no visible group
                     # and is not "ungrouped" either, so it vanishes from the UI
                     # while still sitting in the database.
                     tags = [t for t in tags if t != group_id]

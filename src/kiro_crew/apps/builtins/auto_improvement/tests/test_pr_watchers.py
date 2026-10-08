@@ -154,7 +154,7 @@ def _await_status(
 
 
 def _await_gone(path: Path, timeout: float = WAIT_S) -> None:
-    """Poll until ``path`` no longer exists. Fails the test on timeout."""
+    """Poll until ``path`` is gone. Fails the test on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not path.exists():
@@ -399,7 +399,14 @@ class TestNudgeLoop:
             max_nudges=5,
             interval_s=0.0,
         )
-        snap = _await_status(reg, "fp-breach", {pr_watchers.STATUS_ERROR})
+        # `WAIT_S * 3`, the same allowance the exhausted-after-one-pass test below
+        # carries and for the same reason: reaching a verdict here is a real `git
+        # clone` plus a full loop pass plus the breach detection, and the default
+        # 10s is sized for one cheap poll. MEASURED as
+        # "watcher never reached {'error'}" on a Windows CI shard that had just run
+        # 12,366 tests. The ceiling is not a race to tune -- it only matters when
+        # the property is broken, so it is generous and still far under `--timeout`.
+        snap = _await_status(reg, "fp-breach", {pr_watchers.STATUS_ERROR}, timeout=WAIT_S * 3)
         assert "re-pointed" in snap["lastNote"]
         assert len(breaches) == 1  # stopped after the breaching pass, not 5 passes
         log = reg.get_log("fp-breach")
@@ -559,6 +566,109 @@ class TestRegistrySurface:
             time.sleep(0.02)
         assert not reg.is_alive("fp-a") and not reg.is_alive("fp-b")
 
+    def test_disable_then_enable_relaunches_a_live_watcher(self, loop: Any, scripted: Any) -> None:
+        """``stop_all`` (disable) then ``start`` (enable→reconcile) must run again.
+
+        ``stop_all`` marks a watcher ``stopped`` but leaves it in ``_watchers``, so
+        a disable followed by a reconcile (``reconcile_failing_prs`` →
+        ``_start_item`` → ``start``) must relaunch it rather than hand the stopped
+        entry back — a returned-but-dead entry lists the fp as ``started`` while no
+        thread runs, and the PR sits undriven until a gateway restart. ``start``
+        relaunches a disable-stopped watcher, so a fresh live thread exists.
+        """
+        scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
+        reg = _registry(loop, StubRunner())
+        pr_url = "https://github.com/owner/repo/pull/7"
+
+        reg.start(fp="fp-re", pr=pr_url, max_nudges=50, interval_s=0.05)
+        _await_status(reg, "fp-re", {pr_watchers.STATUS_NUDGING})
+        with reg._lock:
+            first_thread = reg._threads["fp-re"]
+
+        # Disable: exactly what the app-disable hook does.
+        assert reg.stop_all() == 1
+        deadline = time.monotonic() + WAIT_S
+        while reg.is_alive("fp-re") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not reg.is_alive("fp-re")
+        assert (reg.status("fp-re") or {})["status"] == pr_watchers.STATUS_STOPPED
+
+        # Enable→reconcile: the reconciler re-starts the same finding via _start_item,
+        # which calls start() with the same fp. This must relaunch, not no-op.
+        reg._start_item({"fp": "fp-re", "pr": pr_url})
+        _await_status(reg, "fp-re", {pr_watchers.STATUS_NUDGING})
+        assert reg.is_alive("fp-re"), "disable→enable left the watcher dead"
+        with reg._lock:
+            second_thread = reg._threads["fp-re"]
+        assert second_thread is not first_thread, "no fresh thread was launched"
+        reg.stop("fp-re")
+
+    def test_an_operator_stop_survives_the_next_reconcile(self, loop: Any, scripted: Any) -> None:
+        """``stop(fp)`` (operator, per PR) must NOT be undone by the next reconcile.
+
+        A disable (``stop_all``) and an operator stop (``POST /watchers/{fp}/stop``
+        → ``stop(fp)``) both leave ``STATUS_STOPPED`` with the same note, so status
+        alone cannot tell them apart. Only a disable should be re-driven by the next
+        ``reconcile_failing_prs`` sweep; an operator who stops one watcher expects it
+        to stay stopped. ``start`` keys the relaunch on ``stopped_by_disable`` — set
+        by ``stop_all`` and cleared by ``stop`` — so this operator stop holds.
+        """
+        scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
+        reg = _registry(loop, StubRunner())
+        pr_url = "https://github.com/owner/repo/pull/7"
+
+        reg.start(fp="fp-u", pr=pr_url, max_nudges=50, interval_s=0.05)
+        _await_status(reg, "fp-u", {pr_watchers.STATUS_NUDGING})
+
+        # Operator stop of this one watcher (not a disable).
+        assert reg.stop("fp-u") is True
+        deadline = time.monotonic() + WAIT_S
+        while reg.is_alive("fp-u") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not reg.is_alive("fp-u")
+        assert (reg.status("fp-u") or {})["status"] == pr_watchers.STATUS_STOPPED
+        with reg._lock:
+            assert reg._watchers["fp-u"].stopped_by_disable is False
+
+        # The next reconcile sweep re-files the still-red PR via _start_item →
+        # start(). The operator's stop must survive: no fresh thread is launched.
+        reg._start_item({"fp": "fp-u", "pr": pr_url})
+        # Give any (wrongly) launched thread time to come alive before asserting.
+        time.sleep(0.2)
+        assert not reg.is_alive("fp-u"), "user-stopped watcher was relaunched by reconcile"
+        assert (reg.status("fp-u") or {})["status"] == pr_watchers.STATUS_STOPPED
+
+    def test_a_disable_stopped_watcher_the_operator_stops_is_not_relaunched(
+        self, loop: Any, scripted: Any
+    ) -> None:
+        """A disable then an operator stop is an operator stop — not relaunchable.
+
+        ``stop_all`` sets ``stopped_by_disable``; a later ``stop(fp)`` clears it. So
+        a watcher stood down by a disable and then explicitly stopped by the operator
+        must not be re-driven by the next reconcile.
+        """
+        scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
+        reg = _registry(loop, StubRunner())
+        pr_url = "https://github.com/owner/repo/pull/7"
+
+        reg.start(fp="fp-d2", pr=pr_url, max_nudges=50, interval_s=0.05)
+        _await_status(reg, "fp-d2", {pr_watchers.STATUS_NUDGING})
+
+        assert reg.stop_all() == 1
+        with reg._lock:
+            assert reg._watchers["fp-d2"].stopped_by_disable is True
+        # Operator now stops it explicitly; this clears the disable marker.
+        assert reg.stop("fp-d2") is True
+        deadline = time.monotonic() + WAIT_S
+        while reg.is_alive("fp-d2") and time.monotonic() < deadline:
+            time.sleep(0.02)
+        with reg._lock:
+            assert reg._watchers["fp-d2"].stopped_by_disable is False
+
+        reg._start_item({"fp": "fp-d2", "pr": pr_url})
+        time.sleep(0.2)
+        assert not reg.is_alive("fp-d2"), "an operator stop after a disable was relaunched"
+
     def test_watcher_threads_are_daemon_threads(self, loop: Any, scripted: Any) -> None:
         """A 30-minute agent turn must never hold up gateway shutdown."""
         scripted.script.append(_status(pr_checks.VERDICT_PROGRESS))
@@ -588,9 +698,9 @@ class TestGitOutputDecoding:
     `git diff` prints the CONTENT of changed files, and repositories legitimately contain
     binary (a PNG fixture) or non-UTF-8 text (a latin-1 source). Under a strict decode the
     UnicodeDecodeError is raised inside ``subprocess.communicate``, so it is NOT something
-    callers can read off ``returncode`` as data: it propagated out of `_export_is_durable`,
-    past `_run_agent_pass`, and killed the whole watcher with STATUS_ERROR — every PR in a
-    repo containing one binary file. Regression for the strict-decode default.
+    callers can read off ``returncode`` as data: it propagates out of `_export_is_durable`,
+    past `_run_agent_pass`, and kills the whole watcher with STATUS_ERROR — every PR in a
+    repo containing one binary file. These pin the lenient decode that avoids it.
     """
 
     def _repo_with_binary(self, tmp_path: Path) -> Path:
@@ -693,6 +803,56 @@ class TestCloneLifecycleAndExport:
         # `finally` — so that is what this asserts.
         _await_gone(Path(reg._clone_dir("fp-export")))
 
+    def test_a_relaunch_does_not_overwrite_the_prior_patch(
+        self, loop: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A disable→enable relaunch must not reuse a patch name.
+
+        The relaunched watcher's pass counter restarts at 1, but the fingerprint is
+        stable and the clone that held the first pass's commits is already gone — so a
+        patch named by ``attempt`` alone would overwrite the only durable copy of the
+        earlier fix. ``start()`` seeds ``export_base`` from the prior incarnation's pass
+        count, and ``_export_fix`` offsets by it, so the second incarnation writes
+        ``nudge-2.diff`` beside the first's ``nudge-1.diff`` rather than over it.
+        """
+        monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "data")
+        shared = _tiny_repo(tmp_path)  # HEAD is on the feature branch, diff vs origin/main
+        reg = pr_watchers.PRWatcherRegistry(
+            loop=loop, autostart=False, isolate_clone=False, clones_root=str(tmp_path / "clones")
+        )
+
+        # First incarnation: a watcher that reached pass 1, exported, then a disable
+        # stood it down (STATUS_STOPPED, work durable so unexported_work stays False).
+        st1 = pr_watchers.WatcherState(
+            fp="fp-seq",
+            pr="https://github.com/owner/repo/pull/7",
+            base_ref="origin/main",
+            status=pr_watchers.STATUS_STOPPED,
+            stopped_by_disable=True,
+            nudges=1,
+        )
+        with reg._lock:
+            reg._watchers["fp-seq"] = st1
+        reg._export_fix(st1, str(shared), attempt=1)
+        first = store.pr_queue_dir() / "fp-seq.nudge-1.diff"
+        assert first.is_file(), "first incarnation did not export nudge-1"
+        first_text = first.read_text(encoding="utf-8")
+
+        # Enable→reconcile relaunches the same fingerprint; export_base carries forward.
+        st2 = reg.start(
+            fp="fp-seq", pr="https://github.com/owner/repo/pull/7", base_ref="origin/main"
+        )
+        assert st2 is not st1, "relaunch did not install a fresh state"
+        assert st2.export_base == 1, "export sequence base did not carry across relaunch"
+
+        # The relaunched watcher's pass 1 must write nudge-2, leaving nudge-1 intact.
+        reg._export_fix(st2, str(shared), attempt=1)
+        assert (
+            first.is_file() and first.read_text(encoding="utf-8") == first_text
+        ), "relaunch overwrote the prior incarnation's patch"
+        second = store.pr_queue_dir() / "fp-seq.nudge-2.diff"
+        assert second.is_file(), "relaunched pass 1 did not advance the on-disk sequence"
+
     def test_a_clone_failure_stops_the_watcher_without_an_agent_call(
         self, loop: Any, scripted: Any, tmp_path: Path
     ) -> None:
@@ -794,7 +954,13 @@ class TestCloneLifecycleAndExport:
             max_nudges=3,
             interval_s=0.0,
         )
-        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED})
+        # Three times the file-wide budget, named: this test runs a REAL clone and
+        # then three passes that are each several git subprocesses on Windows-speed
+        # process spawns, on a host shared with five other workers. One full run
+        # in five saw every pass complete ("pass 3/3") with only the exhausted
+        # transition still outstanding at WAIT_S -- a bounded wait asserting too
+        # early, not a stuck watcher.
+        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED}, timeout=WAIT_S * 3)
         assert marks == [False, True, True], "the clone must persist across passes"
 
 

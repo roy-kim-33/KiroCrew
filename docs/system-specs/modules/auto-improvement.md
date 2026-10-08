@@ -18,50 +18,83 @@ and every *proposal* is an agent: the agent writes candidate fixes, and the gate
 measurer, keeper, and PR pipeline decide what survives. The agent never grades its
 own work.
 
-Ported from an external app that targeted a proprietary code-review system; the
-port replaced that review service, its CLI, its build tooling, and its cookie auth
-with GitHub equivalents, and renamed the change-request vocabulary to pull request
-throughout.
+The app's origin as a port of an upstream app, and the design decisions the port
+made, are recorded in
+[`PORT_PLAN.md`](../../../src/kiro_crew/apps/builtins/auto_improvement/docs/PORT_PLAN.md).
 
 ## Routes
 
 All routes live under `/api/apps/auto-improvement/` and are registered by
 `apps/builtins/auto_improvement/backend/routes.py:register_routes`, mounted
 in-process on the gateway's own aiohttp app. Every handler is wrapped in
-`_require_enabled` (403 when the app is disabled).
+`_require_enabled` (403 when the app is disabled). The 17 routes marked `owner`
+also call `require_owner_dashboard_request` first: a dashboard subject that is
+not the owner, and any app token, gets 403 `owner_only`, and an allowed call
+writes an SEL row (`_audit_owner_route_allowed`, because the owner gate audits
+only its refusals).
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | liveness; echoes the app name |
-| GET | `/config` | current run configuration |
-| PUT | `/config` | update configuration (allowlisted keys only) |
-| GET | `/pr-status?url=&refresh=` | live PR status, CI checks, watcher verdict |
-| GET | `/ruler` | ruler calibration state |
-| GET | `/findings` | ledger entries, newest first |
-| POST | `/calibrate` | prove the ruler (Phase 1) before any improvement cycle |
-| GET | `/progress` | the cumulative-best staircase for the chart |
-| GET | `/events` | server-sent live run events |
-| GET | `/deps` | external tool availability (git / gh / ruff) |
-| POST | `/deps/install` | install the optional linter |
-| POST | `/draft-pr/{fp}` | draft a PR from an already-queued change |
-| GET | `/profiles` | every captured profiler frame tree |
-| GET | `/profile/{fp}` | one normalized frame tree (flame / sunburst) |
-| POST | `/findings/{fp}/forget` | mark purged so dedup lets it retry |
-| POST | `/findings/{fp}/purge` | forget and remove artifacts |
-| POST | `/findings/purge-dead` | sweep records that can never progress |
-| GET | `/watchers` | per-PR watcher sessions |
-| POST | `/watchers/{fp}/start` | start/re-attach a PR watcher |
-| POST | `/watchers/{fp}/stop` | stop a watcher after its current pass |
-| GET | `/watchers/{fp}/log` | what a watcher has done (`?since=` tails) |
-| GET | `/sessions` | every linked chat-session record |
-| GET | `/sessions/{key}` | one session record |
-| PUT | `/sessions/{key}` | link/update a session (drives resume) |
-| DELETE | `/sessions/{key}` | forget a session link |
+`_require_enabled` closes the API, not the work. `register_routes` therefore stands
+both in-process workers down on both ways the app can be switched off: `on_cleanup`
+hooks for gateway shutdown (`_stop_watchers`, `_stop_run`), and an `apps.teardown`
+`register_app_disable_hook` for the operator disabling the app. Without the second,
+a disable leaves the routes answering 403 while a watcher keeps running agent turns
+in per-PR clones and an in-flight run keeps the clone lock and keeps spending
+budget. The disable hook fires inside the disable request, before the `enabled` flag
+is written, so both are signalled at the click rather than at the next sweep, and
+each is error-contained separately — the shutdown path gets that from holding two
+hooks, the disable path has to spell it out.
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| GET | `/health` | enabled | liveness; echoes the app name |
+| GET | `/config` | enabled | current run configuration |
+| PUT | `/config` | owner | update configuration (allowlisted keys only) |
+| POST | `/setup-clone` | owner | clone or re-point the working repository the run operates on |
+| GET | `/branches` | enabled | branches available in that clone, for choosing a base |
+| GET | `/pr-status?url=&refresh=` | owner | live PR status, CI checks, watcher verdict |
+| POST | `/run` | owner | start an improvement run |
+| GET | `/run` | enabled | the in-flight run's state |
+| POST | `/run/stop` | owner | wind down the in-flight run |
+| GET | `/ruler` | enabled | ruler calibration state |
+| GET | `/findings` | enabled | ledger entries, newest first |
+| GET | `/findings/{fp}` | enabled | one ledger entry in full |
+| POST | `/findings/{fp}/commit` | owner | commit an accepted change from the ledger |
+| POST | `/calibrate` | owner | prove the ruler (Phase 1) before any improvement cycle |
+| GET | `/progress` | enabled | the cumulative-best staircase for the chart |
+| GET | `/events` | enabled | server-sent live run events |
+| GET | `/deps` | enabled | external tool availability (git / gh / ruff) |
+| POST | `/deps/install` | owner | install the optional linter |
+| POST | `/draft-pr/{fp}` | owner | draft a PR from an already-queued change |
+| GET | `/profiles` | enabled | every captured profiler frame tree |
+| GET | `/profile/{fp}` | enabled | one normalized frame tree (flame / sunburst) |
+| POST | `/findings/{fp}/forget` | owner | mark purged so dedup lets it retry |
+| POST | `/findings/{fp}/purge` | owner | forget and remove artifacts |
+| POST | `/findings/purge-dead` | owner | sweep records that can never progress |
+| GET | `/watchers` | owner | per-PR watcher sessions |
+| POST | `/watchers/{fp}/start` | owner | start/re-attach a PR watcher |
+| POST | `/watchers/{fp}/stop` | owner | stop a watcher after its current pass |
+| GET | `/watchers/{fp}/log` | enabled | what a watcher has done (`?since=` tails) |
+| GET | `/sessions` | enabled | every linked chat-session record |
+| GET | `/sessions/{key}` | enabled | one session record |
+| PUT | `/sessions/{key}` | owner | link/update a session (drives resume) |
+| DELETE | `/sessions/{key}` | owner | forget a session link |
+
+`register_routes` mounts exactly these 32 routes. No test asserts the mounted set
+against this table, so an added endpoint has to be added here by hand in the same
+change. Beside the routes, `register_routes` appends three gateway lifecycle
+hooks: `_bind_watcher_loop` on startup (it binds the watcher registry to the
+gateway loop and attaches the crew runtime), and `_stop_watchers` and `_stop_run`
+on cleanup; it also registers `_stop_on_disable` as the app-disable hook (above). `app.json` also declares `backend.hooks` `on_startup` and
+`on_shutdown`, both in `backend/crew.py`.
 
 `PUT /config` is an **allowlist**, not a merge. `clone` and `target_url` are
 deliberately excluded: they decide which repository the agent is turned loose on,
 so they cannot be changed through the generic config endpoint. Rejected keys are
 echoed back in `rejected` rather than silently dropped.
+
+**Pinned invariants.**
+
+- `POST /setup-clone`'s success path is exercised end to end, asserting the persisted config, not only the 200. (D-82)
 
 ## PR status and the watcher verdict
 
@@ -75,15 +108,24 @@ It reduces a PR to one of three verdicts the watcher loop switches on:
 | Verdict | Meaning |
 |---|---|
 | `READY` | merged, or green checks + no conflicts + no open threads |
-| `PROGRESS` | failing required checks, conflicts, open threads, or pending checks |
-| `BLOCKED` | closed unmerged, or something code edits cannot fix |
+| `PROGRESS` | failing required checks, conflicts, open threads, pending checks, or mergeability not yet known |
+| `BLOCKED` | closed without merging — the only `BLOCKED` path |
 
-Precedence is deliberate: **failing checks beat a clean mergeable flag**, and the
-function is fail-safe toward `PROGRESS` — declaring an unfinished PR ready ends
-the watcher early, which is the expensive mistake; an extra cycle is cheap.
+`derive_verdict` checks in this order: merged (`READY`), closed (`BLOCKED`),
+failing checks, conflicting, unresolved threads, pending checks, unknown
+mergeability (each `PROGRESS`), else `READY`. So **failing checks beat a clean
+mergeable flag**, and the function is fail-safe toward `PROGRESS` — declaring an
+unfinished PR ready ends the watcher early, which is the expensive mistake; an
+extra cycle is cheap. A PR status that cannot be read is not a verdict at all:
+the watcher logs it, waits and reads again, and the pass still counts against
+its budget, so a provider that stays down ends the watcher.
 
 Checks that set `allow_failure` (GitLab's advisory opt-out) are counted separately
 and never drive the verdict, or one flaky optional job would nudge forever.
+
+**Pinned invariants.**
+
+- `auto_publish_gate` reads `unresolvedThreads`, counted from `resolvable` + `resolved`, so an unresolved review thread blocks auto-publish. (D-108)
 
 ## Safety controls
 
@@ -97,11 +139,11 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Do-not-pollute gate | `spine/pollute.py` | host state hashed before/after; drift blocks the run |
 | Second reproduce | `spine/pr_pipeline.py` | an independent A/B must confirm before a PR is drafted |
 | Pre-push review gate | `spine/driver.py:_prepush_review_clean` | optional, fail-closed; an unfounded "clean" cannot pass it |
-| Tool-request gate | `spine/agent_runner.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED (it used to be accepted and dropped), and state-mutating shell verbs are refused even when Bash is allowed |
+| Tool-request gate | `spine/agent_runner.py:_tool_permitted` + `shell_command_refusal` | the caller's `allowed_tools` is ENFORCED, and state-mutating shell verbs are refused even when Bash is allowed |
 | Audit-or-deny approval | `spine/agent_runner.py:_approve` | the unattended auto-approve is logged to the SEL with `critical=True` **before** it is granted; an unwritable audit REJECTS the tool |
 | Audited MCP dispatch | `backend/mcp_server.py:_audit` | every `tools/call` is logged, rejected ones included; the pre-dispatch `invoked` event is `critical=True` (audit-or-DENY — an unauditable call is refused), outcome events stay fail-soft since the handler has already run |
 | Redacted evidence | `backend/routes.py:_redact_for_display` / `_redact_tree` | EVERY agent-authored field served to the browser is scanned — diff, PR body, and the candidate's signature/hypothesis/evidence/severity/blast-radius, plus the gate tree recursively; **fail-closed** |
-| Sandboxed fallback agent (NOT SELECTED) | `spine/agent_runner.py:_spawn_sandboxed_agent` | nothing selects this path any more — both selection sites go offline/refuse instead (see "Why the subprocess fallback is sandboxed rather than deleted"). Retained hardening, for any future caller: it runs through `sandboxed_spawn_argv(mode="strict")` + `popen_limited` (post-exec resource ceiling): worktree visible, credential dirs bind-mounted empty, env scrubbed, `PYTHONPATH` stripped. Hides credentials; does NOT confine writes — see "Known limitation" below |
+| Sandboxed fallback agent (NOT SELECTED) | `spine/agent_runner.py:_spawn_sandboxed_agent` | nothing selects this path — both selection sites go offline/refuse instead (see "The subprocess AgentRunner is not selected"). Retained hardening, for any future caller: it runs through `sandboxed_spawn_argv(mode="strict")` + `popen_limited` (post-exec resource ceiling): worktree visible, credential dirs bind-mounted empty, env scrubbed, `PYTHONPATH` stripped. Hides credentials; does NOT confine writes — see "Known limitation: the sandbox hides credentials, it does not confine WRITES" below |
 | Pre-push content scan | `spine/push_policy.py:scan_content_for_secrets` | ONE scanner behind all three exits — draft-PR push, F10 direct push, one-click commit. The full pushed range is scanned; a hit **refuses** the push and the change stays in the local queue; **fail-closed** |
 | Audited subprocess agent (NOT SELECTED) | `spine/agent_runner.py:_audit_unattended_agent` | same — retained for a future caller. The `claude -p` path passes `--dangerously-skip-permissions`, so the launch is one blanket approval — logged `critical=True` before the spawn, and an unwritable audit REFUSES to launch |
 | Redacted PR prose | same, `_redact_prose` | title and description are redacted (prose survives rewriting; a diff does not) |
@@ -148,110 +190,81 @@ and history remain agent-writable, while trusted publishing is contained by
 protected-branch policy, content scanning, final repository-config validation,
 and explicit config-held push destinations.
 
+**Pinned invariants.**
+
+- `setup_isolated_clone` removes the clone and returns an error when the PR head-branch checkout fails, so a watcher never works on the base tree. (D-87)
+
 ### Why the unattended runner consults the platform governance gate
 
 `SessionAgentRunner` auto-approves the provider's permission requests at its OWN gate (an
-app-local allowlist + the shell denylist). That gate alone was NOT enough: it never routed
-the pending call through the platform's `hooks.on_tool_call` chokepoint, so the enterprise
-governance PROFILE ceiling, the builtin denied-command rules, and the `~/.aws`/`~/.ssh`
-sensitive-path blocks were all silently inert on this path. The agent is UNATTENDED and its
-prompt embeds outsider-writable PR-comment text, so an injected instruction could drive an
-auto-approved call the central gate would deny (e.g. a credential-path read). Every request
-now passes through the same `HookManager` the dashboard and Slack paths use, BEFORE the
-app-local checks, and a platform `deny` refuses the call; the app-local allowlist/denylist
-remains as an additional restriction on top. FAIL-CLOSED on a broken hook layer: an earlier
-revision failed open, reasoning it was a second gate stacked on the app-local one, but the
-platform gate is the only thing that carries the enterprise ceiling, `BUILTIN_DENIED_RULES`
-and the `~/.aws`/`~/.ssh` path blocks — so failing open silently dropped exactly the checks
-the app-local list does not make. Raised by the Arbiter's long-term review of this branch.
+app-local allowlist + the shell denylist). That gate alone is not enough: the enterprise
+governance PROFILE ceiling, the builtin denied-command rules and the `~/.aws`/`~/.ssh`
+sensitive-path blocks live only in the platform's `hooks.on_tool_call` chokepoint. The agent is
+UNATTENDED and its prompt embeds outsider-writable PR-comment text, so an injected instruction
+could otherwise drive an auto-approved call the central gate would deny (e.g. a credential-path
+read). Every request therefore passes through the same `HookManager` the dashboard and Slack
+paths use, BEFORE the app-local checks, and a platform `deny` refuses the call; the app-local
+allowlist/denylist remains an additional restriction on top. The hook layer fails CLOSED:
+the platform gate is the only thing that carries the enterprise ceiling,
+`BUILTIN_DENIED_RULES` and the `~/.aws`/`~/.ssh` path blocks, so failing open would drop exactly
+the checks the app-local list does not make.
 
-### Why the subprocess fallback is sandboxed rather than deleted
+**Pinned invariants.**
 
-Review asked for `AgentRunner` (the `claude -p` fallback) to be removed outright, on the
-grounds that its unattended Bash tool escapes the provider sandbox. The concern was right;
-the remedy would have turned "no in-process provider configured" from *degraded but
-functional* into *silently does nothing*. Routing the spawn through the same chokepoint the
-gate's test execution uses answers it directly — a malicious repository prompt can no
-longer reach credentials outside the worktree — while keeping the path that works.
+- `SessionAgentRunner._run_async` consults `hooks.on_tool_call` BEFORE the app-local checks and refuses on a platform deny (a `~/.aws/credentials` read is denied, a benign read is not); a structural test pins the order. (D-32)
+- A broken or unavailable `hooks.on_tool_call` layer DENIES the unattended tool rather than authorizing it. (D-37)
+- `_governance_denial` builds its hooks config with the keystone `denied_commands.json` overlay (`hooks_config_from_config_dict`) and reads the event's own shell flag, keeping the command-derived signal only as a fallback. (D-93)
+- `_credentials_are_unconfined()` requires an effective `strict` sandbox mode before the runner is built, unless `acceptUnsandboxedAgentRisk` is exactly `true`; an unreadable config fails closed and leaves the loop offline. (D-137)
 
-Review asked repeatedly for the fallback to be deleted outright, each time citing the
-unattended Bash tool — and one instance of that concern was CORRECT and is now fixed: an
-exported `GITHUB_TOKEN` did reach the agent even after the spawn was sandboxed, because
-`kiro_crew.sandbox.scrub_env` covers `AWS_SECRET`/`SLACK_*`/`TELEGRAM_*` but not `GITHUB_*`.
-Measured on the author's host: the child printed the real token. The spawn now strips
-credential-*shaped* names (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`, `*CREDENTIAL*`)
-after the sandbox builds the env, matching what the gate already did — the two places
-untrusted content executes. Re-measured: absent, with `PATH` intact.
+### The subprocess AgentRunner is not selected
 
-One later framing of this request asked for the spawn to be routed through `AcpClient._spawn()`
-/ the provider helpers instead. An earlier revision of this section called that "not
-implementable", on the grounds that `SessionAgentRunner.available()` is
-`cfg.create_provider_factory() is not None` and `_build_runner` only reaches `AgentRunner` when
-that returned `None` — so the provider path would require the very provider whose absence
-selected the branch.
+`AgentRunner` (the `claude -p` subprocess runner) is a class nothing constructs.
+Both selection sites refuse instead of falling back to it: `runner._build_runner`
+returns `None` (offline) and `pr_watchers._make_runner` raises, which
+`_run_watcher` turns into `STATUS_ERROR` on that watcher — a failed pass, not a
+dead gateway. That covers a provider whose `ensure_agent_registered()` fails as
+well as no provider at all. Shelling out there would run an unattended agent with
+`--dangerously-skip-permissions`, outside the provider's permission gate, exactly
+when the platform is unhealthy. Both sites' selection paths are pinned by tests.
 
-**That was only true of one of the two branches, and the review was right.** `_build_runner`
-also fell through to `AgentRunner` when a provider WAS available but
-`ensure_agent_registered()` failed — measured: `available()` True + `ensure_agent_registered()`
-False returned `AgentRunner`. In that state a provider exists and its permission gate was
-being bypassed anyway, which is exactly what the objection described. A registration failure
-now returns `None` (offline) instead. The fallback is reached only when there is genuinely no
-provider to route through, which is the narrow case its rationale always claimed.
+`SessionAgentRunner.available()` is `cfg.create_provider_factory() is not None`,
+and `create_provider_factory` never returns `None`; `available()` is False only
+when the config load or the factory raises, which is a broken install rather than
+an unconfigured one. So no working configuration loses its fix author.
 
-There are **two** such selection sites, and fixing one is not enough: `pr_watchers._make_runner`
-had the identical fall-through, and the review finding moved straight from `runner.py` to
-`pr_watchers.py` the moment the first was closed. That site RAISES rather than returning `None`
-(its contract — see the "no agent runner available" exit), and `_run_watcher` turns the raise
-into `STATUS_ERROR` on that watcher, so it is a failed pass rather than a dead gateway. Both
-sites' four selection paths are pinned by tests.
+The class keeps its hardening for any future caller that routes it properly:
 
-The other half the request pointed at — that only the blanket launch was audited — is fixed
-separately; see "Why the subprocess fallback audits every tool it uses".
+- **Strict sandbox.** The spawn runs through `sandboxed_spawn_argv(mode="strict")`
+  plus `popen_limited`. `standard` leaves `~/.aws` readable so a test suite can use
+  the AWS CLI, which is right for the gate's `_run` and wrong for a fix-authoring
+  agent that needs no credentials; under `strict` the child sees no `~/.aws`
+  entries. `TestFallbackAgentCannotSeeCredentials` pins the mode rather than the
+  filesystem, so it stays meaningful on a host without user namespaces.
+- **Credential-shaped env names stripped.** `kiro_crew.sandbox.scrub_env` does not
+  cover `GITHUB_*`, so after the sandbox builds the env the spawn also strips
+  credential-shaped names (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*API_KEY*`,
+  `*CREDENTIAL*`) through `push_policy.strip_credential_env`, the same filter the
+  gate uses, with `PATH` kept.
+- **Per-tool audit.** See "Why the subprocess fallback audits every tool it uses".
 
-**RESOLVED: the fallback selection is REMOVED, and the review was right.** The argument for
-keeping it was that it is "the ONLY path that authors fixes when no in-process provider is
-configured" — so deleting it would turn a working configuration into one that appears to run
-and produces nothing. That premise does not hold. `SessionAgentRunner.available()` is
-`cfg.create_provider_factory() is not None`, and `create_provider_factory` has exactly two
-returns (`AcpProvider(...)` and `_acp`) and **never returns None** — verified by inspecting its
-source. So `available()` is False only when the config load or the factory RAISES: a broken
-install, not an unconfigured one. The state the fallback existed to serve cannot occur.
+The spawn lives in its own uniquely named method, `_spawn_sandboxed_agent`,
+because `test_spawn_audit` keys findings by `file::function` and this module has
+two `run` methods (`AgentRunner` and `SessionAgentRunner`); inline, the spawn would
+be attributed to the wrong one and reported as unrouted.
 
-And in the state that CAN reach it, shelling out is the wrong answer: running an unattended
-agent with `--dangerously-skip-permissions`, outside the provider's permission gate, precisely
-when the platform is unhealthy. Both selection sites (`runner._build_runner` and
-`pr_watchers._make_runner`) now go OFFLINE / refuse instead. The `AgentRunner` CLASS is kept —
-it is still the sandboxed, per-tool-audited implementation a future caller could route properly
-— but nothing selects it.
+**Pinned invariants.**
 
-Worth recording how this was reached, since it took many rounds: the objection was declined
-repeatedly on reasoning that turned out to cover only part of the code path (two fall-through
-holes were real and are fixed above), and the final premise was falsified only by reading
-`create_provider_factory` instead of trusting the docstring. The sandbox hardening described
-below still applies to the class and remains the right defence for any future caller.
-
-**STRICT mode, not the default.** `standard` deliberately leaves `~/.aws` readable so a
-test suite can use the AWS CLI — appropriate for the gate's `_run`, wrong for a
-fix-authoring agent that needs no credentials and runs with
-`--dangerously-skip-permissions`. Measured on the author's host: under `standard` the child
-saw all 7 `~/.aws` entries; under `strict`, 0. `TestFallbackAgentCannotSeeCredentials` pins
-the mode rather than re-measuring the filesystem, so it stays meaningful on a host where
-user namespaces are unavailable.
-
-The spawn lives in its own uniquely-named method for a mechanical reason worth recording:
-`test_spawn_audit` keys findings by `file::function`, and this module has TWO `run`
-methods (`AgentRunner` and `SessionAgentRunner`). Inline, the sandboxed spawn was
-attributed to the wrong one and reported as unrouted — the audit that guarantees every
-agent-influenced spawn is sandboxed was being defeated by a name collision.
+- `runner._build_runner` returns `None` (offline) when `ensure_agent_registered()` fails; it never falls through to `AgentRunner`. (D-59)
+- `pr_watchers._make_runner` RAISES on the same fall-through, and `_run_watcher` turns it into `STATUS_ERROR`; all four selection paths are pinned for both sites. (D-60)
+- Neither selection site selects the subprocess fallback; `AgentRunner` is kept only for a future caller. (D-62)
 
 ### Detect-and-refuse vs redact
 
 There are **three** ways content leaves this app — the draft-PR push, the F10 direct
 push, and the operator's one-click commit — and they share one scanner in
-`spine/push_policy.py`. That is deliberate: a credential gate guarding only some of the
-exits is not a gate, and the first pass at this shipped exactly that bug (the PR path was
-scanned, the other two were not). `TestEveryPushPathScansContent` asserts structurally
-that each path delegates rather than keeping its own copy.
+`spine/push_policy.py`. A credential gate guarding only some of the exits is not a gate.
+`TestEveryPushPathScansContent` asserts structurally that each path delegates rather than
+keeping its own copy.
 
 The push scan **detects and refuses**; it never rewrites. Redacting a code diff would
 corrupt the very fix the gate just proved, so a credential hit sends the change to the
@@ -264,24 +277,30 @@ written as UTF-8 by the GitHub recipe, the direct-commit fallback, and the dry-r
 Candidate content is arbitrary Unicode, so the durable queue must not depend on the host's
 legacy Windows code page.
 
-Note the two distinct failure modes for prose, which the first version conflated. "Scanned,
-and it had a hit" is redacted and ships. "Could not scan at all" is **not** the same thing,
-and it now raises `ProseRedactionUnavailable` so `draft()` degrades to the queue instead of
-calling `gh pr create`. That path used to return the text unscanned, reasoning that the diff
-beside it had already passed a fail-closed scan and the PR is only a draft. The reasoning
-does not survive scrutiny: the prose is a separate artifact from the diff, it is the part
-the agent wrote most freely, and a published PR description cannot be un-published — it
-persists in the API's edit history even after an edit. Every other egress path in this app
-already fails closed (`mcp_server._redact_result`, `routes._redact_for_display`); this was
-the one that did not. The queue copy is still written from the raw text, because it never
-leaves the host and a human needs to see what the agent actually wrote.
+Prose has two distinct failure modes. "Scanned, and it had a hit" is redacted and ships.
+"Could not scan at all" raises `ProseRedactionUnavailable`, so `draft()` degrades to the queue
+instead of calling `gh pr create`. The prose is a separate artifact from the diff, it is the part
+the agent wrote most freely, and a published PR description cannot be un-published — it persists
+in the API's edit history even after an edit — so this path fails closed like every other egress
+path in the app (`mcp_server._redact_result`, `routes._redact_for_display`). The queue copy is
+still written from the raw text, because it never leaves the host and a human needs to see what
+the agent actually wrote.
 
 The direct-push scan diffs `HEAD~1..HEAD` — the verified commit — NOT `<branch>..HEAD`: the
 commit sits on the tip of that local branch, so a branch-vs-HEAD diff is EMPTY and the
-fail-closed scan would pass on 0 bytes, a blind gate. This regressed when the branch checkout
-moved to the local name (see the multi-cycle-detach fix) and was caught by review; measured
-against a real repo, a commit adding an AWS key gave a 0-byte `<branch>..HEAD` diff and a
-144-byte `HEAD~1..HEAD` diff.
+fail-closed scan would pass on 0 bytes, a blind gate.
+
+**Pinned invariants.**
+
+- A prose redactor that RAISES degrades `draft()` to `QUEUED:<fp>` with `gh` never invoked; the queue copy is still written. (D-17)
+- Every reader of run evidence redacts its whole payload with `_redact_tree`, the progress series and the finding-detail `run`/gate blocks included, and the reader sweep enumerates every reader so a new one cannot be added unscanned (`TestEveryReaderOfRunEvidenceRedacts`). (D-19)
+- `commit._commit_message` and `Driver._redact_commit_message` fall back to a fixed prose-free subject when the redactor errors, never committing unscanned agent text. (D-38)
+- `runner._redact_activity` and `pr_watchers._redact` fail CLOSED, substituting a fixed placeholder for an unscannable string, because each is the only pass before the browser. (D-58)
+- Provisional commit messages are fixed text with no model-chosen `cand_id`, because a pushed message cannot be redacted afterwards; the id stays in the archive and ledger. (D-69)
+- Every exception-derived run error (`_state.error`) is redacted before the browser; the numeric canary message is the one marked `redaction-exempt`, and the structural guard excludes `_fail` by source range. (D-81)
+- Watcher `as_dict()` snapshots and the chat-session list/get/save responses are redacted before the browser. (D-92)
+- The commit route and both draft paths redact git-derived `error` text before the browser; a structural guard keyed on `.get("error")` catches a reintroduction. (D-102)
+- `GET /profile/{fp}` and `GET /profiles` redact the profiler frame tree with `_redact_tree`, and the reader sweep requires the call form `redactor(`. (D-122)
 
 ### Why the watcher keeps its shell
 
@@ -291,16 +310,17 @@ its prompt is built from PR-comment text an outsider can write, and it runs agai
 authenticated `gh`. The prompt fences that text as untrusted DATA, but a fence the model
 must choose to obey is not a control.
 
-Review proposed removing Bash for watchers. That would break the feature — the watcher's
-task is literally "run the repo's build, test and lint commands, find the root cause, and
-fix it". So the shell stays and the **verbs** are denied: `git push`,
-`gh pr merge`/`ready`/`close`, `gh api`, `gh auth`, `gh secret`, `gh workflow run`,
-`curl`/`wget`, `ssh`/`scp`. The repo's own `is_sensitive_bash_command` was checked first and
-does not cover this — it allows `gh pr merge`.
+Removing Bash for watchers would break the feature — the watcher's task is "run the repo's
+build, test and lint commands, find the root cause, and fix it". So the shell stays and the
+**verbs** are denied. The source of truth is `spine/agent_runner.py` `_FORBIDDEN_SUBCOMMANDS`
+and `_FORBIDDEN_BINARIES`; they cover, among others, `git push` and `git remote set-url`,
+`gh pr merge`/`ready`/`close`/`comment`/`review`/`edit`/`create`, every `gh issue` and
+`gh release` verb, `gh api`, `gh auth`, `gh secret`, `gh workflow run`, and the
+`curl`/`wget`/`nc`/`ncat`/`netcat`/`ssh`/`scp`/`sftp`/`telnet` binaries. The repo's own
+`is_sensitive_bash_command` does not cover this — it allows `gh pr merge`.
 
 **What that leaves un-confined, stated plainly.** The denylist gates the command a request
-ASKS for, not what that command then does, so it is a first barrier and not a boundary.
-Re-measured after review raised this a second time:
+ASKS for, not what that command then does, so it is a first barrier and not a boundary:
 
 * **Credentials ARE confined.** Under `sandboxed_spawn_argv(mode="strict")` a NESTED process
   sees `~/.aws`, `~/.config/gh` and `~/.docker` as empty on a host where they are populated,
@@ -311,17 +331,19 @@ Re-measured after review raised this a second time:
   commands need reachable networking. `curl`/`wget`/`nc` are denied, but `python helper.py` is
   allowed and can open a socket.
 
-**Watchers are therefore OPT-IN.** An earlier revision of this section called the residual
-risk operator-accepted — which was wrong, because nothing required an operator action:
-`GET /watchers` ran `reconcile_failing_prs(force=True)`, so merely READING the watcher list
-started a shell-capable agent for every filed pull request whose checks had gone red. There
-was no consent moment to point at. Promotion now requires `watcherAutoStart` (default OFF,
-same shape as `autoPublish`), so a GET is read-only and the self-healing loop is something an
-operator switches on deliberately. Orphan-clone reclamation still runs either way — it only
-deletes scratch directories and starts nothing.
+**Watchers therefore need two operator consents, both default OFF.**
 
-So the operating rule is: **turn `watcherAutoStart` on only for repositories whose
-pull-request comments you would be willing to execute.** Closing this properly needs a network-isolating
+- `watcherAcceptEgressRisk` must be exactly `true`, or every watcher runner build is
+  refused (`pr_watchers._make_runner`, read fresh on each build), including a manual
+  `POST /watchers/{fp}/start`. It acknowledges that an unattended agent driven by
+  PR-comment text can reach the network with the host's credentials.
+- `watcherAutoStart` gates promotion only: without it, `GET /watchers` stays read-only and
+  starts nothing, so the self-healing loop is something an operator switches on
+  deliberately (same shape as `autoPublish`). Orphan-clone reclamation runs either way — it
+  only deletes scratch directories.
+
+So the operating rule is: **turn these on only for repositories whose pull-request comments
+you would be willing to execute.** Closing this properly needs a network-isolating
 sandbox primitive at the platform layer, which is a change to shared infrastructure and not
 something this app should grow privately. Recorded at the `security_posture` disclosure sink
 so it appears in the posture snapshot rather than only here, and pinned by
@@ -340,83 +362,107 @@ Two asymmetries worth keeping straight:
   because a new entry that caught one would break the watcher while looking like a
   hardening.
 
-### Why the approval audit is `critical` but the MCP audit is not
+**Pinned invariants.**
 
-Both are audit points on the same app, deliberately with opposite failure modes.
+- The `gh` denylist refuses every publishing verb (`pr comment`/`review`/`edit`/`create`, `issue comment`/`create`/`edit`/`close`) through every evasion form; the app's own draft PR builds its argv directly and never passes the denylist. (D-73)
+- A watcher pass whose work was not exported durably keeps its isolated clone (`_export_is_durable`), and the orphan sweep still reclaims a genuine orphan. (D-83)
+- The watcher keeps `Bash`; its credentials are confined by `strip_credential_env` (GH tokens) plus `sandboxed_spawn_argv(mode="strict")` hiding `~/.config/gh`. (D-84)
+- `_export_is_durable` treats a FAILING diff as "cannot tell" and retains the clone; only an artifact or a succeeding empty diff counts as durable. (D-100)
+- The watcher's network-egress limit is disclosed at the `security_posture` sink, and four tests pin the half that is enforced. (D-105)
+- `GET /watchers` promotes watchers only with `watcherAutoStart`; orphan-clone reclamation runs either way. (D-107)
+- `_export_is_durable` also checks the tree for UNCOMMITTED work, so a watcher's uncommitted fix is not deleted as if exported. (D-114)
+- No watcher runner is built unless `watcherAcceptEgressRisk` is exactly `true`, read fresh on every build. (D-118)
+- The orphan-clone sweep re-checks ownership at the point of deletion (`_delete_clone_if_unowned`), so a clone registered mid-sweep is spared. (D-119)
+- `_delete_clone_if_unowned` holds `reg._lock` across both the ownership check and the `rmtree`. (D-121)
+- Every exit from `_run_agent_pass`, the exception and timed-out paths included, checks `_export_is_durable`. (D-136)
+
+### Why the approval audit is `critical`
+
 The loop's auto-approve is unconditional and unattended, so the SEL entry is the
-only record that a tool ran at all — losing it loses the event, and the tool is
-therefore refused when the log cannot be written. The MCP tools only ever *read*
-on-disk run artifacts, so refusing to answer `get_status` because the audit file is
-unwritable would trade a real capability for no security gain; that path notes the
-failure on stderr (never stdout — that is the JSON-RPC channel) and answers.
+only record that a tool ran at all. Losing it loses the event, so the tool is
+refused when the log cannot be written. The MCP dispatch follows the same
+audit-or-deny rule for the same reason; see "Why the MCP dispatch is audited
+before the handler runs".
 
 ### Why BOTH urls, not just the push url
 
 `git push --push` is honored only when the caller pushes **by remote name**.
 `git push "$(git remote get-url origin)" HEAD` ignores the push url entirely and writes to
 the fetch url — and the loop's agent runs auto-approved Bash *inside this clone*, so a
-repository instruction could do exactly that. Measured against a local bare repo before
-fixing: pushing by name was refused, pushing to the fetch url landed a new branch
-upstream. Disabling one url made `push_disabled` report true for a clone that could still
-write to the remote.
+repository instruction could do exactly that: with only the push url disabled, pushing by
+name is refused while pushing to the fetch url lands a new branch upstream, and
+`push_disabled` would report true for a clone that can still write to the remote.
 
 Both urls are therefore neutralized, and `_ok` verifies both before reporting success. The
 real remote is carried in config as `origin_url` — deliberately NOT in `_CONFIG_WRITABLE`,
 since like `clone`/`target_url` it decides where a push can land — and handed explicitly to
 the three trusted publishers (PR-draft recipe, F10 direct push, one-click commit). Each
-still falls back to reading the clone's remote, which now yields the sentinel and is
+still falls back to reading the clone's remote, which yields the sentinel and is
 refused: an older config degrades to "queued locally", never to an unguarded push.
 
-### Why the stored push destination is host-validated
+**Pinned invariants.**
+
+- `RepoIsolation.push_disabled()` checks BOTH urls, matching `clone_setup._ok`: a push-only-disabled clone reports False. (D-33)
+
+### Why the stored push destination is pinned to the validated repository
 
 ``resolve_origin_url`` is the single place the push destination is resolved for all three
 exits — the draft-PR push, the F10 direct push and one-click commit — so whatever it returns
-is where a verified change goes. It returned ``origin_url`` **verbatim** and re-validated only
-the legacy ``target_url`` fallback, which made its own docstring's promise ("a hand-edited
-``target_url`` cannot smuggle in an arbitrary push destination") false for the preferred path.
-Measured: ``{"origin_url": "https://attacker.example.com/exfil.git"}`` came back unchanged,
-while the identical string under ``target_url`` was correctly refused.
+is where a verified change goes. It never returns a stored ``origin_url`` verbatim; every
+caller treats ``""`` as "no push target", so each refusal below fails closed.
 
-The obvious fix — re-run ``validate_target_url`` on both keys — does not work, and measuring
-caught it: that helper accepts only ``https://`` INPUT, but ``setup_safe_clone`` persists
-``spec.clone_url``, which is the SSH form ``git@github.com:owner/repo.git`` whenever ``gh``
-prefers ssh. Re-validating would have refused every ssh-configured install's own remote and
-degraded it to queue-only (it broke 3 existing tests immediately).
+1. **Host allowlist.** The network host must match exactly, never by ``endswith`` —
+   ``evilgithub.com`` and ``github.com.attacker.net`` both fail. ``http://`` and ``git://``
+   are refused because cleartext is never this app's push transport, and the
+   ``DISABLED_NO_PUSH`` sentinel is refused because it is a marker rather than a
+   destination. ``validate_target_url`` cannot be reused for this check: it accepts only
+   ``https://`` input, while ``setup_safe_clone`` stores the SSH form
+   ``git@github.com:owner/repo.git`` whenever ``gh`` prefers ssh.
+2. **Repository identity.** ``github.com`` is itself an allowed host, so the host alone
+   would let an edited ``config.json`` keep the host and swap the path. A network
+   ``origin_url`` must therefore name the same ``owner/repo`` as the validated
+   ``target_url``, compared transport-agnostically through ``_remote_slug``. When the two
+   differ, or ``target_url`` is missing or does not validate, there is no push target.
+3. **Local paths stay allowed.** ``/tmp/x.git`` and ``file://`` have no network host to
+   redirect to; they are what the app's own tests push to, and a local bare repo is a
+   legitimate offline setup.
 
-So the NETWORK HOST is checked instead, which is the property that matters. Exact host match,
-never ``endswith`` — ``evilgithub.com`` and ``github.com.attacker.net`` both fail. ``http://``
-and ``git://`` are refused because cleartext is never this app's push transport, and the
-``DISABLED_NO_PUSH`` sentinel is refused because it is a marker rather than a destination.
-LOCAL paths (``/tmp/x.git``, ``file://``) stay allowed: there is no network host to redirect
-to, it is what the app's own tests push to, and an operator pointing at a local bare repo is a
-legitimate offline setup. The security guidance on untrusted URL destinations asks for exactly
-this — allowlist the destination rather than trusting persisted input.
+With no ``origin_url``, the legacy ``target_url`` is re-validated and its rebuilt clone URL
+is used. The security guidance on untrusted URL destinations asks for exactly this:
+allowlist the destination rather than trust persisted input.
+
+**Pinned invariants.**
+
+- `resolve_origin_url` host-allowlists a stored `origin_url` (exact host, no `http://`/`git://`, no sentinel); local paths stay allowed. (D-57)
+- A network `origin_url` must name the same `owner/repo` as the validated `target_url` (`_remote_slug`); a mismatch or an invalid `target_url` leaves no push target (`test_origin_url_wins_when_present`). (D-138)
 
 ### Why tool approval is one-shot and a queued change is not "filed"
 
-Two ways a single success used to grant a permanent exemption.
+Two rules keep a single success from granting a permanent exemption.
 
-``_approve`` ran the per-tool allowlist check and a ``critical=True`` audit-or-deny write, then
-called ``approve_tool(rid, always=True)``. Per the provider contract that means "the user picked
-'always allow'" — ACP backends may turn it into an ``addRules`` suggestion — so the provider
-stops sending permission requests and every LATER matching call skipped BOTH of those gates.
-The unattended loop is precisely the caller that must not buy a blanket exemption with its first
-approval, so the approval is now one-shot.
+``_approve`` runs the per-tool allowlist check and a ``critical=True`` audit-or-deny write, then
+calls ``approve_tool(rid, always=False)``. ``always=True`` would mean "the user picked 'always
+allow'" — ACP backends may turn it into an ``addRules`` suggestion — so the provider would stop
+sending permission requests and every LATER matching call would skip both gates. The unattended
+loop is precisely the caller that must not buy a blanket exemption with its first approval, so
+the approval is one-shot.
 
-Separately, ``pr_recipe.draft`` returns ``QUEUED:<fp>`` when the change is on disk but no pull
-request could be opened (no ``gh``, no network, a refused push), and the pipeline recorded that
-as ``filed``. ``filed`` is HARD-terminal in ``Ledger.known`` — "a filed CR is never re-filed" —
-so the locus was deduped forever and never retried, and ``filed_crs()`` handed the PR watchers a
-non-URL. Measured: ``known()`` returned True and ``filed_crs()`` returned ``['QUEUED:abc']``. It
-is now recorded as SOFT-terminal ``STATUS_ERROR``, which becomes retryable once the cooldown
-elapses — the accurate description of "could not file it this time".
+``pr_recipe.draft`` returns ``QUEUED:<fp>`` when the change is on disk but no pull request could
+be opened (no ``gh``, no network, a refused push). The pipeline records that as SOFT-terminal
+``STATUS_ERROR``, retryable once the cooldown elapses, not as ``filed``: ``filed`` is
+HARD-terminal in ``Ledger.known`` — "a filed CR is never re-filed" — so the locus would be
+deduped forever, and ``filed_crs()`` would hand the PR watchers a non-URL.
 
-The subtle half is that ``CrOutcome.filed`` stays **True**. In the driver ``filed`` means "this
-was a realized win", and a False there also rolls the provisional commit back and decrements
+``CrOutcome.filed`` nevertheless stays **True**. In the driver ``filed`` means "this was a
+realized win", and a False there would also roll the provisional commit back and decrement
 ``kept`` — throwing away a change that passed RED×2 → GREEN → STAYGREEN merely because ``gh``
-was absent (measured: a bounded run's ``kept`` went 1 → 0). The win is real and the durable
-queue copy holds it; only the publication failed, which is what the retryable ledger status
-records. Both raised by the GPT review of this branch.
+was absent. The win is real and the durable queue copy holds it; only the publication failed,
+which is what the retryable ledger status records.
+
+**Pinned invariants.**
+
+- Tool approval is one-shot (`always=False`), so every later call still passes the per-tool allowlist and the `critical=True` audit. (D-55)
+- A `QUEUED:<fp>` outcome is recorded as soft-terminal `STATUS_ERROR` (retryable after cooldown) while `CrOutcome.filed` stays True, so the win and its counters are kept. (D-56)
 
 ### Known limitation: a second perf PR carries the first perf fix
 
@@ -425,129 +471,113 @@ re-read from HEAD every cycle, and every measurement is reported as "Δ vs curre
 kept perf winner deliberately stays on the local branch — that is what the next cycle measures
 against.
 
-The consequence, raised by review: the draft PR pushes the clone's whole `HEAD`, and the PR is
-opened against the REMOTE base, so a SECOND cycle's PR contains the first cycle's fix as well.
-Measured: pushing whole HEAD for PR#2 included cycle 1's change.
+The consequence: the draft PR pushes the clone's whole `HEAD`, and the PR is opened against the
+REMOTE base, so a SECOND cycle's PR contains the first cycle's fix as well.
 
-Review's suggested fix — reset after the filed-PR event, mirroring the bug track — is declined
-because it inverts the premise: each cycle would re-measure against the ORIGINAL base, so a
-second improvement to the same hot path could never register as an improvement. The bug track
-has no such property (independent loci, one PR each), which is why the same reset was correct
-there and is not the same change here.
+Resetting after the filed-PR event, as the bug track does, would invert the premise: each cycle
+would re-measure against the ORIGINAL base, so a second improvement to the same hot path could
+never register as an improvement. The bug track has no such property (independent loci, one PR
+each), which is why the reset is correct there and not here.
 
-Rebuilding a per-winner branch from the remote base would satisfy both goals in principle.
-Measured, it is not a safe drop-in: two cycles improving the SAME line produce a patch that
-does not apply to the untouched base, and the naive rebuild silently produced a branch
-containing NEITHER fix. Doing it properly needs a cherry-pick with conflict handling plus a
-decision about what to publish when the replay fails — a design change, not a bug fix.
+Rebuilding a per-winner branch from the remote base would satisfy both goals in principle, but
+it is not a safe drop-in: two cycles improving the SAME line produce a patch that does not apply
+to the untouched base, and a naive rebuild produces a branch containing NEITHER fix. Doing it
+properly needs a cherry-pick with conflict handling plus a decision about what to publish when
+the replay fails — a design change, not a bug fix.
 
-Latent rather than live today: the perf track has never kept a measured win on a real
-repository (see the target-suitability limit above), so no perf PR has been filed for a second
-cycle to contaminate. A maintainer enabling perf on a suitable target should close this first.
+The limitation is latent: the perf track has not kept a measured win on a real repository (see
+the target-suitability limit above), so no perf PR has been filed for a second cycle to
+contaminate. A maintainer enabling perf on a suitable target should close this first.
+
+**Pinned invariants.**
+
+- The perf filed path deliberately does NOT reset, keeping cumulative measurement; two tests pin the perf/bug asymmetry. (D-71)
 
 ### Known limitation: the sandbox hides credentials, it does not confine WRITES
 
-Stated plainly because it bounds every "sandboxed" claim above. `sandboxed_spawn_argv(mode=
-"strict")` bind-mounts credential directories empty and scrubs the environment, so
-agent-authored code cannot READ the operator's secrets — that part is measured (under
-"standard" the child saw all 7 `~/.aws` entries; under "strict", 0). It does **not** make the
-rest of the filesystem read-only. Measured on the author's host: a strict-mode child running
-`open('~/.probe','w')` succeeded, exit 0, file clobbered.
+This bounds every "sandboxed" claim above. `sandboxed_spawn_argv(mode="strict")` bind-mounts
+credential directories empty and scrubs the environment, so agent-authored code cannot READ the
+operator's secrets (under "standard" a child sees `~/.aws`; under "strict" it sees nothing). It
+does **not** make the rest of the filesystem read-only: a strict-mode child can open a same-user
+file such as `~/.probe` for writing.
 
 So a candidate's own `conftest.py` or reproducing test — code the model wrote, executed by the
 gate — can modify same-user files outside the worktree.
 
-**What IS now closed: Kiro Crew's own control files.** The most consequential case was measured
-and fixed rather than merely documented — a strict-mode child appended to
-`~/.kiro/crew/.data-home-ready` and exited 0, corrupting the installation's own state. Those
-paths are `security.write_protected_home_paths()`, and that protection is enforced by the
-platform HOOK layer, which a sandboxed subprocess never passes through — so it was inert for
-exactly the code that most needs it. `_run` now passes the PARENT directory of each
-write-protected path as `extra_hidden_dirs`, bind-mounting an empty dir over it, and the write
-fails at the kernel. Re-measured through the real `_run`: blocked, with the interpreter and all
-71 real-subprocess gate tests unaffected.
+**Kiro Crew's own control files are closed.** The paths in `security.write_protected_home_paths()`
+are protected by the platform HOOK layer, which a sandboxed subprocess never passes through. So
+`_run` passes the PARENT directory of each write-protected path as `extra_hidden_dirs`,
+bind-mounting an empty dir over it, and the write fails at the kernel; the interpreter and the
+real-subprocess gate tests are unaffected.
 
-Two measured details, because the obvious version of this fix does nothing. The mask must name
-a DIRECTORY: `extra_hidden_dirs` reaches the launcher's `SENSITIVE_DIRS` loop, which is guarded
-by `os.path.isdir(target)`, so a file path is silently skipped (files go through a separate
-`SENSITIVE_FILES` list the public helper does not expose). And the mask cannot be widened to
-`$HOME`: the interpreter's own stdlib can live there — hiding `~/.local/share` broke
-`import platform` outright.
+The mask must name a DIRECTORY: `extra_hidden_dirs` reaches the launcher's `sensitive_dirs` loop,
+which is guarded by `os.path.isdir(target)`, so a file path is silently skipped (files go through
+a separate `sensitive_files` list the public helper does not expose). And the mask cannot be
+widened to `$HOME`: the interpreter's own stdlib can live there — hiding `~/.local/share` breaks
+`import platform`.
 
 **What remains open**: arbitrary same-user files elsewhere (`~/notes.txt`) are still writable.
-Closing that needs a general write-confinement primitive in `kiro_crew.sandbox`, which has none
-today — no read-only bind, no tmpfs overlay — and adding one changes the shared sandbox for
-every caller, so it belongs in its own PR. Review's alternative, failing closed at `profile._run`
-until then, would disable the entire bug track (no test could run at all). Raised by the GPT
-review of this branch.
+Kiro Crew's own home is sealed per leaf (`sandbox.py` marks each crew-home leaf hidden,
+read-only or visible), but `kiro_crew.sandbox` has no general write confinement for arbitrary
+same-user files, and adding one changes the shared sandbox for every caller. Failing closed at
+`profile._run` until then would disable the entire bug track (no test could run at all).
+
+**Pinned invariants.**
+
+- `_run` masks the PARENT directory of each `write_protected_home_paths()` entry through `extra_hidden_dirs`, so a strict-mode child cannot write Kiro Crew's own control files. (D-53)
 
 ### Why the credential scan resolves its base (and a refused push rolls back)
 
-Two ways the pre-push credential scan could look clean while publishing a secret. Both are the
-same shape: the scan RANGE and the pushed RANGE disagreed.
+The pre-push credential scan must cover what is pushed: the scan RANGE and the pushed RANGE must
+agree.
 
-`pr_recipe._scan_pushable_content` diffed `base_ref...HEAD`, and `base_ref` is
-`config["branch"]` — a plain LOCAL name if the operator set one. With `base_ref="work"` and
-HEAD on `work`, that diff is EMPTY, so `scan_content_for_secrets("")` reports clean. Measured on
-a real bare repo: 0 bytes with the local name, the planted `AKIAIOSFODNN7EXAMPLE` invisible; 132
-bytes with `origin/work`, caught. `_scannable_base` now resolves to a ref distinct from HEAD
-(trying the remote-tracking form) and REFUSES when it cannot — refusing beats degrading to the
-narrower single-commit scan, because a narrower range that happens to pass is exactly the silent
-downgrade this guards. This is the same self-diff already fixed in `driver._direct_push`; the
-recipe carried its own copy, which is why fixing one did not fix the other.
+`pr_recipe._scan_pushable_content` diffs `base...HEAD`. `base_ref` is `config["branch"]` — a
+plain LOCAL name if the operator set one — and with HEAD on that branch the diff would be EMPTY,
+so `scan_content_for_secrets("")` would report clean. `_scannable_base` therefore resolves to a
+ref distinct from HEAD (trying the remote-tracking form) and REFUSES when it cannot: refusing
+beats degrading to the narrower single-commit scan, because a narrower range that happens to pass
+is exactly the silent downgrade this guards. `driver._direct_push` follows the same rule.
 
-Separately, a REFUSED direct push left its commit at HEAD. The direct-push scan range is
-`HEAD~1..HEAD` — one commit — so the next winner's scan does not see the refused commit while
-its push publishes both. Measured: candidate A refused for a planted credential, then candidate
-B's scan range showed the credential `False` while its pushed range showed `True`. Both tracks
-now `_reset_provisional(pre_sha)` on a failed push. The bug track had no `else` branch at all
-and fell straight through to `return` with the commit intact.
+A REFUSED direct push rolls its commit back. The direct-push scan range is `HEAD~1..HEAD` — one
+commit — so a refused commit left at HEAD would be outside the next winner's scan range while its
+push published both. Both tracks therefore `_reset_provisional(pre_sha)` on a failed push.
+
+**Pinned invariants.**
+
+- The F10 direct push scans `HEAD~1..HEAD` (the verified commit), never `<branch>..HEAD`, which is empty when HEAD sits on that branch's tip. (D-26)
+- `_scannable_base` resolves a base distinct from HEAD (trying the remote-tracking form) and REFUSES when it cannot, so the recipe's scan can never self-diff to zero bytes. (D-64)
+- A refused direct push rolls its commit back (`_reset_provisional(pre_sha)`) on both tracks, so the next winner's push cannot publish it outside its own scan range. (D-65)
 
 ### Why the shell denylist unwraps before it matches
 
-Three rounds on this branch taught the same lesson, and it is worth stating once as a rule:
-**a check that inspects ONE position is evaded by adding a position.**
+One rule governs this parser: **a check that inspects ONE position is evaded by adding a
+position.** So the denylist tokenizes and skips global options (`gh --repo o/r pr ready`),
+splits on every separator (`&&`, `||`, `;`, `|`, a bare `&`, `$(`, backtick, `(` and `)`), and
+does not trust `words[0]`: anything that RUNS another command — `sudo`, `env`, `timeout`,
+`nohup`, `xargs`, `nice`, `setsid`, `stdbuf`, every `sh -c "…"` form — is unwrapped.
 
-* First round: a substring match, evaded by an option — `gh --repo o/r pr ready`. Fixed by
-  tokenizing and skipping global options.
-* Second round: per-command matching, evaded by a separator — `echo hi && git push`. Fixed
-  by splitting on `&&`/`||`/`;`/`|`/`$(`/backtick.
-* Third round: matching on `words[0]`, evaded by anything that RUNS another command.
-  Measured — all of these were ALLOWED while the bare `git push` was refused:
-  `sudo git push`, `env git push`, `timeout 5 git push`, `nohup git push`,
-  `xargs git push`, `nice -n 5 git push`, `setsid git push`, `stdbuf -oL git push`,
-  and every `sh -c "…"` form.
-
-Wrappers are now stripped and the command behind them checked instead, recursively (so
+Wrappers are stripped and the command behind them checked instead, recursively (so
 `sudo env timeout 3 git push` and `sh -c "sudo git push"` both resolve), and a shell's `-c`
 argument is re-analyzed from the top so separators and further wrappers inside the string
-are seen too. Two details that were bugs in the first attempt at this fix: an option's
-VALUE has to go with it (`nice -n 5 git push` left `5` looking like the command), and the
-recursion budget must REFUSE on exhaustion — for a denylist, "gave up" must not mean
-"allowed".
+are seen too. An option's VALUE goes with it (`nice -n 5 git push` must not leave `5` looking
+like the command), and the recursion budget REFUSES on exhaustion — for a denylist, "gave up"
+must not mean "allowed".
 
-Reaching the subcommand also means skipping GLOBAL OPTIONS correctly, and the first attempt got
-this backwards. It assumed any option without `=` takes a value — the comment even claimed that
-"cannot under-skip" — but a VALUELESS option then swallows the verb: measured, bare `git push`
-was REFUSED while `git --no-pager push`, `--paginate`, `--bare`, `--literal-pathspecs` and
-`--no-replace-objects` were all **ALLOWED**, because `push` was consumed as the option's value
-and the denylist matched `['origin', 'main']`.
+Reaching the subcommand also means skipping GLOBAL OPTIONS correctly. A valueless option must not
+swallow the verb: `git --no-pager push`, `--paginate`, `--bare`, `--literal-pathspecs` and
+`--no-replace-objects` must be refused like a bare `git push`. Value-taking global options are
+therefore enumerated per binary (`_VALUE_TAKING_OPTIONS`) and anything unlisted is treated as
+valueless. That direction is the safe one for a denylist: an unlisted value-taking option means
+its value is read as a subcommand, which can only over-refuse a benign command, never
+under-refuse a forbidden one. `--exec-path` is deliberately NOT in the table because its value is
+*optional* (`--exec-path[=<path>]`), and listing it would let `git --exec-path push` swallow the
+verb. Value-taking wrapper LONG options (`_WRAPPER_VALUE_TAKING_LONG_OPTIONS`, such as
+`env --unset`) consume their value the same way.
 
-Value-taking global options are now enumerated per binary (`_VALUE_TAKING_OPTIONS`) and anything
-unlisted is treated as valueless. That direction is the safe one for a denylist: an unlisted
-value-taking option means its value is read as a subcommand, which can only over-refuse a benign
-command, never under-refuse a forbidden one. `--exec-path` is deliberately NOT in the table
-because its value is *optional* (`--exec-path[=<path>]`), and listing it reintroduced the same
-swallow for `git --exec-path push` — found by writing a 25-case matrix rather than by the next
-review round.
-
-The table also has to cover SHELL BUILTIN wrappers, not just binaries on PATH. `command`,
-`exec` and `builtin` never appear as executables, but a nested `sh -c "…"` argument is
-re-analyzed by this same table, so leaving them out was a live hole. Measured before adding
-them: bare `git push` was REFUSED while `command git push` and `exec git push` were both
-ALLOWED, as was `sh -c "command git push origin main"`. `command` was raised by the GPT
-review of this branch; `exec` and `builtin` are the same class and were found by testing the
-neighbours rather than waiting for the next review round.
+The table also covers SHELL BUILTIN wrappers, not just binaries on PATH: `command`, `exec` and
+`builtin` never appear as executables, but a nested `sh -c "…"` argument is re-analyzed by this
+same table, so `command git push`, `exec git push` and `sh -c "command git push origin main"`
+are refused.
 
 `_COMMAND_WRAPPERS` is deliberately not a "forbid these binaries" list. `env`, `timeout`
 and `nice` are legitimate and the gate's own test runs use them, so `timeout 5 pytest -q`
@@ -556,79 +586,81 @@ is the failure mode to avoid. The same holds for the builtins — the wrapper is
 so the real verb behind it can be judged, so `command -v git` (asking where git is, not
 pushing) and `exec pytest -q` stay allowed. A dedicated test pins that non-over-refusal.
 
+**Pinned invariants.**
+
+- Wrappers (`sudo`, `env`, `timeout`, `nohup`, `xargs`, `nice`, `setsid`, `stdbuf`, `sh -c`) are stripped recursively, an option's value goes with the option, and a nested `-c` script is re-analyzed from the top; `timeout 5 pytest -q` stays allowed. (D-18)
+- The wrapper table covers the shell builtins `command`, `exec` and `builtin`; `command -v git` and `exec pytest -q` stay allowed. (D-52)
+- Value-taking global options are enumerated per binary (`_VALUE_TAKING_OPTIONS`) and everything else is valueless, so `git --no-pager push` is refused like `git push`; `--exec-path` is excluded because its value is optional. (D-63)
+- Value-taking wrapper long options (`_WRAPPER_VALUE_TAKING_LONG_OPTIONS`, such as `env --unset`) consume their value, so the command behind them is inspected. (D-117)
+- A bare `&` splits commands like `;`, and `(` and `)` split too, so `true & gh pr comment …` and `echo $(gh pr ready)` are refused; a benign trailing `& true` passes. (D-128)
+
 ### Why the protected-branch denylist normalizes before it matches
 
 A denylist has to see a branch the way **git** does, not the way it was typed.
-`is_protected_branch` originally matched a normalized short name, so `refs/heads/main` —
-the same ref, which `git push <url> HEAD:refs/heads/main` accepts verbatim — did not match
-and `authorize_direct_push` returned yes. `branch` is in `_CONFIG_WRITABLE`, so a
-`PUT /config` sets it with no shape check on write and both one-click commit and the
-driver's F10 path feed it straight through, which makes this reachable rather than
-theoretical.
+`refs/heads/main` is the same ref as `main` — `git push <url> HEAD:refs/heads/main` accepts it
+verbatim — so `is_protected_branch` must match it. `branch` is in `_CONFIG_WRITABLE`, so a
+`PUT /config` sets it with no shape check on write and both one-click commit and the driver's F10
+path feed it straight through, which makes this reachable rather than theoretical.
 
 `normalize_branch` therefore strips `refs/heads/`, `refs/remotes/`, `origin/` and
-`upstream/` **repeatedly until the value stops changing**, not in one ordered pass: the
-first version of the fix did one pass and `origin/refs/heads/main` still got through
-(measured). The loop is bounded at six iterations rather than `while True` so a crafted
-`origin/origin/origin/…` cannot spin.
+`upstream/` **repeatedly until the value stops changing**, not in one ordered pass, so
+`origin/refs/heads/main` is caught too. The loop is bounded at six iterations rather than
+`while True` so a crafted `origin/origin/origin/…` cannot spin.
 
-This came out of applying a review finding about a *different* denylist — the shell
-refusal, which was evadable by re-nesting a command — to this one. The lesson worth
-keeping is the general one: **any normalization that runs once can be re-nested**, so the
-test enumerates the respellings git accepts instead of the two that came to mind.
+The general rule is the shell denylist's: **any normalization that runs once can be re-nested**,
+so the test enumerates the respellings git accepts.
+
+**Pinned invariants.**
+
+- `normalize_branch` strips ref and remote prefixes repeatedly until stable, so `refs/heads/main` and `origin/refs/heads/main` hit the protected-branch denylist like `main` (`branch` is client-writable through `PUT /config`). (D-13)
 
 ### Why branch checkout prefers the remote-tracking ref over a fetch
 
-The same root cause, found by looking for it: **code inside a deliberately push-disabled
-clone cannot reach the remote for READS either.** `checkout_branch` fetched
-`origin/<branch>` and, on failure, fell back to a LOCAL branch of that name. In a fresh
-clone a local branch exists for the DEFAULT branch only, so for every other target the
-fetch failed (exit 128, always — the origin is neutralized), the local lookup missed, and
-the function returned `(False, "could not fetch …")`.
+**Code inside a deliberately push-disabled clone cannot reach the remote for READS either.**
+A fetch of `origin/<branch>` always fails there (exit 128 — the origin is neutralized), and in a
+fresh clone a local branch exists for the DEFAULT branch only. So `checkout_branch` tries the
+remote-tracking ref first (`checkout -B <branch> origin/<branch>`), which the clone already has
+for every branch that existed at clone time, then a local branch for the genuinely-offline case,
+and only then fails. A branch that exists in neither still fails — turning a missing branch into a
+false success would let a run proceed on the wrong tree with an `ok` verdict.
 
-The caller then makes it silent: without `scopeDiffBase` set, a failed checkout logs a
-warning and **starts anyway**. The run discovers, edits and measures `main` while the
-operator believes it is working on the branch they configured — exactly the kind of failure
-that produces confidently-reported nonsense.
+A run on the wrong branch would discover, edit and measure `main` while the operator believes it
+is working on the branch they configured. So a failed checkout makes both the run and calibration
+refuse to start, whether or not `scopeDiffBase` is set; a configured `scopeDiffBase` only adds
+detail to the error.
 
-The DRIVER has the mirror-image of this bug, found in the same review: its stage steps
-checked out `self.branch` in the config form (`origin/main`), and `git checkout origin/main`
-detaches HEAD onto the remote-tracking ref — so each cycle's kept commit was orphaned and
-the next cycle's checkout discarded it. Both stage sites now check out
-`normalize_branch(self.branch)`, the local branch `runner` created before the loop started,
-so cycle N+1 builds on cycle N.
+The DRIVER follows the same rule from the other side: its stage steps check out
+`normalize_branch(self.branch)`, the local branch `runner` created before the loop started, never
+the config form (`origin/main`), because `git checkout origin/main` detaches HEAD onto the
+remote-tracking ref and would orphan each cycle's kept commit. So cycle N+1 builds on cycle N.
 
-The clone already has `origin/<branch>` for every branch that existed at clone time, so the
-fix needs no network: try the remote-tracking ref first (`checkout -B <branch>
-origin/<branch>`), then a local branch for the genuinely-offline case, and only then fail. A
-branch that exists in neither still fails — turning a missing branch into a false success
-would be worse than the bug, since the run would proceed on the wrong tree with an `ok`
-verdict.
+**Pinned invariants.**
+
+- In a push-disabled clone `checkout_branch` lands on the CONFIGURED branch through `origin/<branch>` (no network), and the test asserts the working tree, not only the return value. (D-16)
+- Both driver stage sites check out `normalize_branch(self.branch)`, the local branch, so cycle N's kept commit stays an ancestor of HEAD after cycle N+1's checkout. (D-21)
 
 ### Why one-click commit fetches through the configured url, not `origin`
 
-Neutralizing both origin urls has a consequence that is easy to miss: **nothing inside the
-clone can reach the remote, including the reads.** `commit_finding` fetched its base with
-`git fetch --quiet origin <branch>`, which exits 128 in every clone the loop works in, so
-one-click commit failed before applying its queued diff. Measured against a local bare
-repo: fetch by remote name succeeded before the neutralization and failed with
-`'DISABLED_NO_PUSH' does not appear to be a git repository` after it.
+Neutralizing both origin urls means **nothing inside the clone can reach the remote, including
+the reads**: `git fetch origin <branch>` exits 128 in every clone the loop works in.
 
-It now fetches through the same validated `origin_url` the push already used — one lookup
-serving both — into `refs/auto-improvement/commit-base`, a ref this module owns, and
-checks out / resets / diffs against that ref. Falling back to `origin/<branch>` would
-have been the smaller change and the wrong one: in a frozen clone that tracking ref is a
-snapshot from clone time, so committing on it silently drops whatever landed upstream
-since — a lost update that reports success. With no configured url at all the function
-degrades to committing on the stale local ref (the push cannot succeed either, so the
+`commit_finding` therefore fetches through the same validated `origin_url` the push uses — one
+lookup serving both — into `refs/auto-improvement/commit-base`, a ref this module owns, and
+checks out / resets / diffs against that ref. It never falls back to `origin/<branch>`: in a
+frozen clone that tracking ref is a snapshot from clone time, so committing on it would silently
+drop whatever landed upstream since — a lost update that reports success. With no configured url
+at all the function commits on the stale local ref (the push cannot succeed either, so the
 outcome is "committed locally only") rather than pretending to publish.
 
-Worth recording *why this survived*: every pre-existing test for `commit_finding`
-exercised a refusal path — no queued diff, protected branch — so the whole suite passed
-green while the success path was dead. The regression test drives the real function against
-a real bare repo with the origin neutralized exactly as production leaves it, and a second
-case advances the branch upstream first to pin that the base is fetched rather than
-remembered.
+The regression test drives the real function against a real bare repo with the origin
+neutralized exactly as production leaves it, so the success path is covered, not only the
+refusals; a second case advances the branch upstream first to pin that the base is fetched rather
+than remembered.
+
+**Pinned invariants.**
+
+- `commit_finding` fetches its base through the validated configured url, never `git fetch origin`, because every clone the loop uses has both origin urls neutralized. (D-12)
+- One-click commit's no-remote and push-rejected exits reset `--hard` to the fetched base and drop the `sha` from the payload; the queue copy survives for a retry. (D-54)
 
 ### Why drafting a PR needs a push
 
@@ -645,228 +677,241 @@ denylist first. A refused or failed push degrades to the durable queue
 ### Why every ``{fp}`` route validates at the boundary
 
 The finding fingerprint from a URL is interpolated straight into a filesystem path —
-``pr_queue/<fp>.diff``, the per-repo ledger subtree, a watcher clone dir — so an
-unvalidated ``fp`` is a path-traversal vector (``..``, an absolute path, a value with a
-slash). Nine handlers took ``fp`` from ``match_info``; some downstream sinks validated
-(``ledger_admin.forget``/``purge``) and some did not (``commit_finding`` via
-``pr_queue_dir``, the watcher clone path). ``_validated_fp`` now runs
+``pr_queue/<fp>.diff``, the per-repo ledger subtree, a watcher clone dir — so an unvalidated
+``fp`` is a path-traversal vector (``..``, an absolute path, a value with a slash). Every handler
+that takes ``fp`` from ``match_info`` calls ``_validated_fp``, which runs
 ``ledger_admin.validate_fingerprint`` (allowlist ``^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`` — no
-``.``, ``/`` or ``..``; rejects rather than sanitizes) at the HTTP boundary for all of
-them, matching the input-validation guidance: allowlist at the point of origin, block
-traversal, fail closed. Raised by the GPT review of this branch.
+``.``, ``/`` or ``..``; rejects rather than sanitizes) at the HTTP boundary, before any sink:
+allowlist at the point of origin, block traversal, fail closed.
+
+**Pinned invariants.**
+
+- All `{fp}` handlers validate through `validate_fingerprint` (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`) via `_validated_fp`; a traversal value returns 400/404 before any path is built. (D-22)
 
 ### Why calibration pins its workspace
 
 Findings, the ruler, the PR queue and profiles are scoped per repository+branch, and the
 path helpers derive that scope from live ``config.json``. Calibration runs on a background
-thread and can take seconds to minutes, so reading the scope at WRITE time let an operator
-retarget mid-run and land the ruler in a different workspace — overwriting a ruler
-calibrated on unrelated code. The ``_calibrate_loop`` write now derives its path from the
-config the worker was LAUNCHED with (``workspace_key(config)``), not the live file.
+thread and can take seconds to minutes, so a scope read at WRITE time would let an operator
+retarget mid-run and land the ruler in a different workspace — overwriting a ruler calibrated on
+unrelated code. ``_calibrate_loop`` therefore derives its path from the config the worker was
+LAUNCHED with (``workspace_key(config)``), not the live file.
+
+**Pinned invariants.**
+
+- `_calibrate_loop` derives the ruler path from the CAPTURED config, so a retarget mid-calibration cannot overwrite another workspace's ruler. (D-23)
+- Calibration holds the clone lock across its whole loop body, checkout and `baseline_samples` included. (D-80)
 
 ### Why operator clone mutations hold one lock
 
-The run-active gate above stops the commit and draft routes racing the LOOP. It does not stop
-them racing EACH OTHER, and both mutate the same `config["clone"]`: the dashboard's commit icon
-had no `disabled` while pending, so clicking two `filed` rows started two mutations, each in its
-own `asyncio.to_thread` thread.
-
-Measured on a real bare repo: A stages its diff; B's `checkout -B <branch> <base>` does **not**
-discard it (the branch is already at that base, so no files change); B's `git apply --index`
-stacks on top; and B's commit contains **both** findings — so the commit recorded as B publishes
-A's change too. Worse, A's now-empty commit then fails and its `reset --hard` rewinds the local
-branch past B's already-pushed commit, leaving the local branch missing what the remote has.
+The run-active gate stops the commit and draft routes racing the LOOP. It does not stop them
+racing EACH OTHER, and both mutate the same `config["clone"]`, each in its own
+`asyncio.to_thread` thread. Interleaved, B's `checkout -B <branch> <base>` does **not** discard
+A's staged diff (the branch is already at that base, so no files change), B's `git apply --index`
+stacks on top, and B's commit publishes both findings; A's now-empty commit then fails and its
+`reset --hard` rewinds the local branch past B's already-pushed commit.
 
 `commit.clone_lock()` (an `RLock`, module-level because there is exactly one configured clone)
 serializes every operator-triggered mutation. The draft route holds it across its **whole**
 sequence — materialize → commit → draft → rollback — not around each call, because the race is
-between the steps. The button is additionally disabled while any commit is in flight, which
-stops the operator queueing work rather than being the correctness mechanism.
+between the steps. The button is additionally disabled while any commit is in flight, which stops
+the operator queueing work rather than being the correctness mechanism.
 
 The regression test FORCES the interleaving by parking thread A immediately after it stages,
-rather than starting two threads and hoping: the plain race reproduced the bug only about one
-run in three, which is too flaky to guard anything. Deterministic now — it fails 3/3 without the
-lock and passes 3/3 with it. Raised by the Opus 5 review of this branch.
+rather than starting two threads and hoping, so it is deterministic.
+
+**Pinned invariants.**
+
+- One-click commit refuses with 409 `run_in_progress` while the supervisor is RUNNING, CALIBRATING or STOPPING, and never calls `commit_finding` then. (D-20)
+- The draft route refuses with 409 `run_in_progress` while a run is live, and a structural test asserts every clone-mutating handler carries the gate. (D-49)
+- Operator clone mutations serialize on `commit.clone_lock()` (an `RLock`) across the whole sequence, and the commit control is disabled while a commit is in flight; the test forces the interleaving. (D-61)
+- `PUT /config` and `POST /setup-clone` refuse with 409 `run_in_progress` mid-run, through the one `_refuse_while_running` helper every handler uses. (D-68)
+- Run startup holds `commit.clone_lock` across `_build_driver` (`_build_driver_locked`), and the lock is re-entrant. (D-74)
+- `POST /setup-clone` holds the clone lock across one `_clone_and_persist` section and run startup holds it from config read to `start`, so a run cannot launch against a repository being replaced. (D-77)
+- `start`/`calibrate` set a `_reserved` flag under the lock that the worker clears as its first act, so a run cannot double-start in the assigned-but-unstarted window. (D-94)
+- `POST /setup-clone` re-checks `_run_is_active()` inside `clone_lock` and answers 409 `run_in_progress`. (D-95)
+- `PUT /config` takes `clone_lock` and re-checks `_run_is_active()` inside it; a structural test asserts both workspace-mutating handlers do. (D-96)
+- The draft and commit routes re-check the run status inside `clone_lock`; a structural guard asserts all four clone-mutating handlers do. (D-115)
 
 ### Why the manual draft path materializes its own diff
 
 ``pr_recipe.draft(diff=...)`` only WRITES the queue copy; the branch content comes from
 ``_push_fix_branch``, which pushes the clone's ``HEAD``. In the loop that is correct — the
-driver's ``_stage_winner`` applies the winner into the shared clone before the pipeline drafts
-(that ordering is itself a fix from an earlier review). The backend's **manual** draft button
-had no such step, so drafting an OLDER queued finding published whatever a LATER cycle had
-left at ``HEAD``: measured against a real bare repo, finding A's queued diff adds
-``FINDING_A`` and the branch pushed for A contained ``FINDING_B`` — the pull request's
-metadata and its content disagreeing, which is worse than a failed draft because it looks
-successful.
+driver's ``_stage_winner`` applies the winner into the shared clone before the pipeline drafts.
+The backend's **manual** draft button has no loop around it, so without its own staging it would
+publish whatever a LATER cycle left at ``HEAD``: the pull request's metadata and its content
+would disagree, which is worse than a failed draft because it looks successful.
 
-And committing means every later failure has to ROLL BACK. The commit sits on the configured
-branch, and ``clone_setup.checkout_branch`` prefers an existing local branch — so a draft that
-published nothing (no ``gh``, no network, a refused push, or an unexpected raise) would leave
-the next run starting from an unfiled commit and treating the queued change as already-landed
-baseline. Measured on a real bare repo: local ``work`` sat 1 commit ahead of a remote it had
-never been pushed to. All three post-commit exits now ``reset --hard`` to the fetched base,
-which is what ``commit_finding`` already did at each of its own failure points; the durable
-queue copy is untouched, so a retry still has everything it needs.
+The fix reuses the one place that already does this correctly. ``commit.py``'s one-click commit
+fetches the real base, ``checkout -B``, then ``git apply --index``; that block is
+``materialize_queued_diff`` and BOTH paths call it, so the draft route stages the finding's own
+diff before drafting, and a failed staging returns an error instead of drafting anyway. One copy
+matters here: the base-ref resolution carries the fetch-through-configured-url rule and never
+trusts the frozen ``origin/<branch>`` tracking ref.
 
 Staging is not enough on its own: ``git apply --index`` populates the index but does not move
-``HEAD``, and ``_push_fix_branch`` pushes ``HEAD:refs/heads/<branch>``. The first version of
-this fix therefore published the BASE with the queued fix absent — measured on a real bare
-repo, the worktree read ``return 2`` while the pushed branch still read ``return 1``. The
-route now commits via ``commit_staged_for_draft`` (reusing the redaction-hardened
-``_commit_message``, since a pushed commit message cannot be edited without rewriting
-history). Worth recording why this slipped through: the first regression test asserted the
-WORKTREE, which agreed with the fix, so it passed while the published branch did not. The test
-now performs a real push and reads the content back off the remote.
+``HEAD``, and ``_push_fix_branch`` pushes ``HEAD:refs/heads/<branch>``. So the route commits via
+``commit_staged_for_draft`` (reusing the redaction-hardened ``_commit_message``, since a pushed
+commit message cannot be edited without rewriting history), and the regression test performs a
+real push and reads the content back off the remote rather than asserting the worktree.
 
-Making the route materialize its diff also made it clone-MUTATING, which means it needs the
-run-active gate every other clone-mutating handler already had — and the first version of this
-fix did not add it. `checkout -B` / `apply --index` (plus `reset --hard` on a failed apply) run
-in `config["clone"]`, the same tree the driver's worker thread is mid-cycle on
-(`_stage_winner` / `_commit_winner_provisional` do checkout/apply/`add -A`/commit on that
-branch), so an interleaved draft discards the loop's staged winner and then pushes whatever
-HEAD the interleaving left — reintroducing the exact mismatch this fix exists to prevent. The
-route now returns 409 `run_in_progress` while the supervisor is RUNNING/CALIBRATING/STOPPING,
-identical to `_handle_commit`, and a structural test asserts BOTH handlers carry the gate so
-the next clone-mutating route cannot repeat the omission. Raised by the Opus 5 review.
+Committing means every later failure has to ROLL BACK. The commit sits on the configured branch,
+and ``clone_setup.checkout_branch`` prefers an existing local branch — so a draft that published
+nothing (no ``gh``, no network, a refused push, or an unexpected raise) would leave the next run
+starting from an unfiled commit. All post-commit exits ``reset --hard`` to the fetched base, as
+``commit_finding`` does at each of its own failure points, and a successful draft resets in
+``finally`` after its ledger row is written; the durable queue copy is untouched, so a retry still
+has everything it needs.
 
-The fix reuses the one place that already does this correctly. ``commit.py``'s one-click
-commit fetches the real base, ``checkout -B``, then ``git apply --index``; that block is
-extracted as ``materialize_queued_diff`` and called by BOTH paths, so the draft route stages
-finding A's diff on the remote branch before drafting and a failed staging returns an error
-instead of drafting anyway. Extracting rather than duplicating matters here: the base-ref
-resolution carries two earlier fixes (fetch through the configured url because both origin
-urls are neutralized, and never trust the frozen ``origin/<branch>`` tracking ref), and a
-second copy would have drifted from them.
+Materializing the diff makes the route clone-MUTATING, so it carries the run-active gate every
+other clone-mutating handler has: `checkout -B` / `apply --index` (plus `reset --hard` on a failed
+apply) run in `config["clone"]`, the same tree the driver's worker thread may be mid-cycle on. The
+route returns 409 `run_in_progress` while the supervisor is RUNNING/CALIBRATING/STOPPING,
+identical to `_handle_commit`, and a structural test asserts every clone-mutating handler carries
+the gate.
 
-### Why an unproven ruler halts the perf track (a reversed decision)
+Queued-diff materialization encodes patch text as UTF-8 with `surrogateescape`
+and sends binary stdin to Git, preserving line endings and non-UTF-8 bytes on
+every platform. Apply-failure stderr is decoded with replacement before redaction
+and truncation; failure still resets the clone to its selected base.
 
-``canaryAdvisory`` defaulted to ``True``, so a perf run whose canary failed to clear the band
-still entered Phase 2 and could keep and draft a "win" measured by a ruler that was never
-proven. Review asked for a ``False`` default twice; the first response declined it on this
-argument, recorded here in an earlier revision of this document:
+**Pinned invariants.**
 
-> Defaulting to strict would halt every run on such a target — including bug-track runs,
-> which never consult the ruler.
+- Commit and draft both call `materialize_queued_diff` (fetch → `checkout -B` → `apply --index`), so drafting an older finding publishes that finding's diff; a failed staging returns an error rather than drafting. (D-47)
+- `commit_staged_for_draft` COMMITS the staged diff (with the redaction-hardened `_commit_message`) before drafting, so the pushed branch holds the fix; the test reads the content back off the remote. (D-50)
+- Every post-commit exit of a draft that published nothing resets `--hard` to the fetched base, so the next run never adopts an unfiled commit as its baseline. (D-51)
+- A successful manual draft resets the clone in `finally`, after writing its ledger row, so its commit never leaks into the next draft's branch. (D-79)
+- Ledger writes after a publish are best-effort and logged at ERROR, so a ledger failure never turns a published PR into a raised exception, and the manual path's reset is in `finally`. (D-91)
 
-**That argument is wrong, and the code says so.** ``Driver.run`` skips Phase-1 preflight
-*entirely* for the bug track — "preflight: skipped for bug track (RED→GREEN gate is the
-verdict; no noise band)" — so a strict canary cannot reach a bug run at all. The stated cost
-of strictness does not exist, which leaves nothing on the other side of the scale from
-03_metric §7.1 ("an unproven ruler must HALT"). The default is now ``False``.
+### Why an unproven ruler halts the perf track
 
-The target-suitability limit that motivated the loose default is real and unchanged: on an
-arbitrary Python repo there is no genuine known win to force, so ``measure_canary`` forces
-the one mechanical win available (collect-only on the candidate arm), which is a real
-correctly-signed delta but a **lower bound** on sensitivity rather than proof the ruler
-resolves a 3% win; on a repo whose suite runs in about its own collection time there is no
-win to force at all. The right answer for such a target is an explicit operator opt-in
-(``canaryAdvisory: true``) or a ``benchmarkCommand`` pointing at a real workload — not a
-default that quietly lowers the bar for everyone. ``TestAnUnprovenRulerHaltsThePerfTrack``
-pins the strict default, the surviving opt-out, and the bug-track premise, so if preflight
-ever stops being skipped for the bug track the justification has to be re-derived rather
-than silently inherited.
+``canaryAdvisory`` defaults to ``False``, so a perf run whose canary fails to clear the band halts
+before Phase 2 and cannot keep and draft a "win" measured by a ruler that was never proven
+(03_metric §7.1: "an unproven ruler must HALT"). Strictness costs the bug track nothing:
+``Driver.run`` skips Phase-1 preflight *entirely* there — "preflight: skipped for bug track
+(RED→GREEN gate is the verdict; no noise band)" — so a strict canary cannot reach a bug run.
 
-The disclosure half of the earlier response stands on its own and is kept: a perf pull
-request headed "Evidence it's a real win" said
-nothing about the ruler's proof status, leaving a reviewer unable to tell "band proven to
-resolve this" from "band is a floor". ``perf_pr_description`` now takes ``ruler_proven`` and
-emits a caveat block when it is False; the driver sets it from ``PreflightResult.canary_cleared``
-after preflight (the pipeline is built before preflight runs, so it cannot be a constructor
-argument). It defaults True so a stub or unit-test caller keeps today's wording — crying wolf
-on a proven ruler would train reviewers to ignore the warning.
+The target-suitability limit is real: on an arbitrary Python repo there is no genuine known win to
+force, so ``measure_canary`` forces the one mechanical win available (collect-only on the
+candidate arm), which is a real correctly-signed delta but a **lower bound** on sensitivity rather
+than proof the ruler resolves a 3% win; on a repo whose suite runs in about its own collection
+time there is no win to force at all. The answer for such a target is an explicit operator opt-in
+(``canaryAdvisory: true``) or a ``benchmarkCommand`` pointing at a real workload — not a default
+that quietly lowers the bar for everyone. ``TestAnUnprovenRulerHaltsThePerfTrack`` pins the strict
+default, the opt-out, and the bug-track premise, so if preflight ever stops being skipped for the
+bug track the justification has to be re-derived.
+
+A perf pull request also says whether its ruler was proven: ``perf_pr_description`` takes
+``ruler_proven`` and emits a caveat block when it is False; the driver sets it from
+``PreflightResult.canary_cleared`` after preflight (the pipeline is built before preflight runs,
+so it cannot be a constructor argument). It defaults True so a proven ruler stays silent — crying
+wolf would train reviewers to ignore the warning.
+
+**Pinned invariants.**
+
+- `perf_pr_description(ruler_proven=False)` carries a "Ruler not proven on this target" caveat, set from `PreflightResult.canary_cleared`. (D-46)
+- `POST /calibrate` reuses the spine's `_canary_clears_band` (ok, None and direction), so a failed or regressing canary never records `calibrated`. (D-66)
+- `canaryAdvisory` defaults to False, so a perf run whose canary failed halts before Phase 2; the bug track skips ruler pre-flight, and a test pins that premise. (D-72)
+- `measure_canary` refuses (`ok=False`) when a custom `benchmarkCommand` is set, so the canary never certifies a ruler it cannot force a win on. (D-133)
 
 ### Why the subprocess fallback audits every tool it uses
 
-The fallback logged ONE blanket launch event (``tool_name="claude-cli"``, ``critical=True``)
-before spawning. That records "an unattended agent started" and says nothing about which
-tools it then ran, so a forensic query could not answer "did this run touch a shell?". The
-session path gets per-tool events from its approval hook; the fallback was already parsing
-``tool_use`` blocks out of the stream — that is what drives the UI activity feed — and simply
-never persisted them. The information was present and thrown away.
+The fallback's launch is one blanket event (``tool_name="claude-cli"``, ``critical=True``)
+before spawning, which records "an unattended agent started" and nothing about which tools it
+then ran. So ``_audit_fallback_tool`` also records each ``tool_use`` block the fallback parses out
+of the stream (the same blocks that drive the UI activity feed), so a forensic query can answer
+"did this run touch a shell?". These per-tool events are deliberately NOT ``critical=True``,
+unlike the launch event: by the time one fires the tool has already run inside the sandbox, so
+raising could not prevent anything and would only turn an audit-sink problem into a failed run.
+The audit-or-DENY half of this path is the launch event plus the pre-spawn governance gate and the
+shell denylist; this is the audit-or-RECORD half. The target hint is agent-influenced text landing
+in a log that is signed as-written, so it is redacted and truncated, and a redactor failure emits
+``[redaction unavailable]`` rather than raw text.
 
-``_audit_fallback_tool`` now records each one. Deliberately NOT ``critical=True``, unlike the
-launch event: by the time it fires the tool has already run inside the sandbox, so raising
-could not prevent anything and would only turn an audit-sink problem into a failed run. The
-audit-or-DENY half of this path is the launch event plus the pre-spawn governance gate and
-the shell denylist; this is the audit-or-RECORD half. The target hint is agent-influenced
-text landing in a log that is signed as-written, so it is redacted and truncated, and a
-redactor failure emits ``[redaction unavailable]`` rather than raw text.
+Nothing selects the fallback today (see "The subprocess AgentRunner is not selected"); the
+per-tool record is part of the hardening the class keeps for a future caller.
 
-Review asked for the fallback to be DELETED instead. That is still declined — it is the only
-path that authors fixes when no in-process provider is configured — but the audit gap it named
-was real, and closing it is what the request was actually pointing at.
+**Pinned invariants.**
+
+- `_audit_fallback_tool` records each tool the fallback runs (`outcome="invoked"`, redacted and truncated target hint), not `critical=True`. (D-48)
 
 ### Why the MCP dispatch is audited before the handler runs
 
-The server audited only OUTCOMES, and every outcome event fires after ``fn(args)`` returns or
-from an ``except`` block. So a handler that died in a way this frame cannot catch — a killed
-process, an interpreter-level failure — executed a tool with no audit trail at all. The
-dispatch is now audited with ``outcome="invoked"`` *before* the handler runs (``invoked`` is
-the established SEL token for this, not a new synonym), and the outcome event still follows.
-A served call therefore logs twice, which a test pins as an ordered pair.
+Outcome events fire after ``fn(args)`` returns or from an ``except`` block, so a handler that dies
+in a way that frame cannot catch — a killed process, an interpreter-level failure — would run a
+tool with no audit trail. The dispatch is therefore audited with ``outcome="invoked"`` *before*
+the handler runs (``invoked`` is the established SEL token), and the outcome event still follows.
+A served call logs twice, which a test pins as an ordered pair.
 
-That pre-dispatch event is also ``critical=True`` — audit-or-DENY: it is written
-synchronously and a filesystem failure is re-raised, so a call that cannot be recorded is
-REFUSED (``INTERNAL_ERROR``, "the security audit log is unavailable") rather than served
-untraced. The OUTCOME events stay fail-soft, because by then the handler has already run and
-raising could not prevent anything.
+That pre-dispatch event is ``critical=True`` — audit-or-DENY: it is written synchronously and a
+filesystem failure is re-raised, so a call that cannot be recorded is REFUSED (``INTERNAL_ERROR``,
+"the security audit log is unavailable") rather than served untraced. The OUTCOME events stay
+fail-soft, because by then the handler has already run and raising could not prevent anything.
 
-An earlier revision of this section argued the opposite — that all six handlers are pure
-reads, so gating them traded capability for no security gain. That reasoning weighed blast
-radius, but the criterion ``sel`` itself states is ATTENDEDNESS: "pass ``critical=True`` when
-the caller enforces audit-or-deny (e.g. an unattended heartbeat auto-approve)". This server is
-exactly that shape — no human in the loop, results handed to an LLM — so the audit event is
-the only record that a read ever happened. The review that kept pressing on this was right,
-and the earlier refusal is corrected here.
+All six handlers are reads, but the criterion ``sel`` states for ``critical=True`` is
+attendedness, not blast radius: "pass ``critical=True`` when the caller enforces
+audit-or-deny (e.g. an unattended heartbeat auto-approve)". This server has no human in the
+loop and hands its results to an LLM, so the audit event is the only record that a read ever
+happened.
+
+**Pinned invariants.**
+
+- `tools/call` with present-but-non-dict `arguments` is rejected INVALID_PARAMS before coercion; absent, `None` or `{}` stay valid. (D-34)
+- Every MCP dispatch logs `outcome="invoked"` with `critical=True` BEFORE the handler runs, so an unauditable call is refused `INTERNAL_ERROR`; a served call audits as an ordered pair. (D-45)
+- MCP error paths are redacted like results: the SEL record and the JSON-RPC error never carry raw `str(exc)`, the schema validator's message included. (D-88)
+- An untrusted MCP tool NAME is redacted before the SEL record and the model-facing error. (D-126)
 
 ### Why no builtin agent pre-authorizes a tool
 
 ``allowedTools`` auto-approves a tool, and an auto-approved tool never reaches the platform
-governance chokepoint. This is not an inference — it is this repo's documented architecture:
-``hooks.on_tool_call`` runs only from the ``EVENT_PERMISSION_REQUEST`` branch, while the
-``EVENT_TOOL_CALL`` branch is informational-only ("the tool is already running (auto-approved
-by kiro-cli), so hook results cannot block execution"), and
-[governance.md](governance.md) states the consequence outright: an agent that writes itself
-into ``allowedTools`` makes kiro-cli stop sending permission requests and **Plane A never
-runs at all** for that tool.
+governance chokepoint. This is the repo's documented architecture: ``hooks.on_tool_call`` runs
+only from the ``EVENT_PERMISSION_REQUEST`` branch, while the ``EVENT_TOOL_CALL`` branch is
+informational-only ("the tool is already running (auto-approved by kiro-cli), so hook results
+cannot block execution"), and [governance.md](governance.md) states the consequence outright: an
+agent that writes itself into ``allowedTools`` makes kiro-cli stop sending permission requests and
+**Plane A never runs at all** for that tool.
 
-``discovery.json`` pre-authorized ``fs_read``/``fs_write``/``execute_bash``, so the gate the
-unattended runner was wired through — the enterprise ceiling, ``BUILTIN_DENIED_RULES``, and
-the ``~/.aws``/``~/.ssh`` sensitive-path blocks — was inert for precisely the tools a
-repository prompt injection would reach for. ``allowedTools`` is now ``[]``.
+So every builtin agent config ships ``allowedTools: []`` — a pre-authorized ``fs_read`` /
+``fs_write`` / ``execute_bash`` would leave the enterprise ceiling, ``BUILTIN_DENIED_RULES`` and
+the ``~/.aws``/``~/.ssh`` sensitive-path blocks inert for precisely the tools a repository prompt
+injection would reach for. ``tools`` is deliberately RETAINED: the agent can still request those
+tools, and each request is then governed and audited. This matches the sibling ``pr-author.json``
+(which ships no ``allowedTools``) and the computer-use precedent of granting ``tools`` but not
+``allowedTools``, and it is the posture the GenAI tool-use security guidance asks for — least
+privilege, default deny.
 
-``tools`` is deliberately RETAINED: the agent can still request those tools, and each
-request is then governed and audited. Only the blanket pre-approval is gone. This matches the
-sibling ``pr-author.json`` (which ships no ``allowedTools``) and the computer-use precedent
-of granting ``tools`` but deliberately not ``allowedTools``. The GenAI tool-use security guidance
-asks for exactly this posture — least privilege, default deny, "ensure restrictions are
-placed on tool access to prevent unintended access".
+**Pinned invariants.**
+
+- Discovery runs under a tool-scoped agent with no `@kirocrew-core` (so no `spawn_sub_agents`) and a read-only stage allowlist, and ends in a terminal state with no `Reaper: force-killing` lines. (D-8)
+- Every config under `agents/` has an empty `allowedTools`, so no tool is auto-approved past `hooks.on_tool_call`; `tools` stays so requests are governed and audited. (D-43)
+- Discovery's allowlist has no `Bash` (`Read`/`Grep`/`Glob` only), and its prompt offers no shell commands. (D-89)
 
 ### Why a landed manual commit supersedes its ``filed`` row
 
-One-click commit pushed the queued diff and returned the sha, but wrote nothing to the
-ledger. The ledger is last-write-wins per fingerprint, and ``filed`` is what ``filed_crs()``
-feeds the pull-request watchers and what the UI reads to decide whether to offer the commit
-button — so a change already on the branch kept reporting as an open pull request and the
-operator was invited to commit it a second time. The loop's own direct-commit path records a
-``committed`` row; the manual path now does too, through
-``ledger_admin.record_committed``, so the two agree about the same outcome.
+The ledger is last-write-wins per fingerprint, and ``filed`` is what ``filed_crs()`` feeds the
+pull-request watchers and what the UI reads to decide whether to offer the commit button. So
+one-click commit records a ``committed`` row carrying the landed sha through
+``ledger_admin.record_committed``, as the loop's own direct-commit path does; otherwise a change
+already on the branch would keep reporting as an open pull request and invite a second commit.
 
 It writes ``cr`` and never ``pr``, for the reason spelled out for the purge event:
-``LedgerEntry(**row)`` is a fixed-field dataclass, so an event carrying an unexpected key
-raises ``TypeError`` inside ``_load()``'s torn-line handler and vanishes — leaving the
-record ``filed`` after all. Bookkeeping failure is logged and returns False rather than
-raising: the push already succeeded, so it must not surface as an error the operator retries.
+``LedgerEntry(**row)`` is a fixed-field dataclass, so an event carrying an unexpected key raises
+``TypeError`` inside ``_load()``'s torn-line handler and vanishes — leaving the record ``filed``
+after all. Bookkeeping failure is logged and returns False rather than raising: the push already
+succeeded, so it must not surface as an error the operator retries.
+
+**Pinned invariants.**
+
+- `committed` ledger rows and the success log carry the sha read back after the push, so a rebase cannot leave a sha the remote does not have. (D-41)
+- `ledger_admin.record_committed` appends a `committed` row with the landed sha (writing `cr`, never `pr`), failing soft because the push already succeeded. (D-44)
 
 ### Why a rejected provisional commit discards its diff
 
-The provisional commit stages the winner with ``add -A`` and then commits. When the commit
-FAILS — a rejecting ``pre-commit`` hook, gpg/signing trouble — the helper correctly returns
-False, but the diff stays in the index, and the next candidate's ``add -A`` sweeps it into
-*their* commit. Measured on a real repo with a rejecting hook: candidate B's commit carried
-candidate A's rejected, never-verified change to ``m.py`` alongside B's own file. That is the
-same failure class as publishing an unverified rebase — unmeasured code reaching a branch.
+The provisional commit stages the winner with ``add -A`` and then commits. When the commit FAILS
+— a rejecting ``pre-commit`` hook, gpg/signing trouble — the helper returns False, and the diff
+must not stay in the index, where the next candidate's ``add -A`` would sweep candidate A's
+rejected, never-verified change into candidate B's commit. That is the same failure class as
+publishing an unverified rebase — unmeasured code reaching a branch.
 
 ``_discard_staged`` (called from both the perf and bug helpers) collects the patch's ADDED
 paths from the index *before* resetting, then ``reset --hard`` and removes those paths.
@@ -875,46 +920,107 @@ disk, where the very next ``add -A`` picks it straight back up. Removing only th
 patch added keeps this targeted — a blanket ``git clean`` would also delete unrelated build
 output in the operator's clone.
 
+**Pinned invariants.**
+
+- Both provisional-commit helpers check `git commit`'s return code; a rejected commit returns False and leaves HEAD unmoved (`TestProvisionalCommitFailsClosed`). (D-27)
+- A rejected provisional commit calls `_discard_staged`, which removes the patch's ADDED paths collected from the index before `reset --hard`, so the next candidate's `add -A` cannot absorb them. (D-42)
+
 ### Why a rebased commit is re-verified before it is published
 
 A run takes tens of minutes, so the authorized branch can legitimately advance between the
-clone's fetch and the winner's push. A bare push then dies ``! [rejected] ... (fetch first)``
-and strands a fully verified fix — measured on this app's own dogfood, 3 of 6 gate survivors
-were lost that way. Hence the single narrow rebase-and-retry in ``_push_with_rebase``.
+clone's fetch and the winner's push. A bare push then dies ``! [rejected] ... (fetch first)`` and
+would strand a fully verified fix, so ``_push_with_rebase`` makes a single narrow
+rebase-and-retry.
 
-The subtlety is that **a clean rebase is a statement about text, not about behaviour.** The
-gate result the driver is holding was measured against the PRE-rebase base; replaying the
-commit onto a moved branch produces a tree that nothing has ever built or tested. Measured on
-a real repo: our commit added ``g() -> 2``, the branch meanwhile gained a NEW FILE asserting
-``g() == 3``, the rebase exited **0** (disjoint paths, nothing to conflict) and the combined
-tree was **RED**. Pre-fix, that red tree was pushed to the shared branch — exactly what a
-measurement-first pipeline exists to prevent.
+**A clean rebase is a statement about text, not about behaviour.** The gate result the driver is
+holding was measured against the PRE-rebase base; replaying the commit onto a moved branch
+produces a tree nothing has built or tested — a disjoint new file on the branch can make the
+combined tree RED with no conflict. So the replayed tree is re-verified through the profile's own
+build gate (``_reverify_head``) before the retry push, fail-CLOSED: a gate that returns False *or*
+raises returns the original rejection, leaving the verified commit local and recoverable. The
+retry stays, because dropping it would strand verified fixes on every concurrent push.
 
-So the replayed tree is re-verified through the profile's own build gate
-(``_reverify_head``) before the retry push, fail-CLOSED: a gate that returns False *or*
-raises returns the original rejection, leaving the verified commit local and recoverable.
-Deleting the retry outright (the reviewer's suggested fix) would reinstate the measured
-3-in-6 loss, so the invariant is restored without giving up the recovery.
+The ledger records the sha that actually **landed**: a rebase rewrites HEAD, so the caller's
+pre-push snapshot can name a commit absent from the remote. ``_direct_push`` reads HEAD back after
+the push and both committed-status rows record that, so an audit of "what did the bot land?"
+resolves.
 
-The ledger also has to record the sha that actually **landed**: a rebase rewrites HEAD, so
-the caller's pre-push snapshot names a commit absent from the remote (measured: ``eb828444``
-before, ``11aff54a`` after). ``_direct_push`` reads HEAD back after the push and both
-committed-status rows record that, so an audit of "what did the bot land?" resolves.
+**Pinned invariants.**
+
+- A `non-fast-forward` push retries once after fetch+rebase; a conflict aborts; the app never pushes with `--force`. (D-6)
+- `_push_with_rebase` re-verifies the replayed tree through the profile's build gate before pushing; False or a raise returns the original rejection. (D-40)
+
+### Why host-side git cannot run repository-controlled code
+
+The sandboxed agent edits the same worktree and clone the app's OWN git commands (`add`,
+`commit`, `checkout`, `diff`, `push`) then run in on the HOST as the gateway user. Anything the
+repository can make git execute — a hook pointed at by `core.hooksPath`, `core.fsmonitor`, an
+attribute-bound filter or diff driver — would therefore run outside the sandbox. `spine/git_safety.py`
+is the one place that closes this: every host-side git call goes through its config flags and its
+attributes pin, and a structural test enumerates the helpers that must.
+
+**Pinned invariants.**
+
+- Every host-side git command runs with `-c core.hooksPath=<devnull> -c core.fsmonitor=false`, so a repository-planted hook or fsmonitor never runs outside the sandbox. (D-120)
+- `git_safety` pins `.git/info/attributes` to `* -filter diff`, unbinding repository-controlled filter and diff drivers while keeping content readable for the credential scan. (D-123)
+- The attributes pin is written without following links and fails CLOSED, and the gitdir's own backpointer must name this worktree. (D-125)
+- For a linked worktree the attributes pin lands in the COMMON gitdir, which must itself hold a `HEAD`. (D-127)
+- `clone_setup.checkout_branch` routes through the shared `git_safety` config and pin. (D-129)
+- `proposer._capture_diff` calls `require_pinned` first, and the structural helper list includes it (`test_every_host_side_git_helper_injects_the_safe_config`). (D-132)
+- Host-side `git` decodes output leniently (`errors="replace"`), so a non-UTF-8 byte in a changed file cannot kill a watcher. (D-142)
+
+### Gate and measurement invariants
+
+The deterministic gate, measurer and pollution check decide what survives; these are the
+properties each must keep.
+
+**Pinned invariants.**
+
+- The gate collects the reproducing test the agent actually wrote, never a name invented from the target slug (which also collides between targets). (D-2)
+- Gate pytest runs pass `-o addopts=`, so the target's coverage/xdist `addopts` do not apply; `PYTEST_ADDOPTS=""` is not a substitute because env addopts are appended to the ini value. (D-3)
+- Full-suite gate steps use xdist and scope to the edit-allowlist region when it is narrowed, so a monorepo suite does not time out into the unparseable sentinel that reads as "regressed". (D-4)
+- `_lint_findings` strips ANSI SGR codes before parsing, so T1's rule-code set difference compares real codes. (D-5)
+- With the default budget a multi-surface discovery does not leave most findings at `seen`: the cycle cap does not starve discovery. (D-7)
+- The driver's `--dry-run` completes, and `spine/stub_profile.py` is importable. (D-9)
+- The do-not-pollute gate hashes host state before and after a run, and a non-zero diff blocks the run. (D-10)
+- A candidate that deletes tests is rejected (`test_count_unchanged`), and the perf track's edit fence forbids `tests/**`. (D-11)
+- `spine/pollute.py` reports a non-zero diff for a same-length in-place edit, a deletion, a re-pointed symlink and a created-from-absent path, and an exclude never blinds the rest of its root. (D-14)
+- Pre-flight refuses rather than permits: a canary inside the band raises `RulerNotTrustedError`; a host leak raises `HostPollutionError` even in advisory mode; zero baseline samples raise; a negative `floor` never yields a negative band. (D-15)
+- `spine/measurer.py` discards warmups, aggregates by MEDIAN, checks same-sha before any boot, aborts on any rep's ruler error, ANDs RH-A/B across reps, and runs REPRODUCE as an independent larger run. (D-25)
+- `pollute._is_excluded` matches a subtree with `os.sep`, so on Windows the orchestrator's own data dir is not reported as a leak. (D-31)
+- An unresolvable `scopeDiffBase` refuses rather than widening the edit fence; the legitimate base==HEAD empty diff is allowed (see D-67, D-86). (D-39)
+- `scoped_relpaths` returns `set()` for a successful empty diff and `None` only for a blank ref or a git error, so an empty scope means no file may be edited. (D-67)
+- `profile.py` imports `kiro_crew.sandbox` at module scope, and `test_the_gate_requests_strict_mode` patches the consuming module so it asserts the strict mode for real. (D-78)
+- A configured diff scope that cannot be computed, for any cause, refuses rather than running unscoped. (D-86)
+- `RepoEditAllowlist` receives the track (default `TRACK_BUG`), and the added-reproducing-test carve-out applies only on the bug track, so the perf track may not touch `tests/**` at all; a structural test asserts the profile passes its track. (D-101)
+- `Gate._stage_test_only_base` copies the candidate tree with `symlinks=True`, so a planted link to a credential is copied as a link, never its contents. (D-131)
 
 ## Storage
 
 Under `app_data_dir("auto-improvement")` (i.e. `$KIROCREW_HOME/apps/auto-improvement/data`):
 
 ```
-config.json          run configuration
-ledger.jsonl         append-only findings ledger (dedup by content fingerprint)
-ruler/ruler.json     calibrated ruler (atomic write)
-results/             run metadata, results.tsv, per-candidate diffs
-pr_queue/            <fp>.diff + <fp>.pr.md — durable draft-PR queue
-profiles/            normalized profiler frame trees
-sessions/<key>.json  chat-session records (resume)
-logs/
+config.json                    active run configuration
+crew.json                      app role-to-Crew-Member mapping
+sessions/<key>.json            chat-session records (resume)
+repos/<repo-branch-key>/
+├── ledger.jsonl               append-only findings ledger
+├── ruler/ruler.json           calibrated ruler (atomic write)
+├── results/                   run metadata, results.tsv, per-candidate diffs
+├── pr_queue/                  <fp>.diff + <fp>.pr.md — durable draft-PR queue
+├── profiles/                  normalized profiler frame trees
+└── logs/
 ```
+
+All archive text is UTF-8, including raw candidate diffs and TSV descriptions. When an
+existing `results.tsv` is not valid UTF-8, Archive initialization fails closed with an
+error naming the file and the remedy — it never decodes with the current host locale,
+because an archive written under one legacy code page and opened under another would be
+silently transcoded to mojibake. An incomplete UTF-8 sequence at EOF is reported as a
+crash-torn append (recoverable by deleting the incomplete final line) rather than
+misread as legacy text. Agent output is not restricted to the gateway host's locale, so
+durable state must not inherit a legacy Windows code page that cannot represent the
+candidate text.
 
 Disposable clones and worktrees live **outside** `data/` under
 `~/.autoimprove-scratch` (override: `AUTO_IMPROVEMENT_SCRATCH`), because they are
@@ -924,23 +1030,95 @@ large, regenerable, and must not be mistaken for the durable record.
 stylistic: the upstream app used a plain write for the ruler and readers caught it
 mid-truncate ~31% of the time, reporting a calibrated ruler as uncalibrated.
 
-Session record keys are validated against `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$` and
+Session record keys are validated against `^[A-Za-z0-9][A-Za-z0-9._-]{0,249}$` and
 rejected — not sanitized — when unsafe, because silently rewriting a key would
 make two subjects share one record. The frontend sanitizer strips dot-runs and
 path separators before the key is ever sent, so the two gates agree.
+
+**Pinned invariants.**
+
+- `GET /findings/{fp}` joins evidence by the target's BASENAME slug (`mod_py_sym`, matching `proposer._short`), so a nested target like `src/pkg/sub/mod.py::Sym` shows its `signature`/`hypothesis`. (D-1)
+- The direct-commit queue copy writes `<fp>.pr.md`, the name every reader opens; a structural test pins that no non-test source writes `.cr.md`. (D-24)
+- `results.tsv` cells collapse tab, CR and LF to a space (`_cell`); the unaltered value is kept in `candidates.jsonl`. (D-35)
+- Workspace keys include a digest of the repository identity, so repositories that slug alike (`owner/a-b`, `owner/a_b`) get distinct workspaces, while `origin/main` and `main` still share one. (D-85)
 
 ## Chat integration
 
 Three tiers, each where it fits:
 
 1. **Resumable per-subject sessions** (`website/src/apps/auto-improvement/lib/agentSession.ts`)
-   — `createSlot` → `renameSlot` → `sendChat` → `switchSlot`, with
-   `{slot_key, folder_id}` persisted via `PUT /sessions/{key}` so a repeat click
-   resumes. Sessions are filed into an `Auto-Improve - <repo>` folder. A 404 from
+   — `createSlot` (the title on the create payload, `memory_mode: 'persistent'`) →
+   `sendTurn` with the seed prompt → `PUT /sessions/{key}` persisting
+   `{slot_key, folder_id}` → `switchSlot`, so a repeat click resumes through
+   `switchSlot`. Sessions are filed into an `Auto-Improve - <repo>` folder. A 404 from
    `switchSlot` (and only a 404) means the slot is gone and a fresh one opens;
    treating a transient error that way would orphan a live session.
-2. **Silent background sessions** for the autonomous loop's own agent runs, so a
-   run produces no agent cards, approval prompts, or reaper slots.
+2. **Member assignments** for the autonomous loop. Enabling the app provisions
+   `auto-improvement-scout` and `auto-improvement-engineer` as ordinary Crew Members,
+   each with its own immutable member ID and empty V2 memory store. The app keeps
+   the role-to-ID mapping at `<home>/apps/auto-improvement/data/crew.json`;
+   re-enabling preserves owner edits, rules and memory, and follows member renames.
+   A missing recorded member or store, an occupied foreign name or an incompatible
+   template refuses initialization.
+   Disable and uninstall retain the members and their history.
+   [Owner recovery](../../../src/kiro_crew/apps/builtins/auto_improvement/docs/MANUAL.md#recover-a-missing-or-changed-member)
+   restores an intact member's template through the existing editor, retaining its
+   identity. Fresh replacement requires a stopped gateway and backups of `config.json`
+   and `crew.json`: the owner frees any canonical-name collision by renaming the
+   `agents` key and its store's descriptive `owner_member` label, preserving the
+   existing IDs and store binding, then removes only the broken role mapping.
+   Re-enabling provisions that role afresh while preserving the healthy role's ID
+   and renamed label. Retained memory, manual documents and transcripts remain
+   associated with the old identity and are never transferred to the replacement.
+   `backend/crew.py` owns provisioning and binds the gateway session runtime.
+   `spine/crew_runner.py` assigns discovery to the Scout and bug/performance
+   authoring to the Engineer. Each member is governed under its own member alias,
+   so a task-scoped profile bound to that alias holds as it does on the dashboard;
+   provider allocation and the tool set still come from the shared role template. Handoffs carry the candidate evidence explicitly;
+   the members do not share memory. Before provider allocation, the assignment
+   explicitly scans its working directory's `.kiro/agents` and refuses any spec
+   declaring either role template. The shared bounded JSON/Markdown reader handles
+   declared names, filename fallbacks and symlinks; JSON twins take precedence.
+   The scan includes native skill-view filenames and refuses unreadable directories
+   or unverifiable specs instead of treating them as absent. It does not walk
+   parents or change global discovery. When cwd is omitted, the provider factory's
+   session-workspace resolver supplies the path, which is checked and then passed
+   explicitly to allocation. This prevents project preapprovals from bypassing
+   governance and stage permission gates; credential-risk consent does not waive it.
+   Every assignment uses a fresh managed session
+   with a captured `ExecutionContext`, current member context, transcript and
+   member activity pointer. The app feed payload includes the member and session
+   key; the current feed UI shows the member, and member activity opens the session.
+   Generated assignment prompts, assistant text and assignment error metadata pass
+   through the platform context's credential and exfiltration redactor before
+   storage. Completion activity uses the same sanitized error copy; the actual
+   assignment prompt and returned `AgentResult` remain intact for the deterministic
+   driver. Failed redaction withholds the affected field while session release
+   and removal still run.
+   Stop and timeout cancel the active assignment and release its session.
+   Deadline errors use the existing `timeout after Ns` contract so bug and
+   performance authoring retain completed edits for the deterministic gate.
+   Per-role provider-reported USD totals feed the existing combined run budget.
+   Kiro credit usage is not converted to dollars; the USD cap does not bound
+   credit spend. Cycle, time and tool-call limits still apply. The deterministic
+   gate, ruler, keeper and publication policy retain their authority.
+   Only the two named memory tools (`memory_recall`, `learn_add`) supplement a
+   stage's existing tool allowlist, and only with trusted MCP identity; an empty
+   allowlist still grants no tools. Governance, audited approvals and the app's
+   shell refusal gate apply to every permission request. PR watchers retain their
+   separate opt-in runner and egress controls.
+   The Scout offers `execute_bash` for opt-in pre-push git review; discovery's
+   per-stage allowlist still denies Bash.
+   Native permission frames that omit a kind use the preceding tool-call
+   classification with the same call ID. Neither a title nor the agent-written
+   `tool_purpose` is ever a tool's identity, so an unnamed request stays unnamed and
+   is refused.
+   The recovered kind is shared by hook/governance evaluation and the app allowlist,
+   so both authorize the same tool classification.
+   The credential-confinement preflight reads `config.agent.sandbox` and applies
+   `effective_sandbox_mode`, including the governance `sandbox.min_level` floor.
+   Only an effective `strict` mode satisfies it; other modes require the
+   existing explicit `acceptUnsandboxedAgentRisk` decision.
 3. **Fire-and-forget launcher** for one-shot discussions.
 
 Subject kinds are `pr | finding | ruler | run`, and the record key is
@@ -949,6 +1127,13 @@ kind-namespaced so `finding-7` and `pr-7` are different conversations.
 Seed prompts (`lib/prompts.ts`) all append the same two constraints — never
 publish/merge the PR, and never edit the ruler or harness to improve a number.
 A frontend test asserts every surface carries them, so a new surface cannot forget.
+
+**Pinned invariants.**
+
+- Chat-session keys are `kind-repo-id`, with the repo slugged through the filename-safety pass and `norepo` for a missing repo, so two repositories' subjects never share a record. (D-75)
+- `_SAFE_KEY_RE` admits a max-length GitHub PR key while keeping `<key>.json` under 255 characters, and the character fence is unchanged. (D-104)
+- `sessionKey(kind, id, repo)` appends an FNV-1a hash of the raw values, so repos or ids that sanitize alike never share a key. (D-134)
+- `openSession` guards re-entry with a synchronous `useRef` latch per session, taken before the first `await` and released in `finally`. (D-140)
 
 ## Keep/draft ordering invariant
 
@@ -961,10 +1146,9 @@ prevent that and do not: the queue copy carries `winner.diff` (so the *queued* a
 always right), `gated_commit_sha` feeds the reproduce **measurement** rather than the draft,
 and `gate_res.commit_sha` is the throwaway **worktree's** head.
 
-Staging is not enough, and a first attempt at this fix got it wrong: `git push
-HEAD:refs/heads/<b>` sends the **commit** HEAD points at, while `git apply` + `git add -A`
-only touch the index. Verified against a local bare repo — a staged-but-uncommitted fix
-pushed the ORIGINAL file content. The fix has to be a real commit.
+Staging is not enough: `git push HEAD:refs/heads/<b>` sends the **commit** HEAD points at,
+while `git apply` + `git add -A` only touch the index, so a staged-but-uncommitted fix would push
+the ORIGINAL file content. The fix has to be a real commit.
 
 But the commit MESSAGE needs `outcome.reproduce`, which only the pipeline produces, and
 authoring the final message first would silently degrade it to echoing VERIFY (§3.1/§3.2).
@@ -982,6 +1166,12 @@ So the sequence is **provisional commit → draft → amend**:
 A diff that will not apply is refused *before* the expensive reproduce A/B.
 `TestWinnerIsInTheTreeBeforeDrafting` pins the order and the rollback in both tracks.
 
+**Pinned invariants.**
+
+- A FILED bug winner's provisional commit is reset before the next winner, so each bug PR carries only its own fix. (D-70)
+- A bug PR's `base_anchor` is `{branch} @ {pre_sha}`, captured before the provisional commit, never the fix commit. (D-112)
+- `_apply_bug_winner`'s failed direct push rolls back without decrementing `kept`, which only the perf path increments eagerly. (D-116)
+
 ## Startup ordering invariant
 
 `backend/runner.py` must check out the configured branch **before** calling
@@ -996,26 +1186,46 @@ Calibration has the same requirement for a different reason: it *measures* the s
 a baseline and noise band collected on the default branch would be used to judge
 candidates on a feature branch.
 
-When a `scopeDiffBase` is configured and the checkout fails, the run **refuses to
-start** rather than proceeding unscoped. Without a diff scope a failed checkout stays
-best-effort, as before. `TestCheckoutPrecedesProfileBuild` pins the ordering.
+When the checkout fails, both the run and calibration **refuse to start**, with or
+without a configured `scopeDiffBase` (which only extends the error message):
+`checkout_branch` already tries the remote-tracking ref and a local ref, so a failure means
+the branch exists nowhere. `TestCheckoutPrecedesProfileBuild` pins the ordering.
+
+**Pinned invariants.**
+
+- A failed `checkout_branch` makes both the run and calibration RAISE rather than operate on the wrong revision. (D-36)
 
 ## Spine / profile seam
 
-The engine (`spine/`, ~7.8k lines) consumes a target only through a six-field
-`TargetProfile` protocol: `ruler`, `build_gate`, `edit_allowlist`, `isolation`,
-`pr_recipe`, `calibration`. The protocols are `runtime_checkable`, so the loader
-validates a profile object before the driver trusts it. Adding a new target means
-adding a profile, never editing the engine.
+The engine (`spine/`) consumes a target only through the `TargetProfile` protocol
+(`spine/profile.py`): six data fields (`ruler`, `build_gate`, `edit_allowlist`,
+`isolation`, `pr_recipe`, `calibration`), plus `id` and `track`, an optional
+`bug_runner`, and the `discover()` and `propose()` callables. The protocols are
+`runtime_checkable`, so the loader validates a profile object before the driver
+trusts it. Adding a target never edits the engine, but it does touch
+`profiles/__init__.py`: `build_profile` always builds `github_repo` today.
 
 `profiles/github_repo/` is the reference profile.
+
+**Pinned invariants.**
+
+- `ensure_agent_registered` writes `~/.kiro/agents/<name>.json` only when it is absent or byte-identical; a differing file is left intact and registration returns False. (D-28)
+- `runner` imports `build_profile` lazily, keeping the profile and spine off the gateway boot path; `test_perf_boot_path.py` ratchets it. (D-76)
+- MCP stdio registration resolves a bare `python`/`python3`/`py` to the running interpreter (`bridges.resolve_stdio_command`), so the server launches on every platform. (D-90)
 
 ## Frontend
 
 `website/src/apps/auto-improvement/AutoImprovementPage.tsx`, routed at
 `/auto-improvement` via `builtinRegistry.ts`, code-split into its own chunk.
-React Query for all server state; `i18nT` for every user-facing string (keys under
-`autoImprovement.*`, present in all 10 shipped catalogs); lucide icons only.
+React Query for server state, except `lib/agentSession.ts`, which reads and writes
+session records with a direct `fetch`; `i18nT` for every user-facing string (keys under
+`autoImprovement.*`, present in all 12 production catalogs); lucide icons only.
+
+**Pinned invariants.**
+
+- The commit control's `mutationFn` checks `res.ok`/`ok:false` and throws, and the row shows `commitFinding.error` scoped by `variables`. (D-97)
+- The commit control confirms first, naming the BRANCH, carries a text label, and its confirm copy is a catalog key registered as destructive. (D-98)
+- Ledger statuses render as catalog labels for every `VALID_STATUSES` value, through an inline `i18nT(MAP[k])` lookup, with the raw token as fallback. (D-99)
 
 ## Parity with the upstream app
 
@@ -1042,7 +1252,7 @@ Every gap the audit identified is now closed:
 | Auto-fixer reconciler absent | med | ``reconcile_failing_prs`` + ``promote_deferred`` + ``MAX_ACTIVE_WATCHERS`` cap, driven from the polled ``GET /watchers``; 32 tests |
 | Activity buffer 25× smaller | low | ``ACTIVITY_MAXLEN`` 200 → 5000 |
 | ``autoPublish`` gate dropped | low | ``auto_publish_gate`` + the ``autoPublish`` key — fail-closed, ``gh pr ready`` only |
-| ``autoPublish`` could never fire | med | ``summarize_checks`` omitted ``total``, which that gate reads to prove a PR is green rather than merely un-red — so every green draft was refused with "no checks ran". Found by review of this branch; ``total`` is now derived from the four buckets, with a regression guard that fails without it |
+| ``autoPublish`` could never fire | med | ``summarize_checks`` omitted ``total``, which that gate reads to prove a PR is green rather than merely un-red — so every green draft was refused with "no checks ran". ``total`` is now derived from the four buckets, with a regression guard that fails without it |
 | Orphan-clone sweep absent | low | ``sweep_orphan_clones``, name-shape-matched and symlink-safe |
 
 Three deliberate, documented DIVERGENCES remain — they are design decisions, not
@@ -1078,22 +1288,119 @@ One transport difference: the upstream served its MCP tools over HTTP on its own
 allocated port. A builtin has no port, and the app bridge deliberately SKIPS a
 URL-based MCP entry when there is no live backend (a dead default-port URL would
 poison every session's provider config), so the tools ship as a **stdio** server
-instead — `backend/mcp_server.py`, six read-only tools, all auto-approvable.
+instead — `backend/mcp_server.py`, six read-only tools, all auto-approvable. Its
+loop reads stdin as bytes through `json_line.parse_json_object_line`, so a line
+that is not UTF-8, not a JSON object, or nested past the decoder's ceiling is
+skipped (a request, one with a top-level `method`, is answered `-32700` under
+its top-level id when one is recoverable at either end of the line, so its
+caller does not wait out its own timeout), and a
+request whose handling raises is answered `-32603`: neither ends the server
+mid-session.
 
 ## Tests
 
-Integration coverage (all endpoints, the UI, and a full loop against a real repo) is
-specified in [auto-improvement-test-plan](auto-improvement-test-plan.md).
+Automated coverage is the unit and regression suites below. The endpoint surface,
+the frontend cases and the full keep-or-revert loop against a real GitHub repository
+are covered by the **manual acceptance plan** further down, not by an automated
+integration test — nothing in the tree runs the full loop against a live repository.
 
-- `src/kiro_crew/apps/builtins/auto_improvement/tests/` — 439 tests covering verdict
+- `src/kiro_crew/apps/builtins/auto_improvement/tests/` — tests covering verdict
   derivation, check summarization, provider-error degradation, PR-recipe protocol
   conformance, branch naming, draft-only policy, queue degradation, the audit-or-deny
-  approval, MCP dispatch auditing, and evidence redaction. Not in default `testpaths`;
-  run with an explicit path.
-- `test/test_bug_*.py` — reproducing tests for four defects the app found in its own
-  code while dogfooding. They live under `test/` so the default `testpaths` runs them:
-  a regression guard nobody executes is not a guard.
-- `website/src/test/autoImprovementSession.test.ts` — 13 tests covering session-key
-  namespacing/sanitization and prompt constraints.
-- `website/src/test/autoImprovementActivity.test.ts` — 6 tests over the activity-feed
-  line builder, including app-locale (not host-locale) time formatting.
+  approval, MCP dispatch auditing, and evidence redaction. `setup.cfg` `testpaths`
+  collects all of `src/kiro_crew/apps/builtins`, so the app's safety-control tests
+  run in CI. Four sandbox-dependent files (`test_lint_findings.py`,
+  `test_github_profile.py`, `test_profile_capture.py`, `test_runner.py`) are only
+  omitted from coverage, a rule `test/test_coverage_omit_contract.py` enforces.
+- Repo-level handler and coverage tests under `test/`: `test_ai_backend_routes_coverage.py`,
+  `test_ai_agent_runner_coverage.py`, `test_ai_runner_coverage.py`,
+  `test_ai_pr_watchers_coverage.py`, `test_ai_spine_driver_coverage.py`,
+  `test_ai_github_profile_coverage.py`, `test_ai_runner_purpose_not_identity.py`,
+  `test_auto_improvement_owner_gate.py`, `test_auto_improvement_members.py` and
+  `test_handlers_auto_improvement_deny_notice.py`.
+- `test/test_bug_keeper_maximize_direction.py`, `test_bug_keeper_noise_band_none.py`,
+  `test_bug_proposal_skip_status_default.py` and `test_bug_proposer_fan_out_overlap.py`
+  — reproducing tests for defects the app found while dogfooding.
+- `website/src/test/autoImprovementSession.test.ts` — session-key
+  namespacing/sanitization and prompt-constraint coverage.
+- `website/src/test/autoImprovementActivity.test.ts` — activity-feed line-builder
+  coverage, including app-locale (not host-locale) time formatting.
+
+### Manual acceptance plan
+
+Run by hand before accepting a change to the loop; no automated test covers these.
+
+#### Frontend cases
+
+Driven headless with Playwright. Use the website's own `node_modules`
+(`import { chromium } from 'playwright'`) and run the script **from inside `website/`** so
+ESM resolves.
+
+| Case | Action | Expected |
+|---|---|---|
+| B-1 | Click **Auto-Improve** in the left nav | routes to `/auto-improvement`, renders `<h1>Auto-Improvement</h1>` (a partially-staged `dist` renders a dead click) |
+| B-2 | Paste the chess_test URL → **Connect** | clone succeeds; repo shown; push-disabled state visible |
+| B-3 | Base-branch dropdown | shows the **configured** branch, not "default" — config loads async, so the control must re-sync |
+| B-4 | Config names a branch absent from the list | that value still appears — a `<select>` whose value matches no option silently renders the first entry, misreporting the target |
+| B-5 | Toggle **autocommit** | persists via `PUT /config`; survives reload |
+| B-6 | Click **Run** | activity feed streams; **Stop** reaches a terminal state |
+| B-7 | Activity feed shapes | renders all four backend shapes (`{t,note}`, `{t,cycle,stage}`, `{t,cycle,stage,discovered,fresh}`, `{t,agent:{…}}`) without a React error — typing the feed as `string[]` crashes with a minified React error |
+| B-8 | Expand the **3rd** finding | the 3rd panel opens (duplicate React keys open the 2nd instead) |
+| B-9 | Finding detail | **Defect** and **Hypothesis** populated — not an unexplained diff |
+| B-10 | A `committed` finding | shows **View commit** linking to `https://github.com/Zedmor/chess_test/commit/<sha>`, **not** a re-commit button |
+| B-11 | A `filed` finding | still shows the commit **action** |
+| B-12 | PR row | PR link renders (the ledger field is `cr`; a UI reading only `pr` shows nothing); verdict badge + checks label present |
+| B-13 | Refresh-PR and discuss buttons | refetch works; discuss opens a resumable session |
+| B-14 | Colors | app design tokens only (`text-muted`, `text-accent`, `border-border`, `hover:bg-accent/20`) — no bespoke palette, no undefined CSS vars |
+| B-15 | i18n | no hardcoded English; `viewCommit` resolves in every locale `i18n/languages.ts::SUPPORTED_LANGUAGES` registers (`website/src/test/i18nAllLanguagesEntry.test.ts` pins that every entry point reaches every catalog) |
+| B-16 | Console | no errors beyond the pre-existing CSP / Google-Fonts warnings |
+
+#### Full-loop acceptance against a reference repository
+
+The example reference target is a small public chess engine repository
+(`https://github.com/Zedmor/chess_test`); any repository with a small, fast suite works. A small, fast suite is what makes a full-loop
+test practical: the gate runs the suite several times per candidate, and a whole-repo
+suite cannot finish inside `_SUITE_TIMEOUT_S` (`profiles/github_repo/profile.py`).
+
+Run config. `target_url` is set by **Connect** (`POST /setup-clone`), never by
+`PUT /config`, which refuses it; the remaining keys go through `PUT /config`:
+
+```json
+{
+  "target_url": "https://github.com/Zedmor/chess_test",
+  "branch": "origin/main",
+  "directCommit": false,
+  "maxCycles": 6,
+  "maxHours": 1.0,
+  "proposerWide": 1,
+  "proposerDeep": 1,
+  "forceBugSeeds": true,
+  "canaryAdvisory": true
+}
+```
+
+> `directCommit: false` on the first pass so the loop drafts **PRs** rather than pushing —
+> and `main` would be refused by the protected-branch denylist anyway. Re-run with
+> `directCommit: true` **against a feature branch** to exercise the autocommit path.
+
+**Expected trace, in order:**
+
+1. **Preflight** — push-disabled asserted; deps green; do-not-pollute snapshot taken.
+2. **Calibrate** — ruler `calibrated`, noise band recorded. The canary is *advisory* here:
+   a suite ruler cannot always force a known win, and that must WARN, not halt.
+3. **Discover** — the agent reads real files and emits surfaces pinned to
+   `file:line:symbol`. Assert `runner_ok: true`, `raw_items > 0`, every surface a real path.
+4. **Propose** — wide and deep author in **separate** worktrees on **different**
+   candidates (overlapping candidates spend two agent passes on one locus).
+5. **Gate** — bug candidate: T0 build → T1 lint → T2 collect → RED (×2 flake check) →
+   GREEN → STAYGREEN. Assert each flag explicitly true in the artifact.
+6. **Keep** — accepted only on a real transition; a perf candidate must clear the noise
+   band in the **improving direction** for the ruler's `direction`.
+7. **Draft PR** — a draft PR appears on the repo, body carrying the RED→GREEN narrative.
+   Assert `--draft`; assert nothing merged or marked ready.
+8. **Ledger** — the finding ends `filed` (or `committed` in autocommit mode) with a
+   fingerprint, and a re-run does **not** re-file it (dedup invariant).
+
+**Acceptance:** ≥1 finding reaches `filed`/`committed` with a real draft PR or commit,
+**and** its detail panel explains the defect. A run that legitimately finds nothing must
+end `no_defect` — an honest "no defect" is a pass; a *fabricated* fix is a failure.

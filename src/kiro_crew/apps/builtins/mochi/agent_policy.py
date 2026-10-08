@@ -37,6 +37,7 @@ from typing import Any
 
 from kiro_crew.apps.builtins.mochi.soul_loader import rendered_bg_prompt_path, rendered_prompt_path
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def _configured_server_names() -> list[str]:
     """
     config = Path.home() / ".kiro" / "settings" / "mcp.json"
     try:
-        raw = json.loads(config.read_text(encoding="utf-8"))
+        raw = loads_user_json(config.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []  # no global servers configured at all
     except Exception as exc:  # noqa: BLE001 — a malformed global file is not our error
@@ -186,7 +187,7 @@ def build_policy(settings: dict[str, Any], data_dir: Path | None = None) -> dict
     # never overwrites an explicit choice, it only fills the floor.
     #
     # `mountOnly` marks these built-in grants so the bridge mounts the server
-    # (the tool becomes visible, no longer stranded) but does NOT add it to
+    # (the tool becomes visible rather than stranded) but does NOT add it to
     # `allowedTools`. allowedTools is kiro-cli's auto-approve list, the one path
     # that never reaches hooks.on_tool_call — writing spawn_run/cron_add there
     # would let prompt-injected content (the pet web_fetches watch targets)
@@ -265,11 +266,11 @@ def apply_policy(data_dir: Path, settings: dict[str, Any]) -> dict[str, Any]:
     startup reconcile picks up, so persisting it is useful even when this
     materialization fails.
 
-    Raises :class:`PolicyNotMaterialized` when the refresh does not land. This
-    used to be swallowed with a warning — including the case where
-    ``refresh_app_agents`` returned an EMPTY list, which was logged as "applied to
-    0 agent config(s)" and read as success. Both left the caller believing the
-    deny policy was in force when it was not.
+    Raises :class:`PolicyNotMaterialized` when the refresh does not land,
+    including the case where ``refresh_app_agents`` returns an EMPTY list — a
+    warning there ("applied to 0 agent config(s)") reads as success. Swallowing
+    either one leaves the caller believing the deny policy is in force when it
+    is not.
 
     Not raised when the app has NO registered agent configs: there is then nothing
     for kiro-cli to load either, so nothing holds ambient reach.

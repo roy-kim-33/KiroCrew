@@ -6,8 +6,8 @@
  *  1. English resolves to NO directive, so an English user's seed prompt stays
  *     byte-identical — the feature costs nothing when it is not being used.
  *  2. The directive names the prose fields only. `suggested_labels` values are
- *     matched against the repo's real labels downstream, so a translated label
- *     name stops matching and the suggestion is dropped instead of applied.
+ *     label NAMES a person may apply as written, so a translated name would not
+ *     be a label the repo has.
  *  3. Both hooks read the preference at CLICK time. They live outside the
  *     settings page's tree, so a stale read here would mean the setting appears
  *     to do nothing until a reload.
@@ -41,7 +41,13 @@ vi.mock('../apps/issue-radar/context', async () => {
   const actual = await vi.importActual<typeof import('../apps/issue-radar/context')>(
     '../apps/issue-radar/context',
   )
-  return { ...actual, useIssueRadar: () => ({ aiLanguage: livePref }) }
+  return {
+    ...actual,
+    // `repoSettings` is part of the context contract (useInvestigate reads
+    // `workspace_path` off it); this suite only varies `aiLanguage`, so the rest
+    // stays at defaults.
+    useIssueRadar: () => ({ aiLanguage: livePref, repoSettings: { workspace_path: '' } }),
+  }
 })
 
 const {

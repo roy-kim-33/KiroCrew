@@ -31,8 +31,10 @@ Framework **pushes** activities to a messaging endpoint you host. Kiro Crew:
 - A public HTTPS URL that reaches your gateway. Options:
   - A reverse proxy (nginx/Caddy) terminating TLS in front of the gateway.
   - Hosting the gateway on a VM/App Service with a public hostname. Set
-    `dashboard.host` (or `dashboard_url`) to that hostname — the gateway rejects a
-    `Host` header it does not serve, as a DNS-rebinding barrier.
+    `dashboard.url` to the public URL (for example `https://bot.example.com`).
+    Its hostname joins the `Host` allowlist, which is derived from the allowed
+    origins; the gateway rejects a `Host` header it does not serve, as a
+    DNS-rebinding barrier.
   - A dev tunnel for local testing: `devtunnel host -p 5476` (Microsoft Dev
     Tunnels) or `ngrok http 5476`.
 
@@ -153,7 +155,7 @@ Transport capabilities: streaming and reactions are disabled; editing, inbound a
 
 ## Verifying
 
-- The dashboard **Settings → Teams** badge reports whether the channel connected:
+- The dashboard **Settings → Messaging Channels → Microsoft Teams** badge reports whether the channel connected:
   it turns green once the outbound app credentials validate, and turns red with a
   reason if a later send fails (a delivered message clears it again).
 - The status endpoint is `GET /api/teams/config`.
@@ -162,7 +164,7 @@ Transport capabilities: streaming and reactions are disabled; editing, inbound a
 
 ## Commands
 
-Send `/help` in the chat for the current list. Today:
+Send `/help` in the chat for the current list.
 
 | Command | Effect |
 |---|---|
@@ -171,7 +173,7 @@ Send `/help` in the chat for the current list. Today:
 | `/stop` (`/cancel`) | Stop the reply in progress and clear the queue |
 | `/yolo on\|off\|renew` | Auto-approve tools **everywhere** until it expires — see below |
 | `/link` / `/unlink` | Resume / stop mirroring dashboard replies into this chat |
-| `/sessions [search words]` | Continue a recent dashboard chat here (owner only) |
+| `/sessions [search words]` | Continue a recent dashboard or same-chat session here (owner only) |
 | `/dashboard [<N>h\|<N>m]` | Get a **dashboard login link** — see Security notes |
 | `/help` | Show the command list |
 
@@ -185,13 +187,23 @@ progress. A message sent mid-turn is never lost — if it cannot be folded in, i
 held and shown in a single "⏳ Queued (N)" receipt that is edited in place, then
 answered as one combined turn.
 
-### Continuing a dashboard conversation
+### Continuing an earlier conversation
 
-`/sessions` lists your recent dashboard chats as buttons; press one and it continues in
-this Teams chat, with the last few messages replayed so you can see where you left off.
-`/sessions <words>` searches them — over message content as well as titles, so a phrase
-you remember from the conversation finds it. `/unlink` (or `/new`) comes back to your own
-Teams conversation.
+`/sessions` lists your recent dashboard chats plus generations from this exact Teams
+identity bucket; native sessions for another identity, agent, conversation, or channel
+are excluded. Press one and it continues in this Teams chat, with the last few messages
+replayed so you can see where you left off. `/sessions <words>` searches them — over
+message content as well as titles, so a phrase you remember from the conversation finds
+it. `/unlink` comes back to your own Teams conversation. `/new` leaves the resumed
+session and durably records the fresh generation before replying; its first real turn
+adds it to `/sessions`.
+
+If you message a resumed session while the dashboard is in the middle of a turn, the
+message goes to that dashboard session rather than to this chat's own queue: it is
+folded into the running turn ("↪️ Steering that session") or queued on the session
+("⏳ Queued for that session") and runs when that turn finishes. Attachments are not
+carried into a dashboard turn, so a message with files is refused with a note to resend
+it afterwards.
 
 It is **owner-only**: a dashboard session is your whole working transcript, so the list
 is available only when `teams.allowed_emails` holds exactly one address. With more than
@@ -232,7 +244,7 @@ None of this disables the security gate: the sensitive-path keystone, the
 enterprise governance ceiling, and the destructive-command deny-list all run ahead
 of auto-approval, so anything denied by policy stays denied.
 
-## Security notes
+## Access control
 
 - The webhook is **exempt from the dashboard cookie gate and from the CSRF origin
   check, for `POST` only**, because it performs its own Bot Framework JWT
@@ -257,7 +269,7 @@ of auto-approval, so anything denied by policy stays denied.
 - Authorization is **deny-by-default** on both the allow-list and the conversation
   scope (personal only). All denials are recorded in the security event log.
 - **`/dashboard` issues a login credential.** It mints a presigned dashboard
-  session URL for the asking user (default 1 hour, capped at 24), and issuance is
+  session URL for the asking user (default 1 hour, capped at 20), and issuance is
   recorded in the security event log. Everyone on `allowed_emails` can do this, so
   treat that list as the set of people you would hand a dashboard session to.
 - The App Password and all bearer tokens are treated as secrets: the
@@ -269,7 +281,7 @@ of auto-approval, so anything denied by policy stays denied.
   that resolves into a private, loopback or link-local range is refused — so an
   activity cannot turn the gateway into a proxy for your internal network.
 
-## Limitations (this release)
+## Limits
 
 - 1:1 personal chat only — no team channels, group chats, or @mention handling.
   A reply in a channel would expose tool output to people who are not on your
@@ -295,11 +307,23 @@ of auto-approval, so anything denied by policy stays denied.
   and images do not. Long replies are split without breaking code fences.
 - No emoji reaction on a steered message (a bot cannot add reactions in Teams), so
   a folded-in message is acknowledged with a short reply instead.
-- **No model picker yet.** Telegram can switch models from chat; Teams cannot. Use the
-  dashboard. (`/sessions` — continuing a dashboard chat here — IS supported; see below.)
-- **The `send_message` agent tool does not reach Teams.** A cron result DOES arrive
-  here when its originating dashboard chat is mirrored into this conversation (that is
-  what `/link` binds). What is Slack-only is the explicit `send_message` tool call
-  with a channel or user target — its addressing, allow-list and threading are Slack
-  concepts — so a Teams-only install should rely on the mirror rather than on that
-  tool's own delivery.
+- **Teams has no model picker.** Telegram can switch models from chat; Teams cannot. Use
+  the dashboard. (`/sessions` — continuing a dashboard chat here — is supported; see
+  [Continuing an earlier conversation](#continuing-an-earlier-conversation) above.)
+- **The `send_message` agent tool reaches Teams two ways**: `session="teams"` DMs this
+  channel's own configured owner, which needs exactly one reachable address on
+  `allowed_emails` and otherwise falls back to a dashboard notification and says so;
+  `channel_type="teams"` posts into the conversation the turn is already running in. A cron result also arrives here when its
+  originating dashboard chat is mirrored into this conversation (that is what `/link`
+  binds). What is Slack-only is `channel`, `user`, `blocks`, `thread_ts`,
+  `reply_broadcast`, `unfurl_links` and `unfurl_media` — Slack protocol options, so
+  combining any of them with a Teams target is refused rather than ignored.
+  `unfurl_links` and `unfurl_media` are deprecated even on Slack: an explicit `true`
+  is refused (HTTP 400 `unfurl_disabled`), `false` or absent is accepted, and neither
+  is forwarded, because a bot post never makes the platform fetch a link preview.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

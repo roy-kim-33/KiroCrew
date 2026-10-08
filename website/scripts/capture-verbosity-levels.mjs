@@ -1,5 +1,5 @@
 /**
- * Screenshot harness for the Response Verbosity row after adding `answer_only`.
+ * Screenshot harness for the Response Verbosity row (default / concise / answer_only).
  *
  * Runs the REAL built SPA (website/dist) behind the shared `serveDist` server and
  * answers every /api/** call from fixtures through `stubDashboardApi`. No gateway,
@@ -30,8 +30,7 @@ mkdirSync(OUT, { recursive: true })
 const EXPECTED_OPTIONS = [
   'Default — normal length',
   'Concise — trim filler and narration',
-  'Ultra-concise — answer first, minimal prose',
-  'Answer only — details on request or when critical',
+  'Answer only — plainest words, details on request',
 ]
 
 const { srv, base } = await serveDist()
@@ -116,7 +115,7 @@ await page.screenshot({ path: join(OUT, '02-verbosity-options-open.png') })
 console.log('wrote', join(OUT, '02-verbosity-options-open.png'))
 
 // 3 — the new level selected.
-await page.getByRole('option', { name: 'Answer only — details on request or when critical' }).click()
+await page.getByRole('option', { name: 'Answer only — plainest words, details on request' }).click()
 await page.waitForTimeout(1000)
 if (!(await trigger.textContent()).includes('Answer only')) {
   throw new Error('trigger did not adopt the selected level')
@@ -130,7 +129,7 @@ console.log('re-read value:', after)
 if (!after.includes('Answer only')) throw new Error(`did not round-trip, saw: ${after}`)
 await shootRow('04-answer-only-after-reload.png')
 
-console.log('OK: 4 labelled levels, answer_only selectable and round-trips through the API')
+console.log('OK: 3 labelled levels, answer_only selectable and round-trips through the API')
 await context.close()
 await browser.close()
 srv.close()

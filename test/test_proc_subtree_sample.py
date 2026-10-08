@@ -1,10 +1,10 @@
 """The ONE ``/proc`` subtree walker, and the two callers that read off it.
 
-``mcp_gateway.pool`` and ``subagent`` each used to carry a line-for-line copy of
+``mcp_gateway.pool`` and ``subagent`` must not each carry a line-for-line copy of
 the same breadth-first walk over ``/proc/<pid>/task/<tid>/children``, each with
-its own ``256`` process ceiling (#6096). Two copies of a walk are two copies of
-its ceiling and two copies of its sentinels, which is the drift the earlier
-consolidation *inside* ``subagent`` (#3970) was itself about.
+its own ``256`` process ceiling. Two copies of a walk are two copies of
+its ceiling and two copies of its sentinels, which is the drift a single
+consolidation *inside* ``subagent`` guards against.
 
 So this module asserts three things:
 
@@ -26,7 +26,9 @@ import time
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
+from non_utf8_comm import comm_is_settable, renamed_child
 
+from conftest import absent_sysconf
 from kiro_crew import platform_compat
 from kiro_crew import subagent as sa
 from kiro_crew.mcp_gateway import pool as pool_mod
@@ -75,11 +77,25 @@ class _FakeTree:
 
 class TestPerProcessReads:
     def test_status_rss_parses_vmrss(self) -> None:
-        with patch("builtins.open", mock_open(read_data="Name:\tx\nVmRSS:\t 2048 kB\n")):
+        with (
+            patch.object(platform_compat, "IS_LINUX", True),
+            patch("builtins.open", mock_open(read_data=b"Name:\tx\nVmRSS:\t 2048 kB\n")),
+        ):
             assert platform_compat._proc_status_rss_kb(1234) == 2048
 
     def test_status_rss_unreadable_is_minus_one(self) -> None:
-        with patch("builtins.open", side_effect=OSError):
+        with (
+            patch.object(platform_compat, "IS_LINUX", True),
+            patch("builtins.open", side_effect=OSError),
+        ):
+            assert platform_compat._proc_status_rss_kb(1234) == -1
+
+    def test_status_rss_off_linux_is_minus_one(self) -> None:
+        """Without a /proc there is nothing to open: the walk's unreadable sentinel."""
+        with (
+            patch.object(platform_compat, "IS_LINUX", False),
+            patch("builtins.open", side_effect=AssertionError("opened off Linux")),
+        ):
             assert platform_compat._proc_status_rss_kb(1234) == -1
 
     def test_children_listing_unavailable(self) -> None:
@@ -105,6 +121,62 @@ class TestPerProcessReads:
         # post-comm tokens: state(0) ... utime(11)=120 stime(12)=60
         stat = b"1234 (kiro cli (node)) S 2 3 4 5 6 7 8 9 10 11 120 60 0 0"
         assert platform_compat._parse_cpu_jiffies(stat) == 180
+
+    def test_stat_is_read_as_bytes_past_a_comm_that_is_not_utf8(self, tmp_path) -> None:
+        # A prctl(PR_SET_NAME) name is arbitrary bytes, here with a ')' inside.
+        # post-comm tokens: state(0) ppid(1)=7 pgrp(2)=8 session(3)=9 ...
+        # starttime(19)=4242 vsize(20) rss(21)=55
+        (tmp_path / "1234").mkdir()
+        (tmp_path / "1234" / "stat").write_bytes(
+            b"1234 (\xff) \xfe) S 7 8 9 " + b"0 " * 15 + b"4242 0 55"
+        )
+        assert platform_compat.read_proc_stat(1234, proc_root=tmp_path) == platform_compat.ProcStat(
+            state="S", ppid=7, pgrp=8, session=9, start_ticks=4242, rss_pages=55
+        )
+        assert platform_compat._parse_ppid((tmp_path / "1234" / "stat").read_bytes()) == 7
+
+    def test_stat_fields_tolerate_a_missing_separator_after_comm(self) -> None:
+        assert platform_compat._parse_ppid(b"1 (x)S 7 8") == 7
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (b"no-parens-here", None),
+            (b"1 (x)", platform_compat.ProcStat()),
+            (b"1 (x) S -7 +8", platform_compat.ProcStat(state="S")),
+        ],
+    )
+    def test_malformed_stat_lines(self, tmp_path, raw: bytes, expected) -> None:
+        (tmp_path / "1").mkdir()
+        (tmp_path / "1" / "stat").write_bytes(raw)
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) == expected
+
+    def test_unreadable_stat_is_none(self, tmp_path) -> None:
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) is None
+
+    def test_an_overlong_numeric_token_is_none_not_a_raise(self, tmp_path) -> None:
+        (tmp_path / "1").mkdir()
+        (tmp_path / "1" / "stat").write_bytes(b"1 (x) S " + b"9" * 5000 + b" 8")
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) == platform_compat.ProcStat(
+            "S", None, 8, None
+        )
+
+    def test_a_zero_tick_rate_dates_nothing(self, monkeypatch) -> None:
+        real = getattr(os, "sysconf", absent_sysconf)  # Windows has no os.sysconf
+        monkeypatch.setattr(
+            os, "sysconf", lambda name: 0 if name == "SC_CLK_TCK" else real(name), raising=False
+        )
+        assert platform_compat.process_start_boot_secs(4242) is None
+        assert platform_compat.process_age_secs(4242) is None
+
+    def test_process_age_is_boot_clock_now_minus_start(self, monkeypatch) -> None:
+        real = getattr(os, "sysconf", absent_sysconf)  # Windows has no os.sysconf
+        monkeypatch.setattr(
+            os, "sysconf", lambda name: 100 if name == "SC_CLK_TCK" else real(name), raising=False
+        )
+        monkeypatch.setattr(platform_compat, "boottime_now", lambda: 100.0)
+        assert platform_compat.process_age_secs(4242) == pytest.approx(57.58)
+        assert platform_compat.process_age_secs(20_000) == 0.0  # floored, never negative
 
     @pytest.mark.parametrize("raw", [b"", b"no-parens-here", b"1 (x) S 1 2 3"])
     def test_malformed_jiffies_are_zero(self, raw: bytes) -> None:
@@ -262,7 +334,7 @@ class TestSkippedReadingsCostNothing:
 
 
 class TestOneHome:
-    #: Names the two callers defined privately before #6096. A copy coming back
+    #: Names the two callers once defined privately. A copy coming back
     #: would restore one of them, so their absence is the ratchet.
     RETIRED = (
         "_RSS_SUBTREE_MAX_PROCS",
@@ -312,20 +384,14 @@ class TestOneHome:
 # ── the pool caller ───────────────────────────────────────────────────────
 
 
-def _make_pool_key(server: str = "test-server", agent: str = "test-agent") -> PoolKey:
+def _make_pool_key(server: str = "test-server") -> PoolKey:
     return PoolKey(
         server_name=server,
-        agent_name=agent,
         command_args_hash="abc123",
         effective_env_hash="def456",
         work_dir="/tmp/test",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="ghi789",
-        approval_mode="reads",
-        trust_all_tools=False,
-        config_snapshot_hash="jkl012",
     )
 
 
@@ -384,3 +450,111 @@ class TestPoolReadsTheSharedWalk:
         with _FakeTree(), patch.object(platform_compat, "_proc_status_rss_kb", return_value=-1):
             snap = await pool.metrics_snapshot_async()
         assert snap["backends"][0]["rss_kb"] == -1
+
+
+class TestHostParentMap:
+    """``proc_child_map``: the same edges, asked once for the whole host.
+
+    The walker above asks the kernel per root, which costs one read per THREAD of
+    every process it visits -- fine for one root, a multiplier for a caller that
+    needs forty. This map is one read per process on the host and answers all of
+    them, so what it must prove is that it describes the same edges, and that it
+    refuses in a way a caller can tell from an empty host.
+    """
+
+    def test_it_reports_this_process_under_its_real_parent(self) -> None:
+        """The edge is checked against one the OS itself will confirm."""
+        if not platform_compat.IS_LINUX:
+            pytest.skip("/proc parent map is Linux-only")
+        table = platform_compat.proc_child_map()
+        assert table is not None
+        assert os.getpid() in table.get(os.getppid(), [])
+
+    def test_it_agrees_with_the_kernel_child_list_for_a_live_process(self) -> None:
+        """Both routes, same process, same children.
+
+        The map is the more complete of the two by construction (the kernel's
+        child list is documented as reliable only for a frozen task), so this
+        asserts containment in that direction and equality where both answer.
+        """
+        if not platform_compat.IS_LINUX:
+            pytest.skip("/proc parent map is Linux-only")
+        table = platform_compat.proc_child_map()
+        assert table is not None
+        me = os.getpid()
+        assert set(platform_compat._proc_children(me)) <= set(table.get(me, []))
+
+    def test_it_reads_a_process_whose_name_is_not_utf8(self) -> None:
+        """A process may set its own name to arbitrary bytes, and the map must
+        still carry it and the subtree behind it -- as must :func:`parent_pid`,
+        which reads the same field. A real process is renamed, so the kernel and
+        not a fixture writes the line.
+        """
+        if not comm_is_settable():
+            pytest.skip("/proc parent map is Linux-only")
+        with renamed_child(with_grandchild=True) as (child, grandchild):
+            with open(f"/proc/{child}/stat", "rb") as fh:
+                assert platform_compat._parse_ppid(fh.read()) == os.getpid()
+            assert platform_compat.parent_pid(child) == os.getpid()
+            table = platform_compat.proc_child_map()
+            assert table is not None
+            assert child in table.get(os.getpid(), [])
+            assert grandchild in table.get(child, [])
+
+    def test_off_linux_it_refuses_rather_than_reporting_an_empty_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """None means "walk the roots yourself"; ``{}`` would mean "every tree is
+        its root alone", which is a wrong answer rather than a missing one."""
+        monkeypatch.setattr(platform_compat, "IS_LINUX", False)
+        assert platform_compat.proc_child_map() is None
+
+    def test_an_unlistable_proc_refuses_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        if not platform_compat.IS_LINUX:
+            pytest.skip("/proc parent map is Linux-only")
+        monkeypatch.setattr(platform_compat.os, "listdir", _raise_oserror)
+        assert platform_compat.proc_child_map() is None
+
+    def test_a_process_that_exits_mid_scan_is_skipped_not_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pid listed and then gone is in no live tree, and one such pid must
+        not cost the whole map."""
+        if not platform_compat.IS_LINUX:
+            pytest.skip("/proc parent map is Linux-only")
+        import builtins
+
+        real_open = builtins.open
+        gone = str(os.getpid())
+
+        def flaky_open(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if path == f"/proc/{gone}/stat":
+                raise OSError("vanished")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", flaky_open)
+        table = platform_compat.proc_child_map()
+        assert table is not None
+        assert os.getpid() not in table.get(os.getppid(), [])
+        # The rest of the host still landed.
+        assert len(table) > 0
+
+
+class TestJiffiesOverAWalkedSet:
+    """``proc_cpu_jiffies_for_pids``: the walker's CPU figure, over a set the
+    caller already holds, without enumerating the tree again."""
+
+    def test_it_sums_the_same_per_pid_read_the_walker_uses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same reader, so the total is the walker's total over that set and not a
+        second definition of it."""
+        monkeypatch.setattr(platform_compat, "_proc_cpu_jiffies", lambda pid: JIFFIES[pid])
+        assert platform_compat.proc_cpu_jiffies_for_pids(list(JIFFIES)) == sum(JIFFIES.values())
+
+    def test_an_empty_set_is_zero_not_an_error(self) -> None:
+        assert platform_compat.proc_cpu_jiffies_for_pids([]) == 0
+
+
+def _raise_oserror(*_args: object, **_kwargs: object) -> object:
+    raise OSError("refused")

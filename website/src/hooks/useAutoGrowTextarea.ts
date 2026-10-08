@@ -18,9 +18,19 @@ function measure(el: HTMLTextAreaElement, maxH: number): void {
   // cannot recover it, because becoming visible is not a value change.
   if (el.scrollHeight === 0 || !el.offsetParent) return
   el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, maxH)}px`
-  el.style.overflowY = el.scrollHeight > maxH ? 'auto' : 'hidden'
+  // scrollHeight excludes the border, but `height` on a border-box element
+  // (preflight makes every element one) includes it, so without this the box
+  // shrank by its border on the first keystroke. The cap is compared with the
+  // border included too, or a draft that fits only without it would clip.
+  const needed = el.scrollHeight + el.offsetHeight - el.clientHeight
+  el.style.height = `${Math.min(needed, maxH)}px`
+  el.style.overflowY = needed > maxH ? 'auto' : 'hidden'
 }
+
+/** The hook's own measurement, for a box sized from its own handler (the
+ *  selection composer) or outside a value change (the sidebar rename
+ *  re-opening on an unchanged title), so no copy of it drifts. */
+export { measure as measureAutoGrowTextarea }
 
 export function useAutoGrowTextarea(
   ref: RefObject<HTMLTextAreaElement | null>,
@@ -34,8 +44,8 @@ export function useAutoGrowTextarea(
   }, [ref, value, maxH])
 
   // Re-measure once the field gains a layout box. A responsive shell may mount a
-  // composer inside a hidden pane; IntersectionObserver and not ResizeObserver,
-  // because `measure` SETS the height it would otherwise observe.
+  // composer inside a hidden pane; IntersectionObserver here because visibility
+  // is what changes, and `measure` sets nothing that observer reads.
   useEffect(() => {
     const el = ref.current
     if (!el || typeof IntersectionObserver === 'undefined') return
@@ -44,5 +54,24 @@ export function useAutoGrowTextarea(
     })
     io.observe(el)
     return () => io.disconnect()
+  }, [ref, maxH])
+
+  // Re-measure when the box's WIDTH changes at an unchanged value (a window
+  // resize, a pane folding beside it): the text wraps at a different column and
+  // the value-keyed effect above cannot know. Width only -- `measure` writes the
+  // height, which this observer also sees, and re-measuring on that would loop;
+  // the guard makes a height-only notification a no-op.
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let lastWidth = el.clientWidth
+    const ro = new ResizeObserver(() => {
+      const width = el.clientWidth
+      if (width === lastWidth) return
+      lastWidth = width
+      measure(el, maxH)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [ref, maxH])
 }

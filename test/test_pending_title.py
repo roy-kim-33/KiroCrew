@@ -17,10 +17,15 @@ from kiro_crew.dashboard.chat_title import (
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, _ChatSlot
 
 
-def _fake_state():
+def _fake_state(*slots):
     state = MagicMock()
     # conversation_log must be truthy for _persist_title to attempt a write.
     state.conversation_log = MagicMock()
+    # A restricted slot's title write looks up ``state._slots`` for a live
+    # same-key replacement to pre-tighten; a bare MagicMock there would pose
+    # as one at every key. The background titler only writes for the slot
+    # that still holds its key, so a titled slot is registered here.
+    state._slots = {s.key: s for s in slots}
     return state
 
 
@@ -211,14 +216,14 @@ class TestAutoTitleInFlightGuard:
         from kiro_crew.dashboard import chat_title
 
         async def _scenario():
-            state = _fake_state()
             slot = _ChatSlot("chat-4-1783603256")
+            state = _fake_state(slot)
             slot.messages.append({"role": "user", "content": "debug my flaky test"})
             first_started = asyncio.Event()
             release_first = asyncio.Event()
             attempts = []
 
-            async def _generate(_state, messages):
+            async def _generate(_state, messages, *, session_key: str = ""):
                 attempts.append(list(messages))
                 if len(attempts) == 1:
                     first_started.set()
@@ -304,7 +309,7 @@ class TestSkipFallbackBranch:
 
         from kiro_crew.dashboard import chat_title
 
-        state = _fake_state()
+        state = _fake_state(slot)
 
         async def _skip(*_a, **_k):
             return ""  # simulate SKIP/empty
@@ -344,8 +349,8 @@ class TestSkipFallbackBranch:
 class TestAutoTitleRunsForEveryMemoryMode:
     """Titling is not gated on ``memory_mode``.
 
-    It used to bail on ``slot.blocks_reads`` (true only for ``temporary``),
-    which left temporary tabs showing "New Session…" for their whole life.
+    It must not bail on ``slot.blocks_reads`` (true only for ``temporary``),
+    which would otherwise leave temporary tabs showing "New Session…" for their whole life.
     Titling reads only the slot's own messages, so no memory-privacy rule
     applies; the manual generate-title endpoint never had the guard either.
     """
@@ -355,10 +360,10 @@ class TestAutoTitleRunsForEveryMemoryMode:
 
         from kiro_crew.dashboard import chat_title
 
-        state = _fake_state()
+        state = _fake_state(slot)
         attempts = []
 
-        async def _generate(_state, messages):
+        async def _generate(_state, messages, *, session_key: str = ""):
             attempts.append(list(messages))
             return generated
 
